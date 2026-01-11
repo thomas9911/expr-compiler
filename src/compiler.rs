@@ -26,10 +26,11 @@ fn oke() {
         panic!("host machine is not supported: {msg}");
     });
     let isa = isa_builder.finish(flags.clone()).unwrap();
+    let name = "hallo";
 
     // let mut module = JITModule::new(JITBuilder::with_isa(isa.clone(), default_libcall_names()));
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa.clone(), "simple", default_libcall_names()).unwrap(),
+        ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap(),
     );
     add_operator_to_module(&mut module, isa.clone(), &flags, "add", "add");
     add_operator_to_module(&mut module, isa.clone(), &flags, "subtract", "subtract");
@@ -46,11 +47,16 @@ fn oke() {
     let declarations = module.declarations();
     let mut header_file = String::new();
     to_c_headers(declarations, &mut header_file);
-    std::fs::write("out/hallo.h", header_file).unwrap();
+    std::fs::write(format!("out/{name}.h"), header_file).unwrap();
+
+    let mut header_file = String::new();
+    to_rs_headers(declarations, &mut header_file, name);
+    std::fs::write(format!("out/{name}.rs"), header_file).unwrap();
 
     let finished_object = module.finish();
     let bytes = finished_object.emit().unwrap();
-    std::fs::write("out/hallo.obj", bytes).unwrap();
+    std::fs::write(format!("out/{name}.obj"), &bytes).unwrap();
+    std::fs::write(format!("out/{name}.lib"), bytes).unwrap();
 
     // let mut ctx = Context::for_function(func);
     // let isa_builder = lookup_by_name("x86_64").unwrap();
@@ -62,8 +68,7 @@ fn oke() {
 
 fn to_c_headers(declarations: &ModuleDeclarations, header_file: &mut String) {
     header_file.push_str("#include <stdint.h>\n");
-    for (fn_id, func) in declarations.get_functions() {
-        dbg!(fn_id, func);
+    for (_, func) in declarations.get_functions() {
         if func.linkage == Linkage::Export {
             match func.signature.returns.len() {
                 0 => header_file.push_str("void"),
@@ -98,6 +103,54 @@ fn types_to_c_type(type_: Type) -> &'static str {
         types::I16 => "int8_t",
         types::I32 => "int32_t",
         types::I64 => "int64_t",
+        _ => unimplemented!(),
+    }
+}
+
+fn to_rs_headers(declarations: &ModuleDeclarations, header_file: &mut String, name: &str) {
+    header_file.push_str(&format!("#[link(name = \"{}\")]\n", name));
+    header_file.push_str("unsafe extern \"C\" {\n");
+    for (_, func) in declarations.get_functions() {
+        if func.linkage == Linkage::Export {
+            header_file.push_str("pub unsafe fn ");
+            header_file.push_str(func.name.as_ref().unwrap());
+            header_file.push('(');
+            let param_length = func.signature.params.len();
+            for (i, param) in func.signature.params.iter().enumerate() {
+                header_file.push_str(&format!("arg{i}"));
+                header_file.push(':');
+                header_file.push(' ');
+                header_file.push_str(&types_to_rs_type(param.value_type));
+                if i + 1 != param_length {
+                    header_file.push(',');
+                    header_file.push(' ');
+                }
+            }
+            header_file.push(')');
+            
+            match func.signature.returns.len() {
+                0 => header_file.push_str(""),
+                1 =>{
+                    header_file.push_str(" -> ");
+                     header_file.push_str(&types_to_rs_type(func.signature.returns[0].value_type))
+                    },
+                _ => {
+                    panic!("multiple return values")
+                }
+            }
+            header_file.push(';');
+            header_file.push('\n');
+        }
+    }
+    header_file.push('}');
+}
+
+fn types_to_rs_type(type_: Type) -> &'static str {
+    match type_ {
+        types::I8 => "i8",
+        types::I16 => "ii16",
+        types::I32 => "i32",
+        types::I64 => "i64",
         _ => unimplemented!(),
     }
 }
