@@ -1,13 +1,15 @@
-pub mod tokenizer;
-pub mod parser;
-pub mod interpreter;
 pub mod compiler;
+pub mod interpreter;
+pub mod parser;
+pub mod tokenizer;
 
-
+#[cfg(test)]
+use crate::{
+    interpreter::Interpreter,
+    parser::{Ast, LiteralAst, ParseLexer},
+};
 #[cfg(test)]
 use logos::Logos;
-#[cfg(test)]
-use crate::{interpreter::Interpreter, parser::{Ast, LiteralAst, ParseLexer}};
 
 #[test]
 fn execute_test() {

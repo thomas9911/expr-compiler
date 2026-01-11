@@ -140,5 +140,4 @@ impl LiteralAst {
     }
 }
 
-
 // 1 + 2 * 4

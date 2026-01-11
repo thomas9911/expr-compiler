@@ -32,7 +32,7 @@ impl Interpreter {
                     match self.get_output() {
                         Ast::Literal(LiteralAst::Integer(integer)) => {
                             sum = sum.wrapping_add(*integer)
-                        },
+                        }
                         _ => {
                             eprintln!("sum expects integer arguments")
                         }

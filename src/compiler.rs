@@ -1,10 +1,23 @@
 use std::{fs::File, io::Write, mem};
 
-use cranelift::{codegen::{Context, control::ControlPlane, ir::{Function, UserFuncName}, verify_function}, object::ObjectBuilder, prelude::{isa::{OwnedTargetIsa, lookup_by_name}, settings::Flags}};
-use cranelift::prelude::*;
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{Linkage, Module, default_libcall_names};
 use cranelift::object::ObjectModule;
+use cranelift::prelude::*;
+use cranelift::{
+    codegen::{
+        Context,
+        control::ControlPlane,
+        ir::{Function, UserFuncName},
+        verify_function,
+    },
+    module::ModuleDeclarations,
+    object::ObjectBuilder,
+    prelude::{
+        isa::{OwnedTargetIsa, lookup_by_name},
+        settings::Flags,
+    },
+};
 
 fn oke() {
     let flags = settings::Flags::new(settings::builder());
@@ -12,13 +25,14 @@ fn oke() {
     let isa_builder = cranelift::native::builder().unwrap_or_else(|msg| {
         panic!("host machine is not supported: {msg}");
     });
-    let isa = isa_builder
-        .finish(flags.clone())
-        .unwrap();
+    let isa = isa_builder.finish(flags.clone()).unwrap();
 
     // let mut module = JITModule::new(JITBuilder::with_isa(isa.clone(), default_libcall_names()));
-    let mut module = ObjectModule::new(ObjectBuilder::new(isa.clone(), "simple", default_libcall_names()).unwrap());
-    add_add_to_module(&mut module, isa, &flags);
+    let mut module = ObjectModule::new(
+        ObjectBuilder::new(isa.clone(), "simple", default_libcall_names()).unwrap(),
+    );
+    add_operator_to_module(&mut module, isa.clone(), &flags, "add", "add");
+    add_operator_to_module(&mut module, isa.clone(), &flags, "subtract", "subtract");
 
     // // if jit:
     // module.finalize_definitions().unwrap();
@@ -31,39 +45,8 @@ fn oke() {
 
     let declarations = module.declarations();
     let mut header_file = String::new();
-    header_file.push_str("#include <stdint.h>\n");
-    for (fn_id, func) in declarations.get_functions() {
-        dbg!(fn_id, func);
-        if func.linkage == Linkage::Export {
-            match func.signature.returns.len() {
-                0 => header_file.push_str("void"),
-                1 => {
-                    header_file.push_str(&types_to_c_type(func.signature.returns[0].value_type))
-                }
-                _ => {
-                    panic!("multiple return values")
-                }
-            }
-            header_file.push(' ');
-            header_file.push_str(func.name.as_ref().unwrap());
-            header_file.push('(');
-            let param_length = func.signature.params.len();
-            for (i, param) in func.signature.params.iter().enumerate() {
-                    header_file.push_str(&types_to_c_type(param.value_type));
-                    header_file.push(' ');
-                    header_file.push_str(&format!("arg{i}"));
-                    if i+1 != param_length {
-                        header_file.push(',');
-                        header_file.push(' ');
-                    }
-            }
-            header_file.push(')');
-            header_file.push(';');
-        }
-    }
+    to_c_headers(declarations, &mut header_file);
     std::fs::write("out/hallo.h", header_file).unwrap();
-    
-
 
     let finished_object = module.finish();
     let bytes = finished_object.emit().unwrap();
@@ -75,21 +58,57 @@ fn oke() {
     // let mut control_plane = ControlPlane::default();
     // let compiled_code = ctx.compile(isa.as_ref(), &mut control_plane).unwrap();
     // dbg!(compiled_code);
+}
 
-
+fn to_c_headers(declarations: &ModuleDeclarations, header_file: &mut String) {
+    header_file.push_str("#include <stdint.h>\n");
+    for (fn_id, func) in declarations.get_functions() {
+        dbg!(fn_id, func);
+        if func.linkage == Linkage::Export {
+            match func.signature.returns.len() {
+                0 => header_file.push_str("void"),
+                1 => header_file.push_str(&types_to_c_type(func.signature.returns[0].value_type)),
+                _ => {
+                    panic!("multiple return values")
+                }
+            }
+            header_file.push(' ');
+            header_file.push_str(func.name.as_ref().unwrap());
+            header_file.push('(');
+            let param_length = func.signature.params.len();
+            for (i, param) in func.signature.params.iter().enumerate() {
+                header_file.push_str(&types_to_c_type(param.value_type));
+                header_file.push(' ');
+                header_file.push_str(&format!("arg{i}"));
+                if i + 1 != param_length {
+                    header_file.push(',');
+                    header_file.push(' ');
+                }
+            }
+            header_file.push(')');
+            header_file.push(';');
+            header_file.push('\n');
+        }
+    }
 }
 
 fn types_to_c_type(type_: Type) -> &'static str {
     match type_ {
         types::I8 => "int8_t",
+        types::I16 => "int8_t",
         types::I32 => "int32_t",
         types::I64 => "int64_t",
-        _ => unimplemented!()
+        _ => unimplemented!(),
     }
 }
 
-fn add_add_to_module(module: &mut impl Module, isa: OwnedTargetIsa, flags: &Flags) {
-
+fn add_operator_to_module(
+    module: &mut impl Module,
+    isa: OwnedTargetIsa,
+    flags: &Flags,
+    name: &'static str,
+    operator: &'static str,
+) {
     let mut ctx = module.make_context();
 
     let mut sig = Signature::new(isa.default_call_conv());
@@ -102,7 +121,9 @@ fn add_add_to_module(module: &mut impl Module, isa: OwnedTargetIsa, flags: &Flag
     // let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
 
     // let func = module.declare_function("add", Linkage::Local, &sig).unwrap(); // for jit the function doesnt need to be externa;
-    let func = module.declare_function("add", Linkage::Export, &sig).unwrap(); // for object it does
+    let func = module
+        .declare_function(name, Linkage::Export, &sig)
+        .unwrap(); // for object it does
 
     ctx.func.signature = sig;
     ctx.func.name = UserFuncName::user(0, func.as_u32());
@@ -128,7 +149,11 @@ fn add_add_to_module(module: &mut impl Module, isa: OwnedTargetIsa, flags: &Flag
         {
             let arg1 = builder.use_var(x);
             let arg2 = builder.use_var(y);
-            let tmp = builder.ins().iadd(arg1, arg2);
+            let tmp = match operator {
+                "add" => builder.ins().iadd(arg1, arg2),
+                "subtract" => builder.ins().isub(arg1, arg2),
+                _ => unimplemented!(),
+            };
             builder.def_var(z, tmp);
         }
         {
@@ -136,7 +161,7 @@ fn add_add_to_module(module: &mut impl Module, isa: OwnedTargetIsa, flags: &Flag
             builder.ins().return_(&[arg]);
         }
 
-         builder.finalize();
+        builder.finalize();
     }
     let res = verify_function(&ctx.func, flags);
     // println!("{}", ctx.func.display());
@@ -147,9 +172,6 @@ fn add_add_to_module(module: &mut impl Module, isa: OwnedTargetIsa, flags: &Flag
     module.define_function(func, &mut ctx).unwrap();
     module.clear_context(&mut ctx);
 }
-
-
-
 
 #[test]
 fn testingintestg() {
