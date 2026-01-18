@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write, mem};
+// use std::{fs::File, io::Write, mem};
 
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{Linkage, Module, default_libcall_names};
@@ -29,9 +29,8 @@ fn oke() {
     let name = "hallo";
 
     // let mut module = JITModule::new(JITBuilder::with_isa(isa.clone(), default_libcall_names()));
-    let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap(),
-    );
+    let mut module =
+        ObjectModule::new(ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap());
     add_operator_to_module(&mut module, isa.clone(), &flags, "add", "add");
     add_operator_to_module(&mut module, isa.clone(), &flags, "subtract", "subtract");
 
@@ -127,13 +126,13 @@ fn to_rs_headers(declarations: &ModuleDeclarations, header_file: &mut String, na
                 }
             }
             header_file.push(')');
-            
+
             match func.signature.returns.len() {
                 0 => header_file.push_str(""),
-                1 =>{
+                1 => {
                     header_file.push_str(" -> ");
-                     header_file.push_str(&types_to_rs_type(func.signature.returns[0].value_type))
-                    },
+                    header_file.push_str(&types_to_rs_type(func.signature.returns[0].value_type))
+                }
                 _ => {
                     panic!("multiple return values")
                 }
@@ -173,7 +172,7 @@ fn add_operator_to_module(
     let mut fn_builder_ctx = FunctionBuilderContext::new();
     // let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
 
-    // let func = module.declare_function("add", Linkage::Local, &sig).unwrap(); // for jit the function doesnt need to be externa;
+    // let func = module.declare_function("add", Linkage::Local, &sig).unwrap(); // for jit the function doesnt need to be external;
     let func = module
         .declare_function(name, Linkage::Export, &sig)
         .unwrap(); // for object it does
@@ -230,5 +229,5 @@ fn add_operator_to_module(
 fn testingintestg() {
     oke();
 
-    panic!()
+    // panic!()
 }

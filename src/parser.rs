@@ -56,13 +56,121 @@ impl<'a> ParseError<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ast {
+    Block(BlockAst),
+    FunctionDef(FunctionDefAst),
     Expression(ExpressionAst),
     Literal(LiteralAst),
 }
 
+fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
+    while lex.peek() == Some(&Ok(Token::Newline)) {
+        lex.next();
+    }
+}
+
 impl Ast {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
-        Ok(Ast::Expression(ExpressionAst::from_lexer(lex)?))
+        trim_newlines(lex);
+
+        match lex.peek() {
+            Some(&Ok(Token::DefineFunction)) => {
+                Ok(Ast::FunctionDef(FunctionDefAst::from_lexer(lex)?))
+            }
+            _ => Ok(Ast::Expression(ExpressionAst::from_lexer(lex)?)),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct BlockAst {
+    lines: Vec<Ast>,
+}
+
+impl BlockAst {
+    pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
+        let mut block = BlockAst::default();
+        let mut current_indent = 0;
+        assert!(lex.next() == Some(Ok(Token::StartBlock)));
+
+        trim_newlines(lex);
+        loop {
+            match dbg!(lex.peek()) {
+                Some(Ok(Token::Indent)) => {
+                    lex.next();
+                    current_indent += 1;
+                }
+                Some(Ok(Token::EndBlock)) => {
+                    lex.next();
+                    current_indent = 0;
+                    break;
+                }
+                Some(Ok(Token::Newline)) => {
+                    lex.next();
+                    current_indent = 0;
+                }
+                None => {
+                    break;
+                }
+                x => {
+                    block.lines.push(Ast::from_lexer(lex)?);
+                    current_indent = 0;
+                }
+            }
+        }
+
+        Ok(block)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct FunctionDefAst {
+    name: String,
+    inputs: Vec<String>,
+    output: Option<String>,
+    block: BlockAst,
+}
+
+impl FunctionDefAst {
+    pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
+        let mut function_def = FunctionDefAst::default();
+        assert!(lex.next() == Some(Ok(Token::DefineFunction)));
+        let mut first = true;
+        let mut bracket_counter = 0;
+
+        loop {
+            match lex.peek() {
+                Some(Ok(Token::Symbol(_))) if first => {
+                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
+                        unreachable!()
+                    };
+                    function_def.name = name;
+                    first = false;
+                }
+                Some(Ok(Token::OpenBracket)) if bracket_counter == 0 => {
+                    lex.next();
+                    bracket_counter = 1;
+                }
+                Some(Ok(Token::CloseBracket)) if bracket_counter == 1 => {
+                    lex.next();
+                    bracket_counter = 0;
+                }
+                Some(Ok(Token::StartBlock)) => {
+                    function_def.block = BlockAst::from_lexer(lex)?;
+                }
+                None => {
+                    break;
+                }
+                Some(Ok(Token::Newline)) => {
+                    break;
+                }
+
+                x => {
+                    unimplemented!("{:?}", x)
+                }
+            }
+        }
+
+        Ok(function_def)
     }
 }
 
@@ -140,4 +248,84 @@ impl LiteralAst {
     }
 }
 
-// 1 + 2 * 4
+#[cfg(test)]
+use crate::tokenizer::{self, Logos};
+
+#[test]
+fn parse_test_elixir_style() {
+    use Ast::*;
+
+    let text = r#"
+
+fn main() do
+    1 + 2 - 3
+end
+
+    "#;
+
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "subtract".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function: "add".to_string(),
+                        args: vec![
+                            Literal(LiteralAst::Integer(1)),
+                            Literal(LiteralAst::Integer(2)),
+                        ],
+                    }),
+                    Literal(LiteralAst::Integer(3)),
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_test_python_style() {
+    use Ast::*;
+
+    let text = r#"
+
+fn main():
+    1 + 2 - 3
+
+    "#;
+
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "subtract".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function: "add".to_string(),
+                        args: vec![
+                            Literal(LiteralAst::Integer(1)),
+                            Literal(LiteralAst::Integer(2)),
+                        ],
+                    }),
+                    Literal(LiteralAst::Integer(3)),
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}

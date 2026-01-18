@@ -16,6 +16,8 @@ impl Default for Interpreter {
 impl Interpreter {
     pub fn execute(&mut self, ast: Ast) {
         match ast {
+            Ast::Block(_) => todo!(),
+            Ast::FunctionDef(_) => todo!(),
             Ast::Expression(expr) => {
                 self.execute_expression(expr);
             }
