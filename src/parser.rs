@@ -83,7 +83,7 @@ impl Ast {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct BlockAst {
-    lines: Vec<Ast>,
+    pub lines: Vec<Ast>,
 }
 
 impl BlockAst {
@@ -124,10 +124,10 @@ impl BlockAst {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct FunctionDefAst {
-    name: String,
-    inputs: Vec<String>,
-    output: Option<String>,
-    block: BlockAst,
+    pub name: String,
+    pub inputs: Vec<String>,
+    pub output: Option<String>,
+    pub block: BlockAst,
 }
 
 impl FunctionDefAst {

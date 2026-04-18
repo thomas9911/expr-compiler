@@ -1,5 +1,6 @@
 pub mod compiler;
 pub mod interpreter;
+pub mod module;
 pub mod parser;
 pub mod tokenizer;
 // pub mod instruction;
