@@ -5,6 +5,8 @@ use cranelift::module::{FuncId, Linkage, Module as CraneliftModule, default_libc
 use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::HashMap;
+use std::path::Path;
+use std::process::Command;
 
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
@@ -47,7 +49,7 @@ impl Module {
 
         let mut func_ids = HashMap::new();
         for func_def in &self.functions {
-            let id = add_function_to_module(&mut cranelift_module, isa.clone(), &flags, func_def);
+            let id = add_function_to_module(&mut cranelift_module, isa.clone(), &flags, func_def, &func_def.name, Linkage::Export);
             func_ids.insert(func_def.name.clone(), id);
         }
 
@@ -71,9 +73,64 @@ impl Module {
         );
 
         for func_def in &self.functions {
-            add_function_to_module(&mut cranelift_module, isa.clone(), &flags, func_def);
+            add_function_to_module(&mut cranelift_module, isa.clone(), &flags, func_def, &func_def.name, Linkage::Export);
         }
         cranelift_module.finish().emit().unwrap()
+    }
+
+    pub fn compile_to_executable(self, output: &Path) {
+        let flags = settings::Flags::new(settings::builder());
+        let isa = cranelift::native::builder()
+            .expect("host machine supported")
+            .finish(flags.clone())
+            .unwrap();
+
+        let mut cranelift_module = ObjectModule::new(
+            ObjectBuilder::new(isa.clone(), "exe", default_libcall_names()).unwrap(),
+        );
+
+        let mut expr_main_id: Option<FuncId> = None;
+        for func_def in &self.functions {
+            if func_def.name == "main" {
+                let id = add_function_to_module(
+                    &mut cranelift_module,
+                    isa.clone(),
+                    &flags,
+                    func_def,
+                    "__expr_main",
+                    Linkage::Local,
+                );
+                expr_main_id = Some(id);
+            } else {
+                add_function_to_module(
+                    &mut cranelift_module,
+                    isa.clone(),
+                    &flags,
+                    func_def,
+                    &func_def.name,
+                    Linkage::Export,
+                );
+            }
+        }
+
+        if let Some(id) = expr_main_id {
+            generate_c_main(&mut cranelift_module, isa.clone(), &flags, id);
+        }
+
+        let bytes = cranelift_module.finish().emit().unwrap();
+
+        let tmp = std::env::temp_dir().join("__expr_compiler_main.o");
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        let status = Command::new("cc")
+            .arg(&tmp)
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("cc not found — install gcc or clang");
+
+        std::fs::remove_file(&tmp).ok();
+        assert!(status.success(), "linker failed with: {status}");
     }
 }
 
@@ -93,6 +150,8 @@ fn add_function_to_module(
     isa: OwnedTargetIsa,
     flags: &settings::Flags,
     func_def: &FunctionDefAst,
+    name: &str,
+    linkage: Linkage,
 ) -> FuncId {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I64));
@@ -101,7 +160,7 @@ fn add_function_to_module(
     }
 
     let func_id = module
-        .declare_function(&func_def.name, Linkage::Export, &sig)
+        .declare_function(name, linkage, &sig)
         .unwrap();
 
     let mut ctx = module.make_context();
@@ -148,6 +207,71 @@ fn add_function_to_module(
     module.define_function(func_id, &mut ctx).unwrap();
     module.clear_context(&mut ctx);
     func_id
+}
+
+fn generate_c_main(
+    module: &mut impl CraneliftModule,
+    isa: OwnedTargetIsa,
+    flags: &settings::Flags,
+    expr_main_id: FuncId,
+) {
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.returns.push(AbiParam::new(types::I32));
+    sig.params.push(AbiParam::new(types::I32)); // argc
+    sig.params.push(AbiParam::new(types::I64)); // argv (pointer)
+
+    let main_id = module
+        .declare_function("main", Linkage::Export, &sig)
+        .unwrap();
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = sig;
+    ctx.func.name = UserFuncName::user(0, main_id.as_u32());
+
+    let expr_main_ref = module.declare_func_in_func(expr_main_id, &mut ctx.func);
+
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+
+        let block_entry = builder.create_block();
+        let block_fits = builder.create_block();
+        let block_overflow = builder.create_block();
+
+        builder.append_block_params_for_function_params(block_entry);
+        builder.switch_to_block(block_entry);
+
+        let call = builder.ins().call(expr_main_ref, &[]);
+        let result = builder.inst_results(call)[0];
+
+        let min = builder.ins().iconst(types::I64, i32::MIN as i64);
+        let max = builder.ins().iconst(types::I64, i32::MAX as i64);
+        let fits_low = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, result, min);
+        let fits_high = builder.ins().icmp(IntCC::SignedLessThanOrEqual, result, max);
+        let fits = builder.ins().band(fits_low, fits_high);
+        builder.ins().brif(fits, block_fits, &[], block_overflow, &[]);
+        builder.seal_block(block_entry);
+
+        builder.switch_to_block(block_fits);
+        builder.seal_block(block_fits);
+        let narrow = builder.ins().ireduce(types::I32, result);
+        builder.ins().return_(&[narrow]);
+
+        builder.switch_to_block(block_overflow);
+        builder.seal_block(block_overflow);
+        let one = builder.ins().iconst(types::I32, 1);
+        builder.ins().return_(&[one]);
+
+        builder.finalize();
+    }
+
+    let res = verify_function(&ctx.func, flags);
+    if let Err(errors) = res {
+        panic!("{}", errors);
+    }
+
+    module.define_function(main_id, &mut ctx).unwrap();
+    module.clear_context(&mut ctx);
 }
 
 fn compile_ast(
@@ -219,6 +343,25 @@ fn text_to_native_execute_with_params() {
 
     assert_eq!(func(3, 5), 8);
     assert_eq!(func(10, -4), 6);
+}
+
+#[test]
+fn compile_to_executable_runs() {
+    use crate::parser::ParseLexer;
+    use crate::tokenizer::{self, Logos};
+
+    let src = "fn main() do\n    7 + 5 - 4\nend";
+    let lex = tokenizer::Token::lexer(src);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let output = std::env::temp_dir().join("__expr_compiler_test_exe");
+    Module::from_ast(ast).compile_to_executable(&output);
+
+    let status = Command::new(&output).status().expect("failed to run executable");
+    assert_eq!(status.code(), Some(8)); // 7 + 5 - 4 = 8
+
+    std::fs::remove_file(&output).ok();
 }
 
 #[test]
