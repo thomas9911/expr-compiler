@@ -222,12 +222,44 @@ impl ExpressionAst {
                     let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
                         unreachable!()
                     };
+                    let node = if lex.peek() == Some(&Ok(Token::OpenBracket)) {
+                        lex.next(); // consume '('
+                        let mut call_args = vec![];
+                        loop {
+                            match lex.peek() {
+                                Some(Ok(Token::CloseBracket)) => {
+                                    lex.next();
+                                    break;
+                                }
+                                Some(Ok(Token::Comma)) => {
+                                    lex.next();
+                                }
+                                _ => {
+                                    let arg_expr = ExpressionAst::from_lexer(lex)?;
+                                    let arg = if arg_expr.function.is_empty()
+                                        && arg_expr.args.len() == 1
+                                    {
+                                        arg_expr.args.into_iter().next().unwrap()
+                                    } else {
+                                        Ast::Expression(arg_expr)
+                                    };
+                                    call_args.push(arg);
+                                }
+                            }
+                        }
+                        Ast::Expression(ExpressionAst {
+                            function: name,
+                            args: call_args,
+                        })
+                    } else {
+                        Ast::Variable(name)
+                    };
                     if !in_prefix {
                         if expr.args.len() < 1 {
                             in_infix = true;
                         }
                     }
-                    expr.args.push(Ast::Variable(name));
+                    expr.args.push(node);
                 }
                 Some(Ok(x)) if x.kind() == TokenKind::InfixOperator && in_infix => {
                     set_function(&mut expr, x);
@@ -241,7 +273,11 @@ impl ExpressionAst {
                     expr.args.push(first_arg);
                     lex.next();
                 }
+                Some(Ok(Token::Comma)) | Some(Ok(Token::CloseBracket)) => break,
                 None if !expr.function.is_empty() && expr.args.len() == 2 => {
+                    break;
+                }
+                None if expr.args.len() == 1 => {
                     break;
                 }
                 x => {
@@ -259,6 +295,9 @@ fn set_function(expr: &mut ExpressionAst, token: &Token) {
     match token {
         Token::Add => expr.function = "add".to_string(),
         Token::Subtract => expr.function = "subtract".to_string(),
+        Token::Multiply => expr.function = "multiply".to_string(),
+        Token::Divide => expr.function = "divide".to_string(),
+        Token::Modulo => expr.function = "modulo".to_string(),
         _ => unreachable!(),
     }
 }
@@ -352,6 +391,121 @@ fn main():
                     }),
                     Literal(LiteralAst::Integer(3)),
                 ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_function_call_single_arg() {
+    use Ast::*;
+
+    let text = "fn main() do\n    double(21)\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "".to_string(),
+                args: vec![Expression(ExpressionAst {
+                    function: "double".to_string(),
+                    args: vec![Literal(LiteralAst::Integer(21))],
+                })],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_function_call_multi_args() {
+    use Ast::*;
+
+    let text = "fn main() do\n    add(1, 2)\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "".to_string(),
+                args: vec![Expression(ExpressionAst {
+                    function: "add".to_string(),
+                    args: vec![
+                        Literal(LiteralAst::Integer(1)),
+                        Literal(LiteralAst::Integer(2)),
+                    ],
+                })],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_function_call_in_expression() {
+    use Ast::*;
+
+    // double(3) + 1 — call result used in infix, no passthrough wrapper
+    let text = "fn main() do\n    double(3) + 1\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "add".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function: "double".to_string(),
+                        args: vec![Literal(LiteralAst::Integer(3))],
+                    }),
+                    Literal(LiteralAst::Integer(1)),
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_function_calling_other_with_params() {
+    use Ast::*;
+
+    let text = "fn double(x) do\n    add(x, x)\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "double".to_string(),
+        inputs: vec!["x".to_string()],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "".to_string(),
+                args: vec![Expression(ExpressionAst {
+                    function: "add".to_string(),
+                    args: vec![Variable("x".to_string()), Variable("x".to_string())],
+                })],
             })],
         },
     });

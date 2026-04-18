@@ -59,6 +59,12 @@ pub enum Token {
     Add,
     #[token("-")]
     Subtract,
+    #[token("*")]
+    Multiply,
+    #[token("/")]
+    Divide,
+    #[token("%")]
+    Modulo,
     #[token("(")]
     OpenBracket,
     #[token(")")]
@@ -85,6 +91,9 @@ impl Token {
             Token::Integer(_) => TokenKind::Integer,
             Token::Add => TokenKind::InfixOperator,
             Token::Subtract => TokenKind::InfixOperator,
+            Token::Multiply => TokenKind::InfixOperator,
+            Token::Divide => TokenKind::InfixOperator,
+            Token::Modulo => TokenKind::InfixOperator,
             Token::OpenBracket => TokenKind::OpenBracket,
             Token::CloseBracket => TokenKind::CloseBracket,
             Token::Comma => TokenKind::Comma,
@@ -235,6 +244,35 @@ fn add(x, y):
             Symbol("y".to_string()),
             Newline,
             Indent,
+        ]
+    );
+}
+
+#[test]
+fn tokenize_function_call() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("double(x)").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("double".to_string()),
+            OpenBracket,
+            Symbol("x".to_string()),
+            CloseBracket,
+        ]
+    );
+
+    let result: Result<Vec<_>, _> = Token::lexer("add(x, y)").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("add".to_string()),
+            OpenBracket,
+            Symbol("x".to_string()),
+            Comma,
+            Symbol("y".to_string()),
+            CloseBracket,
         ]
     );
 }

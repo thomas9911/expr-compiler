@@ -1,4 +1,5 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
+use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::{ir::UserFuncName, verify_function};
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{FuncId, Linkage, Module as CraneliftModule, default_libcall_names};
@@ -19,6 +20,30 @@ impl Module {
 
     pub fn add_function(&mut self, func: FunctionDefAst) {
         self.functions.push(func);
+    }
+
+    pub fn from_source(source: &str) -> Self {
+        use crate::parser::ParseLexer;
+        use crate::tokenizer::{Logos, Token};
+
+        let mut module = Module::new();
+        let lex = Token::lexer(source);
+        let mut lexer = ParseLexer::new(lex);
+
+        loop {
+            while lexer.peek() == Some(&Ok(Token::Newline)) {
+                lexer.next();
+            }
+            if lexer.peek().is_none() {
+                break;
+            }
+            match Ast::from_lexer(&mut lexer) {
+                Ok(Ast::FunctionDef(func)) => module.functions.push(func),
+                Ok(_) | Err(_) => break,
+            }
+        }
+
+        module
     }
 
     pub fn from_ast(ast: Ast) -> Self {
@@ -47,10 +72,26 @@ impl Module {
         let mut cranelift_module =
             JITModule::new(JITBuilder::with_isa(isa.clone(), default_libcall_names()));
 
-        let mut func_ids = HashMap::new();
+        let mut func_ids: HashMap<String, FuncId> = HashMap::new();
         for func_def in &self.functions {
-            let id = add_function_to_module(&mut cranelift_module, isa.clone(), &flags, func_def, &func_def.name, Linkage::Export);
+            let id = declare_function_sig(
+                &mut cranelift_module,
+                &isa,
+                func_def,
+                &func_def.name,
+                Linkage::Export,
+            );
             func_ids.insert(func_def.name.clone(), id);
+        }
+        for func_def in &self.functions {
+            define_function_body(
+                &mut cranelift_module,
+                isa.clone(),
+                &flags,
+                func_def,
+                func_ids[&func_def.name],
+                &func_ids,
+            );
         }
 
         cranelift_module.finalize_definitions().unwrap();
@@ -72,8 +113,26 @@ impl Module {
             ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap(),
         );
 
+        let mut func_ids: HashMap<String, FuncId> = HashMap::new();
         for func_def in &self.functions {
-            add_function_to_module(&mut cranelift_module, isa.clone(), &flags, func_def, &func_def.name, Linkage::Export);
+            let id = declare_function_sig(
+                &mut cranelift_module,
+                &isa,
+                func_def,
+                &func_def.name,
+                Linkage::Export,
+            );
+            func_ids.insert(func_def.name.clone(), id);
+        }
+        for func_def in &self.functions {
+            define_function_body(
+                &mut cranelift_module,
+                isa.clone(),
+                &flags,
+                func_def,
+                func_ids[&func_def.name],
+                &func_ids,
+            );
         }
         cranelift_module.finish().emit().unwrap()
     }
@@ -89,28 +148,39 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "exe", default_libcall_names()).unwrap(),
         );
 
+        let mut all_funcs: HashMap<String, FuncId> = HashMap::new();
         let mut expr_main_id: Option<FuncId> = None;
         for func_def in &self.functions {
             if func_def.name == "main" {
-                let id = add_function_to_module(
+                let id = declare_function_sig(
                     &mut cranelift_module,
-                    isa.clone(),
-                    &flags,
+                    &isa,
                     func_def,
                     "__expr_main",
                     Linkage::Local,
                 );
+                all_funcs.insert("main".to_string(), id);
                 expr_main_id = Some(id);
             } else {
-                add_function_to_module(
+                let id = declare_function_sig(
                     &mut cranelift_module,
-                    isa.clone(),
-                    &flags,
+                    &isa,
                     func_def,
                     &func_def.name,
-                    Linkage::Export,
+                    Linkage::Local,
                 );
+                all_funcs.insert(func_def.name.clone(), id);
             }
+        }
+        for func_def in &self.functions {
+            define_function_body(
+                &mut cranelift_module,
+                isa.clone(),
+                &flags,
+                func_def,
+                all_funcs[&func_def.name],
+                &all_funcs,
+            );
         }
 
         if let Some(id) = expr_main_id {
@@ -145,10 +215,9 @@ impl JitModule {
     }
 }
 
-fn add_function_to_module(
+fn declare_function_sig(
     module: &mut impl CraneliftModule,
-    isa: OwnedTargetIsa,
-    flags: &settings::Flags,
+    isa: &OwnedTargetIsa,
     func_def: &FunctionDefAst,
     name: &str,
     linkage: Linkage,
@@ -158,14 +227,31 @@ fn add_function_to_module(
     for _ in &func_def.inputs {
         sig.params.push(AbiParam::new(types::I64));
     }
+    module.declare_function(name, linkage, &sig).unwrap()
+}
 
-    let func_id = module
-        .declare_function(name, linkage, &sig)
-        .unwrap();
+fn define_function_body(
+    module: &mut impl CraneliftModule,
+    isa: OwnedTargetIsa,
+    flags: &settings::Flags,
+    func_def: &FunctionDefAst,
+    func_id: FuncId,
+    all_funcs: &HashMap<String, FuncId>,
+) {
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.returns.push(AbiParam::new(types::I64));
+    for _ in &func_def.inputs {
+        sig.params.push(AbiParam::new(types::I64));
+    }
 
     let mut ctx = module.make_context();
     ctx.func.signature = sig;
     ctx.func.name = UserFuncName::user(0, func_id.as_u32());
+
+    let func_refs: HashMap<String, FuncRef> = all_funcs
+        .iter()
+        .map(|(name, &id)| (name.clone(), module.declare_func_in_func(id, &mut ctx.func)))
+        .collect();
 
     let mut fn_builder_ctx = FunctionBuilderContext::new();
     {
@@ -189,7 +275,7 @@ fn add_function_to_module(
 
         let mut last_val = None;
         for line in &func_def.block.lines {
-            last_val = Some(compile_ast(&mut builder, line, &params));
+            last_val = Some(compile_ast(&mut builder, line, &params, &func_refs));
         }
 
         if let Some(val) = last_val {
@@ -206,7 +292,6 @@ fn add_function_to_module(
 
     module.define_function(func_id, &mut ctx).unwrap();
     module.clear_context(&mut ctx);
-    func_id
 }
 
 fn generate_c_main(
@@ -246,10 +331,16 @@ fn generate_c_main(
 
         let min = builder.ins().iconst(types::I64, i32::MIN as i64);
         let max = builder.ins().iconst(types::I64, i32::MAX as i64);
-        let fits_low = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, result, min);
-        let fits_high = builder.ins().icmp(IntCC::SignedLessThanOrEqual, result, max);
+        let fits_low = builder
+            .ins()
+            .icmp(IntCC::SignedGreaterThanOrEqual, result, min);
+        let fits_high = builder
+            .ins()
+            .icmp(IntCC::SignedLessThanOrEqual, result, max);
         let fits = builder.ins().band(fits_low, fits_high);
-        builder.ins().brif(fits, block_fits, &[], block_overflow, &[]);
+        builder
+            .ins()
+            .brif(fits, block_fits, &[], block_overflow, &[]);
         builder.seal_block(block_entry);
 
         builder.switch_to_block(block_fits);
@@ -278,24 +369,38 @@ fn compile_ast(
     builder: &mut FunctionBuilder,
     ast: &Ast,
     params: &[(String, Variable)],
+    func_refs: &HashMap<String, FuncRef>,
 ) -> cranelift::prelude::Value {
     match ast {
         Ast::Literal(LiteralAst::Integer(n)) => builder.ins().iconst(types::I64, *n),
         Ast::Expression(ExpressionAst { function, args }) => {
             let compiled: Vec<_> = args
                 .iter()
-                .map(|arg| compile_ast(builder, arg, params))
+                .map(|arg| compile_ast(builder, arg, params, func_refs))
                 .collect();
+            if function.is_empty() {
+                // single-term passthrough produced by the parser
+                return compiled[0];
+            }
             match function.as_str() {
                 "add" => builder.ins().iadd(compiled[0], compiled[1]),
                 "subtract" => builder.ins().isub(compiled[0], compiled[1]),
-                _ => unimplemented!("unknown function: {function}"),
+                "multiply" => builder.ins().imul(compiled[0], compiled[1]),
+                "divide" => builder.ins().sdiv(compiled[0], compiled[1]),
+                "modulo" => builder.ins().srem(compiled[0], compiled[1]),
+                name => {
+                    let func_ref = func_refs
+                        .get(name)
+                        .unwrap_or_else(|| panic!("undefined function: {name}"));
+                    let call = builder.ins().call(*func_ref, &compiled);
+                    builder.inst_results(call)[0]
+                }
             }
         }
         Ast::Block(block) => {
             let mut last = None;
             for line in &block.lines {
-                last = Some(compile_ast(builder, line, params));
+                last = Some(compile_ast(builder, line, params, func_refs));
             }
             last.expect("empty block")
         }
@@ -346,6 +451,36 @@ fn text_to_native_execute_with_params() {
 }
 
 #[test]
+fn call_user_defined_function() {
+    use crate::parser::ParseLexer;
+    use crate::tokenizer::{self, Logos};
+
+    let src = "fn double(x) do\n    x + x\nend\nfn main() do\n    double(21)\nend";
+    let lex = tokenizer::Token::lexer(src);
+    let mut lexer = ParseLexer::new(lex);
+
+    // parse both functions from sequential Ast::from_lexer calls
+    let ast1 = Ast::from_lexer(&mut lexer).unwrap();
+    let ast2 = Ast::from_lexer(&mut lexer).unwrap();
+
+    let mut module = Module::new();
+    module.add_function(match ast1 {
+        Ast::FunctionDef(f) => f,
+        _ => panic!(),
+    });
+    module.add_function(match ast2 {
+        Ast::FunctionDef(f) => f,
+        _ => panic!(),
+    });
+
+    let jit = module.compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+
+    assert_eq!(func(), 42); // double(21) = 42
+}
+
+#[test]
 fn compile_to_executable_runs() {
     use crate::parser::ParseLexer;
     use crate::tokenizer::{self, Logos};
@@ -358,7 +493,9 @@ fn compile_to_executable_runs() {
     let output = std::env::temp_dir().join("__expr_compiler_test_exe");
     Module::from_ast(ast).compile_to_executable(&output);
 
-    let status = Command::new(&output).status().expect("failed to run executable");
+    let status = Command::new(&output)
+        .status()
+        .expect("failed to run executable");
     assert_eq!(status.code(), Some(8)); // 7 + 5 - 4 = 8
 
     std::fs::remove_file(&output).ok();
