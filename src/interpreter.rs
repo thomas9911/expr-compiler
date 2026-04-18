@@ -23,6 +23,7 @@ impl Interpreter {
             }
             Ast::Literal(literal_ast) => self.execute_literal(literal_ast),
             Ast::Variable(_) => todo!(),
+            Ast::Assign { .. } => todo!(),
         }
     }
 

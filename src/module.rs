@@ -193,6 +193,7 @@ impl Module {
         std::fs::write(&tmp, &bytes).unwrap();
 
         let status = Command::new("cc")
+            .arg("-no-pie")
             .arg(&tmp)
             .arg("-o")
             .arg(output)
@@ -324,21 +325,22 @@ fn define_function_body(
         builder.switch_to_block(block0);
         builder.seal_block(block0);
 
-        let params: Vec<(String, Variable)> = func_def
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let var = builder.declare_var(types::I64);
-                let param_val = builder.block_params(block0)[i];
-                builder.def_var(var, param_val);
-                (name.clone(), var)
-            })
-            .collect();
+        let mut vars: HashMap<String, Variable> = HashMap::new();
+        for (i, name) in func_def.inputs.iter().enumerate() {
+            let var = builder.declare_var(types::I64);
+            let param_val = builder.block_params(block0)[i];
+            builder.def_var(var, param_val);
+            vars.insert(name.clone(), var);
+        }
+        for name in local_var_names(&func_def.block) {
+            if !vars.contains_key(&name) {
+                vars.insert(name, builder.declare_var(types::I64));
+            }
+        }
 
         let mut last_val = None;
         for line in &func_def.block.lines {
-            last_val = Some(compile_ast(&mut builder, line, &params, &func_refs));
+            last_val = Some(compile_ast(&mut builder, line, &vars, &func_refs));
         }
 
         if let Some(val) = last_val {
@@ -428,10 +430,22 @@ fn generate_c_main(
     module.clear_context(&mut ctx);
 }
 
+fn local_var_names(block: &BlockAst) -> Vec<String> {
+    let mut names = vec![];
+    for line in &block.lines {
+        if let Ast::Assign { name, .. } = line {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    names
+}
+
 fn compile_ast(
     builder: &mut FunctionBuilder,
     ast: &Ast,
-    params: &[(String, Variable)],
+    vars: &HashMap<String, Variable>,
     func_refs: &HashMap<String, FuncRef>,
 ) -> cranelift::prelude::Value {
     match ast {
@@ -439,10 +453,9 @@ fn compile_ast(
         Ast::Expression(ExpressionAst { function, args }) => {
             let compiled: Vec<_> = args
                 .iter()
-                .map(|arg| compile_ast(builder, arg, params, func_refs))
+                .map(|arg| compile_ast(builder, arg, vars, func_refs))
                 .collect();
             if function.is_empty() {
-                // single-term passthrough produced by the parser
                 return compiled[0];
             }
             match function.as_str() {
@@ -463,19 +476,35 @@ fn compile_ast(
         Ast::Block(block) => {
             let mut last = None;
             for line in &block.lines {
-                last = Some(compile_ast(builder, line, params, func_refs));
+                last = Some(compile_ast(builder, line, vars, func_refs));
             }
             last.expect("empty block")
         }
         Ast::Variable(name) => {
-            let (_, var) = params
-                .iter()
-                .find(|(n, _)| n == name)
+            let var = vars
+                .get(name)
                 .unwrap_or_else(|| panic!("undefined variable: {name}"));
             builder.use_var(*var)
         }
+        Ast::Assign { name, value } => {
+            let val = compile_ast(builder, value, vars, func_refs);
+            let var = vars
+                .get(name)
+                .unwrap_or_else(|| panic!("undeclared variable: {name}"));
+            builder.def_var(*var, val);
+            val
+        }
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
+}
+
+#[test]
+fn jit_python_style_multi_function() {
+    let src = "fn double(a):\n    a + a\n\nfn square(a):\n    a * a\n\nfn main():\n    square(25) / double(4)\n";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 78); // square(25)/double(4) = 625/8 = 78
 }
 
 #[test]
@@ -593,4 +622,13 @@ fn compile_parsed_function() {
 
     let bytes = module.compile_to_object("test_module");
     assert!(!bytes.is_empty());
+}
+
+#[test]
+fn local_variable_assignment() {
+    let src = "fn main() do\n    x = 10\n    y = x + 5\n    y * 2\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 30); // x=10, y=15, 15*2=30
 }

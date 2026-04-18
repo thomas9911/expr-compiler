@@ -1,28 +1,28 @@
 use crate::tokenizer::{Lexer, LexingError, Token, TokenKind};
 use logos::Span;
+use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub struct ParseLexer<'a> {
     lexer: Lexer<'a>,
-    peeked: Option<Result<Token, LexingError>>,
+    buf: VecDeque<Result<Token, LexingError>>,
 }
 
 impl<'a> ParseLexer<'a> {
     pub fn new(lex: Lexer<'a>) -> Self {
-        ParseLexer {
-            lexer: lex,
-            peeked: None,
-        }
+        ParseLexer { lexer: lex, buf: VecDeque::new() }
     }
 
     pub fn peek(&mut self) -> Option<&Result<Token, LexingError>> {
-        if let Some(ref x) = self.peeked {
-            return Some(x);
+        if self.buf.is_empty() {
+            let token = self.lexer.next()?;
+            self.buf.push_back(token);
         }
+        self.buf.front()
+    }
 
-        let token = self.lexer.next()?;
-        self.peeked = Some(token);
-        self.peek()
+    pub fn push_back(&mut self, token: Result<Token, LexingError>) {
+        self.buf.push_front(token);
     }
 }
 
@@ -30,10 +30,9 @@ impl<'a> Iterator for ParseLexer<'a> {
     type Item = Result<Token, LexingError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(x) = self.peeked.take() {
-            return Some(x);
+        if let Some(tok) = self.buf.pop_front() {
+            return Some(tok);
         }
-
         self.lexer.next()
     }
 }
@@ -61,6 +60,7 @@ pub enum Ast {
     Expression(ExpressionAst),
     Literal(LiteralAst),
     Variable(String),
+    Assign { name: String, value: Box<Ast> },
 }
 
 fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
@@ -72,6 +72,17 @@ fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
 impl Ast {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
         trim_newlines(lex);
+
+        if matches!(lex.peek(), Some(Ok(Token::Symbol(_)))) {
+            let tok = lex.next().unwrap();
+            if lex.peek() == Some(&Ok(Token::Assign)) {
+                lex.next();
+                let Token::Symbol(name) = tok.unwrap() else { unreachable!() };
+                let value = parse_expr(lex, 0)?;
+                return Ok(Ast::Assign { name, value: Box::new(value) });
+            }
+            lex.push_back(tok);
+        }
 
         match lex.peek() {
             Some(&Ok(Token::DefineFunction)) => {
@@ -90,7 +101,6 @@ pub struct BlockAst {
 impl BlockAst {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
         let mut block = BlockAst::default();
-        let mut current_indent = 0;
         assert!(lex.next() == Some(Ok(Token::StartBlock)));
 
         trim_newlines(lex);
@@ -98,26 +108,19 @@ impl BlockAst {
             match lex.peek() {
                 Some(Ok(Token::Indent)) => {
                     lex.next();
-                    current_indent += 1;
                 }
                 Some(Ok(Token::EndBlock)) => {
                     lex.next();
-                    current_indent = 0;
                     break;
                 }
                 Some(Ok(Token::Newline)) => {
                     lex.next();
-                    current_indent = 0;
                 }
-                Some(Ok(Token::DefineFunction)) => {
+                Some(Ok(Token::DefineFunction)) | None => {
                     break;
                 }
-                None => {
-                    break;
-                }
-                x => {
+                _ => {
                     block.lines.push(Ast::from_lexer(lex)?);
-                    current_indent = 0;
                 }
             }
         }

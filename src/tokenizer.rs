@@ -71,6 +71,8 @@ pub enum Token {
     CloseBracket,
     #[token(",")]
     Comma,
+    #[token("=")]
+    Assign,
     #[token("fn")]
     DefineFunction,
     #[regex("do|:", priority = 5)]
@@ -97,6 +99,7 @@ impl Token {
             Token::OpenBracket => TokenKind::OpenBracket,
             Token::CloseBracket => TokenKind::CloseBracket,
             Token::Comma => TokenKind::Comma,
+            Token::Assign => TokenKind::Assign,
             Token::DefineFunction => TokenKind::DefineFunction,
             Token::StartBlock => TokenKind::StartBlock,
             Token::EndBlock => TokenKind::EndBlock,
@@ -115,6 +118,7 @@ pub enum TokenKind {
     OpenBracket,
     CloseBracket,
     Comma,
+    Assign,
     DefineFunction,
     StartBlock,
     EndBlock,
