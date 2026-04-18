@@ -77,7 +77,7 @@ impl Ast {
             Some(&Ok(Token::DefineFunction)) => {
                 Ok(Ast::FunctionDef(FunctionDefAst::from_lexer(lex)?))
             }
-            _ => Ok(Ast::Expression(ExpressionAst::from_lexer(lex)?)),
+            _ => parse_expr(lex, 0),
         }
     }
 }
@@ -95,7 +95,7 @@ impl BlockAst {
 
         trim_newlines(lex);
         loop {
-            match dbg!(lex.peek()) {
+            match lex.peek() {
                 Some(Ok(Token::Indent)) => {
                     lex.next();
                     current_indent += 1;
@@ -108,6 +108,9 @@ impl BlockAst {
                 Some(Ok(Token::Newline)) => {
                     lex.next();
                     current_indent = 0;
+                }
+                Some(Ok(Token::DefineFunction)) => {
+                    break;
                 }
                 None => {
                     break;
@@ -171,8 +174,9 @@ impl FunctionDefAst {
                 }
                 Some(Ok(Token::StartBlock)) => {
                     function_def.block = BlockAst::from_lexer(lex)?;
+                    break;
                 }
-                None => {
+                None | Some(Ok(Token::DefineFunction)) => {
                     break;
                 }
                 Some(Ok(Token::Newline)) => {
@@ -197,108 +201,79 @@ pub struct ExpressionAst {
 
 impl ExpressionAst {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
-        let mut expr = ExpressionAst::default();
-        let mut in_prefix = false;
-        let mut in_infix = false;
-        loop {
-            match lex.peek() {
-                Some(Ok(Token::Newline)) => break,
-                Some(Ok(x)) if [TokenKind::Integer].contains(&x.kind()) && in_infix => {
-                    todo!("error")
-                }
-                Some(Ok(x)) if [TokenKind::Integer].contains(&x.kind()) => {
-                    let literal = LiteralAst::from_lexer(lex)?;
-                    if !in_prefix {
-                        if expr.args.len() < 1 {
-                            in_infix = true;
-                        }
-                    }
-                    expr.args.push(Ast::Literal(literal.clone()));
-                }
-                Some(Ok(x)) if x.kind() == TokenKind::Symbol && in_infix => {
-                    todo!("error")
-                }
-                Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
-                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
-                        unreachable!()
-                    };
-                    let node = if lex.peek() == Some(&Ok(Token::OpenBracket)) {
-                        lex.next(); // consume '('
-                        let mut call_args = vec![];
-                        loop {
-                            match lex.peek() {
-                                Some(Ok(Token::CloseBracket)) => {
-                                    lex.next();
-                                    break;
-                                }
-                                Some(Ok(Token::Comma)) => {
-                                    lex.next();
-                                }
-                                _ => {
-                                    let arg_expr = ExpressionAst::from_lexer(lex)?;
-                                    let arg = if arg_expr.function.is_empty()
-                                        && arg_expr.args.len() == 1
-                                    {
-                                        arg_expr.args.into_iter().next().unwrap()
-                                    } else {
-                                        Ast::Expression(arg_expr)
-                                    };
-                                    call_args.push(arg);
-                                }
-                            }
-                        }
-                        Ast::Expression(ExpressionAst {
-                            function: name,
-                            args: call_args,
-                        })
-                    } else {
-                        Ast::Variable(name)
-                    };
-                    if !in_prefix {
-                        if expr.args.len() < 1 {
-                            in_infix = true;
-                        }
-                    }
-                    expr.args.push(node);
-                }
-                Some(Ok(x)) if x.kind() == TokenKind::InfixOperator && in_infix => {
-                    set_function(&mut expr, x);
-                    lex.next();
-                    in_infix = false;
-                }
-                Some(Ok(x)) if x.kind() == TokenKind::InfixOperator => {
-                    let first_arg = Ast::Expression(expr);
-                    expr = ExpressionAst::default();
-                    set_function(&mut expr, x);
-                    expr.args.push(first_arg);
-                    lex.next();
-                }
-                Some(Ok(Token::Comma)) | Some(Ok(Token::CloseBracket)) => break,
-                None if !expr.function.is_empty() && expr.args.len() == 2 => {
-                    break;
-                }
-                None if expr.args.len() == 1 => {
-                    break;
-                }
-                x => {
-                    dbg!(x, expr);
-                    unimplemented!()
-                }
-            };
+        match parse_expr(lex, 0)? {
+            Ast::Expression(e) => Ok(e),
+            single => Ok(ExpressionAst { function: String::new(), args: vec![single] }),
         }
-
-        Ok(expr)
     }
 }
 
-fn set_function(expr: &mut ExpressionAst, token: &Token) {
+fn infix_precedence(token: &Token) -> Option<u8> {
     match token {
-        Token::Add => expr.function = "add".to_string(),
-        Token::Subtract => expr.function = "subtract".to_string(),
-        Token::Multiply => expr.function = "multiply".to_string(),
-        Token::Divide => expr.function = "divide".to_string(),
-        Token::Modulo => expr.function = "modulo".to_string(),
+        Token::Add | Token::Subtract => Some(1),
+        Token::Multiply | Token::Divide | Token::Modulo => Some(2),
+        _ => None,
+    }
+}
+
+fn infix_name(token: &Token) -> &'static str {
+    match token {
+        Token::Add => "add",
+        Token::Subtract => "subtract",
+        Token::Multiply => "multiply",
+        Token::Divide => "divide",
+        Token::Modulo => "modulo",
         _ => unreachable!(),
+    }
+}
+
+fn parse_expr<'a>(lex: &mut ParseLexer<'a>, min_prec: u8) -> Result<Ast, ParseError<'a>> {
+    let mut lhs = parse_primary(lex)?;
+
+    loop {
+        let prec = match lex.peek() {
+            Some(Ok(t)) => match infix_precedence(t) {
+                Some(p) if p >= min_prec => p,
+                _ => break,
+            },
+            _ => break,
+        };
+
+        let op = lex.next().unwrap().unwrap();
+        let rhs = parse_expr(lex, prec + 1)?;
+
+        lhs = Ast::Expression(ExpressionAst {
+            function: infix_name(&op).to_string(),
+            args: vec![lhs, rhs],
+        });
+    }
+
+    Ok(lhs)
+}
+
+fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    match lex.peek() {
+        Some(Ok(x)) if x.kind() == TokenKind::Integer => {
+            Ok(Ast::Literal(LiteralAst::from_lexer(lex)?))
+        }
+        Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
+            let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
+            if lex.peek() == Some(&Ok(Token::OpenBracket)) {
+                lex.next();
+                let mut args = vec![];
+                loop {
+                    match lex.peek() {
+                        Some(Ok(Token::CloseBracket)) => { lex.next(); break; }
+                        Some(Ok(Token::Comma)) => { lex.next(); }
+                        _ => args.push(parse_expr(lex, 0)?),
+                    }
+                }
+                Ok(Ast::Expression(ExpressionAst { function: name, args }))
+            } else {
+                Ok(Ast::Variable(name))
+            }
+        }
+        _ => Err(ParseError::unexpected(lex)),
     }
 }
 
@@ -399,6 +374,40 @@ fn main():
 }
 
 #[test]
+fn parse_operator_precedence() {
+    use Ast::*;
+
+    // 2 + 3 * 4 must parse as add(2, multiply(3, 4)), not multiply(add(2,3), 4)
+    let text = "fn main() do\n    2 + 3 * 4\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "add".to_string(),
+                args: vec![
+                    Literal(LiteralAst::Integer(2)),
+                    Expression(ExpressionAst {
+                        function: "multiply".to_string(),
+                        args: vec![
+                            Literal(LiteralAst::Integer(3)),
+                            Literal(LiteralAst::Integer(4)),
+                        ],
+                    }),
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
 fn parse_function_call_single_arg() {
     use Ast::*;
 
@@ -413,11 +422,8 @@ fn parse_function_call_single_arg() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
-                function: "".to_string(),
-                args: vec![Expression(ExpressionAst {
-                    function: "double".to_string(),
-                    args: vec![Literal(LiteralAst::Integer(21))],
-                })],
+                function: "double".to_string(),
+                args: vec![Literal(LiteralAst::Integer(21))],
             })],
         },
     });
@@ -440,14 +446,11 @@ fn parse_function_call_multi_args() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
-                function: "".to_string(),
-                args: vec![Expression(ExpressionAst {
-                    function: "add".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
-                })],
+                function: "add".to_string(),
+                args: vec![
+                    Literal(LiteralAst::Integer(1)),
+                    Literal(LiteralAst::Integer(2)),
+                ],
             })],
         },
     });
@@ -501,11 +504,8 @@ fn parse_function_calling_other_with_params() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
-                function: "".to_string(),
-                args: vec![Expression(ExpressionAst {
-                    function: "add".to_string(),
-                    args: vec![Variable("x".to_string()), Variable("x".to_string())],
-                })],
+                function: "add".to_string(),
+                args: vec![Variable("x".to_string()), Variable("x".to_string())],
             })],
         },
     });

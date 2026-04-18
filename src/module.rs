@@ -2,7 +2,7 @@ use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::{ir::UserFuncName, verify_function};
 use cranelift::jit::{JITBuilder, JITModule};
-use cranelift::module::{FuncId, Linkage, Module as CraneliftModule, default_libcall_names};
+use cranelift::module::{DataDescription, FuncId, Linkage, Module as CraneliftModule, default_libcall_names};
 use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::HashMap;
@@ -72,7 +72,7 @@ impl Module {
         let mut cranelift_module =
             JITModule::new(JITBuilder::with_isa(isa.clone(), default_libcall_names()));
 
-        let mut func_ids: HashMap<String, FuncId> = HashMap::new();
+        let mut func_ids = setup_builtins(&mut cranelift_module, &isa, &flags);
         for func_def in &self.functions {
             let id = declare_function_sig(
                 &mut cranelift_module,
@@ -113,7 +113,7 @@ impl Module {
             ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap(),
         );
 
-        let mut func_ids: HashMap<String, FuncId> = HashMap::new();
+        let mut func_ids = setup_builtins(&mut cranelift_module, &isa, &flags);
         for func_def in &self.functions {
             let id = declare_function_sig(
                 &mut cranelift_module,
@@ -148,7 +148,7 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "exe", default_libcall_names()).unwrap(),
         );
 
-        let mut all_funcs: HashMap<String, FuncId> = HashMap::new();
+        let mut all_funcs = setup_builtins(&mut cranelift_module, &isa, &flags);
         let mut expr_main_id: Option<FuncId> = None;
         for func_def in &self.functions {
             if func_def.name == "main" {
@@ -189,7 +189,7 @@ impl Module {
 
         let bytes = cranelift_module.finish().emit().unwrap();
 
-        let tmp = std::env::temp_dir().join("__expr_compiler_main.o");
+        let tmp = output.with_extension("o");
         std::fs::write(&tmp, &bytes).unwrap();
 
         let status = Command::new("cc")
@@ -213,6 +213,69 @@ impl JitModule {
     pub fn get_fn_ptr(&self, name: &str) -> *const u8 {
         self.module.get_finalized_function(self.func_ids[name])
     }
+}
+
+fn setup_builtins(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+) -> HashMap<String, FuncId> {
+    let fmt_id = module
+        .declare_data("__fmt_int", Linkage::Local, false, false)
+        .unwrap();
+    let mut data_desc = DataDescription::new();
+    data_desc.define(b"%lld\n\0".to_vec().into_boxed_slice());
+    module.define_data(fmt_id, &data_desc).unwrap();
+
+    let mut printf_sig = Signature::new(isa.default_call_conv());
+    printf_sig.params.push(AbiParam::new(isa.pointer_type()));
+    printf_sig.params.push(AbiParam::new(types::I64));
+    printf_sig.returns.push(AbiParam::new(types::I32));
+    let printf_id = module
+        .declare_function("printf", Linkage::Import, &printf_sig)
+        .unwrap();
+
+    let mut print_sig = Signature::new(isa.default_call_conv());
+    print_sig.params.push(AbiParam::new(types::I64));
+    print_sig.returns.push(AbiParam::new(types::I64));
+    let print_id = module
+        .declare_function("__expr_print", Linkage::Local, &print_sig)
+        .unwrap();
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = print_sig;
+    ctx.func.name = UserFuncName::user(0, print_id.as_u32());
+
+    let fmt_gv = module.declare_data_in_func(fmt_id, &mut ctx.func);
+    let printf_ref = module.declare_func_in_func(printf_id, &mut ctx.func);
+
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+        let block0 = builder.create_block();
+        builder.append_block_params_for_function_params(block0);
+        builder.switch_to_block(block0);
+        builder.seal_block(block0);
+
+        let n = builder.block_params(block0)[0];
+        let fmt_ptr = builder.ins().global_value(isa.pointer_type(), fmt_gv);
+        builder.ins().call(printf_ref, &[fmt_ptr, n]);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().return_(&[zero]);
+
+        builder.finalize();
+    }
+
+    let res = verify_function(&ctx.func, flags);
+    if let Err(errors) = res {
+        panic!("{}", errors);
+    }
+    module.define_function(print_id, &mut ctx).unwrap();
+    module.clear_context(&mut ctx);
+
+    let mut builtins = HashMap::new();
+    builtins.insert("print".to_string(), print_id);
+    builtins
 }
 
 fn declare_function_sig(
@@ -499,6 +562,19 @@ fn compile_to_executable_runs() {
     assert_eq!(status.code(), Some(8)); // 7 + 5 - 4 = 8
 
     std::fs::remove_file(&output).ok();
+}
+
+#[test]
+fn print_builtin_executable() {
+    let src = "fn main() do\n    print(42)\nend";
+    let output = std::env::temp_dir().join("__expr_compiler_print_test");
+    Module::from_source(src).compile_to_executable(&output);
+
+    let out = Command::new(&output).output().expect("run failed");
+    std::fs::remove_file(&output).ok();
+
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
+    assert_eq!(out.status.code(), Some(0));
 }
 
 #[test]
