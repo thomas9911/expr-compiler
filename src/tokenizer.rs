@@ -63,6 +63,8 @@ pub enum Token {
     OpenBracket,
     #[token(")")]
     CloseBracket,
+    #[token(",")]
+    Comma,
     #[token("fn")]
     DefineFunction,
     #[regex("do|:", priority = 5)]
@@ -85,6 +87,7 @@ impl Token {
             Token::Subtract => TokenKind::InfixOperator,
             Token::OpenBracket => TokenKind::OpenBracket,
             Token::CloseBracket => TokenKind::CloseBracket,
+            Token::Comma => TokenKind::Comma,
             Token::DefineFunction => TokenKind::DefineFunction,
             Token::StartBlock => TokenKind::StartBlock,
             Token::EndBlock => TokenKind::EndBlock,
@@ -102,6 +105,7 @@ pub enum TokenKind {
     InfixOperator,
     OpenBracket,
     CloseBracket,
+    Comma,
     DefineFunction,
     StartBlock,
     EndBlock,
@@ -174,4 +178,80 @@ fn main():
     assert_eq!(result.unwrap(), expected);
 
     // todo!("determine if do end (like elixir) or use spaces and : (like python)")
+}
+
+#[test]
+fn tokenize_function_with_params() {
+    use Token::*;
+
+    let text = "fn add(x, y) do\n    x + y\nend";
+    let result: Result<Vec<_>, _> = Token::lexer(text).collect();
+
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            DefineFunction,
+            Symbol("add".to_string()),
+            OpenBracket,
+            Symbol("x".to_string()),
+            Comma,
+            Symbol("y".to_string()),
+            CloseBracket,
+            StartBlock,
+            Newline,
+            Indent,
+            Symbol("x".to_string()),
+            Add,
+            Symbol("y".to_string()),
+            Newline,
+            EndBlock,
+        ]
+    );
+
+    let text = r#"
+
+fn add(x, y):
+    x + y
+
+    "#;
+    let result: Result<Vec<_>, _> = Token::lexer(text).collect();
+
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Newline,
+            DefineFunction,
+            Symbol("add".to_string()),
+            OpenBracket,
+            Symbol("x".to_string()),
+            Comma,
+            Symbol("y".to_string()),
+            CloseBracket,
+            StartBlock,
+            Newline,
+            Indent,
+            Symbol("x".to_string()),
+            Add,
+            Symbol("y".to_string()),
+            Newline,
+            Indent,
+        ]
+    );
+}
+
+#[test]
+fn tokenize_comma() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("a, b, c").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("a".to_string()),
+            Comma,
+            Symbol("b".to_string()),
+            Comma,
+            Symbol("c".to_string()),
+        ]
+    );
 }

@@ -22,6 +22,7 @@ impl Interpreter {
                 self.execute_expression(expr);
             }
             Ast::Literal(literal_ast) => self.execute_literal(literal_ast),
+            Ast::Variable(_) => todo!(),
         }
     }
 

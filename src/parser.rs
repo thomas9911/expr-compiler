@@ -60,6 +60,7 @@ pub enum Ast {
     FunctionDef(FunctionDefAst),
     Expression(ExpressionAst),
     Literal(LiteralAst),
+    Variable(String),
 }
 
 fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
@@ -149,6 +150,20 @@ impl FunctionDefAst {
                 Some(Ok(Token::OpenBracket)) if bracket_counter == 0 => {
                     lex.next();
                     bracket_counter = 1;
+                    loop {
+                        match lex.peek() {
+                            Some(Ok(Token::Symbol(_))) => {
+                                let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
+                                    unreachable!()
+                                };
+                                function_def.inputs.push(name);
+                            }
+                            Some(Ok(Token::Comma)) => {
+                                lex.next();
+                            }
+                            _ => break,
+                        }
+                    }
                 }
                 Some(Ok(Token::CloseBracket)) if bracket_counter == 1 => {
                     lex.next();
@@ -199,6 +214,20 @@ impl ExpressionAst {
                         }
                     }
                     expr.args.push(Ast::Literal(literal.clone()));
+                }
+                Some(Ok(x)) if x.kind() == TokenKind::Symbol && in_infix => {
+                    todo!("error")
+                }
+                Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
+                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
+                        unreachable!()
+                    };
+                    if !in_prefix {
+                        if expr.args.len() < 1 {
+                            in_infix = true;
+                        }
+                    }
+                    expr.args.push(Ast::Variable(name));
                 }
                 Some(Ok(x)) if x.kind() == TokenKind::InfixOperator && in_infix => {
                     set_function(&mut expr, x);

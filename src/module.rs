@@ -175,6 +175,13 @@ fn compile_ast(
             }
             last.expect("empty block")
         }
+        Ast::Variable(name) => {
+            let (_, var) = params
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("undefined variable: {name}"));
+            builder.use_var(*var)
+        }
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
@@ -197,9 +204,27 @@ fn text_to_native_execute() {
 }
 
 #[test]
-fn compile_parsed_function() {
-    use crate::tokenizer::{self, Logos};
+fn text_to_native_execute_with_params() {
     use crate::parser::ParseLexer;
+    use crate::tokenizer::{self, Logos};
+
+    let src = "fn add(x, y) do\n    x + y\nend";
+    let lex = tokenizer::Token::lexer(src);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let jit = Module::from_ast(ast).compile_to_jit();
+    let ptr = jit.get_fn_ptr("add");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
+
+    assert_eq!(func(3, 5), 8);
+    assert_eq!(func(10, -4), 6);
+}
+
+#[test]
+fn compile_parsed_function() {
+    use crate::parser::ParseLexer;
+    use crate::tokenizer::{self, Logos};
 
     let src = "fn main() do\n    1 + 2 - 3\nend";
     let lex = tokenizer::Token::lexer(src);
