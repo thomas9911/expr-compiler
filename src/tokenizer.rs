@@ -65,6 +65,18 @@ pub enum Token {
     Divide,
     #[token("%")]
     Modulo,
+    #[token(">=")]
+    GreaterThanOrEqual,
+    #[token("<=")]
+    LessThanOrEqual,
+    #[token("==")]
+    EqualEqual,
+    #[token("!=")]
+    NotEqual,
+    #[token(">")]
+    GreaterThan,
+    #[token("<")]
+    LessThan,
     #[token("(")]
     OpenBracket,
     #[token(")")]
@@ -75,6 +87,10 @@ pub enum Token {
     Assign,
     #[token("fn")]
     DefineFunction,
+    #[token("if")]
+    If,
+    #[token("else")]
+    Else,
     #[regex("do|:", priority = 5)]
     StartBlock,
     #[token("end")]
@@ -96,11 +112,19 @@ impl Token {
             Token::Multiply => TokenKind::InfixOperator,
             Token::Divide => TokenKind::InfixOperator,
             Token::Modulo => TokenKind::InfixOperator,
+            Token::GreaterThan => TokenKind::InfixOperator,
+            Token::LessThan => TokenKind::InfixOperator,
+            Token::GreaterThanOrEqual => TokenKind::InfixOperator,
+            Token::LessThanOrEqual => TokenKind::InfixOperator,
+            Token::EqualEqual => TokenKind::InfixOperator,
+            Token::NotEqual => TokenKind::InfixOperator,
             Token::OpenBracket => TokenKind::OpenBracket,
             Token::CloseBracket => TokenKind::CloseBracket,
             Token::Comma => TokenKind::Comma,
             Token::Assign => TokenKind::Assign,
             Token::DefineFunction => TokenKind::DefineFunction,
+            Token::If => TokenKind::If,
+            Token::Else => TokenKind::Else,
             Token::StartBlock => TokenKind::StartBlock,
             Token::EndBlock => TokenKind::EndBlock,
             Token::Symbol(_) => TokenKind::Symbol,
@@ -120,6 +144,8 @@ pub enum TokenKind {
     Comma,
     Assign,
     DefineFunction,
+    If,
+    Else,
     StartBlock,
     EndBlock,
     Symbol,
@@ -296,4 +322,93 @@ fn tokenize_comma() {
             Symbol("c".to_string()),
         ]
     );
+}
+
+#[test]
+fn tokenize_comparison_operators() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("a > b").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("a".to_string()),
+            GreaterThan,
+            Symbol("b".to_string())
+        ]
+    );
+
+    let result: Result<Vec<_>, _> = Token::lexer("a < b").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![Symbol("a".to_string()), LessThan, Symbol("b".to_string())]
+    );
+
+    let result: Result<Vec<_>, _> = Token::lexer("a >= b").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("a".to_string()),
+            GreaterThanOrEqual,
+            Symbol("b".to_string())
+        ]
+    );
+
+    let result: Result<Vec<_>, _> = Token::lexer("a <= b").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("a".to_string()),
+            LessThanOrEqual,
+            Symbol("b".to_string())
+        ]
+    );
+
+    let result: Result<Vec<_>, _> = Token::lexer("a == b").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![Symbol("a".to_string()), EqualEqual, Symbol("b".to_string())]
+    );
+
+    let result: Result<Vec<_>, _> = Token::lexer("a != b").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![Symbol("a".to_string()), NotEqual, Symbol("b".to_string())]
+    );
+}
+
+#[test]
+fn tokenize_if_else_keywords() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("if x > 0 do\n    x\nelse\n    0\nend").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            If,
+            Symbol("x".to_string()),
+            GreaterThan,
+            Integer(0),
+            StartBlock,
+            Newline,
+            Indent,
+            Symbol("x".to_string()),
+            Newline,
+            Else,
+            Newline,
+            Indent,
+            Integer(0),
+            Newline,
+            EndBlock,
+        ]
+    );
+}
+
+#[test]
+fn tokenize_if_not_symbol() {
+    use Token::*;
+
+    // 'if' and 'else' must not lex as Symbol
+    let result: Result<Vec<_>, _> = Token::lexer("if else").collect();
+    assert_eq!(result.unwrap(), vec![If, Else]);
 }

@@ -1,8 +1,12 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use cranelift::codegen::ir::FuncRef;
+use cranelift::codegen::ir::condcodes::IntCC;
+use cranelift::codegen::ir::instructions::BlockArg;
 use cranelift::codegen::{ir::UserFuncName, verify_function};
 use cranelift::jit::{JITBuilder, JITModule};
-use cranelift::module::{DataDescription, FuncId, Linkage, Module as CraneliftModule, default_libcall_names};
+use cranelift::module::{
+    DataDescription, FuncId, Linkage, Module as CraneliftModule, default_libcall_names,
+};
 use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::HashMap;
@@ -433,13 +437,36 @@ fn generate_c_main(
 fn local_var_names(block: &BlockAst) -> Vec<String> {
     let mut names = vec![];
     for line in &block.lines {
-        if let Ast::Assign { name, .. } = line {
+        collect_var_names(line, &mut names);
+    }
+    names
+}
+
+fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
+    match ast {
+        Ast::Assign { name, value } => {
             if !names.contains(name) {
                 names.push(name.clone());
             }
+            collect_var_names(value, names);
         }
+        Ast::If {
+            condition,
+            then,
+            else_,
+        } => {
+            collect_var_names(condition, names);
+            for line in &then.lines {
+                collect_var_names(line, names);
+            }
+            if let Some(e) = else_ {
+                for line in &e.lines {
+                    collect_var_names(line, names);
+                }
+            }
+        }
+        _ => {}
     }
-    names
 }
 
 fn compile_ast(
@@ -464,6 +491,24 @@ fn compile_ast(
                 "multiply" => builder.ins().imul(compiled[0], compiled[1]),
                 "divide" => builder.ins().sdiv(compiled[0], compiled[1]),
                 "modulo" => builder.ins().srem(compiled[0], compiled[1]),
+                "gt" => builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThan, compiled[0], compiled[1]),
+                "lt" => builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, compiled[0], compiled[1]),
+                "gte" => {
+                    builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, compiled[0], compiled[1])
+                }
+                "lte" => builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, compiled[0], compiled[1]),
+                "eq" => builder.ins().icmp(IntCC::Equal, compiled[0], compiled[1]),
+                "ne" => builder
+                    .ins()
+                    .icmp(IntCC::NotEqual, compiled[0], compiled[1]),
                 name => {
                     let func_ref = func_refs
                         .get(name)
@@ -493,6 +538,67 @@ fn compile_ast(
                 .unwrap_or_else(|| panic!("undeclared variable: {name}"));
             builder.def_var(*var, val);
             val
+        }
+        Ast::If {
+            condition,
+            then,
+            else_,
+        } => {
+            let cond_val = compile_ast(builder, condition, vars, func_refs);
+
+            let then_block = builder.create_block();
+            let merge_block = builder.create_block();
+            builder.append_block_param(merge_block, types::I64);
+
+            if let Some(else_block_ast) = else_ {
+                let else_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(cond_val, then_block, &[], else_block, &[]);
+
+                builder.switch_to_block(then_block);
+                builder.seal_block(then_block);
+                let mut then_val = builder.ins().iconst(types::I64, 0);
+                for line in &then.lines {
+                    then_val = compile_ast(builder, line, vars, func_refs);
+                }
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(then_val)]);
+
+                builder.switch_to_block(else_block);
+                builder.seal_block(else_block);
+                let mut else_val = builder.ins().iconst(types::I64, 0);
+                for line in &else_block_ast.lines {
+                    else_val = compile_ast(builder, line, vars, func_refs);
+                }
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(else_val)]);
+            } else {
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.ins().brif(
+                    cond_val,
+                    then_block,
+                    &[],
+                    merge_block,
+                    &[BlockArg::Value(zero)],
+                );
+
+                builder.switch_to_block(then_block);
+                builder.seal_block(then_block);
+                let mut then_val = builder.ins().iconst(types::I64, 0);
+                for line in &then.lines {
+                    then_val = compile_ast(builder, line, vars, func_refs);
+                }
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(then_val)]);
+            }
+
+            builder.switch_to_block(merge_block);
+            builder.seal_block(merge_block);
+            builder.block_params(merge_block)[0]
         }
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
@@ -631,4 +737,32 @@ fn local_variable_assignment() {
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), 30); // x=10, y=15, 15*2=30
+}
+
+#[test]
+fn if_without_else() {
+    // returns then-value when true, 0 when false
+    let src = "fn main() do\n    if 10 > 5 do\n        42\n    end\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 42);
+}
+
+#[test]
+fn if_with_else() {
+    let src = "fn main() do\n    if 3 > 5 do\n        1\n    else\n        99\n    end\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 99);
+}
+
+#[test]
+fn if_python_style() {
+    let src = "fn main():\n    x = 10\n    if x > 5:\n        x * 2\n    else:\n        x\n";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 20);
 }
