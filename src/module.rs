@@ -130,6 +130,19 @@ impl Module {
         }
 
         let mut out = String::new();
+
+        // Stub for __expr_print: the Cranelift interpreter cannot call external
+        // functions (printf), so we emit a pure-IR stub that returns its argument.
+        // This means print() won't produce output in --run-ir mode but won't crash,
+        // and the "printed" value surfaces as the function's return value.
+        let print_func_id = func_ids["print"].as_u32();
+        let print_stub = format!(
+            "; builtin: print (interpreter stub — no I/O; use --run-jit for real output)\n\
+             function u0:{print_func_id}(i64) -> i64 system_v {{\n\
+             block0(v0: i64):\n    return v0\n}}\n\n"
+        );
+        out.push_str(&print_stub);
+
         for func_def in &self.functions {
             let ir = define_function_body(
                 &mut cranelift_module,
@@ -256,6 +269,14 @@ pub struct JitModule {
 impl JitModule {
     pub fn get_fn_ptr(&self, name: &str) -> *const u8 {
         self.module.get_finalized_function(self.func_ids[name])
+    }
+
+    pub fn has_function(&self, name: &str) -> bool {
+        self.func_ids.contains_key(name)
+    }
+
+    pub fn user_function_names(&self) -> impl Iterator<Item = &str> {
+        self.func_ids.keys().filter(|n| !n.starts_with("__")).map(|s| s.as_str())
     }
 }
 
