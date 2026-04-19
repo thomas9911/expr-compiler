@@ -106,6 +106,45 @@ impl Module {
         }
     }
 
+    pub fn compile_to_ir(self) -> String {
+        let flags = settings::Flags::new(settings::builder());
+        let isa = cranelift::native::builder()
+            .expect("host machine supported")
+            .finish(flags.clone())
+            .unwrap();
+
+        let mut cranelift_module = ObjectModule::new(
+            ObjectBuilder::new(isa.clone(), "ir", default_libcall_names()).unwrap(),
+        );
+
+        let mut func_ids = setup_builtins(&mut cranelift_module, &isa, &flags);
+        for func_def in &self.functions {
+            let id = declare_function_sig(
+                &mut cranelift_module,
+                &isa,
+                func_def,
+                &func_def.name,
+                Linkage::Export,
+            );
+            func_ids.insert(func_def.name.clone(), id);
+        }
+
+        let mut out = String::new();
+        for func_def in &self.functions {
+            let ir = define_function_body(
+                &mut cranelift_module,
+                isa.clone(),
+                &flags,
+                func_def,
+                func_ids[&func_def.name],
+                &func_ids,
+            );
+            out.push_str(&ir);
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn compile_to_object(self, name: &str) -> Vec<u8> {
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
@@ -305,7 +344,7 @@ fn define_function_body(
     func_def: &FunctionDefAst,
     func_id: FuncId,
     all_funcs: &HashMap<String, FuncId>,
-) {
+) -> String {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I64));
     for _ in &func_def.inputs {
@@ -359,8 +398,10 @@ fn define_function_body(
         panic!("{}", errors);
     }
 
+    let ir = format!("; fn {}\n{}", func_def.name, ctx.func.display());
     module.define_function(func_id, &mut ctx).unwrap();
     module.clear_context(&mut ctx);
+    ir
 }
 
 fn generate_c_main(

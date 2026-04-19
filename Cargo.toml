@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cranelift = { version = "*", features = ["module", "jit", "native", "object"] }
+cranelift = { version = "*", features = ["module", "jit", "native", "object", "interpreter"] }
+cranelift-reader = "0.127.1"
 logos = "0.16.0"
