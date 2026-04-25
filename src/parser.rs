@@ -242,9 +242,7 @@ impl FunctionDefAst {
                     break;
                 }
 
-                x => {
-                    unimplemented!("{:?}", x)
-                }
+                _ => return Err(ParseError::unexpected(lex)),
             }
         }
 
@@ -729,4 +727,48 @@ fn parse_comparison_precedence() {
     });
 
     assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_test_python_style_crlf() {
+    use Ast::*;
+
+    let text = "fn main():\r\n    1 + 2 - 3\r\n";
+
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "subtract".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function: "add".to_string(),
+                        args: vec![
+                            Literal(LiteralAst::Integer(1)),
+                            Literal(LiteralAst::Integer(2)),
+                        ],
+                    }),
+                    Literal(LiteralAst::Integer(3)),
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_function_def_invalid_token_returns_error() {
+    let text = "fn main()) do\n    1\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+
+    let ast = Ast::from_lexer(&mut lexer);
+    assert!(ast.is_err());
 }

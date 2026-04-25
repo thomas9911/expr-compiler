@@ -4,9 +4,9 @@ use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
 use cranelift::codegen::{ir::UserFuncName, verify_function};
 use cranelift::jit::{JITBuilder, JITModule};
-use cranelift::module::{
-    DataDescription, FuncId, Linkage, Module as CraneliftModule, default_libcall_names,
-};
+#[cfg(not(windows))]
+use cranelift::module::DataDescription;
+use cranelift::module::{FuncId, Linkage, Module as CraneliftModule, default_libcall_names};
 use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::HashMap;
@@ -73,8 +73,12 @@ impl Module {
             .finish(flags.clone())
             .unwrap();
 
-        let mut cranelift_module =
-            JITModule::new(JITBuilder::with_isa(isa.clone(), default_libcall_names()));
+        let mut jit_builder = JITBuilder::with_isa(isa.clone(), default_libcall_names());
+        #[cfg(windows)]
+        {
+            jit_builder.symbol("__expr_print_host", windows_print_host as *const u8);
+        }
+        let mut cranelift_module = JITModule::new(jit_builder);
 
         let mut func_ids = setup_builtins(&mut cranelift_module, &isa, &flags);
         for func_def in &self.functions {
@@ -206,14 +210,23 @@ impl Module {
 
         let mut all_funcs = setup_builtins(&mut cranelift_module, &isa, &flags);
         let mut expr_main_id: Option<FuncId> = None;
+        #[cfg(windows)]
+        let expr_main_symbol = "expr_main_entry";
+        #[cfg(not(windows))]
+        let expr_main_symbol = "__expr_main";
         for func_def in &self.functions {
             if func_def.name == "main" {
+                let main_linkage = if cfg!(windows) {
+                    Linkage::Export
+                } else {
+                    Linkage::Local
+                };
                 let id = declare_function_sig(
                     &mut cranelift_module,
                     &isa,
                     func_def,
-                    "__expr_main",
-                    Linkage::Local,
+                    expr_main_symbol,
+                    main_linkage,
                 );
                 all_funcs.insert("main".to_string(), id);
                 expr_main_id = Some(id);
@@ -239,15 +252,36 @@ impl Module {
             );
         }
 
+        #[cfg(not(windows))]
         if let Some(id) = expr_main_id {
             generate_c_main(&mut cranelift_module, isa.clone(), &flags, id);
+        }
+        #[cfg(windows)]
+        if true {
+            _ = expr_main_id;
         }
 
         let bytes = cranelift_module.finish().emit().unwrap();
 
+        #[cfg(windows)]
+        let tmp = output.with_extension("obj");
+        #[cfg(not(windows))]
         let tmp = output.with_extension("o");
         std::fs::write(&tmp, &bytes).unwrap();
 
+        #[cfg(windows)]
+        let status = Command::new("rustc")
+            .arg(write_windows_wrapper(output))
+            .arg("--crate-name")
+            .arg("expr_windows_wrapper")
+            .arg("-C")
+            .arg(format!("link-arg={}", tmp.display()))
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("rustc not found");
+
+        #[cfg(not(windows))]
         let status = Command::new("cc")
             .arg("-no-pie")
             .arg(&tmp)
@@ -256,6 +290,8 @@ impl Module {
             .status()
             .expect("cc not found — install gcc or clang");
 
+        #[cfg(windows)]
+        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
         assert!(status.success(), "linker failed with: {status}");
     }
@@ -276,7 +312,10 @@ impl JitModule {
     }
 
     pub fn user_function_names(&self) -> impl Iterator<Item = &str> {
-        self.func_ids.keys().filter(|n| !n.starts_with("__")).map(|s| s.as_str())
+        self.func_ids
+            .keys()
+            .filter(|n| !n.starts_with("__"))
+            .map(|s| s.as_str())
     }
 }
 
@@ -285,6 +324,19 @@ fn setup_builtins(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
 ) -> HashMap<String, FuncId> {
+    let print_id = define_print_builtin(module, isa, flags);
+
+    let mut builtins = HashMap::new();
+    builtins.insert("print".to_string(), print_id);
+    builtins
+}
+
+#[cfg(not(windows))]
+fn define_print_builtin(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+) -> FuncId {
     let fmt_id = module
         .declare_data("__fmt_int", Linkage::Local, false, false)
         .unwrap();
@@ -327,7 +379,6 @@ fn setup_builtins(
         builder.ins().call(printf_ref, &[fmt_ptr, n]);
         let zero = builder.ins().iconst(types::I64, 0);
         builder.ins().return_(&[zero]);
-
         builder.finalize();
     }
 
@@ -337,10 +388,64 @@ fn setup_builtins(
     }
     module.define_function(print_id, &mut ctx).unwrap();
     module.clear_context(&mut ctx);
+    print_id
+}
 
-    let mut builtins = HashMap::new();
-    builtins.insert("print".to_string(), print_id);
-    builtins
+#[cfg(windows)]
+fn define_print_builtin(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    _flags: &settings::Flags,
+) -> FuncId {
+    let mut print_sig = Signature::new(isa.default_call_conv());
+    print_sig.params.push(AbiParam::new(types::I64));
+    print_sig.returns.push(AbiParam::new(types::I64));
+    module
+        .declare_function("__expr_print_host", Linkage::Import, &print_sig)
+        .unwrap()
+}
+
+#[cfg(windows)]
+extern "C" fn windows_print_host(n: i64) -> i64 {
+    println!("{n}");
+    0
+}
+
+#[cfg(windows)]
+fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
+    let wrapper = output.with_extension("wrapper.rs");
+    let source = r#"
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_print_host(n: i64) -> i64 {
+    println!("{}", n);
+    0
+}
+
+unsafe extern "C" {
+    fn expr_main_entry() -> i64;
+}
+
+fn main() {
+    let code = unsafe { expr_main_entry() };
+    let exit_code = if code < i32::MIN as i64 || code > i32::MAX as i64 {
+        1
+    } else {
+        code as i32
+    };
+    std::process::exit(exit_code);
+}
+"#;
+    std::fs::write(&wrapper, source).unwrap();
+    wrapper
+}
+
+#[cfg(windows)]
+fn windows_temp_exe_path(base: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir().join(base);
+    if path.extension().is_none() {
+        path.set_extension("exe");
+    }
+    path
 }
 
 fn declare_function_sig(
@@ -662,7 +767,7 @@ fn compile_ast(
             builder.seal_block(merge_block);
             builder.block_params(merge_block)[0]
         }
-        Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
+        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
     }
 }
 
@@ -750,6 +855,9 @@ fn compile_to_executable_runs() {
     let mut lexer = ParseLexer::new(lex);
     let ast = Ast::from_lexer(&mut lexer).unwrap();
 
+    #[cfg(windows)]
+    let output = windows_temp_exe_path("__expr_compiler_test_exe");
+    #[cfg(not(windows))]
     let output = std::env::temp_dir().join("__expr_compiler_test_exe");
     Module::from_ast(ast).compile_to_executable(&output);
 
@@ -764,6 +872,9 @@ fn compile_to_executable_runs() {
 #[test]
 fn print_builtin_executable() {
     let src = "fn main() do\n    print(42)\nend";
+    #[cfg(windows)]
+    let output = windows_temp_exe_path("__expr_compiler_print_test");
+    #[cfg(not(windows))]
     let output = std::env::temp_dir().join("__expr_compiler_print_test");
     Module::from_source(src).compile_to_executable(&output);
 

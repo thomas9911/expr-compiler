@@ -1,11 +1,21 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
 use expr_compiler::module::Module;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn finalize_output_path(mut output: PathBuf) -> PathBuf {
+    if cfg!(windows) && output.extension().is_none() {
+        output.set_extension("exe");
+    }
+    output
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit]", args[0]);
+        eprintln!(
+            "usage: {} <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit]",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -16,7 +26,7 @@ fn main() {
     });
 
     let emit_ir = args.contains(&"--emit-ir".to_string());
-    let run_ir  = args.contains(&"--run-ir".to_string());
+    let run_ir = args.contains(&"--run-ir".to_string());
     let run_jit = args.contains(&"--run-jit".to_string());
 
     if emit_ir || run_ir {
@@ -89,9 +99,9 @@ fn main() {
     }
 
     let output = if let Some(pos) = args.iter().position(|a| a == "-o") {
-        Path::new(&args[pos + 1]).to_path_buf()
+        finalize_output_path(Path::new(&args[pos + 1]).to_path_buf())
     } else {
-        input.with_extension("")
+        finalize_output_path(input.with_extension(""))
     };
 
     Module::from_source(&source).compile_to_executable(&output);

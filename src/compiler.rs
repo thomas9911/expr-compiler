@@ -99,10 +99,10 @@ fn to_c_headers(declarations: &ModuleDeclarations, header_file: &mut String) {
 fn types_to_c_type(type_: Type) -> &'static str {
     match type_ {
         types::I8 => "int8_t",
-        types::I16 => "int8_t",
+        types::I16 => "int16_t",
         types::I32 => "int32_t",
         types::I64 => "int64_t",
-        _ => unimplemented!(),
+        _ => panic!("unsupported C type mapping for {type_}"),
     }
 }
 
@@ -147,10 +147,10 @@ fn to_rs_headers(declarations: &ModuleDeclarations, header_file: &mut String, na
 fn types_to_rs_type(type_: Type) -> &'static str {
     match type_ {
         types::I8 => "i8",
-        types::I16 => "ii16",
+        types::I16 => "i16",
         types::I32 => "i32",
         types::I64 => "i64",
-        _ => unimplemented!(),
+        _ => panic!("unsupported Rust type mapping for {type_}"),
     }
 }
 
@@ -204,7 +204,7 @@ fn add_operator_to_module(
             let tmp = match operator {
                 "add" => builder.ins().iadd(arg1, arg2),
                 "subtract" => builder.ins().isub(arg1, arg2),
-                _ => unimplemented!(),
+                _ => panic!("unsupported operator '{operator}'"),
             };
             builder.def_var(z, tmp);
         }

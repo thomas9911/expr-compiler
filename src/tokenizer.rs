@@ -51,7 +51,7 @@ impl LexingError {
 pub enum Token {
     #[token("    ")]
     Indent,
-    #[regex(r"[\n]+")]
+    #[regex(r"[\r\n]+")]
     Newline,
     #[regex(r"[0-9]+", parse_integer)]
     Integer(i64),
@@ -216,7 +216,7 @@ fn main():
 
     assert_eq!(result.unwrap(), expected);
 
-    // todo!("determine if do end (like elixir) or use spaces and : (like python)")
+    // Both block styles are currently accepted: `do ... end` and `: + indentation`.
 }
 
 #[test]
