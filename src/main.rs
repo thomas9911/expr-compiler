@@ -1,6 +1,18 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
 use expr_compiler::module::Module;
+use pico_args::Arguments;
 use std::path::{Path, PathBuf};
+
+const USAGE: &str =
+    "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit]";
+
+struct CliArgs {
+    input: PathBuf,
+    output: Option<PathBuf>,
+    emit_ir: bool,
+    run_ir: bool,
+    run_jit: bool,
+}
 
 fn finalize_output_path(mut output: PathBuf) -> PathBuf {
     if cfg!(windows) && output.extension().is_none() {
@@ -9,32 +21,67 @@ fn finalize_output_path(mut output: PathBuf) -> PathBuf {
     output
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!(
-            "usage: {} <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit]",
-            args[0]
-        );
-        std::process::exit(1);
+fn parse_cli_args() -> Result<CliArgs, String> {
+    let mut args = Arguments::from_env();
+
+    if args.contains(["-h", "--help"]) {
+        return Err(USAGE.to_string());
     }
 
-    let input = Path::new(&args[1]);
+    let output = args
+        .opt_value_from_str::<_, String>("-o")
+        .map_err(|e| format!("failed to parse -o: {e}"))?
+        .map(PathBuf::from);
+
+    let emit_ir = args.contains("--emit-ir");
+    let run_ir = args.contains("--run-ir");
+    let run_jit = args.contains("--run-jit");
+
+    let input = args
+        .free_from_str::<String>()
+        .map_err(|_| USAGE.to_string())?;
+
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        let unknown = remaining
+            .into_iter()
+            .map(|x| x.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(format!("unknown arguments: {unknown}\n{USAGE}"));
+    }
+
+    Ok(CliArgs {
+        input: PathBuf::from(input),
+        output,
+        emit_ir,
+        run_ir,
+        run_jit,
+    })
+}
+
+fn main() {
+    let cli = match parse_cli_args() {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("{err}");
+            let code = if err == USAGE { 0 } else { 1 };
+            std::process::exit(code);
+        }
+    };
+
+    let input = Path::new(&cli.input);
     let source = std::fs::read_to_string(input).unwrap_or_else(|e| {
         eprintln!("error reading {}: {e}", input.display());
         std::process::exit(1);
     });
 
-    let emit_ir = args.contains(&"--emit-ir".to_string());
-    let run_ir = args.contains(&"--run-ir".to_string());
-    let run_jit = args.contains(&"--run-jit".to_string());
-
-    if emit_ir || run_ir {
+    if cli.emit_ir || cli.run_ir {
         let ir = Module::from_source(&source).compile_to_ir();
 
-        if emit_ir {
-            if let Some(pos) = args.iter().position(|a| a == "-o") {
-                std::fs::write(&args[pos + 1], &ir).unwrap_or_else(|e| {
+        if cli.emit_ir {
+            if let Some(output) = cli.output.as_ref() {
+                std::fs::write(output, &ir).unwrap_or_else(|e| {
                     eprintln!("error writing IR: {e}");
                     std::process::exit(1);
                 });
@@ -43,7 +90,7 @@ fn main() {
             }
         }
 
-        if run_ir {
+        if cli.run_ir {
             let functions = cranelift_reader::parse_functions(&ir).unwrap_or_else(|e| {
                 eprintln!("error parsing IR: {e}");
                 std::process::exit(1);
@@ -77,12 +124,12 @@ fn main() {
             }
         }
 
-        if !run_jit {
+        if !cli.run_jit {
             return;
         }
     }
 
-    if run_jit {
+    if cli.run_jit {
         let jit = Module::from_source(&source).compile_to_jit();
         let func_name = if jit.has_function("main") {
             "main"
@@ -98,11 +145,10 @@ fn main() {
         std::process::exit(result as i32);
     }
 
-    let output = if let Some(pos) = args.iter().position(|a| a == "-o") {
-        finalize_output_path(Path::new(&args[pos + 1]).to_path_buf())
-    } else {
-        finalize_output_path(input.with_extension(""))
-    };
+    let output = finalize_output_path(
+        cli.output
+            .unwrap_or_else(|| input.with_extension("").to_path_buf()),
+    );
 
     Module::from_source(&source).compile_to_executable(&output);
     println!("compiled to {}", output.display());

@@ -7,3 +7,4 @@ edition = "2024"
 cranelift = { version = "*", features = ["module", "jit", "native", "object", "interpreter"] }
 cranelift-reader = "0.127.1"
 logos = "0.16.0"
+pico-args = "0.5.0"

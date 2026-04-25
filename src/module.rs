@@ -275,6 +275,20 @@ impl Module {
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
+            .arg("panic=abort")
+            .arg("-C")
+            .arg("opt-level=s")
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("-C")
+            .arg("debuginfo=0")
+            .arg("-C")
+            .arg("link-arg=/DEBUG:NONE")
+            .arg("-C")
+            .arg("link-arg=/ENTRY:mainCRTStartup")
+            .arg("-C")
+            .arg("link-arg=/SUBSYSTEM:CONSOLE")
+            .arg("-C")
             .arg(format!("link-arg={}", tmp.display()))
             .arg("-o")
             .arg(output)
@@ -414,38 +428,9 @@ extern "C" fn windows_print_host(n: i64) -> i64 {
 #[cfg(windows)]
 fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
     let wrapper = output.with_extension("wrapper.rs");
-    let source = r#"
-#[unsafe(no_mangle)]
-pub extern "C" fn __expr_print_host(n: i64) -> i64 {
-    println!("{}", n);
-    0
-}
-
-unsafe extern "C" {
-    fn expr_main_entry() -> i64;
-}
-
-fn main() {
-    let code = unsafe { expr_main_entry() };
-    let exit_code = if code < i32::MIN as i64 || code > i32::MAX as i64 {
-        1
-    } else {
-        code as i32
-    };
-    std::process::exit(exit_code);
-}
-"#;
+    let source = include_str!("./wrapper/windows.rs");
     std::fs::write(&wrapper, source).unwrap();
     wrapper
-}
-
-#[cfg(windows)]
-fn windows_temp_exe_path(base: &str) -> std::path::PathBuf {
-    let mut path = std::env::temp_dir().join(base);
-    if path.extension().is_none() {
-        path.set_extension("exe");
-    }
-    path
 }
 
 fn declare_function_sig(
@@ -530,6 +515,7 @@ fn define_function_body(
     ir
 }
 
+#[cfg(not(windows))]
 fn generate_c_main(
     module: &mut impl CraneliftModule,
     isa: OwnedTargetIsa,
@@ -769,6 +755,15 @@ fn compile_ast(
         }
         Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
     }
+}
+
+#[cfg(all(windows, test))]
+fn windows_temp_exe_path(base: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir().join(base);
+    if path.extension().is_none() {
+        path.set_extension("exe");
+    }
+    path
 }
 
 #[test]

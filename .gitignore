@@ -1,1 +1,9 @@
 /target
+
+# Generated Windows binaries
+*.exe
+*.pdb
+
+# Generated Linux/macOS binaries from example programs (no extension)
+/examples/*
+!/examples/*.expr
