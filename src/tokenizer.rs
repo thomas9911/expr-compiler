@@ -81,6 +81,10 @@ pub enum Token {
     OpenBracket,
     #[token(")")]
     CloseBracket,
+    #[token("[")]
+    OpenSquareBracket,
+    #[token("]")]
+    CloseSquareBracket,
     #[token(",")]
     Comma,
     #[token("=")]
@@ -122,6 +126,8 @@ impl Token {
             Token::NotEqual => TokenKind::InfixOperator,
             Token::OpenBracket => TokenKind::OpenBracket,
             Token::CloseBracket => TokenKind::CloseBracket,
+            Token::OpenSquareBracket => TokenKind::OpenSquareBracket,
+            Token::CloseSquareBracket => TokenKind::CloseSquareBracket,
             Token::Comma => TokenKind::Comma,
             Token::Assign => TokenKind::Assign,
             Token::DefineFunction => TokenKind::DefineFunction,
@@ -144,6 +150,8 @@ pub enum TokenKind {
     InfixOperator,
     OpenBracket,
     CloseBracket,
+    OpenSquareBracket,
+    CloseSquareBracket,
     Comma,
     Assign,
     DefineFunction,
@@ -414,6 +422,25 @@ fn tokenize_if_not_symbol() {
     // 'if' and 'else' must not lex as Symbol
     let result: Result<Vec<_>, _> = Token::lexer("if else").collect();
     assert_eq!(result.unwrap(), vec![If, Else]);
+}
+
+#[test]
+fn tokenize_list_literal() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("[1, 2, 3]").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            OpenSquareBracket,
+            Integer(1),
+            Comma,
+            Integer(2),
+            Comma,
+            Integer(3),
+            CloseSquareBracket,
+        ]
+    );
 }
 
 #[test]

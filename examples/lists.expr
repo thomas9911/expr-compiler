@@ -1,0 +1,13 @@
+# Use recursion + list_pop to count and sum list items
+fn consume(xs, count, total):
+    if list_len(xs) == 0:
+        print(count)
+        print(total)
+        0
+    else:
+        x = list_pop(xs)
+        consume(xs, count + 1, total + x)
+
+fn main():
+    xs = [1, 4, 9, 16]
+    consume(xs, 0, 0)

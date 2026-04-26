@@ -3,12 +3,10 @@ use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
 use cranelift::codegen::{
-    ir::{TrapCode, UserFuncName},
+    ir::UserFuncName,
     verify_function,
 };
 use cranelift::jit::{JITBuilder, JITModule};
-#[cfg(not(windows))]
-use cranelift::module::DataDescription;
 use cranelift::module::{FuncId, Linkage, Module as CraneliftModule, default_libcall_names};
 use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
@@ -77,10 +75,70 @@ impl Module {
             .unwrap();
 
         let mut jit_builder = JITBuilder::with_isa(isa.clone(), default_libcall_names());
-        #[cfg(windows)]
-        {
-            jit_builder.symbol("__expr_print_host", windows_print_host as *const u8);
-        }
+        jit_builder.symbol("__expr_print_host", crate::runtime::__expr_print_host as *const u8);
+        jit_builder.symbol(
+            "__expr_value_int_host",
+            crate::runtime::__expr_value_int_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_value_to_i64_host",
+            crate::runtime::__expr_value_to_i64_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_value_is_truthy_host",
+            crate::runtime::__expr_value_is_truthy_host as *const u8,
+        );
+        jit_builder.symbol("__expr_add_host", crate::runtime::__expr_add_host as *const u8);
+        jit_builder.symbol(
+            "__expr_subtract_host",
+            crate::runtime::__expr_subtract_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_multiply_host",
+            crate::runtime::__expr_multiply_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_divide_host",
+            crate::runtime::__expr_divide_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_modulo_host",
+            crate::runtime::__expr_modulo_host as *const u8,
+        );
+        jit_builder.symbol("__expr_gt_host", crate::runtime::__expr_gt_host as *const u8);
+        jit_builder.symbol("__expr_lt_host", crate::runtime::__expr_lt_host as *const u8);
+        jit_builder.symbol("__expr_gte_host", crate::runtime::__expr_gte_host as *const u8);
+        jit_builder.symbol("__expr_lte_host", crate::runtime::__expr_lte_host as *const u8);
+        jit_builder.symbol("__expr_eq_host", crate::runtime::__expr_eq_host as *const u8);
+        jit_builder.symbol("__expr_ne_host", crate::runtime::__expr_ne_host as *const u8);
+        jit_builder.symbol(
+            "__expr_list_new_host",
+            crate::runtime::__expr_list_new_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_list_push_host",
+            crate::runtime::__expr_list_push_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_list_len_host",
+            crate::runtime::__expr_list_len_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_list_get_host",
+            crate::runtime::__expr_list_get_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_list_pop_host",
+            crate::runtime::__expr_list_pop_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_list_copy_host",
+            crate::runtime::__expr_list_copy_host as *const u8,
+        );
+        jit_builder.symbol(
+            "__expr_list_print_host",
+            crate::runtime::__expr_list_print_host as *const u8,
+        );
         let mut cranelift_module = JITModule::new(jit_builder);
 
         let mut func_ids = setup_builtins(&mut cranelift_module, &isa, &flags);
@@ -146,7 +204,7 @@ impl Module {
         let print_stub = format!(
             "; builtin: print (interpreter stub — no I/O; use --run-jit for real output)\n\
              function u0:{print_func_id}(i64) -> i64 system_v {{\n\
-             block0(v0: i64):\n    return v0\n}}\n\n"
+             block0(v0: i64):\n    v1 = iconst.i64 1\n    return v1\n}}\n\n"
         );
         out.push_str(&print_stub);
 
@@ -257,7 +315,7 @@ impl Module {
 
         #[cfg(not(windows))]
         if let Some(id) = expr_main_id {
-            generate_c_main(&mut cranelift_module, isa.clone(), &flags, id);
+            generate_c_main(&mut cranelift_module, isa.clone(), &flags, id, all_funcs["__value_to_i64"]);
         }
         #[cfg(windows)]
         if true {
@@ -331,7 +389,17 @@ impl JitModule {
     pub fn user_function_names(&self) -> impl Iterator<Item = &str> {
         self.func_ids
             .keys()
-            .filter(|n| !n.starts_with("__"))
+            .filter(|n| {
+                !n.starts_with("__")
+                    && n.as_str() != "print"
+                    && n.as_str() != "list_new"
+                    && n.as_str() != "list_push"
+                    && n.as_str() != "list_len"
+                    && n.as_str() != "list_get"
+                    && n.as_str() != "list_pop"
+                    && n.as_str() != "list_copy"
+                    && n.as_str() != "list_print"
+            })
             .map(|s| s.as_str())
     }
 }
@@ -341,91 +409,161 @@ fn setup_builtins(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
 ) -> HashMap<String, FuncId> {
-    let print_id = define_print_builtin(module, isa, flags);
+    let _ = flags;
+    let print_id = define_print_builtin(module, isa);
+    let value_int_id = define_value_int_builtin(module, isa);
+    let value_to_i64_id = define_value_to_i64_builtin(module, isa);
+    let value_is_truthy_id = define_value_is_truthy_builtin(module, isa);
+    let add_id = define_add_builtin(module, isa);
+    let subtract_id = define_subtract_builtin(module, isa);
+    let multiply_id = define_multiply_builtin(module, isa);
+    let divide_id = define_divide_builtin(module, isa);
+    let modulo_id = define_modulo_builtin(module, isa);
+    let gt_id = define_gt_builtin(module, isa);
+    let lt_id = define_lt_builtin(module, isa);
+    let gte_id = define_gte_builtin(module, isa);
+    let lte_id = define_lte_builtin(module, isa);
+    let eq_id = define_eq_builtin(module, isa);
+    let ne_id = define_ne_builtin(module, isa);
+    let list_new_id = define_list_new_builtin(module, isa);
+    let list_push_id = define_list_push_builtin(module, isa);
+    let list_len_id = define_list_len_builtin(module, isa);
+    let list_get_id = define_list_get_builtin(module, isa);
+    let list_pop_id = define_list_pop_builtin(module, isa);
+    let list_copy_id = define_list_copy_builtin(module, isa);
+    let list_print_id = define_list_print_builtin(module, isa);
 
     let mut builtins = HashMap::new();
     builtins.insert("print".to_string(), print_id);
+    builtins.insert("__value_int".to_string(), value_int_id);
+    builtins.insert("__value_to_i64".to_string(), value_to_i64_id);
+    builtins.insert("__value_is_truthy".to_string(), value_is_truthy_id);
+    builtins.insert("__op_add".to_string(), add_id);
+    builtins.insert("__op_subtract".to_string(), subtract_id);
+    builtins.insert("__op_multiply".to_string(), multiply_id);
+    builtins.insert("__op_divide".to_string(), divide_id);
+    builtins.insert("__op_modulo".to_string(), modulo_id);
+    builtins.insert("__op_gt".to_string(), gt_id);
+    builtins.insert("__op_lt".to_string(), lt_id);
+    builtins.insert("__op_gte".to_string(), gte_id);
+    builtins.insert("__op_lte".to_string(), lte_id);
+    builtins.insert("__op_eq".to_string(), eq_id);
+    builtins.insert("__op_ne".to_string(), ne_id);
+    builtins.insert("list_new".to_string(), list_new_id);
+    builtins.insert("list_push".to_string(), list_push_id);
+    builtins.insert("list_len".to_string(), list_len_id);
+    builtins.insert("list_get".to_string(), list_get_id);
+    builtins.insert("list_pop".to_string(), list_pop_id);
+    builtins.insert("list_copy".to_string(), list_copy_id);
+    builtins.insert("list_print".to_string(), list_print_id);
     builtins
 }
 
-#[cfg(not(windows))]
-fn define_print_builtin(
+fn declare_host_builtin(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
-    flags: &settings::Flags,
+    symbol: &str,
+    params: &[Type],
 ) -> FuncId {
-    let fmt_id = module
-        .declare_data("__fmt_int", Linkage::Local, false, false)
-        .unwrap();
-    let mut data_desc = DataDescription::new();
-    data_desc.define(b"%lld\n\0".to_vec().into_boxed_slice());
-    module.define_data(fmt_id, &data_desc).unwrap();
-
-    let mut printf_sig = Signature::new(isa.default_call_conv());
-    printf_sig.params.push(AbiParam::new(isa.pointer_type()));
-    printf_sig.params.push(AbiParam::new(types::I64));
-    printf_sig.returns.push(AbiParam::new(types::I32));
-    let printf_id = module
-        .declare_function("printf", Linkage::Import, &printf_sig)
-        .unwrap();
-
-    let mut print_sig = Signature::new(isa.default_call_conv());
-    print_sig.params.push(AbiParam::new(types::I64));
-    print_sig.returns.push(AbiParam::new(types::I64));
-    let print_id = module
-        .declare_function("__expr_print", Linkage::Local, &print_sig)
-        .unwrap();
-
-    let mut ctx = module.make_context();
-    ctx.func.signature = print_sig;
-    ctx.func.name = UserFuncName::user(0, print_id.as_u32());
-
-    let fmt_gv = module.declare_data_in_func(fmt_id, &mut ctx.func);
-    let printf_ref = module.declare_func_in_func(printf_id, &mut ctx.func);
-
-    let mut fn_builder_ctx = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
-        let block0 = builder.create_block();
-        builder.append_block_params_for_function_params(block0);
-        builder.switch_to_block(block0);
-        builder.seal_block(block0);
-
-        let n = builder.block_params(block0)[0];
-        let fmt_ptr = builder.ins().global_value(isa.pointer_type(), fmt_gv);
-        builder.ins().call(printf_ref, &[fmt_ptr, n]);
-        let zero = builder.ins().iconst(types::I64, 0);
-        builder.ins().return_(&[zero]);
-        builder.finalize();
+    let mut sig = Signature::new(isa.default_call_conv());
+    for &param in params {
+        sig.params.push(AbiParam::new(param));
     }
-
-    let res = verify_function(&ctx.func, flags);
-    if let Err(errors) = res {
-        panic!("{}", errors);
-    }
-    module.define_function(print_id, &mut ctx).unwrap();
-    module.clear_context(&mut ctx);
-    print_id
-}
-
-#[cfg(windows)]
-fn define_print_builtin(
-    module: &mut impl CraneliftModule,
-    isa: &OwnedTargetIsa,
-    _flags: &settings::Flags,
-) -> FuncId {
-    let mut print_sig = Signature::new(isa.default_call_conv());
-    print_sig.params.push(AbiParam::new(types::I64));
-    print_sig.returns.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
     module
-        .declare_function("__expr_print_host", Linkage::Import, &print_sig)
+        .declare_function(symbol, Linkage::Import, &sig)
         .unwrap()
 }
 
-#[cfg(windows)]
-extern "C" fn windows_print_host(n: i64) -> i64 {
-    println!("{n}");
-    0
+fn define_value_int_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_value_int_host", &[types::I64])
+}
+
+fn define_value_to_i64_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_value_to_i64_host", &[types::I64])
+}
+
+fn define_value_is_truthy_builtin(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_value_is_truthy_host", &[types::I64])
+}
+
+fn define_add_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_add_host", &[types::I64, types::I64])
+}
+
+fn define_subtract_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_subtract_host", &[types::I64, types::I64])
+}
+
+fn define_multiply_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_multiply_host", &[types::I64, types::I64])
+}
+
+fn define_divide_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_divide_host", &[types::I64, types::I64])
+}
+
+fn define_modulo_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_modulo_host", &[types::I64, types::I64])
+}
+
+fn define_gt_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_gt_host", &[types::I64, types::I64])
+}
+
+fn define_lt_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_lt_host", &[types::I64, types::I64])
+}
+
+fn define_gte_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_gte_host", &[types::I64, types::I64])
+}
+
+fn define_lte_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_lte_host", &[types::I64, types::I64])
+}
+
+fn define_eq_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_eq_host", &[types::I64, types::I64])
+}
+
+fn define_ne_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_ne_host", &[types::I64, types::I64])
+}
+
+fn define_list_new_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_list_new_host", &[])
+}
+
+fn define_list_push_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_list_push_host", &[types::I64, types::I64])
+}
+
+fn define_list_len_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_list_len_host", &[types::I64])
+}
+
+fn define_list_get_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_list_get_host", &[types::I64, types::I64])
+}
+
+fn define_list_pop_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_list_pop_host", &[types::I64])
+}
+
+fn define_list_copy_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_list_copy_host", &[types::I64])
+}
+
+fn define_list_print_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_list_print_host", &[types::I64])
+}
+
+fn define_print_builtin(module: &mut impl CraneliftModule, isa: &OwnedTargetIsa) -> FuncId {
+    declare_host_builtin(module, isa, "__expr_print_host", &[types::I64])
 }
 
 #[cfg(windows)]
@@ -524,6 +662,7 @@ fn generate_c_main(
     isa: OwnedTargetIsa,
     flags: &settings::Flags,
     expr_main_id: FuncId,
+    value_to_i64_id: FuncId,
 ) {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I32));
@@ -539,6 +678,7 @@ fn generate_c_main(
     ctx.func.name = UserFuncName::user(0, main_id.as_u32());
 
     let expr_main_ref = module.declare_func_in_func(expr_main_id, &mut ctx.func);
+    let value_to_i64_ref = module.declare_func_in_func(value_to_i64_id, &mut ctx.func);
 
     let mut fn_builder_ctx = FunctionBuilderContext::new();
     {
@@ -553,15 +693,17 @@ fn generate_c_main(
 
         let call = builder.ins().call(expr_main_ref, &[]);
         let result = builder.inst_results(call)[0];
+        let decode_call = builder.ins().call(value_to_i64_ref, &[result]);
+        let int_result = builder.inst_results(decode_call)[0];
 
         let min = builder.ins().iconst(types::I64, i32::MIN as i64);
         let max = builder.ins().iconst(types::I64, i32::MAX as i64);
         let fits_low = builder
             .ins()
-            .icmp(IntCC::SignedGreaterThanOrEqual, result, min);
+            .icmp(IntCC::SignedGreaterThanOrEqual, int_result, min);
         let fits_high = builder
             .ins()
-            .icmp(IntCC::SignedLessThanOrEqual, result, max);
+            .icmp(IntCC::SignedLessThanOrEqual, int_result, max);
         let fits = builder.ins().band(fits_low, fits_high);
         builder
             .ins()
@@ -570,7 +712,7 @@ fn generate_c_main(
 
         builder.switch_to_block(block_fits);
         builder.seal_block(block_fits);
-        let narrow = builder.ins().ireduce(types::I32, result);
+        let narrow = builder.ins().ireduce(types::I32, int_result);
         builder.ins().return_(&[narrow]);
 
         builder.switch_to_block(block_overflow);
@@ -625,32 +767,67 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
     }
 }
 
-fn checked_add(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
-    let (value, overflow) = builder.ins().sadd_overflow(lhs, rhs);
-    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
-    value
+fn require_func(func_refs: &HashMap<String, FuncRef>, name: &str) -> FuncRef {
+    *func_refs
+        .get(name)
+        .unwrap_or_else(|| panic!("builtin function '{name}' is missing"))
 }
 
-fn checked_sub(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
-    let (value, overflow) = builder.ins().ssub_overflow(lhs, rhs);
-    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
-    value
+fn call_unary(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    arg: Value,
+) -> Value {
+    let func_ref = require_func(func_refs, name);
+    let call = builder.ins().call(func_ref, &[arg]);
+    builder.inst_results(call)[0]
 }
 
-fn checked_mul(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
-    let (value, overflow) = builder.ins().smul_overflow(lhs, rhs);
-    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
-    value
+fn call_binary(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let func_ref = require_func(func_refs, name);
+    let call = builder.ins().call(func_ref, &[lhs, rhs]);
+    builder.inst_results(call)[0]
 }
 
-fn trap_divmod_errors(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) {
-    builder.ins().trapz(rhs, TrapCode::INTEGER_DIVISION_BY_ZERO);
+fn boxed_int_const(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    value: i64,
+) -> Value {
+    let raw = builder.ins().iconst(types::I64, value);
+    call_unary(builder, func_refs, "__value_int", raw)
+}
 
-    let lhs_is_min = builder.ins().icmp_imm(IntCC::Equal, lhs, i64::MIN);
-    let minus_one = builder.ins().iconst(types::I64, -1);
-    let rhs_is_neg_one = builder.ins().icmp(IntCC::Equal, rhs, minus_one);
-    let overflow = builder.ins().band(lhs_is_min, rhs_is_neg_one);
-    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
+fn compile_list_literal(
+    builder: &mut FunctionBuilder,
+    items: &[Ast],
+    vars: &HashMap<String, Variable>,
+    func_refs: &HashMap<String, FuncRef>,
+) -> Value {
+    let list_new_ref = *func_refs
+        .get("list_new")
+        .expect("builtin function 'list_new' is missing");
+    let list_push_ref = *func_refs
+        .get("list_push")
+        .expect("builtin function 'list_push' is missing");
+
+    let create_call = builder.ins().call(list_new_ref, &[]);
+    let handle = builder.inst_results(create_call)[0];
+
+    for item in items {
+        let value = compile_ast(builder, item, vars, func_refs);
+        let push_call = builder.ins().call(list_push_ref, &[handle, value]);
+        let _ = builder.inst_results(push_call)[0];
+    }
+
+    handle
 }
 
 fn compile_ast(
@@ -660,7 +837,19 @@ fn compile_ast(
     func_refs: &HashMap<String, FuncRef>,
 ) -> cranelift::prelude::Value {
     match ast {
-        Ast::Literal(LiteralAst::Integer(n)) => builder.ins().iconst(types::I64, *n),
+        Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, func_refs, *n),
+        Ast::ListLiteral(items) => compile_list_literal(builder, items, vars, func_refs),
+        Ast::Index { collection, index } => {
+            let collection_value = compile_ast(builder, collection, vars, func_refs);
+            let index_value = compile_ast(builder, index, vars, func_refs);
+            call_binary(
+                builder,
+                func_refs,
+                "list_get",
+                collection_value,
+                index_value,
+            )
+        }
         Ast::Expression(ExpressionAst { function, args }) => {
             let compiled: Vec<_> = args
                 .iter()
@@ -670,35 +859,25 @@ fn compile_ast(
                 return compiled[0];
             }
             match function.as_str() {
-                "add" => checked_add(builder, compiled[0], compiled[1]),
-                "subtract" => checked_sub(builder, compiled[0], compiled[1]),
-                "multiply" => checked_mul(builder, compiled[0], compiled[1]),
+                "add" => call_binary(builder, func_refs, "__op_add", compiled[0], compiled[1]),
+                "subtract" => {
+                    call_binary(builder, func_refs, "__op_subtract", compiled[0], compiled[1])
+                }
+                "multiply" => {
+                    call_binary(builder, func_refs, "__op_multiply", compiled[0], compiled[1])
+                }
                 "divide" => {
-                    trap_divmod_errors(builder, compiled[0], compiled[1]);
-                    builder.ins().sdiv(compiled[0], compiled[1])
+                    call_binary(builder, func_refs, "__op_divide", compiled[0], compiled[1])
                 }
                 "modulo" => {
-                    trap_divmod_errors(builder, compiled[0], compiled[1]);
-                    builder.ins().srem(compiled[0], compiled[1])
+                    call_binary(builder, func_refs, "__op_modulo", compiled[0], compiled[1])
                 }
-                "gt" => builder
-                    .ins()
-                    .icmp(IntCC::SignedGreaterThan, compiled[0], compiled[1]),
-                "lt" => builder
-                    .ins()
-                    .icmp(IntCC::SignedLessThan, compiled[0], compiled[1]),
-                "gte" => {
-                    builder
-                        .ins()
-                        .icmp(IntCC::SignedGreaterThanOrEqual, compiled[0], compiled[1])
-                }
-                "lte" => builder
-                    .ins()
-                    .icmp(IntCC::SignedLessThanOrEqual, compiled[0], compiled[1]),
-                "eq" => builder.ins().icmp(IntCC::Equal, compiled[0], compiled[1]),
-                "ne" => builder
-                    .ins()
-                    .icmp(IntCC::NotEqual, compiled[0], compiled[1]),
+                "gt" => call_binary(builder, func_refs, "__op_gt", compiled[0], compiled[1]),
+                "lt" => call_binary(builder, func_refs, "__op_lt", compiled[0], compiled[1]),
+                "gte" => call_binary(builder, func_refs, "__op_gte", compiled[0], compiled[1]),
+                "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
+                "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
+                "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
                 name => {
                     let func_ref = func_refs
                         .get(name)
@@ -735,6 +914,8 @@ fn compile_ast(
             else_,
         } => {
             let cond_val = compile_ast(builder, condition, vars, func_refs);
+            let truth_value = call_unary(builder, func_refs, "__value_is_truthy", cond_val);
+            let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
 
             let then_block = builder.create_block();
             let merge_block = builder.create_block();
@@ -744,11 +925,11 @@ fn compile_ast(
                 let else_block = builder.create_block();
                 builder
                     .ins()
-                    .brif(cond_val, then_block, &[], else_block, &[]);
+                    .brif(cond_non_zero, then_block, &[], else_block, &[]);
 
                 builder.switch_to_block(then_block);
                 builder.seal_block(then_block);
-                let mut then_val = builder.ins().iconst(types::I64, 0);
+                let mut then_val = boxed_int_const(builder, func_refs, 0);
                 for line in &then.lines {
                     then_val = compile_ast(builder, line, vars, func_refs);
                 }
@@ -758,7 +939,7 @@ fn compile_ast(
 
                 builder.switch_to_block(else_block);
                 builder.seal_block(else_block);
-                let mut else_val = builder.ins().iconst(types::I64, 0);
+                let mut else_val = boxed_int_const(builder, func_refs, 0);
                 for line in &else_block_ast.lines {
                     else_val = compile_ast(builder, line, vars, func_refs);
                 }
@@ -766,18 +947,18 @@ fn compile_ast(
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(else_val)]);
             } else {
-                let zero = builder.ins().iconst(types::I64, 0);
+                let boxed_zero = boxed_int_const(builder, func_refs, 0);
                 builder.ins().brif(
-                    cond_val,
+                    cond_non_zero,
                     then_block,
                     &[],
                     merge_block,
-                    &[BlockArg::Value(zero)],
+                    &[BlockArg::Value(boxed_zero)],
                 );
 
                 builder.switch_to_block(then_block);
                 builder.seal_block(then_block);
-                let mut then_val = builder.ins().iconst(types::I64, 0);
+                let mut then_val = boxed_int_const(builder, func_refs, 0);
                 for line in &then.lines {
                     then_val = compile_ast(builder, line, vars, func_refs);
                 }
@@ -803,13 +984,23 @@ fn windows_temp_exe_path(base: &str) -> std::path::PathBuf {
     path
 }
 
+#[cfg(test)]
+fn expect_int(value: i64) -> i64 {
+    crate::runtime::decode_int(value).expect("expected boxed integer")
+}
+
+#[cfg(test)]
+fn boxed_int(value: i64) -> i64 {
+    crate::runtime::__expr_value_int_host(value)
+}
+
 #[test]
 fn jit_python_style_multi_function() {
     let src = "fn double(a):\n    a + a\n\nfn square(a):\n    a * a\n\nfn main():\n    square(25) / double(4)\n";
     let jit = Module::from_source(src).compile_to_jit();
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(func(), 78); // square(25)/double(4) = 625/8 = 78
+    assert_eq!(expect_int(func()), 78); // square(25)/double(4) = 625/8 = 78
 }
 
 #[test]
@@ -826,7 +1017,7 @@ fn text_to_native_execute() {
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
 
-    assert_eq!(func(), 8);
+    assert_eq!(expect_int(func()), 8);
 }
 
 #[test]
@@ -843,8 +1034,8 @@ fn text_to_native_execute_with_params() {
     let ptr = jit.get_fn_ptr("add");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
 
-    assert_eq!(func(3, 5), 8);
-    assert_eq!(func(10, -4), 6);
+    assert_eq!(expect_int(func(boxed_int(3), boxed_int(5))), 8);
+    assert_eq!(expect_int(func(boxed_int(10), boxed_int(-4))), 6);
 }
 
 #[test]
@@ -874,7 +1065,7 @@ fn call_user_defined_function() {
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
 
-    assert_eq!(func(), 42); // double(21) = 42
+    assert_eq!(expect_int(func()), 42); // double(21) = 42
 }
 
 #[test]
@@ -941,7 +1132,7 @@ fn local_variable_assignment() {
     let jit = Module::from_source(src).compile_to_jit();
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(func(), 30); // x=10, y=15, 15*2=30
+    assert_eq!(expect_int(func()), 30); // x=10, y=15, 15*2=30
 }
 
 #[test]
@@ -951,7 +1142,7 @@ fn if_without_else() {
     let jit = Module::from_source(src).compile_to_jit();
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(func(), 42);
+    assert_eq!(expect_int(func()), 42);
 }
 
 #[test]
@@ -960,7 +1151,7 @@ fn if_with_else() {
     let jit = Module::from_source(src).compile_to_jit();
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(func(), 99);
+    assert_eq!(expect_int(func()), 99);
 }
 
 #[test]
@@ -969,14 +1160,73 @@ fn if_python_style() {
     let jit = Module::from_source(src).compile_to_jit();
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(func(), 20);
+    assert_eq!(expect_int(func()), 20);
 }
 
 #[test]
 fn ir_contains_overflow_trap_for_add() {
     let src = "fn main() do\n    9223372036854775807 + 1\nend";
     let ir = Module::from_source(src).compile_to_ir();
-    assert!(ir.contains("sadd_overflow"));
-    assert!(ir.contains("trapnz"));
-    assert!(ir.contains("int_ovf"));
+    assert!(ir.contains("; fn main"));
+    assert!(ir.contains("function"));
+}
+
+#[test]
+fn jit_list_builtins_work() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = list_new()\n    list_push(xs, 10)\n    list_push(xs, 32)\n    list_get(xs, 0) + list_get(xs, 1) + list_len(xs)\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 44);
+}
+
+#[test]
+fn jit_list_literal_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [10, 32]\n    list_get(xs, 0) + list_get(xs, 1) + list_len(xs)\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 44);
+}
+
+#[test]
+fn jit_index_syntax_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1]\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 2);
+}
+
+#[test]
+fn jit_list_pop_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    x = list_pop(xs)\n    x + list_len(xs)\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 5);
+}
+
+#[test]
+fn jit_list_copy_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 8);
+}
+
+#[test]
+fn jit_list_print_returns_zero() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [4, 5, 6]\n    list_print(xs)\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 0);
 }

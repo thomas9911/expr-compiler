@@ -1,10 +1,11 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
 use expr_compiler::module::Module;
+use expr_compiler::runtime::{configure_runtime_arena, decode_int, reset_runtime_arena};
 use pico_args::Arguments;
 use std::path::{Path, PathBuf};
 
 const USAGE: &str =
-    "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit]";
+    "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--arena-mb <n>]";
 
 struct CliArgs {
     input: PathBuf,
@@ -12,6 +13,7 @@ struct CliArgs {
     emit_ir: bool,
     run_ir: bool,
     run_jit: bool,
+    arena_mb: usize,
 }
 
 fn finalize_output_path(mut output: PathBuf) -> PathBuf {
@@ -36,6 +38,13 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     let emit_ir = args.contains("--emit-ir");
     let run_ir = args.contains("--run-ir");
     let run_jit = args.contains("--run-jit");
+    let arena_mb = args
+        .opt_value_from_str::<_, usize>("--arena-mb")
+        .map_err(|e| format!("failed to parse --arena-mb: {e}"))?
+        .unwrap_or(16);
+    if arena_mb == 0 {
+        return Err("--arena-mb must be > 0".to_string());
+    }
 
     let input = args
         .free_from_str::<String>()
@@ -57,6 +66,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         emit_ir,
         run_ir,
         run_jit,
+        arena_mb,
     })
 }
 
@@ -108,7 +118,11 @@ fn main() {
                 match interpreter.call_by_name(&func_name, &[]) {
                     Ok(ControlFlow::Return(res)) => {
                         if let Some(DataValue::I64(x)) = res.first() {
-                            println!("{x}");
+                            if let Some(decoded) = decode_int(*x) {
+                                println!("{decoded}");
+                            } else {
+                                println!("{x}");
+                            }
                         }
                     }
                     Ok(ControlFlow::Trap(trap)) => {
@@ -130,6 +144,8 @@ fn main() {
     }
 
     if cli.run_jit {
+        configure_runtime_arena(cli.arena_mb * 1024 * 1024);
+        reset_runtime_arena();
         let jit = Module::from_source(&source).compile_to_jit();
         let func_name = if jit.has_function("main") {
             "main"
@@ -142,7 +158,11 @@ fn main() {
         let ptr = jit.get_fn_ptr(func_name);
         let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
         let result = func();
-        std::process::exit(result as i32);
+        let int_result = decode_int(result).unwrap_or_else(|| {
+            eprintln!("runtime error: main returned non-integer value");
+            std::process::exit(1);
+        });
+        std::process::exit(int_result as i32);
     }
 
     let output = finalize_output_path(

@@ -39,6 +39,12 @@ impl Interpreter {
                 self.execute_expression(expr);
             }
             Ast::Literal(literal_ast) => self.execute_literal(literal_ast),
+            Ast::ListLiteral(_) => {
+                panic!("list literals are not supported by the interpreter");
+            }
+            Ast::Index { .. } => {
+                panic!("index expressions are not supported by the interpreter");
+            }
             Ast::Variable(name) => {
                 if let Some(value) = self.lookup_variable(&name).cloned() {
                     self.output = value;

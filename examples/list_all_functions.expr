@@ -1,0 +1,22 @@
+# Demonstrates all list builtins
+fn main():
+    xs = list_new()
+    list_push(xs, 10)
+    list_push(xs, 20)
+    list_push(xs, 30)
+
+    ys = list_copy(xs)
+    list_print(xs)
+
+    print(list_len(xs))
+    print(list_get(xs, 0))
+    print(xs[1])
+    print(list_get(xs, 2))
+
+    print(list_pop(xs))
+    print(list_len(xs))
+
+    print(list_len(ys))
+    print(ys[2])
+
+    0

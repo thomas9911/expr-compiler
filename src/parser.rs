@@ -62,6 +62,11 @@ pub enum Ast {
     FunctionDef(FunctionDefAst),
     Expression(ExpressionAst),
     Literal(LiteralAst),
+    ListLiteral(Vec<Ast>),
+    Index {
+        collection: Box<Ast>,
+        index: Box<Ast>,
+    },
     Variable(String),
     Assign {
         name: String,
@@ -324,15 +329,42 @@ fn parse_expr<'a>(lex: &mut ParseLexer<'a>, min_prec: u8) -> Result<Ast, ParseEr
 }
 
 fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
-    match lex.peek() {
+    let mut lhs = match lex.peek() {
         Some(Ok(x)) if x.kind() == TokenKind::Integer => {
-            Ok(Ast::Literal(LiteralAst::from_lexer(lex)?))
+            Ast::Literal(LiteralAst::from_lexer(lex)?)
         }
         Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
             let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
                 unreachable!()
             };
-            if lex.peek() == Some(&Ok(Token::OpenBracket)) {
+            Ast::Variable(name)
+        }
+        Some(Ok(Token::OpenSquareBracket)) => {
+            lex.next();
+            let mut items = vec![];
+            loop {
+                match lex.peek() {
+                    Some(Ok(Token::CloseSquareBracket)) => {
+                        lex.next();
+                        break;
+                    }
+                    Some(Ok(Token::Comma)) => {
+                        lex.next();
+                    }
+                    _ => items.push(parse_expr(lex, 0)?),
+                }
+            }
+            Ast::ListLiteral(items)
+        }
+        _ => return Err(ParseError::unexpected(lex)),
+    };
+
+    loop {
+        match lex.peek() {
+            Some(Ok(Token::OpenBracket)) => {
+                let Ast::Variable(function_name) = lhs else {
+                    return Err(ParseError::unexpected(lex));
+                };
                 lex.next();
                 let mut args = vec![];
                 loop {
@@ -347,16 +379,27 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
                         _ => args.push(parse_expr(lex, 0)?),
                     }
                 }
-                Ok(Ast::Expression(ExpressionAst {
-                    function: name,
+                lhs = Ast::Expression(ExpressionAst {
+                    function: function_name,
                     args,
-                }))
-            } else {
-                Ok(Ast::Variable(name))
+                });
             }
+            Some(Ok(Token::OpenSquareBracket)) => {
+                lex.next();
+                let index = parse_expr(lex, 0)?;
+                if lex.next() != Some(Ok(Token::CloseSquareBracket)) {
+                    return Err(ParseError::unexpected(lex));
+                }
+                lhs = Ast::Index {
+                    collection: Box::new(lhs),
+                    index: Box::new(index),
+                };
+            }
+            _ => break,
         }
-        _ => Err(ParseError::unexpected(lex)),
     }
+
+    Ok(lhs)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -771,4 +814,63 @@ fn parse_function_def_invalid_token_returns_error() {
 
     let ast = Ast::from_lexer(&mut lexer);
     assert!(ast.is_err());
+}
+
+#[test]
+fn parse_list_literal() {
+    use Ast::*;
+
+    let text = "fn main() do\n    [1, 2, 3]\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![ListLiteral(vec![
+                Literal(LiteralAst::Integer(1)),
+                Literal(LiteralAst::Integer(2)),
+                Literal(LiteralAst::Integer(3)),
+            ])],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_index_expression() {
+    use Ast::*;
+
+    let text = "fn main() do\n    xs = [1, 2, 3]\n    xs[1]\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![
+                Assign {
+                    name: "xs".to_string(),
+                    value: Box::new(ListLiteral(vec![
+                        Literal(LiteralAst::Integer(1)),
+                        Literal(LiteralAst::Integer(2)),
+                        Literal(LiteralAst::Integer(3)),
+                    ])),
+                },
+                Index {
+                    collection: Box::new(Variable("xs".to_string())),
+                    index: Box::new(Literal(LiteralAst::Integer(1))),
+                },
+            ],
+        },
+    });
+
+    assert_eq!(ast, expected);
 }
