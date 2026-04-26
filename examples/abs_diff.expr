@@ -1,0 +1,9 @@
+fn abs_diff(a, b):
+    if a >= b:
+        a - b
+    else:
+        b - a
+
+fn main():
+    print(abs_diff(19, 42))
+    0

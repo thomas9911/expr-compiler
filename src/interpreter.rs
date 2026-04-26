@@ -87,7 +87,9 @@ impl Interpreter {
                     self.execute(arg);
                     match self.get_output() {
                         Ast::Literal(LiteralAst::Integer(integer)) => {
-                            sum = sum.wrapping_add(*integer)
+                            sum = sum
+                                .checked_add(*integer)
+                                .unwrap_or_else(|| panic!("integer overflow in add"));
                         }
                         _ => {
                             eprintln!("sum expects integer arguments")
@@ -107,7 +109,9 @@ impl Interpreter {
                                 sum = *integer;
                                 first = false;
                             } else {
-                                sum = sum.wrapping_sub(*integer);
+                                sum = sum
+                                    .checked_sub(*integer)
+                                    .unwrap_or_else(|| panic!("integer overflow in subtract"));
                             }
                         }
                         _ => {
@@ -123,7 +127,9 @@ impl Interpreter {
                     self.execute(arg);
                     match self.get_output() {
                         Ast::Literal(LiteralAst::Integer(integer)) => {
-                            product = product.wrapping_mul(*integer)
+                            product = product
+                                .checked_mul(*integer)
+                                .unwrap_or_else(|| panic!("integer overflow in multiply"));
                         }
                         _ => {
                             eprintln!("multiply expects integer arguments")
@@ -147,7 +153,9 @@ impl Interpreter {
                                 self.execute_literal(LiteralAst::Integer(0));
                                 return;
                             } else {
-                                quotient /= *integer;
+                                quotient = quotient.checked_div(*integer).unwrap_or_else(|| {
+                                    panic!("integer overflow in divide")
+                                });
                             }
                         }
                         _ => {
@@ -172,7 +180,9 @@ impl Interpreter {
                                 self.execute_literal(LiteralAst::Integer(0));
                                 return;
                             } else {
-                                remainder %= *integer;
+                                remainder = remainder.checked_rem(*integer).unwrap_or_else(|| {
+                                    panic!("integer overflow in modulo")
+                                });
                             }
                         }
                         _ => {
@@ -348,5 +358,18 @@ mod tests {
             *interpreter.get_output(),
             Ast::Literal(LiteralAst::Integer(42))
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "integer overflow in add")]
+    fn add_overflow_panics() {
+        let mut interpreter = Interpreter::default();
+        interpreter.execute(Ast::Expression(ExpressionAst {
+            function: "add".to_string(),
+            args: vec![
+                Ast::Literal(LiteralAst::Integer(i64::MAX)),
+                Ast::Literal(LiteralAst::Integer(1)),
+            ],
+        }));
     }
 }

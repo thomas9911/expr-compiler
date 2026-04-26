@@ -2,7 +2,7 @@ use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
-use cranelift::codegen::{ir::UserFuncName, verify_function};
+use cranelift::codegen::{ir::{TrapCode, UserFuncName}, verify_function};
 use cranelift::jit::{JITBuilder, JITModule};
 #[cfg(not(windows))]
 use cranelift::module::DataDescription;
@@ -622,6 +622,34 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
     }
 }
 
+fn checked_add(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+    let (value, overflow) = builder.ins().sadd_overflow(lhs, rhs);
+    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
+    value
+}
+
+fn checked_sub(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+    let (value, overflow) = builder.ins().ssub_overflow(lhs, rhs);
+    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
+    value
+}
+
+fn checked_mul(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+    let (value, overflow) = builder.ins().smul_overflow(lhs, rhs);
+    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
+    value
+}
+
+fn trap_divmod_errors(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) {
+    builder.ins().trapz(rhs, TrapCode::INTEGER_DIVISION_BY_ZERO);
+
+    let lhs_is_min = builder.ins().icmp_imm(IntCC::Equal, lhs, i64::MIN);
+    let minus_one = builder.ins().iconst(types::I64, -1);
+    let rhs_is_neg_one = builder.ins().icmp(IntCC::Equal, rhs, minus_one);
+    let overflow = builder.ins().band(lhs_is_min, rhs_is_neg_one);
+    builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
+}
+
 fn compile_ast(
     builder: &mut FunctionBuilder,
     ast: &Ast,
@@ -639,11 +667,17 @@ fn compile_ast(
                 return compiled[0];
             }
             match function.as_str() {
-                "add" => builder.ins().iadd(compiled[0], compiled[1]),
-                "subtract" => builder.ins().isub(compiled[0], compiled[1]),
-                "multiply" => builder.ins().imul(compiled[0], compiled[1]),
-                "divide" => builder.ins().sdiv(compiled[0], compiled[1]),
-                "modulo" => builder.ins().srem(compiled[0], compiled[1]),
+                "add" => checked_add(builder, compiled[0], compiled[1]),
+                "subtract" => checked_sub(builder, compiled[0], compiled[1]),
+                "multiply" => checked_mul(builder, compiled[0], compiled[1]),
+                "divide" => {
+                    trap_divmod_errors(builder, compiled[0], compiled[1]);
+                    builder.ins().sdiv(compiled[0], compiled[1])
+                }
+                "modulo" => {
+                    trap_divmod_errors(builder, compiled[0], compiled[1]);
+                    builder.ins().srem(compiled[0], compiled[1])
+                }
                 "gt" => builder
                     .ins()
                     .icmp(IntCC::SignedGreaterThan, compiled[0], compiled[1]),
@@ -933,4 +967,13 @@ fn if_python_style() {
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), 20);
+}
+
+#[test]
+fn ir_contains_overflow_trap_for_add() {
+    let src = "fn main() do\n    9223372036854775807 + 1\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    assert!(ir.contains("sadd_overflow"));
+    assert!(ir.contains("trapnz"));
+    assert!(ir.contains("int_ovf"));
 }

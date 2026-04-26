@@ -1,0 +1,17 @@
+fn inner_fib(a, b, i, n):
+    if i + 1 == n:
+        print(a)
+        b
+    else:
+        print(a)
+        inner_fib(b, a + b, i + 1, n)
+
+fn fibonacci(n):
+    if n == 0:
+        0
+    else:
+        inner_fib(0, 1, 0, n)
+
+fn main():
+    print(fibonacci(92))
+    0

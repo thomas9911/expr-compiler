@@ -42,8 +42,8 @@ impl<'a> Iterator for ParseLexer<'a> {
 
 #[derive(Debug)]
 pub struct ParseError<'a> {
-    span: Span,
-    text: &'a str,
+    pub span: Span,
+    pub text: &'a str,
 }
 
 impl<'a> ParseError<'a> {
