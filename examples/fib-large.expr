@@ -13,5 +13,6 @@ fn fibonacci(n):
         inner_fib(0, 1, 0, n)
 
 fn main():
+    # calculate to the 92th fibonacci number (max for i64)
     print(fibonacci(92))
     0

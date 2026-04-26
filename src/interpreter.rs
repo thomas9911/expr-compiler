@@ -153,9 +153,9 @@ impl Interpreter {
                                 self.execute_literal(LiteralAst::Integer(0));
                                 return;
                             } else {
-                                quotient = quotient.checked_div(*integer).unwrap_or_else(|| {
-                                    panic!("integer overflow in divide")
-                                });
+                                quotient = quotient
+                                    .checked_div(*integer)
+                                    .unwrap_or_else(|| panic!("integer overflow in divide"));
                             }
                         }
                         _ => {
@@ -180,9 +180,9 @@ impl Interpreter {
                                 self.execute_literal(LiteralAst::Integer(0));
                                 return;
                             } else {
-                                remainder = remainder.checked_rem(*integer).unwrap_or_else(|| {
-                                    panic!("integer overflow in modulo")
-                                });
+                                remainder = remainder
+                                    .checked_rem(*integer)
+                                    .unwrap_or_else(|| panic!("integer overflow in modulo"));
                             }
                         }
                         _ => {

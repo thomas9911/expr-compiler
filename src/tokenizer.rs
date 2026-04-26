@@ -91,6 +91,8 @@ pub enum Token {
     If,
     #[token("else")]
     Else,
+    #[regex(r"#[^\r\n]*", logos::skip, allow_greedy = true)]
+    Comment,
     #[regex("do|:", priority = 5)]
     StartBlock,
     #[token("end")]
@@ -125,6 +127,7 @@ impl Token {
             Token::DefineFunction => TokenKind::DefineFunction,
             Token::If => TokenKind::If,
             Token::Else => TokenKind::Else,
+            Token::Comment => unreachable!(),
             Token::StartBlock => TokenKind::StartBlock,
             Token::EndBlock => TokenKind::EndBlock,
             Token::Symbol(_) => TokenKind::Symbol,
@@ -411,4 +414,59 @@ fn tokenize_if_not_symbol() {
     // 'if' and 'else' must not lex as Symbol
     let result: Result<Vec<_>, _> = Token::lexer("if else").collect();
     assert_eq!(result.unwrap(), vec![If, Else]);
+}
+
+#[test]
+fn tokenize_skips_line_comments() {
+    use Token::*;
+
+    let text = "fn main():\n    # comment only line\n    x = 1 # trailing comment\n    x\n";
+    let result: Result<Vec<_>, _> = Token::lexer(text).collect();
+
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            DefineFunction,
+            Symbol("main".to_string()),
+            OpenBracket,
+            CloseBracket,
+            StartBlock,
+            Newline,
+            Indent,
+            Newline,
+            Indent,
+            Symbol("x".to_string()),
+            Assign,
+            Integer(1),
+            Newline,
+            Indent,
+            Symbol("x".to_string()),
+            Newline,
+        ]
+    );
+}
+
+#[test]
+fn tokenize_skips_line_comments_crlf() {
+    use Token::*;
+
+    let text = "fn main():\r\n    x = 1 # comment\r\n";
+    let result: Result<Vec<_>, _> = Token::lexer(text).collect();
+
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            DefineFunction,
+            Symbol("main".to_string()),
+            OpenBracket,
+            CloseBracket,
+            StartBlock,
+            Newline,
+            Indent,
+            Symbol("x".to_string()),
+            Assign,
+            Integer(1),
+            Newline,
+        ]
+    );
 }

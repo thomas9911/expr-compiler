@@ -2,7 +2,10 @@ use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
-use cranelift::codegen::{ir::{TrapCode, UserFuncName}, verify_function};
+use cranelift::codegen::{
+    ir::{TrapCode, UserFuncName},
+    verify_function,
+};
 use cranelift::jit::{JITBuilder, JITModule};
 #[cfg(not(windows))]
 use cranelift::module::DataDescription;
