@@ -330,9 +330,7 @@ fn parse_expr<'a>(lex: &mut ParseLexer<'a>, min_prec: u8) -> Result<Ast, ParseEr
 
 fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
     let mut lhs = match lex.peek() {
-        Some(Ok(x)) if x.kind() == TokenKind::Integer => {
-            Ast::Literal(LiteralAst::from_lexer(lex)?)
-        }
+        Some(Ok(x)) if x.kind() == TokenKind::Integer => Ast::Literal(LiteralAst::from_lexer(lex)?),
         Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
             let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
                 unreachable!()

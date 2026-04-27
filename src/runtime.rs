@@ -71,7 +71,9 @@ fn arena() -> &'static Mutex<Arena> {
 }
 
 fn with_arena<T>(f: impl FnOnce(&mut Arena) -> T) -> T {
-    let mut guard = arena().lock().unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
+    let mut guard = arena()
+        .lock()
+        .unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
     f(&mut guard)
 }
 
@@ -83,7 +85,8 @@ fn value_ptr(handle: i64) -> *const Value {
 }
 
 fn alloc_value(arena: &mut Arena, tag: ValueTag, payload: i64) -> i64 {
-    let ptr = arena.alloc(std::mem::size_of::<Value>(), std::mem::align_of::<Value>()) as *mut Value;
+    let ptr =
+        arena.alloc(std::mem::size_of::<Value>(), std::mem::align_of::<Value>()) as *mut Value;
     unsafe {
         *ptr = Value {
             tag,
@@ -126,7 +129,9 @@ pub fn configure_runtime_arena(bytes: usize) {
     if bytes == 0 {
         runtime_trap("arena size must be > 0");
     }
-    let mut guard = arena().lock().unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
+    let mut guard = arena()
+        .lock()
+        .unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
     *guard = Arena::with_capacity(bytes);
 }
 

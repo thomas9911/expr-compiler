@@ -4,8 +4,7 @@ use expr_compiler::runtime::{configure_runtime_arena, decode_int, reset_runtime_
 use pico_args::Arguments;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str =
-    "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--arena-mb <n>]";
+const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--arena-mb <n>]";
 
 struct CliArgs {
     input: PathBuf,
