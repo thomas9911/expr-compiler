@@ -28,11 +28,33 @@ pub(super) fn setup_builtins(
 ) -> HashMap<String, FuncId> {
     let print_id = declare_host_builtin(module, isa, "__expr_print_host", &[types::I64]);
     let list_print_id = declare_host_builtin(module, isa, "__expr_list_print_host", &[types::I64]);
-    let memcpy_id =
-        declare_host_builtin(module, isa, "memcpy", &[types::I64, types::I64, types::I64]);
+    let runtime = define_runtime_ir(module, isa, flags);
+    build_builtin_map(print_id, list_print_id, runtime)
+}
 
-    let runtime = define_runtime_ir(module, isa, flags, memcpy_id);
+pub(super) fn setup_builtins_jit(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    print_host_addr: i64,
+    list_print_host_addr: i64,
+    arena_base_addr: i64,
+    arena_offset_addr: i64,
+) -> HashMap<String, FuncId> {
+    let print_id = declare_local_builtin(module, isa, "__rt_print", &[types::I64]);
+    let list_print_id = declare_local_builtin(module, isa, "__rt_list_print", &[types::I64]);
+    define_rt_host_print_shim(module, isa, flags, print_id, print_host_addr);
+    define_rt_host_print_shim(module, isa, flags, list_print_id, list_print_host_addr);
 
+    let runtime = define_runtime_ir_jit(module, isa, flags, arena_base_addr, arena_offset_addr);
+    build_builtin_map(print_id, list_print_id, runtime)
+}
+
+fn build_builtin_map(
+    print_id: FuncId,
+    list_print_id: FuncId,
+    runtime: RuntimeBuiltins,
+) -> HashMap<String, FuncId> {
     let mut builtins = HashMap::new();
     builtins.insert("print".to_string(), print_id);
     builtins.insert("__value_int".to_string(), runtime.value_int);
@@ -87,6 +109,12 @@ struct RuntimeData {
     offset: DataId,
 }
 
+struct RuntimeFunctionIds {
+    alloc: FuncId,
+    memcpy: FuncId,
+    builtins: RuntimeBuiltins,
+}
+
 fn declare_local_builtin(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -121,15 +149,17 @@ fn init_runtime_data(module: &mut impl CraneliftModule) -> RuntimeData {
     RuntimeData { arena, offset }
 }
 
-fn define_runtime_ir(
+fn declare_runtime_function_ids(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
-    flags: &settings::Flags,
-    memcpy_id: FuncId,
-) -> RuntimeBuiltins {
-    let data = init_runtime_data(module);
-
+) -> RuntimeFunctionIds {
     let alloc = declare_local_builtin(module, isa, "__rt_alloc", &[types::I64, types::I64]);
+    let memcpy = declare_local_builtin(
+        module,
+        isa,
+        "__rt_memcpy",
+        &[types::I64, types::I64, types::I64],
+    );
     let value_int = declare_local_builtin(module, isa, "__rt_value_int", &[types::I64]);
     let value_to_i64 = declare_local_builtin(module, isa, "__rt_value_to_i64", &[types::I64]);
     let value_is_truthy = declare_local_builtin(module, isa, "__rt_value_is_truthy", &[types::I64]);
@@ -153,138 +183,195 @@ fn define_runtime_ir(
     let list_pop = declare_local_builtin(module, isa, "__rt_list_pop", &[types::I64]);
     let list_copy = declare_local_builtin(module, isa, "__rt_list_copy", &[types::I64]);
 
-    define_rt_alloc(module, isa, flags, alloc, &data);
-    define_rt_value_int(module, isa, flags, value_int, alloc);
-    define_rt_value_to_i64(module, isa, flags, value_to_i64);
-    define_rt_value_is_truthy(module, isa, flags, value_is_truthy);
-    define_rt_binary_op(module, isa, flags, op_add, value_to_i64, value_int, "add");
+    RuntimeFunctionIds {
+        alloc,
+        memcpy,
+        builtins: RuntimeBuiltins {
+            value_int,
+            value_to_i64,
+            value_is_truthy,
+            op_add,
+            op_subtract,
+            op_multiply,
+            op_divide,
+            op_modulo,
+            op_gt,
+            op_lt,
+            op_gte,
+            op_lte,
+            op_eq,
+            op_ne,
+            list_new,
+            list_push,
+            list_len,
+            list_get,
+            list_pop,
+            list_copy,
+        },
+    }
+}
+
+fn define_runtime_operations(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    ids: &RuntimeFunctionIds,
+) {
+    define_rt_memcpy(module, isa, flags, ids.memcpy);
+    define_rt_value_int(module, isa, flags, ids.builtins.value_int, ids.alloc);
+    define_rt_value_to_i64(module, isa, flags, ids.builtins.value_to_i64);
+    define_rt_value_is_truthy(module, isa, flags, ids.builtins.value_is_truthy);
     define_rt_binary_op(
         module,
         isa,
         flags,
-        op_subtract,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_add,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        "add",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_subtract,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         "subtract",
     );
     define_rt_binary_op(
         module,
         isa,
         flags,
-        op_multiply,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_multiply,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         "multiply",
     );
     define_rt_binary_op(
         module,
         isa,
         flags,
-        op_divide,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_divide,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         "divide",
     );
     define_rt_binary_op(
         module,
         isa,
         flags,
-        op_modulo,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_modulo,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         "modulo",
     );
     define_rt_compare_op(
         module,
         isa,
         flags,
-        op_gt,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_gt,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         IntCC::SignedGreaterThan,
     );
     define_rt_compare_op(
         module,
         isa,
         flags,
-        op_lt,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_lt,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         IntCC::SignedLessThan,
     );
     define_rt_compare_op(
         module,
         isa,
         flags,
-        op_gte,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_gte,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         IntCC::SignedGreaterThanOrEqual,
     );
     define_rt_compare_op(
         module,
         isa,
         flags,
-        op_lte,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_lte,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         IntCC::SignedLessThanOrEqual,
     );
     define_rt_compare_op(
         module,
         isa,
         flags,
-        op_eq,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_eq,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         IntCC::Equal,
     );
     define_rt_compare_op(
         module,
         isa,
         flags,
-        op_ne,
-        value_to_i64,
-        value_int,
+        ids.builtins.op_ne,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
         IntCC::NotEqual,
     );
-    define_rt_list_new(module, isa, flags, list_new, alloc);
-    define_rt_list_push(module, isa, flags, list_push, alloc, memcpy_id);
-    define_rt_list_len(module, isa, flags, list_len, value_to_i64, value_int);
-    define_rt_list_get(module, isa, flags, list_get, value_to_i64);
-    define_rt_list_pop(module, isa, flags, list_pop, value_to_i64);
+    define_rt_list_new(module, isa, flags, ids.builtins.list_new, ids.alloc);
+    define_rt_list_push(
+        module,
+        isa,
+        flags,
+        ids.builtins.list_push,
+        ids.alloc,
+        ids.memcpy,
+    );
+    define_rt_list_len(
+        module,
+        isa,
+        flags,
+        ids.builtins.list_len,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+    );
+    define_rt_list_get(
+        module,
+        isa,
+        flags,
+        ids.builtins.list_get,
+        ids.builtins.value_to_i64,
+    );
+    define_rt_list_pop(
+        module,
+        isa,
+        flags,
+        ids.builtins.list_pop,
+        ids.builtins.value_to_i64,
+    );
     define_rt_list_copy(
         module,
         isa,
         flags,
-        list_copy,
-        value_to_i64,
-        alloc,
-        memcpy_id,
+        ids.builtins.list_copy,
+        ids.builtins.value_to_i64,
+        ids.alloc,
+        ids.memcpy,
     );
+}
 
-    RuntimeBuiltins {
-        value_int,
-        value_to_i64,
-        value_is_truthy,
-        op_add,
-        op_subtract,
-        op_multiply,
-        op_divide,
-        op_modulo,
-        op_gt,
-        op_lt,
-        op_gte,
-        op_lte,
-        op_eq,
-        op_ne,
-        list_new,
-        list_push,
-        list_len,
-        list_get,
-        list_pop,
-        list_copy,
-    }
+fn define_runtime_ir(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+) -> RuntimeBuiltins {
+    let data = init_runtime_data(module);
+    let ids = declare_runtime_function_ids(module, isa);
+    define_rt_alloc(module, isa, flags, ids.alloc, &data);
+    define_runtime_operations(module, isa, flags, &ids);
+    ids.builtins
 }
 
 fn declare_host_builtin(
@@ -353,6 +440,88 @@ fn define_runtime_fn(
     module.clear_context(&mut ctx);
 }
 
+fn define_runtime_ir_jit(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    arena_base_addr: i64,
+    arena_offset_addr: i64,
+) -> RuntimeBuiltins {
+    let ids = declare_runtime_function_ids(module, isa);
+    define_rt_alloc_from_addrs(
+        module,
+        isa,
+        flags,
+        ids.alloc,
+        arena_base_addr,
+        arena_offset_addr,
+    );
+    define_runtime_operations(module, isa, flags, &ids);
+    ids.builtins
+}
+
+fn define_rt_host_print_shim(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    host_addr: i64,
+) {
+    define_runtime_fn(module, isa, flags, id, &[types::I64], |b, p, func| {
+        let sig_ref = func.import_signature(runtime_sig(isa, &[types::I64]));
+        let callee = b.ins().iconst(types::I64, host_addr);
+        let call = b.ins().call_indirect(sig_ref, callee, &[p[0]]);
+        let out = b.inst_results(call)[0];
+        b.ins().return_(&[out]);
+    });
+}
+
+fn define_rt_memcpy(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+) {
+    define_runtime_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64],
+        |b, p, _| {
+            let dst = p[0];
+            let src = p[1];
+            let len = p[2];
+            let idx_block = b.create_block();
+            let body_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(idx_block, types::I64);
+
+            let zero = b.ins().iconst(types::I64, 0);
+            b.ins().jump(idx_block, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(idx_block);
+            let i = b.block_params(idx_block)[0];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, i, len);
+            b.ins().brif(more, body_block, &[], done_block, &[]);
+
+            b.switch_to_block(body_block);
+            b.seal_block(body_block);
+            let src_i = b.ins().iadd(src, i);
+            let dst_i = b.ins().iadd(dst, i);
+            let byte = b.ins().load(types::I8, MemFlags::new(), src_i, 0);
+            b.ins().store(MemFlags::new(), byte, dst_i, 0);
+            let next = b.ins().iadd_imm(i, 1);
+            b.ins().jump(idx_block, &[BlockArg::Value(next)]);
+
+            b.switch_to_block(done_block);
+            b.seal_block(done_block);
+            b.seal_block(idx_block);
+            b.ins().return_(&[dst]);
+        },
+    );
+}
+
 fn define_rt_alloc(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -374,6 +543,44 @@ fn define_rt_alloc(
             let off_gv = unsafe { (&mut *module_ptr).declare_data_in_func(data.offset, func) };
             let base = b.ins().global_value(types::I64, arena_gv);
             let off_addr = b.ins().global_value(types::I64, off_gv);
+            let off = b.ins().load(types::I64, MemFlags::new(), off_addr, 0);
+            let addr = b.ins().iadd(base, off);
+            let one = b.ins().iconst(types::I64, 1);
+            let align_minus = b.ins().isub(align, one);
+            let addr_plus = b.ins().iadd(addr, align_minus);
+            let neg_one = b.ins().iconst(types::I64, -1);
+            let mask = b.ins().bxor(align_minus, neg_one);
+            let aligned = b.ins().band(addr_plus, mask);
+            let rel = b.ins().isub(aligned, base);
+            let new_off = b.ins().iadd(rel, size);
+            let max = b.ins().iconst(types::I64, ARENA_BYTES);
+            let ok = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_off, max);
+            b.ins().trapz(ok, TrapCode::HEAP_OUT_OF_BOUNDS);
+            b.ins().store(MemFlags::new(), new_off, off_addr, 0);
+            b.ins().return_(&[aligned]);
+        },
+    );
+}
+
+fn define_rt_alloc_from_addrs(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    arena_base_addr: i64,
+    arena_offset_addr: i64,
+) {
+    define_runtime_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64],
+        |b, p, _| {
+            let size = p[0];
+            let align = p[1];
+            let base = b.ins().iconst(types::I64, arena_base_addr);
+            let off_addr = b.ins().iconst(types::I64, arena_offset_addr);
             let off = b.ins().load(types::I64, MemFlags::new(), off_addr, 0);
             let addr = b.ins().iadd(base, off);
             let one = b.ins().iconst(types::I64, 1);

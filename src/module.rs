@@ -72,18 +72,19 @@ impl Module {
             .finish(flags.clone())
             .unwrap();
 
-        let mut jit_builder = JITBuilder::with_isa(isa.clone(), default_libcall_names());
-        jit_builder.symbol(
-            "__expr_print_host",
-            crate::runtime::__expr_print_host as *const u8,
-        );
-        jit_builder.symbol(
-            "__expr_list_print_host",
-            crate::runtime::__expr_list_print_host as *const u8,
-        );
+        let jit_builder = JITBuilder::with_isa(isa.clone(), default_libcall_names());
         let mut cranelift_module = JITModule::new(jit_builder);
 
-        let mut func_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let (arena_base_addr, arena_offset_addr) = crate::runtime::jit_arena_addresses();
+        let mut func_ids = runtime_ir::setup_builtins_jit(
+            &mut cranelift_module,
+            &isa,
+            &flags,
+            crate::runtime::__expr_print_host as usize as i64,
+            crate::runtime::__expr_list_print_host as usize as i64,
+            arena_base_addr,
+            arena_offset_addr,
+        );
         for func_def in &self.functions {
             let id = declare_function_sig(
                 &mut cranelift_module,
@@ -305,9 +306,12 @@ impl Module {
             .expect("rustc not found");
 
         #[cfg(not(windows))]
+        let wrapper = write_unix_wrapper(output);
+        #[cfg(not(windows))]
         let status = Command::new("cc")
             .arg("-no-pie")
             .arg(&tmp)
+            .arg(&wrapper)
             .arg("-o")
             .arg(output)
             .status()
@@ -315,6 +319,8 @@ impl Module {
 
         #[cfg(windows)]
         std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        #[cfg(not(windows))]
+        std::fs::remove_file(output.with_extension("wrapper.c")).ok();
         std::fs::remove_file(&tmp).ok();
         assert!(status.success(), "linker failed with: {status}");
     }
@@ -356,6 +362,14 @@ impl JitModule {
 fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
     let wrapper = output.with_extension("wrapper.rs");
     let source = include_str!("./wrapper/windows.rs");
+    std::fs::write(&wrapper, source).unwrap();
+    wrapper
+}
+
+#[cfg(not(windows))]
+fn write_unix_wrapper(output: &Path) -> std::path::PathBuf {
+    let wrapper = output.with_extension("wrapper.c");
+    let source = include_str!("./wrapper/unix.c");
     std::fs::write(&wrapper, source).unwrap();
     wrapper
 }

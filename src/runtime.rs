@@ -135,6 +135,14 @@ pub fn configure_runtime_arena(bytes: usize) {
     *guard = Arena::with_capacity(bytes);
 }
 
+pub fn jit_arena_addresses() -> (i64, i64) {
+    with_arena(|arena| {
+        let base = arena.buf.as_mut_ptr() as usize as i64;
+        let offset = (&mut arena.offset as *mut usize) as usize as i64;
+        (base, offset)
+    })
+}
+
 pub fn decode_int(handle: i64) -> Option<i64> {
     if handle == 0 {
         return None;
