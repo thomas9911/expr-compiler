@@ -108,7 +108,7 @@ fn init_runtime_data(module: &mut impl CraneliftModule) -> RuntimeData {
         .declare_data("__rt_arena", Linkage::Local, true, false)
         .unwrap();
     let mut arena_desc = DataDescription::new();
-    arena_desc.define(vec![0u8; ARENA_BYTES as usize].into_boxed_slice());
+    arena_desc.define_zeroinit(ARENA_BYTES as usize);
     module.define_data(arena, &arena_desc).unwrap();
 
     let offset = module
