@@ -1,6 +1,18 @@
 examples:
     for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file" --run-jit; done
 
+llvm-test:
+    pwsh -File scripts/llvm-backend.ps1 test
+
+llvm-build:
+    pwsh -File scripts/llvm-backend.ps1 build
+
+llvm-run input:
+    pwsh -File scripts/llvm-backend.ps1 run -Input {{input}}
+
+llvm-example name:
+    pwsh -File scripts/llvm-backend.ps1 example -Input {{name}}
+
 compile-examples:
     for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file"; done
 

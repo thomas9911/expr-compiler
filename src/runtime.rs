@@ -1,6 +1,7 @@
 use std::sync::{Mutex, OnceLock};
 
 const DEFAULT_ARENA_BYTES: usize = 16 * 1024 * 1024;
+const LIST_INITIAL_CAPACITY: usize = 1024;
 
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -84,6 +85,26 @@ fn value_ptr(handle: i64) -> *const Value {
     handle as usize as *const Value
 }
 
+fn value_ref(handle: i64) -> &'static Value {
+    unsafe { &*value_ptr(handle) }
+}
+
+fn list_header_ptr(handle: i64) -> *mut ListHeader {
+    let value = value_ref(handle);
+    if value.tag != ValueTag::List {
+        runtime_trap("expected list value");
+    }
+    value.payload as usize as *mut ListHeader
+}
+
+fn list_header_ref(handle: i64) -> &'static ListHeader {
+    unsafe { &*list_header_ptr(handle) }
+}
+
+fn list_header_mut(handle: i64) -> &'static mut ListHeader {
+    unsafe { &mut *list_header_ptr(handle) }
+}
+
 fn alloc_value(arena: &mut Arena, tag: ValueTag, payload: i64) -> i64 {
     let ptr =
         arena.alloc(std::mem::size_of::<Value>(), std::mem::align_of::<Value>()) as *mut Value;
@@ -147,13 +168,262 @@ pub fn decode_int(handle: i64) -> Option<i64> {
     if handle == 0 {
         return None;
     }
-    let value = unsafe { &*value_ptr(handle) };
+    let value = value_ref(handle);
     (value.tag == ValueTag::Int).then_some(value.payload)
+}
+
+fn expect_int(handle: i64) -> i64 {
+    decode_int(handle).unwrap_or_else(|| runtime_trap("expected integer value"))
+}
+
+fn truthy(handle: i64) -> bool {
+    let value = value_ref(handle);
+    match value.tag {
+        ValueTag::Int => value.payload != 0,
+        ValueTag::List => list_header_ref(handle).len != 0,
+    }
+}
+
+fn raw_to_index(raw: i64) -> usize {
+    usize::try_from(raw).unwrap_or_else(|_| runtime_trap("list index out of bounds"))
+}
+
+fn usize_to_i64(raw: usize) -> i64 {
+    i64::try_from(raw).unwrap_or_else(|_| runtime_trap("integer conversion overflow"))
+}
+
+fn new_list_handle() -> i64 {
+    with_arena(|arena| {
+        let data_bytes = LIST_INITIAL_CAPACITY
+            .checked_mul(std::mem::size_of::<i64>())
+            .unwrap_or_else(|| runtime_trap("list allocation overflow"));
+        let data_ptr = arena.alloc(data_bytes, std::mem::align_of::<i64>()) as *mut i64;
+        unsafe {
+            std::ptr::write_bytes(data_ptr as *mut u8, 0, data_bytes);
+        }
+
+        let header_ptr = arena.alloc(
+            std::mem::size_of::<ListHeader>(),
+            std::mem::align_of::<ListHeader>(),
+        ) as *mut ListHeader;
+        unsafe {
+            *header_ptr = ListHeader {
+                ptr: data_ptr,
+                len: 0,
+                cap: LIST_INITIAL_CAPACITY,
+            };
+        }
+
+        alloc_value(arena, ValueTag::List, header_ptr as usize as i64)
+    })
+}
+
+fn list_grow(handle: i64, new_cap: usize) {
+    with_arena(|arena| {
+        let header = list_header_mut(handle);
+        let data_bytes = new_cap
+            .checked_mul(std::mem::size_of::<i64>())
+            .unwrap_or_else(|| runtime_trap("list allocation overflow"));
+        let new_data = arena.alloc(data_bytes, std::mem::align_of::<i64>()) as *mut i64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(header.ptr, new_data, header.len);
+            let tail = new_cap.saturating_sub(header.len);
+            if tail != 0 {
+                std::ptr::write_bytes(new_data.add(header.len) as *mut u8, 0, tail * 8);
+            }
+        }
+        header.ptr = new_data;
+        header.cap = new_cap;
+    });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __expr_value_int_host(raw: i64) -> i64 {
     new_int(raw)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_value_to_i64_host(handle: i64) -> i64 {
+    expect_int(handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_value_is_truthy_host(handle: i64) -> i64 {
+    if truthy(handle) { 1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_add_host(lhs: i64, rhs: i64) -> i64 {
+    let lhs = expect_int(lhs);
+    let rhs = expect_int(rhs);
+    new_int(
+        lhs.checked_add(rhs)
+            .unwrap_or_else(|| runtime_trap("integer overflow")),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_subtract_host(lhs: i64, rhs: i64) -> i64 {
+    let lhs = expect_int(lhs);
+    let rhs = expect_int(rhs);
+    new_int(
+        lhs.checked_sub(rhs)
+            .unwrap_or_else(|| runtime_trap("integer overflow")),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_multiply_host(lhs: i64, rhs: i64) -> i64 {
+    let lhs = expect_int(lhs);
+    let rhs = expect_int(rhs);
+    new_int(
+        lhs.checked_mul(rhs)
+            .unwrap_or_else(|| runtime_trap("integer overflow")),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_divide_host(lhs: i64, rhs: i64) -> i64 {
+    let lhs = expect_int(lhs);
+    let rhs = expect_int(rhs);
+    if rhs == 0 {
+        runtime_trap("division by zero");
+    }
+    new_int(
+        lhs.checked_div(rhs)
+            .unwrap_or_else(|| runtime_trap("integer overflow")),
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_modulo_host(lhs: i64, rhs: i64) -> i64 {
+    let lhs = expect_int(lhs);
+    let rhs = expect_int(rhs);
+    if rhs == 0 {
+        runtime_trap("division by zero");
+    }
+    new_int(
+        lhs.checked_rem(rhs)
+            .unwrap_or_else(|| runtime_trap("integer overflow")),
+    )
+}
+
+fn compare_boxed(lhs: i64, rhs: i64, pred: impl FnOnce(i64, i64) -> bool) -> i64 {
+    let lhs = expect_int(lhs);
+    let rhs = expect_int(rhs);
+    new_int(if pred(lhs, rhs) { 1 } else { 0 })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_gt_host(lhs: i64, rhs: i64) -> i64 {
+    compare_boxed(lhs, rhs, |lhs, rhs| lhs > rhs)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_lt_host(lhs: i64, rhs: i64) -> i64 {
+    compare_boxed(lhs, rhs, |lhs, rhs| lhs < rhs)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_gte_host(lhs: i64, rhs: i64) -> i64 {
+    compare_boxed(lhs, rhs, |lhs, rhs| lhs >= rhs)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_lte_host(lhs: i64, rhs: i64) -> i64 {
+    compare_boxed(lhs, rhs, |lhs, rhs| lhs <= rhs)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_eq_host(lhs: i64, rhs: i64) -> i64 {
+    compare_boxed(lhs, rhs, |lhs, rhs| lhs == rhs)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_ne_host(lhs: i64, rhs: i64) -> i64 {
+    compare_boxed(lhs, rhs, |lhs, rhs| lhs != rhs)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_new_host() -> i64 {
+    new_list_handle()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_push_host(list: i64, value: i64) -> i64 {
+    let header = list_header_ref(list);
+    if header.len == header.cap {
+        let new_cap = header
+            .cap
+            .checked_mul(2)
+            .unwrap_or_else(|| runtime_trap("integer overflow"));
+        list_grow(list, new_cap);
+    }
+
+    let header = list_header_mut(list);
+    unsafe {
+        *header.ptr.add(header.len) = value;
+    }
+    header.len += 1;
+    list
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_len_host(list: i64) -> i64 {
+    new_int(usize_to_i64(list_header_ref(list).len))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_get_host(list: i64, index: i64) -> i64 {
+    let index = raw_to_index(expect_int(index));
+    let header = list_header_ref(list);
+    if index >= header.len {
+        runtime_trap("list index out of bounds");
+    }
+    unsafe { *header.ptr.add(index) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_pop_host(list: i64) -> i64 {
+    let header = list_header_mut(list);
+    if header.len == 0 {
+        runtime_trap("list pop on empty list");
+    }
+    header.len -= 1;
+    unsafe { *header.ptr.add(header.len) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_copy_host(list: i64) -> i64 {
+    let header = list_header_ref(list);
+    with_arena(|arena| {
+        let data_bytes = header
+            .cap
+            .checked_mul(std::mem::size_of::<i64>())
+            .unwrap_or_else(|| runtime_trap("list allocation overflow"));
+        let new_data = arena.alloc(data_bytes, std::mem::align_of::<i64>()) as *mut i64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(header.ptr, new_data, header.len);
+            let tail = header.cap.saturating_sub(header.len);
+            if tail != 0 {
+                std::ptr::write_bytes(new_data.add(header.len) as *mut u8, 0, tail * 8);
+            }
+        }
+
+        let new_header = arena.alloc(
+            std::mem::size_of::<ListHeader>(),
+            std::mem::align_of::<ListHeader>(),
+        ) as *mut ListHeader;
+        unsafe {
+            *new_header = ListHeader {
+                ptr: new_data,
+                len: header.len,
+                cap: header.cap,
+            };
+        }
+
+        alloc_value(arena, ValueTag::List, new_header as usize as i64)
+    })
 }
 
 #[unsafe(no_mangle)]
