@@ -5,6 +5,7 @@ use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
+use inkwell::module::Linkage;
 use inkwell::module::Module as LlvmModule;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
@@ -179,61 +180,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "__expr_value_is_truthy_host",
                 vec![i64_type.into()],
             ),
-            (
-                "__op_add",
-                "__expr_add_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_subtract",
-                "__expr_subtract_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_multiply",
-                "__expr_multiply_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_divide",
-                "__expr_divide_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_modulo",
-                "__expr_modulo_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_gt",
-                "__expr_gt_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_lt",
-                "__expr_lt_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_gte",
-                "__expr_gte_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_lte",
-                "__expr_lte_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_eq",
-                "__expr_eq_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__op_ne",
-                "__expr_ne_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
             ("list_new", "__expr_list_new_host", vec![]),
             (
                 "list_push",
@@ -256,6 +202,26 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     .add_function(symbol, self.i64_type.fn_type(&params, false), None);
             self.functions.insert(name.to_string(), function);
         }
+
+        self.define_runtime_operation("__op_add", "llvm_rt_add", BinaryArithOp::Add);
+        self.define_runtime_operation(
+            "__op_subtract",
+            "llvm_rt_subtract",
+            BinaryArithOp::Subtract,
+        );
+        self.define_runtime_operation(
+            "__op_multiply",
+            "llvm_rt_multiply",
+            BinaryArithOp::Multiply,
+        );
+        self.define_runtime_operation("__op_divide", "llvm_rt_divide", BinaryArithOp::Divide);
+        self.define_runtime_operation("__op_modulo", "llvm_rt_modulo", BinaryArithOp::Modulo);
+        self.define_runtime_compare("__op_gt", "llvm_rt_gt", IntPredicate::SGT);
+        self.define_runtime_compare("__op_lt", "llvm_rt_lt", IntPredicate::SLT);
+        self.define_runtime_compare("__op_gte", "llvm_rt_gte", IntPredicate::SGE);
+        self.define_runtime_compare("__op_lte", "llvm_rt_lte", IntPredicate::SLE);
+        self.define_runtime_compare("__op_eq", "llvm_rt_eq", IntPredicate::EQ);
+        self.define_runtime_compare("__op_ne", "llvm_rt_ne", IntPredicate::NE);
     }
 
     fn declare_user_functions(&mut self, functions: &[FunctionDefAst], mode: LlvmOutputMode) {
@@ -505,6 +471,223 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .get(name)
             .unwrap_or_else(|| panic!("missing function declaration: {name}"))
     }
+
+    fn define_runtime_operation(&mut self, name: &str, symbol: &str, op: BinaryArithOp) {
+        let function = self.module.add_function(
+            symbol,
+            self.i64_type
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let lhs = function.get_first_param().unwrap().into_int_value();
+        let rhs = function.get_nth_param(1).unwrap().into_int_value();
+        let lhs_raw = self.call_func("__value_to_i64", &[lhs], "lhs_raw");
+        let rhs_raw = self.call_func("__value_to_i64", &[rhs], "rhs_raw");
+        let raw = match op {
+            BinaryArithOp::Add => {
+                let (value, overflow) =
+                    self.build_overflow_intrinsic_call("llvm.sadd.with.overflow.i64", lhs_raw, rhs_raw, "add");
+                self.builder
+                    .build_conditional_branch(overflow, trap_block, ok_block)
+                    .expect("failed to branch on add overflow");
+                self.builder.position_at_end(ok_block);
+                value
+            }
+            BinaryArithOp::Subtract => {
+                let (value, overflow) =
+                    self.build_overflow_intrinsic_call("llvm.ssub.with.overflow.i64", lhs_raw, rhs_raw, "sub");
+                self.builder
+                    .build_conditional_branch(overflow, trap_block, ok_block)
+                    .expect("failed to branch on subtract overflow");
+                self.builder.position_at_end(ok_block);
+                value
+            }
+            BinaryArithOp::Multiply => {
+                let (value, overflow) =
+                    self.build_overflow_intrinsic_call("llvm.smul.with.overflow.i64", lhs_raw, rhs_raw, "mul");
+                self.builder
+                    .build_conditional_branch(overflow, trap_block, ok_block)
+                    .expect("failed to branch on multiply overflow");
+                self.builder.position_at_end(ok_block);
+                value
+            }
+            BinaryArithOp::Divide => {
+                let div_ok = self.build_division_safe_check(lhs_raw, rhs_raw, "div");
+                self.builder
+                    .build_conditional_branch(div_ok, ok_block, trap_block)
+                    .expect("failed to build div branch");
+                self.builder.position_at_end(ok_block);
+                self.builder
+                    .build_int_signed_div(lhs_raw, rhs_raw, "quot")
+                    .expect("failed to divide")
+            }
+            BinaryArithOp::Modulo => {
+                let rem_ok = self.build_division_safe_check(lhs_raw, rhs_raw, "rem");
+                self.builder
+                    .build_conditional_branch(rem_ok, ok_block, trap_block)
+                    .expect("failed to build rem branch");
+                self.builder.position_at_end(ok_block);
+                self.builder
+                    .build_int_signed_rem(lhs_raw, rhs_raw, "rem")
+                    .expect("failed to modulo")
+            }
+        };
+
+        let boxed = self.call_func("__value_int", &[raw], "boxed");
+        self.builder
+            .build_return(Some(&boxed))
+            .expect("failed to build runtime return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    fn define_runtime_compare(&mut self, name: &str, symbol: &str, pred: IntPredicate) {
+        let function = self.module.add_function(
+            symbol,
+            self.i64_type
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let lhs = function.get_first_param().unwrap().into_int_value();
+        let rhs = function.get_nth_param(1).unwrap().into_int_value();
+        let lhs_raw = self.call_func("__value_to_i64", &[lhs], "lhs_raw");
+        let rhs_raw = self.call_func("__value_to_i64", &[rhs], "rhs_raw");
+        let cmp = self
+            .builder
+            .build_int_compare(pred, lhs_raw, rhs_raw, "cmp")
+            .expect("failed to build compare");
+        let raw = self
+            .builder
+            .build_int_z_extend(cmp, self.i64_type, "cmp_i64")
+            .expect("failed to extend compare");
+        let boxed = self.call_func("__value_int", &[raw], "boxed");
+        self.builder
+            .build_return(Some(&boxed))
+            .expect("failed to return compare");
+    }
+
+    fn build_trap_and_unreachable(&self) {
+        let void_type = self.context.void_type();
+        let trap_fn = self.module.get_function("llvm.trap").unwrap_or_else(|| {
+            self.module
+                .add_function("llvm.trap", void_type.fn_type(&[], false), None)
+        });
+        self.builder
+            .build_call(trap_fn, &[], "trap")
+            .expect("failed to build trap call");
+        self.builder
+            .build_unreachable()
+            .expect("failed to build unreachable");
+    }
+
+    fn invert_i1(&self, value: IntValue<'ctx>, name: &str) -> IntValue<'ctx> {
+        let one = self.context.bool_type().const_all_ones();
+        self.builder
+            .build_xor(value, one, name)
+            .expect("failed to invert i1")
+    }
+
+    fn build_division_safe_check(
+        &self,
+        lhs: IntValue<'ctx>,
+        rhs: IntValue<'ctx>,
+        prefix: &str,
+    ) -> IntValue<'ctx> {
+        let zero = self.i64_type.const_zero();
+        let rhs_non_zero = self
+            .builder
+            .build_int_compare(IntPredicate::NE, rhs, zero, &format!("{prefix}_rhs_non_zero"))
+            .expect("failed to compare rhs");
+        let min_i64 = self.i64_type.const_int(i64::MIN as u64, true);
+        let neg_one = self.i64_type.const_all_ones();
+        let lhs_is_min = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, lhs, min_i64, &format!("{prefix}_lhs_is_min"))
+            .expect("failed to compare lhs min");
+        let rhs_is_neg_one = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                rhs,
+                neg_one,
+                &format!("{prefix}_rhs_is_neg_one"),
+            )
+            .expect("failed to compare rhs neg one");
+        let overflow = self
+            .builder
+            .build_and(lhs_is_min, rhs_is_neg_one, &format!("{prefix}_overflow"))
+            .expect("failed to build div overflow");
+        self.builder
+            .build_and(
+                rhs_non_zero,
+                self.invert_i1(overflow, &format!("{prefix}_ok")),
+                &format!("{prefix}_safe"),
+            )
+            .expect("failed to build div ok")
+    }
+
+    fn build_overflow_intrinsic_call(
+        &self,
+        intrinsic_name: &str,
+        lhs: IntValue<'ctx>,
+        rhs: IntValue<'ctx>,
+        label: &str,
+    ) -> (IntValue<'ctx>, IntValue<'ctx>) {
+        let result_type = self
+            .context
+            .struct_type(&[self.i64_type.into(), self.context.bool_type().into()], false);
+        let function = self.module.get_function(intrinsic_name).unwrap_or_else(|| {
+            self.module.add_function(
+                intrinsic_name,
+                result_type.fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+                None,
+            )
+        });
+        let call = self
+            .builder
+            .build_call(
+                function,
+                &[lhs.into(), rhs.into()],
+                &format!("{label}_overflow"),
+            )
+            .expect("failed to build intrinsic call")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_struct_value();
+        let value = self
+            .builder
+            .build_extract_value(call, 0, &format!("{label}_value"))
+            .expect("failed to extract value")
+            .into_int_value();
+        let overflow = self
+            .builder
+            .build_extract_value(call, 1, &format!("{label}_overflow_flag"))
+            .expect("failed to extract overflow")
+            .into_int_value();
+        (value, overflow)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BinaryArithOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
 }
 
 fn function_symbol_name(func: &FunctionDefAst, mode: LlvmOutputMode) -> String {
@@ -544,23 +727,6 @@ fn install_runtime_mappings<'ctx>(
             "__value_is_truthy",
             crate::runtime::__expr_value_is_truthy_host as usize,
         ),
-        ("__op_add", crate::runtime::__expr_add_host as usize),
-        (
-            "__op_subtract",
-            crate::runtime::__expr_subtract_host as usize,
-        ),
-        (
-            "__op_multiply",
-            crate::runtime::__expr_multiply_host as usize,
-        ),
-        ("__op_divide", crate::runtime::__expr_divide_host as usize),
-        ("__op_modulo", crate::runtime::__expr_modulo_host as usize),
-        ("__op_gt", crate::runtime::__expr_gt_host as usize),
-        ("__op_lt", crate::runtime::__expr_lt_host as usize),
-        ("__op_gte", crate::runtime::__expr_gte_host as usize),
-        ("__op_lte", crate::runtime::__expr_lte_host as usize),
-        ("__op_eq", crate::runtime::__expr_eq_host as usize),
-        ("__op_ne", crate::runtime::__expr_ne_host as usize),
         ("list_new", crate::runtime::__expr_list_new_host as usize),
         ("list_push", crate::runtime::__expr_list_push_host as usize),
         ("list_len", crate::runtime::__expr_list_len_host as usize),
