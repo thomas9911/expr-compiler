@@ -2,19 +2,22 @@ examples:
     for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file" --run-jit; done
 
 llvm-test:
-    pwsh -File scripts/llvm-backend.ps1 test
+    bash scripts/llvm-backend.sh test
 
 llvm-build:
-    pwsh -File scripts/llvm-backend.ps1 build
+    bash scripts/llvm-backend.sh build
 
 llvm-run input:
-    pwsh -File scripts/llvm-backend.ps1 run -Input {{input}}
+    bash scripts/llvm-backend.sh run --input {{input}}
 
 llvm-example name:
-    pwsh -File scripts/llvm-backend.ps1 example -Input {{name}}
+    bash scripts/llvm-backend.sh example --input {{name}}
 
 compile-examples:
     for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file"; done
+
+compile-llvm-examples:
+    for file in examples/*.expr; do echo "$file"; bash scripts/llvm-backend.sh compile --input "$file"; done
 
 run-examples:
     for file in examples/*.exe; do \
@@ -25,6 +28,9 @@ run-examples:
             echo "$file"; "$file"; \
         fi; \
     done
+
+run-llvm-examples:
+    for file in examples/*.expr; do echo "$file"; bash scripts/llvm-backend.sh run --input "$file"; done
 
 clean-examples:
     rm -f examples/*.exe

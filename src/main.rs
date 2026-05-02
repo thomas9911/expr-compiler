@@ -110,7 +110,7 @@ fn main() {
     }
 
     if cli.backend == CodegenBackend::Llvm && (cli.emit_ir || cli.run_ir) {
-        eprintln!("llvm backend currently supports only --run-jit");
+        eprintln!("llvm backend does not support --emit-ir or --run-ir");
         std::process::exit(1);
     }
 

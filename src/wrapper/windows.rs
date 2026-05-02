@@ -19,7 +19,7 @@ extern "system" {
 
 const STD_OUTPUT_HANDLE: i32 = -11;
 const ARENA_BYTES: usize = 16 * 1024 * 1024;
-const LIST_INITIAL_CAPACITY: usize = 4;
+const LIST_INITIAL_CAPACITY: usize = 1024;
 
 #[repr(u8)]
 #[derive(Copy, Clone, PartialEq, Eq)]

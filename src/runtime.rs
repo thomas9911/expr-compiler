@@ -168,7 +168,17 @@ pub fn decode_int(handle: i64) -> Option<i64> {
     if handle == 0 {
         return None;
     }
-    let value = value_ref(handle);
+    let addr = usize::try_from(handle).ok()?;
+    let guard = arena().lock().ok()?;
+    let base = guard.buf.as_ptr() as usize;
+    let end = base.checked_add(guard.buf.len())?;
+    let value_end = addr.checked_add(std::mem::size_of::<Value>())?;
+    if addr < base || value_end > end {
+        return None;
+    }
+    drop(guard);
+
+    let value = unsafe { &*(addr as *const Value) };
     (value.tag == ValueTag::Int).then_some(value.payload)
 }
 
@@ -438,4 +448,14 @@ pub extern "C" fn __expr_list_print_host(handle: i64) -> i64 {
     print_value_inner(handle);
     println!();
     new_int(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_int;
+
+    #[test]
+    fn decode_int_rejects_non_runtime_pointer() {
+        assert_eq!(decode_int(1), None);
+    }
 }

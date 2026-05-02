@@ -194,7 +194,7 @@ impl Module {
         let print_stub = format!(
             "; builtin: print (interpreter stub — no I/O; use --run-jit for real output)\n\
              function u0:{print_func_id}(i64) -> i64 system_v {{\n\
-             block0(v0: i64):\n    v1 = iconst.i64 1\n    return v1\n}}\n\n"
+             block0(v0: i64):\n    v1 = iconst.i64 0\n    return v1\n}}\n\n"
         );
         out.push_str(&print_stub);
 
@@ -422,44 +422,65 @@ impl Module {
 
     #[cfg(feature = "llvm-backend")]
     fn compile_to_llvm_executable(self, output: &Path) {
+        let bytes = llvm_backend::compile_to_object(self, "llvm_exe");
+        #[cfg(windows)]
+        let tmp = output.with_extension("obj");
         #[cfg(not(windows))]
-        panic!("llvm executable output is currently supported only on Windows");
+        let tmp = output.with_extension("o");
+        std::fs::write(&tmp, &bytes).unwrap();
 
         #[cfg(windows)]
-        {
-            let bytes = llvm_backend::compile_to_object(self, "llvm_exe");
-            let tmp = output.with_extension("obj");
-            std::fs::write(&tmp, &bytes).unwrap();
+        let status = Command::new("rustc")
+            .arg(write_windows_wrapper(output))
+            .arg("--crate-name")
+            .arg("expr_windows_wrapper")
+            .arg("-C")
+            .arg("panic=abort")
+            .arg("-C")
+            .arg("opt-level=s")
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("-C")
+            .arg("debuginfo=0")
+            .arg("-C")
+            .arg("link-arg=/DEBUG:NONE")
+            .arg("-C")
+            .arg("link-arg=/ENTRY:mainCRTStartup")
+            .arg("-C")
+            .arg("link-arg=/SUBSYSTEM:CONSOLE")
+            .arg("-C")
+            .arg(format!("link-arg={}", tmp.display()))
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("rustc not found");
 
-            let status = Command::new("rustc")
-                .arg(write_windows_wrapper(output))
-                .arg("--crate-name")
-                .arg("expr_windows_wrapper")
-                .arg("-C")
-                .arg("panic=abort")
-                .arg("-C")
-                .arg("opt-level=s")
-                .arg("-C")
-                .arg("strip=symbols")
-                .arg("-C")
-                .arg("debuginfo=0")
-                .arg("-C")
-                .arg("link-arg=/DEBUG:NONE")
-                .arg("-C")
-                .arg("link-arg=/ENTRY:mainCRTStartup")
-                .arg("-C")
-                .arg("link-arg=/SUBSYSTEM:CONSOLE")
-                .arg("-C")
-                .arg(format!("link-arg={}", tmp.display()))
-                .arg("-o")
-                .arg(output)
-                .status()
-                .expect("rustc not found");
+        #[cfg(not(windows))]
+        let status = Command::new("rustc")
+            .arg(write_unix_rust_wrapper(output))
+            .arg("--crate-name")
+            .arg("expr_unix_wrapper")
+            .arg("-C")
+            .arg("panic=abort")
+            .arg("-C")
+            .arg("opt-level=s")
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("-C")
+            .arg("debuginfo=0")
+            .arg("-C")
+            .arg(format!("link-arg={}", tmp.display()))
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("rustc not found");
 
-            std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
-            std::fs::remove_file(&tmp).ok();
-            assert!(status.success(), "linker failed with: {status}");
-        }
+        #[cfg(windows)]
+        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        #[cfg(not(windows))]
+        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        std::fs::remove_file(&tmp).ok();
+        assert!(status.success(), "linker failed with: {status}");
     }
 }
 
@@ -529,6 +550,14 @@ fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
 fn write_unix_wrapper(output: &Path) -> std::path::PathBuf {
     let wrapper = output.with_extension("wrapper.c");
     let source = include_str!("./wrapper/unix.c");
+    std::fs::write(&wrapper, source).unwrap();
+    wrapper
+}
+
+#[cfg(not(windows))]
+fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
+    let wrapper = output.with_extension("wrapper.rs");
+    let source = include_str!("./wrapper/unix.rs");
     std::fs::write(&wrapper, source).unwrap();
     wrapper
 }

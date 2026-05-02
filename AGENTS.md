@@ -43,10 +43,14 @@ From `Justfile`:
   - `cargo run --release -q -- "$file" --run-jit`
 - `just compile-examples`
   - Compiles each `examples/*.expr` to a native executable.
+- `just compile-llvm-examples`
+  - Compiles each `examples/*.expr` through `scripts/llvm-backend.sh`.
 - `just run-examples`
   - Runs compiled example binaries on both platforms:
   - Windows: `examples/*.exe`
   - Linux/Unix: executable files in `examples/` without an extension
+- `just run-llvm-examples`
+  - Runs each `examples/*.expr` through LLVM JIT via `scripts/llvm-backend.sh`.
 - `just clean-examples`
   - Removes compiled example binaries on both platforms:
   - Windows: `examples/*.exe`

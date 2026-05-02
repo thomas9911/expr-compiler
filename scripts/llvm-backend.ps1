@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("test", "build", "run", "example")]
+    [ValidateSet("test", "build", "run", "example", "compile")]
     [string]$Action = "test",
     [string]$Input,
     [string]$LlvmRoot,
@@ -70,6 +70,15 @@ switch ($Action) {
         $cargoArgs = @(
             "run", "--release", "-q", "--features", "llvm-backend", "--",
             $examplePath, "--run-jit", "--backend", "llvm"
+        )
+    }
+    "compile" {
+        if ([string]::IsNullOrWhiteSpace($Input)) {
+            throw "Action 'compile' requires -Input <path-to-.expr>"
+        }
+        $cargoArgs = @(
+            "run", "--release", "-q", "--features", "llvm-backend", "--",
+            $Input, "--backend", "llvm"
         )
     }
 }
