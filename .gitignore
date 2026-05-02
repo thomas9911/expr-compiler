@@ -8,3 +8,5 @@
 /examples/*
 !/examples/*.expr
 !/examples/*/
+
+__pycache__/

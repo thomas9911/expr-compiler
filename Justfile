@@ -13,6 +13,9 @@ llvm-run input:
 llvm-example name:
     bash scripts/llvm-backend.sh example --input {{name}}
 
+check-matrix:
+    if command -v python >/dev/null 2>&1; then python scripts/check-matrix.py --release; else python3 scripts/check-matrix.py --release; fi
+
 compile-examples:
     for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file"; done
 

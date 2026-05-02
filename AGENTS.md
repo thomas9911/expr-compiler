@@ -45,6 +45,11 @@ From `Justfile`:
   - Compiles each `examples/*.expr` to a native executable.
 - `just compile-llvm-examples`
   - Compiles each `examples/*.expr` through `scripts/llvm-backend.sh`.
+- `just check-matrix`
+  - Runs `scripts/check-matrix.py --release`.
+  - Uses Cranelift JIT as the baseline and compares Cranelift/LLVM runnable modes.
+  - Excludes `run-ir`, because that path does not support the same stdout behavior.
+  - Fails native-mode checks if a compiled executable exceeds `50 KB`.
 - `just run-examples`
   - Runs compiled example binaries on both platforms:
   - Windows: `examples/*.exe`
