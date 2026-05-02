@@ -140,24 +140,6 @@ pub extern "C" fn __expr_value_int_host(raw: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn __expr_value_to_i64_host(handle: i64) -> i64 {
-    as_int(handle)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn __expr_value_is_truthy_host(handle: i64) -> i64 {
-    let ptr = value_ptr(handle);
-    let value = unsafe { &*ptr };
-    match value.tag {
-        ValueTag::Int => i64::from(value.payload != 0),
-        ValueTag::List => {
-            let header = unsafe { &*(value.payload as usize as *const ListHeader) };
-            i64::from(header.len != 0)
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn __expr_print_host(handle: i64) -> i64 {
     print_value_inner(handle);
     println!();

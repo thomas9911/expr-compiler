@@ -142,6 +142,9 @@ struct LlvmCompiler<'ctx> {
 }
 
 impl<'ctx> LlvmCompiler<'ctx> {
+    const VALUE_TAG_INT: u64 = 1;
+    const VALUE_TAG_LIST: u64 = 2;
+
     fn new(context: &'ctx Context, module: &'ctx LlvmModule<'ctx>) -> Self {
         Self {
             context,
@@ -170,16 +173,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "__expr_value_int_host",
                 vec![i64_type.into()],
             ),
-            (
-                "__value_to_i64",
-                "__expr_value_to_i64_host",
-                vec![i64_type.into()],
-            ),
-            (
-                "__value_is_truthy",
-                "__expr_value_is_truthy_host",
-                vec![i64_type.into()],
-            ),
             ("list_new", "__expr_list_new_host", vec![]),
             (
                 "list_push",
@@ -203,6 +196,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.functions.insert(name.to_string(), function);
         }
 
+        self.define_value_to_i64();
+        self.define_value_is_truthy();
         self.define_runtime_operation("__op_add", "llvm_rt_add", BinaryArithOp::Add);
         self.define_runtime_operation(
             "__op_subtract",
@@ -472,6 +467,229 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .unwrap_or_else(|| panic!("missing function declaration: {name}"))
     }
 
+    fn value_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context.struct_type(
+            &[
+                self.context.i8_type().into(),
+                self.context.i8_type().array_type(7).into(),
+                self.i64_type.into(),
+            ],
+            false,
+        )
+    }
+
+    fn list_header_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context.struct_type(
+            &[
+                self.context.ptr_type(Default::default()).into(),
+                self.i64_type.into(),
+                self.i64_type.into(),
+            ],
+            false,
+        )
+    }
+
+    fn build_value_tag_load(
+        &self,
+        value_ptr: PointerValue<'ctx>,
+        label: &str,
+    ) -> IntValue<'ctx> {
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(self.value_type(), value_ptr, 0, &format!("{label}_tag_ptr"))
+            .expect("failed to build value tag gep");
+        self.builder
+            .build_load(self.context.i8_type(), tag_ptr, &format!("{label}_tag"))
+            .expect("failed to load value tag")
+            .into_int_value()
+    }
+
+    fn build_value_payload_load(
+        &self,
+        value_ptr: PointerValue<'ctx>,
+        label: &str,
+    ) -> IntValue<'ctx> {
+        let payload_ptr = self
+            .builder
+            .build_struct_gep(
+                self.value_type(),
+                value_ptr,
+                2,
+                &format!("{label}_payload_ptr"),
+            )
+            .expect("failed to build value payload gep");
+        self.builder
+            .build_load(self.i64_type, payload_ptr, &format!("{label}_payload"))
+            .expect("failed to load value payload")
+            .into_int_value()
+    }
+
+    fn define_value_to_i64(&mut self) {
+        let function = self.module.add_function(
+            "llvm_rt_value_to_i64",
+            self.i64_type.fn_type(&[self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert("__value_to_i64".to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let handle = function.get_first_param().unwrap().into_int_value();
+        let ptr = self
+            .builder
+            .build_int_to_ptr(
+                handle,
+                self.context.ptr_type(Default::default()),
+                "value_to_i64_ptr",
+            )
+            .expect("failed to convert handle to pointer");
+
+        let tag = self.build_value_tag_load(ptr, "value_to_i64");
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.context.i8_type().const_int(Self::VALUE_TAG_INT, false),
+                "value_to_i64_is_int",
+            )
+            .expect("failed to compare value tag");
+        self.builder
+            .build_conditional_branch(is_int, ok_block, trap_block)
+            .expect("failed to branch on int tag");
+
+        self.builder.position_at_end(ok_block);
+        let raw = self.build_value_payload_load(ptr, "value_to_i64");
+
+        self.builder
+            .build_return(Some(&raw))
+            .expect("failed to return raw int");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    fn define_value_is_truthy(&mut self) {
+        let function = self.module.add_function(
+            "llvm_rt_value_is_truthy",
+            self.i64_type.fn_type(&[self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions
+            .insert("__value_is_truthy".to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let int_block = self.context.append_basic_block(function, "int");
+        let list_check_block = self.context.append_basic_block(function, "list_check");
+        let list_block = self.context.append_basic_block(function, "list");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let handle = function.get_first_param().unwrap().into_int_value();
+        let value_ptr = self
+            .builder
+            .build_int_to_ptr(
+                handle,
+                self.context.ptr_type(Default::default()),
+                "truthy_value_ptr",
+            )
+            .expect("failed to convert truthy handle to pointer");
+        let tag = self.build_value_tag_load(value_ptr, "truthy");
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.context.i8_type().const_int(Self::VALUE_TAG_INT, false),
+                "truthy_is_int",
+            )
+            .expect("failed to compare int tag");
+        let is_list = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.context.i8_type().const_int(Self::VALUE_TAG_LIST, false),
+                "truthy_is_list",
+            )
+            .expect("failed to compare list tag");
+        self.builder
+            .build_conditional_branch(is_int, int_block, list_check_block)
+            .expect("failed to branch on int truthiness");
+
+        self.builder.position_at_end(int_block);
+        let int_payload = self.build_value_payload_load(value_ptr, "truthy_int");
+        let int_truthy = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                int_payload,
+                self.i64_type.const_zero(),
+                "truthy_int_flag",
+            )
+            .expect("failed to compare int truthiness");
+        let int_raw = self
+            .builder
+            .build_int_z_extend(int_truthy, self.i64_type, "truthy_int_i64")
+            .expect("failed to extend int truthiness");
+        self.builder
+            .build_return(Some(&int_raw))
+            .expect("failed to return int truthiness");
+
+        self.builder.position_at_end(list_check_block);
+        self.builder
+            .build_conditional_branch(is_list, list_block, trap_block)
+            .expect("failed to validate list truthiness");
+
+        self.builder.position_at_end(list_block);
+        let list_payload = self.build_value_payload_load(value_ptr, "truthy_list");
+        let list_ptr = self
+            .builder
+            .build_int_to_ptr(
+                list_payload,
+                self.context.ptr_type(Default::default()),
+                "truthy_list_ptr",
+            )
+            .expect("failed to convert list payload to pointer");
+        let len_ptr = self
+            .builder
+            .build_struct_gep(
+                self.list_header_type(),
+                list_ptr,
+                1,
+                "truthy_list_len_ptr",
+            )
+            .expect("failed to build list len gep");
+        let len = self
+            .builder
+            .build_load(self.i64_type, len_ptr, "truthy_list_len")
+            .expect("failed to load list len")
+            .into_int_value();
+        let list_truthy = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                len,
+                self.i64_type.const_zero(),
+                "truthy_list_flag",
+            )
+            .expect("failed to compare list truthiness");
+        let list_raw = self
+            .builder
+            .build_int_z_extend(list_truthy, self.i64_type, "truthy_list_i64")
+            .expect("failed to extend list truthiness");
+
+        self.builder
+            .build_return(Some(&list_raw))
+            .expect("failed to return truthiness");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
     fn define_runtime_operation(&mut self, name: &str, symbol: &str, op: BinaryArithOp) {
         let function = self.module.add_function(
             symbol,
@@ -718,14 +936,6 @@ fn install_runtime_mappings<'ctx>(
         (
             "__value_int",
             crate::runtime::__expr_value_int_host as usize,
-        ),
-        (
-            "__value_to_i64",
-            crate::runtime::__expr_value_to_i64_host as usize,
-        ),
-        (
-            "__value_is_truthy",
-            crate::runtime::__expr_value_is_truthy_host as usize,
         ),
         ("list_new", crate::runtime::__expr_list_new_host as usize),
         ("list_push", crate::runtime::__expr_list_push_host as usize),
