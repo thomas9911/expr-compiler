@@ -199,16 +199,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.define_value_to_i64();
         self.define_value_is_truthy();
         self.define_runtime_operation("__op_add", "llvm_rt_add", BinaryArithOp::Add);
-        self.define_runtime_operation(
-            "__op_subtract",
-            "llvm_rt_subtract",
-            BinaryArithOp::Subtract,
-        );
-        self.define_runtime_operation(
-            "__op_multiply",
-            "llvm_rt_multiply",
-            BinaryArithOp::Multiply,
-        );
+        self.define_runtime_operation("__op_subtract", "llvm_rt_subtract", BinaryArithOp::Subtract);
+        self.define_runtime_operation("__op_multiply", "llvm_rt_multiply", BinaryArithOp::Multiply);
         self.define_runtime_operation("__op_divide", "llvm_rt_divide", BinaryArithOp::Divide);
         self.define_runtime_operation("__op_modulo", "llvm_rt_modulo", BinaryArithOp::Modulo);
         self.define_runtime_compare("__op_gt", "llvm_rt_gt", IntPredicate::SGT);
@@ -489,11 +481,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         )
     }
 
-    fn build_value_tag_load(
-        &self,
-        value_ptr: PointerValue<'ctx>,
-        label: &str,
-    ) -> IntValue<'ctx> {
+    fn build_value_tag_load(&self, value_ptr: PointerValue<'ctx>, label: &str) -> IntValue<'ctx> {
         let tag_ptr = self
             .builder
             .build_struct_gep(self.value_type(), value_ptr, 0, &format!("{label}_tag_ptr"))
@@ -530,7 +518,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.i64_type.fn_type(&[self.i64_type.into()], false),
             Some(Linkage::Private),
         );
-        self.functions.insert("__value_to_i64".to_string(), function);
+        self.functions
+            .insert("__value_to_i64".to_string(), function);
 
         let entry = self.context.append_basic_block(function, "entry");
         let ok_block = self.context.append_basic_block(function, "ok");
@@ -612,7 +601,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_int_compare(
                 IntPredicate::EQ,
                 tag,
-                self.context.i8_type().const_int(Self::VALUE_TAG_LIST, false),
+                self.context
+                    .i8_type()
+                    .const_int(Self::VALUE_TAG_LIST, false),
                 "truthy_is_list",
             )
             .expect("failed to compare list tag");
@@ -656,12 +647,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to convert list payload to pointer");
         let len_ptr = self
             .builder
-            .build_struct_gep(
-                self.list_header_type(),
-                list_ptr,
-                1,
-                "truthy_list_len_ptr",
-            )
+            .build_struct_gep(self.list_header_type(), list_ptr, 1, "truthy_list_len_ptr")
             .expect("failed to build list len gep");
         let len = self
             .builder
@@ -710,8 +696,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let rhs_raw = self.call_func("__value_to_i64", &[rhs], "rhs_raw");
         let raw = match op {
             BinaryArithOp::Add => {
-                let (value, overflow) =
-                    self.build_overflow_intrinsic_call("llvm.sadd.with.overflow.i64", lhs_raw, rhs_raw, "add");
+                let (value, overflow) = self.build_overflow_intrinsic_call(
+                    "llvm.sadd.with.overflow.i64",
+                    lhs_raw,
+                    rhs_raw,
+                    "add",
+                );
                 self.builder
                     .build_conditional_branch(overflow, trap_block, ok_block)
                     .expect("failed to branch on add overflow");
@@ -719,8 +709,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 value
             }
             BinaryArithOp::Subtract => {
-                let (value, overflow) =
-                    self.build_overflow_intrinsic_call("llvm.ssub.with.overflow.i64", lhs_raw, rhs_raw, "sub");
+                let (value, overflow) = self.build_overflow_intrinsic_call(
+                    "llvm.ssub.with.overflow.i64",
+                    lhs_raw,
+                    rhs_raw,
+                    "sub",
+                );
                 self.builder
                     .build_conditional_branch(overflow, trap_block, ok_block)
                     .expect("failed to branch on subtract overflow");
@@ -728,8 +722,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 value
             }
             BinaryArithOp::Multiply => {
-                let (value, overflow) =
-                    self.build_overflow_intrinsic_call("llvm.smul.with.overflow.i64", lhs_raw, rhs_raw, "mul");
+                let (value, overflow) = self.build_overflow_intrinsic_call(
+                    "llvm.smul.with.overflow.i64",
+                    lhs_raw,
+                    rhs_raw,
+                    "mul",
+                );
                 self.builder
                     .build_conditional_branch(overflow, trap_block, ok_block)
                     .expect("failed to branch on multiply overflow");
@@ -827,13 +825,23 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let zero = self.i64_type.const_zero();
         let rhs_non_zero = self
             .builder
-            .build_int_compare(IntPredicate::NE, rhs, zero, &format!("{prefix}_rhs_non_zero"))
+            .build_int_compare(
+                IntPredicate::NE,
+                rhs,
+                zero,
+                &format!("{prefix}_rhs_non_zero"),
+            )
             .expect("failed to compare rhs");
         let min_i64 = self.i64_type.const_int(i64::MIN as u64, true);
         let neg_one = self.i64_type.const_all_ones();
         let lhs_is_min = self
             .builder
-            .build_int_compare(IntPredicate::EQ, lhs, min_i64, &format!("{prefix}_lhs_is_min"))
+            .build_int_compare(
+                IntPredicate::EQ,
+                lhs,
+                min_i64,
+                &format!("{prefix}_lhs_is_min"),
+            )
             .expect("failed to compare lhs min");
         let rhs_is_neg_one = self
             .builder
@@ -864,9 +872,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs: IntValue<'ctx>,
         label: &str,
     ) -> (IntValue<'ctx>, IntValue<'ctx>) {
-        let result_type = self
-            .context
-            .struct_type(&[self.i64_type.into(), self.context.bool_type().into()], false);
+        let result_type = self.context.struct_type(
+            &[self.i64_type.into(), self.context.bool_type().into()],
+            false,
+        );
         let function = self.module.get_function(intrinsic_name).unwrap_or_else(|| {
             self.module.add_function(
                 intrinsic_name,
