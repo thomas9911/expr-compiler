@@ -1,29 +1,9 @@
 use std::sync::{Mutex, OnceLock};
 
+use crate::value::{ListHeader, TAG_INT, TAG_LIST, TAG_STRING, Value, ValueTag};
+
 const DEFAULT_ARENA_BYTES: usize = 16 * 1024 * 1024;
 const LIST_INITIAL_CAPACITY: usize = 1024;
-
-#[repr(u8)]
-#[derive(Copy, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-enum ValueTag {
-    Int = 1,
-    List = 2,
-}
-
-#[repr(C)]
-struct Value {
-    tag: ValueTag,
-    _padding: [u8; 7],
-    payload: i64,
-}
-
-#[repr(C)]
-struct ListHeader {
-    ptr: *mut i64,
-    len: usize,
-    cap: usize,
-}
 
 struct Arena {
     buf: Vec<u8>,
@@ -89,19 +69,19 @@ fn value_ref(handle: i64) -> &'static Value {
     unsafe { &*value_ptr(handle) }
 }
 
-fn list_header_ptr(handle: i64) -> *mut ListHeader {
+fn list_header_ptr(handle: i64) -> *mut ListHeader<i64> {
     let value = value_ref(handle);
     if value.tag != ValueTag::List {
         runtime_trap("expected list value");
     }
-    value.payload as usize as *mut ListHeader
+    value.payload as usize as *mut ListHeader<i64>
 }
 
-fn list_header_ref(handle: i64) -> &'static ListHeader {
+fn list_header_ref(handle: i64) -> &'static ListHeader<i64> {
     unsafe { &*list_header_ptr(handle) }
 }
 
-fn list_header_mut(handle: i64) -> &'static mut ListHeader {
+fn list_header_mut(handle: i64) -> &'static mut ListHeader<i64> {
     unsafe { &mut *list_header_ptr(handle) }
 }
 
@@ -111,7 +91,7 @@ fn alloc_value(arena: &mut Arena, tag: ValueTag, payload: i64) -> i64 {
     unsafe {
         *ptr = Value {
             tag,
-            _padding: [0; 7],
+            padding: [0; 7],
             payload,
         };
     }
@@ -128,7 +108,7 @@ fn print_value_inner(handle: i64) {
     match value.tag {
         ValueTag::Int => print!("{}", value.payload),
         ValueTag::List => {
-            let header = unsafe { &*(value.payload as usize as *const ListHeader) };
+            let header = unsafe { &*(value.payload as usize as *const ListHeader<i64>) };
             print!("[");
             for i in 0..header.len {
                 if i != 0 {
@@ -139,6 +119,7 @@ fn print_value_inner(handle: i64) {
             }
             print!("]");
         }
+        ValueTag::String => runtime_trap("string values are not supported yet"),
     }
 }
 
@@ -162,6 +143,17 @@ pub fn jit_arena_addresses() -> (i64, i64) {
         let offset = (&mut arena.offset as *mut usize) as usize as i64;
         (base, offset)
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_alloc_host(size: i64, align: i64) -> i64 {
+    let size = usize::try_from(size).unwrap_or_else(|_| runtime_trap("allocation size overflow"));
+    let align =
+        usize::try_from(align).unwrap_or_else(|_| runtime_trap("allocation align overflow"));
+    if align == 0 || !align.is_power_of_two() {
+        runtime_trap("allocation align must be a non-zero power of two");
+    }
+    with_arena(|arena| arena.alloc(size, align) as usize as i64)
 }
 
 pub fn decode_int(handle: i64) -> Option<i64> {
@@ -191,6 +183,7 @@ fn truthy(handle: i64) -> bool {
     match value.tag {
         ValueTag::Int => value.payload != 0,
         ValueTag::List => list_header_ref(handle).len != 0,
+        ValueTag::String => runtime_trap("string values are not supported yet"),
     }
 }
 
@@ -213,9 +206,9 @@ fn new_list_handle() -> i64 {
         }
 
         let header_ptr = arena.alloc(
-            std::mem::size_of::<ListHeader>(),
-            std::mem::align_of::<ListHeader>(),
-        ) as *mut ListHeader;
+            std::mem::size_of::<ListHeader<i64>>(),
+            std::mem::align_of::<ListHeader<i64>>(),
+        ) as *mut ListHeader<i64>;
         unsafe {
             *header_ptr = ListHeader {
                 ptr: data_ptr,
@@ -250,6 +243,16 @@ fn list_grow(handle: i64, new_cap: usize) {
 #[unsafe(no_mangle)]
 pub extern "C" fn __expr_value_int_host(raw: i64) -> i64 {
     new_int(raw)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
+    match tag {
+        TAG_INT => new_int(payload),
+        TAG_LIST => with_arena(|arena| alloc_value(arena, ValueTag::List, payload)),
+        TAG_STRING => with_arena(|arena| alloc_value(arena, ValueTag::String, payload)),
+        _ => runtime_trap("unknown value tag"),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -477,9 +480,9 @@ pub extern "C" fn __expr_list_copy_host(list: i64) -> i64 {
         }
 
         let new_header = arena.alloc(
-            std::mem::size_of::<ListHeader>(),
-            std::mem::align_of::<ListHeader>(),
-        ) as *mut ListHeader;
+            std::mem::size_of::<ListHeader<i64>>(),
+            std::mem::align_of::<ListHeader<i64>>(),
+        ) as *mut ListHeader<i64>;
         unsafe {
             *new_header = ListHeader {
                 ptr: new_data,

@@ -4,6 +4,7 @@ pub mod module;
 pub mod parser;
 pub mod runtime;
 pub mod tokenizer;
+pub mod value;
 // pub mod instruction;
 
 #[cfg(test)]

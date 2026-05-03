@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::convert::TryFrom;
 use core::panic::PanicInfo;
 use core::ptr;
 
@@ -26,6 +27,7 @@ const LIST_INITIAL_CAPACITY: usize = 1024;
 enum ValueTag {
     Int = 1,
     List = 2,
+    String = 3,
 }
 
 #[repr(C)]
@@ -173,6 +175,7 @@ fn print_value_inner(handle: i64) {
                 }
                 write_stdout(b"]");
             }
+            ValueTag::String => runtime_abort(),
         }
     }
 }
@@ -230,6 +233,26 @@ pub extern "C" fn __CxxFrameHandler3() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn __expr_value_int_host(raw: i64) -> i64 {
     new_int(raw)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_alloc_host(size: i64, align: i64) -> i64 {
+    let size = usize::try_from(size).unwrap_or_else(|_| runtime_abort());
+    let align = usize::try_from(align).unwrap_or_else(|_| runtime_abort());
+    if align == 0 || !align.is_power_of_two() {
+        runtime_abort();
+    }
+    unsafe { arena_alloc(size, align) as usize as i64 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
+    match tag {
+        1 => unsafe { alloc_value(ValueTag::Int, payload) },
+        2 => unsafe { alloc_value(ValueTag::List, payload) },
+        3 => unsafe { alloc_value(ValueTag::String, payload) },
+        _ => runtime_abort(),
+    }
 }
 
 #[unsafe(no_mangle)]
