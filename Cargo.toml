@@ -3,8 +3,13 @@ name = "expr-compiler"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+llvm-backend = ["dep:inkwell"]
+
 [dependencies]
 cranelift = { version = "*", features = ["module", "jit", "native", "object", "interpreter"] }
 cranelift-reader = "0.127.1"
+inkwell = { version = "0.9.0", features = ["llvm20-1"], optional = true }
 logos = "0.16.0"
 pico-args = "0.5.0"

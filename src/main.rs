@@ -1,17 +1,19 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
-use expr_compiler::module::Module;
+use expr_compiler::module::{CodegenBackend, Module, llvm_backend_available};
 use expr_compiler::runtime::{configure_runtime_arena, decode_int, reset_runtime_arena};
 use pico_args::Arguments;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--arena-mb <n>]";
+const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--backend <cranelift|llvm>] [--arena-mb <n>]";
 
+#[derive(Debug)]
 struct CliArgs {
     input: PathBuf,
     output: Option<PathBuf>,
     emit_ir: bool,
     run_ir: bool,
     run_jit: bool,
+    backend: CodegenBackend,
     arena_mb: usize,
 }
 
@@ -23,7 +25,15 @@ fn finalize_output_path(mut output: PathBuf) -> PathBuf {
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
-    let mut args = Arguments::from_env();
+    parse_cli_args_from(std::env::args_os().skip(1).collect::<Vec<_>>())
+}
+
+fn parse_cli_args_from<I, T>(args: I) -> Result<CliArgs, String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let mut args = Arguments::from_vec(args.into_iter().map(Into::into).collect());
 
     if args.contains(["-h", "--help"]) {
         return Err(USAGE.to_string());
@@ -37,6 +47,12 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     let emit_ir = args.contains("--emit-ir");
     let run_ir = args.contains("--run-ir");
     let run_jit = args.contains("--run-jit");
+    let backend = args
+        .opt_value_from_str::<_, String>("--backend")
+        .map_err(|e| format!("failed to parse --backend: {e}"))?
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(CodegenBackend::Cranelift);
     let arena_mb = args
         .opt_value_from_str::<_, usize>("--arena-mb")
         .map_err(|e| format!("failed to parse --arena-mb: {e}"))?
@@ -65,6 +81,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         emit_ir,
         run_ir,
         run_jit,
+        backend,
         arena_mb,
     })
 }
@@ -84,6 +101,18 @@ fn main() {
         eprintln!("error reading {}: {e}", input.display());
         std::process::exit(1);
     });
+
+    if cli.backend == CodegenBackend::Llvm && !llvm_backend_available() {
+        eprintln!(
+            "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
+        );
+        std::process::exit(1);
+    }
+
+    if cli.backend == CodegenBackend::Llvm && (cli.emit_ir || cli.run_ir) {
+        eprintln!("llvm backend does not support --emit-ir or --run-ir");
+        std::process::exit(1);
+    }
 
     if cli.emit_ir || cli.run_ir {
         let ir = Module::from_source(&source).compile_to_ir();
@@ -145,7 +174,7 @@ fn main() {
     if cli.run_jit {
         configure_runtime_arena(cli.arena_mb * 1024 * 1024);
         reset_runtime_arena();
-        let jit = Module::from_source(&source).compile_to_jit();
+        let jit = Module::from_source(&source).compile_to_jit_with_backend(cli.backend);
         let func_name = if jit.has_function("main") {
             "main"
         } else {
@@ -169,6 +198,44 @@ fn main() {
             .unwrap_or_else(|| input.with_extension("").to_path_buf()),
     );
 
-    Module::from_source(&source).compile_to_executable(&output);
+    Module::from_source(&source).compile_to_executable_with_backend(&output, cli.backend);
     println!("compiled to {}", output.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ok(args: &[&str]) -> CliArgs {
+        parse_cli_args_from(args.iter().copied()).expect("cli parse should succeed")
+    }
+
+    #[test]
+    fn cli_defaults_to_cranelift() {
+        let cli = parse_ok(&["examples/test.expr"]);
+        assert_eq!(cli.backend, CodegenBackend::Cranelift);
+        assert_eq!(cli.arena_mb, 16);
+        assert!(!cli.run_jit);
+    }
+
+    #[test]
+    fn cli_accepts_llvm_backend() {
+        let cli = parse_ok(&["examples/test.expr", "--run-jit", "--backend", "llvm"]);
+        assert_eq!(cli.backend, CodegenBackend::Llvm);
+        assert!(cli.run_jit);
+    }
+
+    #[test]
+    fn cli_rejects_unknown_backend() {
+        let err = parse_cli_args_from(["examples/test.expr", "--backend", "nope"])
+            .expect_err("cli parse should fail");
+        assert!(err.contains("unknown backend: nope"));
+    }
+
+    #[test]
+    fn cli_rejects_zero_arena() {
+        let err = parse_cli_args_from(["examples/test.expr", "--arena-mb", "0"])
+            .expect_err("cli parse should fail");
+        assert_eq!(err, "--arena-mb must be > 0");
+    }
 }

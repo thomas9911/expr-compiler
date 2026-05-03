@@ -10,7 +10,31 @@ use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+#[cfg(feature = "llvm-backend")]
+mod llvm_backend;
 mod runtime_ir;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodegenBackend {
+    Cranelift,
+    Llvm,
+}
+
+impl std::str::FromStr for CodegenBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "cranelift" => Ok(Self::Cranelift),
+            "llvm" => Ok(Self::Llvm),
+            _ => Err(format!("unknown backend: {value}")),
+        }
+    }
+}
+
+pub fn llvm_backend_available() -> bool {
+    cfg!(feature = "llvm-backend")
+}
 
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
@@ -65,7 +89,30 @@ impl Module {
         module
     }
 
-    pub fn compile_to_jit(self) -> JitModule {
+    pub fn compile_to_jit(self) -> JitArtifact {
+        self.compile_to_jit_with_backend(CodegenBackend::Cranelift)
+    }
+
+    pub fn compile_to_jit_with_backend(self, backend: CodegenBackend) -> JitArtifact {
+        match backend {
+            CodegenBackend::Cranelift => JitArtifact::Cranelift(self.compile_to_cranelift_jit()),
+            CodegenBackend::Llvm => {
+                #[cfg(feature = "llvm-backend")]
+                {
+                    JitArtifact::Llvm(llvm_backend::compile_to_jit(self))
+                }
+                #[cfg(not(feature = "llvm-backend"))]
+                {
+                    let _ = self;
+                    panic!(
+                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
+                    );
+                }
+            }
+        }
+    }
+
+    fn compile_to_cranelift_jit(self) -> CraneliftJitModule {
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -108,7 +155,7 @@ impl Module {
 
         cranelift_module.finalize_definitions().unwrap();
 
-        JitModule {
+        CraneliftJitModule {
             module: cranelift_module,
             func_ids,
         }
@@ -147,7 +194,7 @@ impl Module {
         let print_stub = format!(
             "; builtin: print (interpreter stub — no I/O; use --run-jit for real output)\n\
              function u0:{print_func_id}(i64) -> i64 system_v {{\n\
-             block0(v0: i64):\n    v1 = iconst.i64 1\n    return v1\n}}\n\n"
+             block0(v0: i64):\n    v1 = iconst.i64 0\n    return v1\n}}\n\n"
         );
         out.push_str(&print_stub);
 
@@ -167,6 +214,30 @@ impl Module {
     }
 
     pub fn compile_to_object(self, name: &str) -> Vec<u8> {
+        self.compile_to_object_with_backend(name, CodegenBackend::Cranelift)
+    }
+
+    pub fn compile_to_object_with_backend(self, name: &str, backend: CodegenBackend) -> Vec<u8> {
+        match backend {
+            CodegenBackend::Cranelift => self.compile_to_cranelift_object(name),
+            CodegenBackend::Llvm => {
+                #[cfg(feature = "llvm-backend")]
+                {
+                    llvm_backend::compile_to_object(self, name)
+                }
+                #[cfg(not(feature = "llvm-backend"))]
+                {
+                    let _ = name;
+                    let _ = self;
+                    panic!(
+                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
+                    );
+                }
+            }
+        }
+    }
+
+    fn compile_to_cranelift_object(self, name: &str) -> Vec<u8> {
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -202,6 +273,30 @@ impl Module {
     }
 
     pub fn compile_to_executable(self, output: &Path) {
+        self.compile_to_executable_with_backend(output, CodegenBackend::Cranelift)
+    }
+
+    pub fn compile_to_executable_with_backend(self, output: &Path, backend: CodegenBackend) {
+        match backend {
+            CodegenBackend::Cranelift => self.compile_to_cranelift_executable(output),
+            CodegenBackend::Llvm => {
+                #[cfg(feature = "llvm-backend")]
+                {
+                    self.compile_to_llvm_executable(output);
+                }
+                #[cfg(not(feature = "llvm-backend"))]
+                {
+                    let _ = output;
+                    let _ = self;
+                    panic!(
+                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
+                    );
+                }
+            }
+        }
+    }
+
+    fn compile_to_cranelift_executable(self, output: &Path) {
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -324,14 +419,109 @@ impl Module {
         std::fs::remove_file(&tmp).ok();
         assert!(status.success(), "linker failed with: {status}");
     }
+
+    #[cfg(feature = "llvm-backend")]
+    fn compile_to_llvm_executable(self, output: &Path) {
+        let bytes = llvm_backend::compile_to_object(self, "llvm_exe");
+        #[cfg(windows)]
+        let tmp = output.with_extension("obj");
+        #[cfg(not(windows))]
+        let tmp = output.with_extension("o");
+        std::fs::write(&tmp, &bytes).unwrap();
+
+        #[cfg(windows)]
+        let status = Command::new("rustc")
+            .arg(write_windows_wrapper(output))
+            .arg("--crate-name")
+            .arg("expr_windows_wrapper")
+            .arg("-C")
+            .arg("panic=abort")
+            .arg("-C")
+            .arg("opt-level=s")
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("-C")
+            .arg("debuginfo=0")
+            .arg("-C")
+            .arg("link-arg=/DEBUG:NONE")
+            .arg("-C")
+            .arg("link-arg=/ENTRY:mainCRTStartup")
+            .arg("-C")
+            .arg("link-arg=/SUBSYSTEM:CONSOLE")
+            .arg("-C")
+            .arg(format!("link-arg={}", tmp.display()))
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("rustc not found");
+
+        #[cfg(not(windows))]
+        let status = Command::new("rustc")
+            .arg(write_unix_rust_wrapper(output))
+            .arg("--crate-name")
+            .arg("expr_unix_wrapper")
+            .arg("-C")
+            .arg("panic=abort")
+            .arg("-C")
+            .arg("opt-level=s")
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("-C")
+            .arg("debuginfo=0")
+            .arg("-C")
+            .arg(format!("link-arg={}", tmp.display()))
+            .arg("-o")
+            .arg(output)
+            .status()
+            .expect("rustc not found");
+
+        #[cfg(windows)]
+        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        #[cfg(not(windows))]
+        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        std::fs::remove_file(&tmp).ok();
+        assert!(status.success(), "linker failed with: {status}");
+    }
 }
 
-pub struct JitModule {
+pub enum JitArtifact {
+    Cranelift(CraneliftJitModule),
+    #[cfg(feature = "llvm-backend")]
+    Llvm(llvm_backend::LlvmJitModule),
+}
+
+impl JitArtifact {
+    pub fn get_fn_ptr(&self, name: &str) -> *const u8 {
+        match self {
+            Self::Cranelift(module) => module.get_fn_ptr(name),
+            #[cfg(feature = "llvm-backend")]
+            Self::Llvm(module) => module.get_fn_ptr(name),
+        }
+    }
+
+    pub fn has_function(&self, name: &str) -> bool {
+        match self {
+            Self::Cranelift(module) => module.has_function(name),
+            #[cfg(feature = "llvm-backend")]
+            Self::Llvm(module) => module.has_function(name),
+        }
+    }
+
+    pub fn user_function_names(&self) -> impl Iterator<Item = &str> {
+        match self {
+            Self::Cranelift(module) => module.user_function_names().collect::<Vec<_>>().into_iter(),
+            #[cfg(feature = "llvm-backend")]
+            Self::Llvm(module) => module.user_function_names().collect::<Vec<_>>().into_iter(),
+        }
+    }
+}
+
+pub struct CraneliftJitModule {
     module: JITModule,
     func_ids: HashMap<String, FuncId>,
 }
 
-impl JitModule {
+impl CraneliftJitModule {
     pub fn get_fn_ptr(&self, name: &str) -> *const u8 {
         self.module.get_finalized_function(self.func_ids[name])
     }
@@ -343,17 +533,7 @@ impl JitModule {
     pub fn user_function_names(&self) -> impl Iterator<Item = &str> {
         self.func_ids
             .keys()
-            .filter(|n| {
-                !n.starts_with("__")
-                    && n.as_str() != "print"
-                    && n.as_str() != "list_new"
-                    && n.as_str() != "list_push"
-                    && n.as_str() != "list_len"
-                    && n.as_str() != "list_get"
-                    && n.as_str() != "list_pop"
-                    && n.as_str() != "list_copy"
-                    && n.as_str() != "list_print"
-            })
+            .filter(|n| !is_builtin_name(n))
             .map(|s| s.as_str())
     }
 }
@@ -370,6 +550,14 @@ fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
 fn write_unix_wrapper(output: &Path) -> std::path::PathBuf {
     let wrapper = output.with_extension("wrapper.c");
     let source = include_str!("./wrapper/unix.c");
+    std::fs::write(&wrapper, source).unwrap();
+    wrapper
+}
+
+#[cfg(not(windows))]
+fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
+    let wrapper = output.with_extension("wrapper.rs");
+    let source = include_str!("./wrapper/unix.rs");
     std::fs::write(&wrapper, source).unwrap();
     wrapper
 }
@@ -532,12 +720,27 @@ fn generate_c_main(
     module.clear_context(&mut ctx);
 }
 
-fn local_var_names(block: &BlockAst) -> Vec<String> {
+pub(super) fn local_var_names(block: &BlockAst) -> Vec<String> {
     let mut names = vec![];
     for line in &block.lines {
         collect_var_names(line, &mut names);
     }
     names
+}
+
+pub(super) fn is_builtin_name(name: &str) -> bool {
+    name.starts_with("__")
+        || matches!(
+            name,
+            "print"
+                | "list_new"
+                | "list_push"
+                | "list_len"
+                | "list_get"
+                | "list_pop"
+                | "list_copy"
+                | "list_print"
+        )
 }
 
 fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
@@ -802,6 +1005,15 @@ fn boxed_int(value: i64) -> i64 {
     crate::runtime::__expr_value_int_host(value)
 }
 
+#[cfg(all(test, feature = "llvm-backend"))]
+fn assert_jit_backend_result(src: &str, backend: CodegenBackend, expected: i64) {
+    crate::runtime::reset_runtime_arena();
+    let jit = Module::from_source(src).compile_to_jit_with_backend(backend);
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), expected);
+}
+
 #[test]
 fn jit_python_style_multi_function() {
     let src = "fn double(a):\n    a + a\n\nfn square(a):\n    a * a\n\nfn main():\n    square(25) / double(4)\n";
@@ -1037,4 +1249,53 @@ fn jit_list_print_returns_zero() {
     let ptr = jit.get_fn_ptr("main");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(expect_int(func()), 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_arithmetic_works() {
+    assert_jit_backend_result("fn main() do\n    7 + 5 - 4\nend", CodegenBackend::Llvm, 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_function_calls_work() {
+    let src = "fn add(x, y) do\n    x + y\nend\n\nfn main() do\n    add(20, 22)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 42);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_if_else_works() {
+    let src = "fn main() do\n    if 1 do\n        41\n    else\n        0\n    end\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 41);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_lists_work() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_print_returns_zero() {
+    let src = "fn main() do\n    xs = [4, 5, 6]\n    list_print(xs)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 0);
+}
+
+#[cfg(all(feature = "llvm-backend", windows))]
+#[test]
+fn llvm_compile_to_executable_runs() {
+    let src = "fn main() do\n    7 + 5 - 4\nend";
+    let output = windows_temp_exe_path("__expr_compiler_llvm_test_exe");
+    Module::from_source(src).compile_to_executable_with_backend(&output, CodegenBackend::Llvm);
+
+    let status = Command::new(&output)
+        .status()
+        .expect("failed to run llvm executable");
+    assert_eq!(status.code(), Some(8));
+
+    std::fs::remove_file(&output).ok();
 }
