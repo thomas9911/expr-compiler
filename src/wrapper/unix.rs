@@ -449,13 +449,12 @@ pub extern "C" fn __expr_list_print_host(handle: i64) -> i64 {
 }
 
 unsafe extern "C" {
-    fn __expr_main() -> i64;
+    fn __expr_main_i64() -> i64;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
-    let code = unsafe { __expr_main() };
-    let int_code = as_int(code);
+    let int_code = unsafe { __expr_main_i64() };
     if int_code < i32::MIN as i64 || int_code > i32::MAX as i64 {
         1
     } else {

@@ -451,13 +451,12 @@ pub extern "C" fn __expr_list_print_host(handle: i64) -> i64 {
 }
 
 unsafe extern "C" {
-    fn expr_main_entry() -> i64;
+    fn expr_main_entry_int() -> i64;
 }
 
 #[no_mangle]
 pub extern "C" fn mainCRTStartup() -> ! {
-    let code = unsafe { expr_main_entry() };
-    let int_code = as_int(code);
+    let int_code = unsafe { expr_main_entry_int() };
     let exit_code = if int_code < u32::MIN as i64 || int_code > u32::MAX as i64 {
         1
     } else {

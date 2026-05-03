@@ -31,10 +31,11 @@ pub(super) enum LlvmOutputMode {
 
 impl LlvmJitModule {
     pub fn get_fn_ptr(&self, name: &str) -> *const u8 {
+        let symbol = internal_symbol_name(name);
         let addr = self
             .execution_engine
-            .get_function_address(name)
-            .unwrap_or_else(|e| panic!("unable to find JIT function '{name}': {e}"));
+            .get_function_address(&symbol)
+            .unwrap_or_else(|e| panic!("unable to find JIT function '{symbol}': {e}"));
         addr as usize as *const u8
     }
 
@@ -165,7 +166,6 @@ struct LlvmCompiler<'ctx> {
     builder: Builder<'ctx>,
     i64_type: IntType<'ctx>,
     functions: HashMap<String, FunctionValue<'ctx>>,
-    public_functions: HashMap<String, FunctionValue<'ctx>>,
 }
 
 #[derive(Clone, Copy)]
@@ -182,7 +182,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
             builder: context.create_builder(),
             i64_type: context.i64_type(),
             functions: HashMap::new(),
-            public_functions: HashMap::new(),
         }
     }
 
@@ -250,6 +249,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
     }
 
     fn declare_user_functions(&mut self, functions: &[FunctionDefAst], mode: LlvmOutputMode) {
+        let _ = mode;
         for func in functions {
             let internal_params = vec![self.i64_type.into(); func.inputs.len() * 2];
             let internal_symbol = internal_symbol_name(&func.name);
@@ -259,22 +259,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 Some(Linkage::Private),
             );
             self.functions.insert(func.name.clone(), internal);
-
-            let public_params = vec![self.i64_type.into(); func.inputs.len()];
-            let public_symbol = function_symbol_name(func, mode);
-            let public = self.module.add_function(
-                &public_symbol,
-                self.i64_type.fn_type(&public_params, false),
-                None,
-            );
-            self.public_functions.insert(func.name.clone(), public);
         }
     }
 
     fn define_user_functions(&self, functions: &[FunctionDefAst]) {
         for func in functions {
             self.define_user_function(func);
-            self.define_public_wrapper(func);
         }
     }
 
@@ -377,23 +367,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 )))
                 .expect("failed to build empty return");
         }
-    }
-
-    fn define_public_wrapper(&self, func_def: &FunctionDefAst) {
-        let function = self.require_public_func(&func_def.name);
-        let internal = self.require_func(&func_def.name);
-        let entry = self.context.append_basic_block(function, "entry");
-        self.builder.position_at_end(entry);
-
-        let args = function
-            .get_param_iter()
-            .map(|param| self.unbox_handle(param.into_int_value(), "public_arg"))
-            .collect::<Vec<_>>();
-        let result = self.build_internal_call(internal, &args, "public_call");
-        let handle = self.box_compiled_value(result, "public_result");
-        self.builder
-            .build_return(Some(&handle))
-            .expect("failed to build public wrapper return");
     }
 
     fn compile_ast(
@@ -672,11 +645,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
         }
     }
 
-    fn call_func(&self, name: &str, args: &[IntValue<'ctx>], label: &str) -> IntValue<'ctx> {
-        let function = self.require_func(name);
-        self.build_boxed_call(function, args, label)
-    }
-
     fn build_boxed_call(
         &self,
         function: FunctionValue<'ctx>,
@@ -751,13 +719,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .functions
             .get(name)
             .unwrap_or_else(|| panic!("missing function declaration: {name}"))
-    }
-
-    fn require_public_func(&self, name: &str) -> FunctionValue<'ctx> {
-        *self
-            .public_functions
-            .get(name)
-            .unwrap_or_else(|| panic!("missing public function declaration: {name}"))
     }
 
     fn pair_type(&self) -> inkwell::types::StructType<'ctx> {
@@ -1691,7 +1652,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "list_push_new_data_ptr",
             )
             .expect("failed to convert new data ptr");
-        let old_data_ptr = self.build_list_data_ptr_load(list_payload, "list_push_old_data");
         let header_ptr = self.build_list_header_ptr(list_payload, "list_push_header");
         self.build_list_data_ptr_store(header_ptr, new_data_ptr, "list_push");
         self.build_list_cap_store(list_payload, new_cap, "list_push");
@@ -1955,7 +1915,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "list_insert_new_data_ptr",
             )
             .expect("failed to convert insert data ptr");
-        let old_data_ptr = self.build_list_data_ptr_load(list_payload, "list_insert_old_data");
         let header_ptr = self.build_list_header_ptr(list_payload, "list_insert_header");
         self.build_list_data_ptr_store(header_ptr, new_data_ptr, "list_insert");
         self.build_list_cap_store(list_payload, new_cap, "list_insert");
@@ -2385,21 +2344,6 @@ enum BinaryArithOp {
     Multiply,
     Divide,
     Modulo,
-}
-
-fn function_symbol_name(func: &FunctionDefAst, mode: LlvmOutputMode) -> String {
-    if func.name == "main" && matches!(mode, LlvmOutputMode::Executable) {
-        #[cfg(windows)]
-        {
-            return "expr_main_entry".to_string();
-        }
-        #[cfg(not(windows))]
-        {
-            return "__expr_main".to_string();
-        }
-    }
-
-    func.name.clone()
 }
 
 fn internal_symbol_name(name: &str) -> String {

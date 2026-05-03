@@ -243,11 +243,6 @@ fn list_grow(handle: i64, new_cap: usize) {
     });
 }
 
-#[cfg(test)]
-pub(crate) fn boxed_int_for_test(raw: i64) -> i64 {
-    new_int(raw)
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
     match tag {

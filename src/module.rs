@@ -1,5 +1,5 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
-use crate::value::{TAG_INT, VALUE_PAYLOAD_OFFSET};
+use crate::value::TAG_INT;
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
@@ -145,7 +145,6 @@ impl Module {
             arena_base_addr,
             arena_offset_addr,
         );
-        let mut public_func_ids = builtin_ids.clone();
         let mut internal_func_ids = builtin_ids.clone();
         let mut int_result_func_ids = HashMap::new();
         for func_def in &self.functions {
@@ -157,14 +156,6 @@ impl Module {
                 Linkage::Local,
             );
             internal_func_ids.insert(func_def.name.clone(), internal_id);
-            let public_id = declare_function_sig(
-                &mut cranelift_module,
-                &isa,
-                func_def,
-                &func_def.name,
-                Linkage::Export,
-            );
-            public_func_ids.insert(func_def.name.clone(), public_id);
         }
         for func_def in &self.functions {
             define_function_body(
@@ -174,15 +165,6 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
-            );
-            define_public_wrapper(
-                &mut cranelift_module,
-                isa.clone(),
-                &flags,
-                func_def,
-                public_func_ids[&func_def.name],
-                internal_func_ids[&func_def.name],
-                builtin_ids["__box_value"],
             );
             if func_def.inputs.is_empty() {
                 let scalar_id = declare_zero_arg_int_result_sig(
@@ -206,7 +188,7 @@ impl Module {
 
         CraneliftJitModule {
             module: cranelift_module,
-            func_ids: public_func_ids,
+            func_ids: internal_func_ids.clone(),
             internal_func_ids,
             int_result_func_ids,
         }
@@ -302,7 +284,6 @@ impl Module {
         );
 
         let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
-        let mut public_func_ids = builtin_ids.clone();
         let mut internal_func_ids = builtin_ids.clone();
         for func_def in &self.functions {
             let internal_id = declare_internal_function_sig(
@@ -313,14 +294,6 @@ impl Module {
                 Linkage::Local,
             );
             internal_func_ids.insert(func_def.name.clone(), internal_id);
-            let public_id = declare_function_sig(
-                &mut cranelift_module,
-                &isa,
-                func_def,
-                &func_def.name,
-                Linkage::Export,
-            );
-            public_func_ids.insert(func_def.name.clone(), public_id);
         }
         for func_def in &self.functions {
             define_function_body(
@@ -330,15 +303,6 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
-            );
-            define_public_wrapper(
-                &mut cranelift_module,
-                isa.clone(),
-                &flags,
-                func_def,
-                public_func_ids[&func_def.name],
-                internal_func_ids[&func_def.name],
-                builtin_ids["__box_value"],
             );
         }
         cranelift_module.finish().emit().unwrap()
@@ -380,23 +344,10 @@ impl Module {
         );
 
         let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
-        let mut public_func_ids = builtin_ids.clone();
         let mut internal_func_ids = builtin_ids.clone();
-        let mut expr_main_id: Option<FuncId> = None;
         let mut expr_main_int_id: Option<FuncId> = None;
-        #[cfg(windows)]
-        let mut use_windows_int_wrapper = false;
-        #[cfg(windows)]
-        let expr_main_symbol = "expr_main_entry";
-        #[cfg(not(windows))]
-        let expr_main_symbol = "__expr_main";
         for func_def in &self.functions {
             if func_def.name == "main" {
-                let main_linkage = if cfg!(windows) {
-                    Linkage::Export
-                } else {
-                    Linkage::Local
-                };
                 let internal_id = declare_internal_function_sig(
                     &mut cranelift_module,
                     &isa,
@@ -405,15 +356,6 @@ impl Module {
                     Linkage::Local,
                 );
                 internal_func_ids.insert("main".to_string(), internal_id);
-                let public_id = declare_function_sig(
-                    &mut cranelift_module,
-                    &isa,
-                    func_def,
-                    expr_main_symbol,
-                    main_linkage,
-                );
-                public_func_ids.insert("main".to_string(), public_id);
-                expr_main_id = Some(public_id);
                 if func_def.inputs.is_empty() {
                     #[cfg(windows)]
                     let int_symbol = "expr_main_entry_int";
@@ -430,10 +372,6 @@ impl Module {
                         },
                     );
                     expr_main_int_id = Some(int_id);
-                    #[cfg(windows)]
-                    {
-                        use_windows_int_wrapper = true;
-                    }
                 }
             } else {
                 let internal_id = declare_internal_function_sig(
@@ -444,14 +382,6 @@ impl Module {
                     Linkage::Local,
                 );
                 internal_func_ids.insert(func_def.name.clone(), internal_id);
-                let public_id = declare_function_sig(
-                    &mut cranelift_module,
-                    &isa,
-                    func_def,
-                    &func_def.name,
-                    Linkage::Export,
-                );
-                public_func_ids.insert(func_def.name.clone(), public_id);
             }
         }
         for func_def in &self.functions {
@@ -462,15 +392,6 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
-            );
-            define_public_wrapper(
-                &mut cranelift_module,
-                isa.clone(),
-                &flags,
-                func_def,
-                public_func_ids[&func_def.name],
-                internal_func_ids[&func_def.name],
-                builtin_ids["__box_value"],
             );
             if func_def.name == "main" && func_def.inputs.is_empty() {
                 define_zero_arg_int_result_wrapper(
@@ -487,12 +408,6 @@ impl Module {
         if let Some(id) = expr_main_int_id {
             generate_c_main(&mut cranelift_module, isa.clone(), &flags, id);
         }
-        #[cfg(windows)]
-        if true {
-            _ = expr_main_id;
-            _ = expr_main_int_id;
-        }
-
         let bytes = cranelift_module.finish().emit().unwrap();
 
         #[cfg(windows)]
@@ -503,11 +418,7 @@ impl Module {
 
         #[cfg(windows)]
         let status = Command::new("rustc")
-            .arg(if use_windows_int_wrapper {
-                write_windows_int_wrapper(output)
-            } else {
-                write_windows_wrapper(output)
-            })
+            .arg(write_windows_wrapper(output))
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -553,10 +464,6 @@ impl Module {
 
     #[cfg(feature = "llvm-backend")]
     fn compile_to_llvm_executable(self, output: &Path) {
-        let use_int_main_wrapper = self
-            .functions
-            .iter()
-            .any(|func| func.name == "main" && func.inputs.is_empty());
         let bytes = llvm_backend::compile_to_object(self, "llvm_exe");
         #[cfg(windows)]
         let tmp = output.with_extension("obj");
@@ -566,11 +473,7 @@ impl Module {
 
         #[cfg(windows)]
         let status = Command::new("rustc")
-            .arg(if use_int_main_wrapper {
-                write_windows_int_wrapper(output)
-            } else {
-                write_windows_wrapper(output)
-            })
+            .arg(write_windows_wrapper(output))
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -596,11 +499,7 @@ impl Module {
 
         #[cfg(not(windows))]
         let status = Command::new("rustc")
-            .arg(if use_int_main_wrapper {
-                write_unix_rust_int_wrapper(output)
-            } else {
-                write_unix_rust_wrapper(output)
-            })
+            .arg(write_unix_rust_wrapper(output))
             .arg("--crate-name")
             .arg("expr_unix_wrapper")
             .arg("-C")
@@ -719,52 +618,6 @@ fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
     wrapper
 }
 
-#[cfg(windows)]
-fn write_windows_int_wrapper(output: &Path) -> std::path::PathBuf {
-    const OLD_ENTRY: &str = r#"unsafe extern "C" {
-    fn expr_main_entry() -> i64;
-}
-
-#[no_mangle]
-pub extern "C" fn mainCRTStartup() -> ! {
-    let code = unsafe { expr_main_entry() };
-    let int_code = as_int(code);
-    let exit_code = if int_code < u32::MIN as i64 || int_code > u32::MAX as i64 {
-        1
-    } else {
-        int_code as u32
-    };
-
-    unsafe {
-        ExitProcess(exit_code);
-    }
-}
-"#;
-    const NEW_ENTRY: &str = r#"unsafe extern "C" {
-    fn expr_main_entry_int() -> i64;
-}
-
-#[no_mangle]
-pub extern "C" fn mainCRTStartup() -> ! {
-    let int_code = unsafe { expr_main_entry_int() };
-    let exit_code = if int_code < u32::MIN as i64 || int_code > u32::MAX as i64 {
-        1
-    } else {
-        int_code as u32
-    };
-
-    unsafe {
-        ExitProcess(exit_code);
-    }
-}
-"#;
-
-    let wrapper = output.with_extension("wrapper.rs");
-    let source = include_str!("./wrapper/windows.rs").replace(OLD_ENTRY, NEW_ENTRY);
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
-}
-
 #[cfg(not(windows))]
 fn write_unix_wrapper(output: &Path) -> std::path::PathBuf {
     let wrapper = output.with_extension("wrapper.c");
@@ -779,61 +632,6 @@ fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
     let source = include_str!("./wrapper/unix.rs");
     std::fs::write(&wrapper, source).unwrap();
     wrapper
-}
-
-#[cfg(not(windows))]
-fn write_unix_rust_int_wrapper(output: &Path) -> std::path::PathBuf {
-    const OLD_ENTRY: &str = r#"unsafe extern "C" {
-    fn __expr_main() -> i64;
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn main() -> i32 {
-    let code = unsafe { __expr_main() };
-    let int_code = as_int(code);
-    if int_code < i32::MIN as i64 || int_code > i32::MAX as i64 {
-        1
-    } else {
-        int_code as i32
-    }
-}
-"#;
-    const NEW_ENTRY: &str = r#"unsafe extern "C" {
-    fn __expr_main_i64() -> i64;
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn main() -> i32 {
-    let int_code = unsafe { __expr_main_i64() };
-    if int_code < i32::MIN as i64 || int_code > i32::MAX as i64 {
-        1
-    } else {
-        int_code as i32
-    }
-}
-"#;
-
-    let wrapper = output.with_extension("wrapper.rs");
-    let source = include_str!("./wrapper/unix.rs").replace(OLD_ENTRY, NEW_ENTRY);
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
-}
-
-fn declare_function_sig(
-    module: &mut impl CraneliftModule,
-    isa: &OwnedTargetIsa,
-    func_def: &FunctionDefAst,
-    name: &str,
-    linkage: Linkage,
-) -> FuncId {
-    let mut sig = Signature::new(isa.default_call_conv());
-    sig.returns.push(AbiParam::new(types::I64));
-    sig.returns.push(AbiParam::new(types::I64));
-    for _ in &func_def.inputs {
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(types::I64));
-    }
-    module.declare_function(name, linkage, &sig).unwrap()
 }
 
 fn declare_internal_function_sig(
@@ -948,66 +746,6 @@ fn define_function_body(
     module.define_function(func_id, &mut ctx).unwrap();
     module.clear_context(&mut ctx);
     ir
-}
-
-fn define_public_wrapper(
-    module: &mut impl CraneliftModule,
-    isa: OwnedTargetIsa,
-    flags: &settings::Flags,
-    func_def: &FunctionDefAst,
-    wrapper_id: FuncId,
-    internal_id: FuncId,
-    box_value_id: FuncId,
-) {
-    let mut sig = Signature::new(isa.default_call_conv());
-    sig.returns.push(AbiParam::new(types::I64));
-    for _ in &func_def.inputs {
-        sig.params.push(AbiParam::new(types::I64));
-    }
-
-    let mut ctx = module.make_context();
-    ctx.func.signature = sig;
-    ctx.func.name = UserFuncName::user(0, wrapper_id.as_u32());
-
-    let internal_ref = module.declare_func_in_func(internal_id, &mut ctx.func);
-    let box_ref = module.declare_func_in_func(box_value_id, &mut ctx.func);
-
-    let mut fn_builder_ctx = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
-        let block0 = builder.create_block();
-        builder.append_block_params_for_function_params(block0);
-        builder.switch_to_block(block0);
-        builder.seal_block(block0);
-
-        let mut internal_args = Vec::with_capacity(func_def.inputs.len() * 2);
-        let handles = builder.block_params(block0).to_vec();
-        for handle in handles {
-            let tag_i8 = builder.ins().load(types::I8, MemFlags::new(), handle, 0);
-            let tag = builder.ins().uextend(types::I64, tag_i8);
-            let payload =
-                builder
-                    .ins()
-                    .load(types::I64, MemFlags::new(), handle, VALUE_PAYLOAD_OFFSET);
-            internal_args.push(tag);
-            internal_args.push(payload);
-        }
-
-        let internal_call = builder.ins().call(internal_ref, &internal_args);
-        let result_tag = builder.inst_results(internal_call)[0];
-        let result_payload = builder.inst_results(internal_call)[1];
-        let boxed = builder.ins().call(box_ref, &[result_tag, result_payload]);
-        let handle = builder.inst_results(boxed)[0];
-        builder.ins().return_(&[handle]);
-        builder.finalize();
-    }
-
-    let res = verify_function(&ctx.func, flags);
-    if let Err(errors) = res {
-        panic!("{}", errors);
-    }
-    module.define_function(wrapper_id, &mut ctx).unwrap();
-    module.clear_context(&mut ctx);
 }
 
 fn define_zero_arg_int_result_wrapper(
@@ -1485,31 +1223,31 @@ fn windows_temp_exe_path(base: &str) -> std::path::PathBuf {
 }
 
 #[cfg(test)]
-fn expect_int(value: i64) -> i64 {
-    crate::runtime::decode_int(value).expect("expected boxed integer")
-}
-
-#[cfg(test)]
-fn boxed_int(value: i64) -> i64 {
-    crate::runtime::boxed_int_for_test(value)
+fn assert_cranelift_jit_result(src: &str, expected: i64) {
+    crate::runtime::reset_runtime_arena();
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("cranelift int-result wrapper should exist");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), expected);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
 fn assert_jit_backend_result(src: &str, backend: CodegenBackend, expected: i64) {
     crate::runtime::reset_runtime_arena();
     let jit = Module::from_source(src).compile_to_jit_with_backend(backend);
-    let ptr = jit.get_fn_ptr("main");
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), expected);
+    assert_eq!(func(), expected);
 }
 
 #[test]
 fn jit_python_style_multi_function() {
     let src = "fn double(a):\n    a + a\n\nfn square(a):\n    a * a\n\nfn main():\n    square(25) / double(4)\n";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 78); // square(25)/double(4) = 625/8 = 78
+    assert_cranelift_jit_result(src, 78); // square(25)/double(4) = 625/8 = 78
 }
 
 #[test]
@@ -1523,58 +1261,23 @@ fn text_to_native_execute() {
     let ast = Ast::from_lexer(&mut lexer).unwrap();
 
     let jit = Module::from_ast(ast).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("cranelift int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-
-    assert_eq!(expect_int(func()), 8);
+    assert_eq!(func(), 8);
 }
 
 #[test]
 fn text_to_native_execute_with_params() {
-    use crate::parser::ParseLexer;
-    use crate::tokenizer::{self, Logos};
-
-    let src = "fn add(x, y) do\n    x + y\nend";
-    let lex = tokenizer::Token::lexer(src);
-    let mut lexer = ParseLexer::new(lex);
-    let ast = Ast::from_lexer(&mut lexer).unwrap();
-
-    let jit = Module::from_ast(ast).compile_to_jit();
-    let ptr = jit.get_fn_ptr("add");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
-
-    assert_eq!(expect_int(func(boxed_int(3), boxed_int(5))), 8);
-    assert_eq!(expect_int(func(boxed_int(10), boxed_int(-4))), 6);
+    let src = "fn add(x, y) do\n    x + y\nend\nfn main() do\n    add(10, 4)\nend";
+    assert_cranelift_jit_result(src, 14);
 }
 
 #[test]
 fn call_user_defined_function() {
-    use crate::parser::ParseLexer;
-    use crate::tokenizer::{self, Logos};
-
     let src = "fn double(x) do\n    x + x\nend\nfn main() do\n    double(21)\nend";
-    let lex = tokenizer::Token::lexer(src);
-    let mut lexer = ParseLexer::new(lex);
-
-    // parse both functions from sequential Ast::from_lexer calls
-    let ast1 = Ast::from_lexer(&mut lexer).unwrap();
-    let ast2 = Ast::from_lexer(&mut lexer).unwrap();
-
-    let mut module = Module::new();
-    module.add_function(match ast1 {
-        Ast::FunctionDef(f) => f,
-        _ => panic!(),
-    });
-    module.add_function(match ast2 {
-        Ast::FunctionDef(f) => f,
-        _ => panic!(),
-    });
-
-    let jit = module.compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-
-    assert_eq!(expect_int(func()), 42); // double(21) = 42
+    assert_cranelift_jit_result(src, 42); // double(21) = 42
 }
 
 #[test]
@@ -1638,38 +1341,26 @@ fn compile_parsed_function() {
 #[test]
 fn local_variable_assignment() {
     let src = "fn main() do\n    x = 10\n    y = x + 5\n    y * 2\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 30); // x=10, y=15, 15*2=30
+    assert_cranelift_jit_result(src, 30); // x=10, y=15, 15*2=30
 }
 
 #[test]
 fn if_without_else() {
     // returns then-value when true, 0 when false
     let src = "fn main() do\n    if 10 > 5 do\n        42\n    end\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 42);
+    assert_cranelift_jit_result(src, 42);
 }
 
 #[test]
 fn if_with_else() {
     let src = "fn main() do\n    if 3 > 5 do\n        1\n    else\n        99\n    end\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 99);
+    assert_cranelift_jit_result(src, 99);
 }
 
 #[test]
 fn if_python_style() {
     let src = "fn main():\n    x = 10\n    if x > 5:\n        x * 2\n    else:\n        x\n";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 20);
+    assert_cranelift_jit_result(src, 20);
 }
 
 #[test]
@@ -1682,112 +1373,68 @@ fn ir_contains_overflow_trap_for_add() {
 
 #[test]
 fn jit_list_builtins_work() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = list_new()\n    list_push(xs, 10)\n    list_push(xs, 32)\n    list_get(xs, 0) + list_get(xs, 1) + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 44);
+    assert_cranelift_jit_result(src, 44);
 }
 
 #[test]
 fn jit_list_literal_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [10, 32]\n    list_get(xs, 0) + list_get(xs, 1) + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 44);
+    assert_cranelift_jit_result(src, 44);
 }
 
 #[test]
 fn jit_index_syntax_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 2);
+    assert_cranelift_jit_result(src, 2);
 }
 
 #[test]
 fn jit_list_set_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    list_set(xs, 1, 9)\n    xs[1]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 9);
+    assert_cranelift_jit_result(src, 9);
 }
 
 #[test]
 fn jit_list_insert_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 3]\n    list_insert(xs, 1, 2)\n    xs[0] + xs[1] + xs[2] + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 9);
+    assert_cranelift_jit_result(src, 9);
 }
 
 #[test]
 fn jit_index_assignment_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1] = 9\n    xs[1]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 9);
+    assert_cranelift_jit_result(src, 9);
 }
 
 #[test]
 fn jit_list_swap_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    list_swap(xs, 0, 2)\n    xs[0] + xs[2]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 4);
+    assert_cranelift_jit_result(src, 4);
 }
 
 #[test]
 fn jit_list_pop_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    x = list_pop(xs)\n    x + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 5);
+    assert_cranelift_jit_result(src, 5);
 }
 
 #[test]
 fn jit_list_copy_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 8);
+    assert_cranelift_jit_result(src, 8);
 }
 
 #[test]
 fn jit_nested_list_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [[1, 2], [3, 4, 5]]\n    list_len(xs) + list_len(xs[1])\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 5);
+    assert_cranelift_jit_result(src, 5);
 }
 
 #[test]
 fn jit_list_print_returns_zero() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [4, 5, 6]\n    list_print(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 0);
+    assert_cranelift_jit_result(src, 0);
 }
 
 #[cfg(feature = "llvm-backend")]
