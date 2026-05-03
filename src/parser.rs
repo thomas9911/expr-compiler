@@ -67,6 +67,11 @@ pub enum Ast {
         collection: Box<Ast>,
         index: Box<Ast>,
     },
+    IndexAssign {
+        collection: Box<Ast>,
+        index: Box<Ast>,
+        value: Box<Ast>,
+    },
     Variable(String),
     Assign {
         name: String,
@@ -108,19 +113,27 @@ impl Ast {
         trim_newlines(lex);
 
         if matches!(lex.peek(), Some(Ok(Token::Symbol(_)))) {
-            let tok = lex.next().unwrap();
+            let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
+                unreachable!()
+            };
+            let lhs = parse_postfix(lex, Ast::Variable(name))?;
             if lex.peek() == Some(&Ok(Token::Assign)) {
                 lex.next();
-                let Token::Symbol(name) = tok.unwrap() else {
-                    unreachable!()
-                };
                 let value = parse_expr(lex, 0)?;
-                return Ok(Ast::Assign {
-                    name,
-                    value: Box::new(value),
-                });
+                return match lhs {
+                    Ast::Variable(name) => Ok(Ast::Assign {
+                        name,
+                        value: Box::new(value),
+                    }),
+                    Ast::Index { collection, index } => Ok(Ast::IndexAssign {
+                        collection,
+                        index,
+                        value: Box::new(value),
+                    }),
+                    _ => Err(ParseError::unexpected(lex)),
+                };
             }
-            lex.push_back(tok);
+            return parse_expr_with_lhs(lex, 0, lhs);
         }
 
         match lex.peek() {
@@ -329,7 +342,7 @@ fn parse_expr<'a>(lex: &mut ParseLexer<'a>, min_prec: u8) -> Result<Ast, ParseEr
 }
 
 fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
-    let mut lhs = match lex.peek() {
+    let lhs = match lex.peek() {
         Some(Ok(x)) if x.kind() == TokenKind::Integer => Ast::Literal(LiteralAst::from_lexer(lex)?),
         Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
             let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
@@ -357,6 +370,10 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         _ => return Err(ParseError::unexpected(lex)),
     };
 
+    parse_postfix(lex, lhs)
+}
+
+fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, ParseError<'a>> {
     loop {
         match lex.peek() {
             Some(Ok(Token::OpenBracket)) => {
@@ -395,6 +412,32 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
             }
             _ => break,
         }
+    }
+
+    Ok(lhs)
+}
+
+fn parse_expr_with_lhs<'a>(
+    lex: &mut ParseLexer<'a>,
+    min_prec: u8,
+    mut lhs: Ast,
+) -> Result<Ast, ParseError<'a>> {
+    loop {
+        let prec = match lex.peek() {
+            Some(Ok(t)) => match infix_precedence(t) {
+                Some(p) if p >= min_prec => p,
+                _ => break,
+            },
+            _ => break,
+        };
+
+        let op = lex.next().unwrap().unwrap();
+        let rhs = parse_expr(lex, prec + 1)?;
+
+        lhs = Ast::Expression(ExpressionAst {
+            function: infix_name(&op).to_string(),
+            args: vec![lhs, rhs],
+        });
     }
 
     Ok(lhs)
@@ -865,6 +908,41 @@ fn parse_index_expression() {
                 Index {
                     collection: Box::new(Variable("xs".to_string())),
                     index: Box::new(Literal(LiteralAst::Integer(1))),
+                },
+            ],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_index_assignment_expression() {
+    use Ast::*;
+
+    let text = "fn main() do\n    xs = [1, 2, 3]\n    xs[1] = 9\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![
+                Assign {
+                    name: "xs".to_string(),
+                    value: Box::new(ListLiteral(vec![
+                        Literal(LiteralAst::Integer(1)),
+                        Literal(LiteralAst::Integer(2)),
+                        Literal(LiteralAst::Integer(3)),
+                    ])),
+                },
+                IndexAssign {
+                    collection: Box::new(Variable("xs".to_string())),
+                    index: Box::new(Literal(LiteralAst::Integer(1))),
+                    value: Box::new(Literal(LiteralAst::Integer(9))),
                 },
             ],
         },

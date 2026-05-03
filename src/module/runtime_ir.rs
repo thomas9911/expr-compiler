@@ -73,8 +73,11 @@ fn build_builtin_map(
     builtins.insert("__op_ne".to_string(), runtime.op_ne);
     builtins.insert("list_new".to_string(), runtime.list_new);
     builtins.insert("list_push".to_string(), runtime.list_push);
+    builtins.insert("list_insert".to_string(), runtime.list_insert);
     builtins.insert("list_len".to_string(), runtime.list_len);
     builtins.insert("list_get".to_string(), runtime.list_get);
+    builtins.insert("list_set".to_string(), runtime.list_set);
+    builtins.insert("list_swap".to_string(), runtime.list_swap);
     builtins.insert("list_pop".to_string(), runtime.list_pop);
     builtins.insert("list_copy".to_string(), runtime.list_copy);
     builtins.insert("list_print".to_string(), list_print_id);
@@ -98,8 +101,11 @@ struct RuntimeBuiltins {
     op_ne: FuncId,
     list_new: FuncId,
     list_push: FuncId,
+    list_insert: FuncId,
     list_len: FuncId,
     list_get: FuncId,
+    list_set: FuncId,
+    list_swap: FuncId,
     list_pop: FuncId,
     list_copy: FuncId,
 }
@@ -178,8 +184,26 @@ fn declare_runtime_function_ids(
     let op_ne = declare_local_builtin(module, isa, "__rt_ne", &[types::I64, types::I64]);
     let list_new = declare_local_builtin(module, isa, "__rt_list_new", &[]);
     let list_push = declare_local_builtin(module, isa, "__rt_list_push", &[types::I64, types::I64]);
+    let list_insert = declare_local_builtin(
+        module,
+        isa,
+        "__rt_list_insert",
+        &[types::I64, types::I64, types::I64],
+    );
     let list_len = declare_local_builtin(module, isa, "__rt_list_len", &[types::I64]);
     let list_get = declare_local_builtin(module, isa, "__rt_list_get", &[types::I64, types::I64]);
+    let list_set = declare_local_builtin(
+        module,
+        isa,
+        "__rt_list_set",
+        &[types::I64, types::I64, types::I64],
+    );
+    let list_swap = declare_local_builtin(
+        module,
+        isa,
+        "__rt_list_swap",
+        &[types::I64, types::I64, types::I64],
+    );
     let list_pop = declare_local_builtin(module, isa, "__rt_list_pop", &[types::I64]);
     let list_copy = declare_local_builtin(module, isa, "__rt_list_copy", &[types::I64]);
 
@@ -203,8 +227,11 @@ fn declare_runtime_function_ids(
             op_ne,
             list_new,
             list_push,
+            list_insert,
             list_len,
             list_get,
+            list_set,
+            list_swap,
             list_pop,
             list_copy,
         },
@@ -329,6 +356,15 @@ fn define_runtime_operations(
         ids.alloc,
         ids.memcpy,
     );
+    define_rt_list_insert(
+        module,
+        isa,
+        flags,
+        ids.builtins.list_insert,
+        ids.builtins.value_to_i64,
+        ids.alloc,
+        ids.memcpy,
+    );
     define_rt_list_len(
         module,
         isa,
@@ -342,6 +378,20 @@ fn define_runtime_operations(
         isa,
         flags,
         ids.builtins.list_get,
+        ids.builtins.value_to_i64,
+    );
+    define_rt_list_set(
+        module,
+        isa,
+        flags,
+        ids.builtins.list_set,
+        ids.builtins.value_to_i64,
+    );
+    define_rt_list_swap(
+        module,
+        isa,
+        flags,
+        ids.builtins.list_swap,
         ids.builtins.value_to_i64,
     );
     define_rt_list_pop(
@@ -978,6 +1028,203 @@ fn define_rt_list_pop(
         let value = b.ins().load(types::I64, MemFlags::new(), elem_ptr, 0);
         b.ins().return_(&[value]);
     });
+}
+
+fn define_rt_list_insert(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    to_i64_id: FuncId,
+    alloc_id: FuncId,
+    memcpy_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let list = p[0];
+            let value = p[2];
+            let header_ptr = rt_payload_for_tag(b, list, VALUE_TAG_LIST);
+            let to_i64 = unsafe { (&mut *module_ptr).declare_func_in_func(to_i64_id, func) };
+            let idx_call = b.ins().call(to_i64, &[p[1]]);
+            let idx = b.inst_results(idx_call)[0];
+            let non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, idx, 0);
+            b.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+            let len = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_LEN_OFFSET);
+            let in_bounds = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, idx, len);
+            b.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+            let cap = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_CAP_OFFSET);
+            let data_ptr = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_PTR_OFFSET);
+
+            let has_room = b.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+            let fast_block = b.create_block();
+            let grow_block = b.create_block();
+            let cont_block = b.create_block();
+            b.append_block_param(cont_block, types::I64);
+            b.ins().brif(has_room, fast_block, &[], grow_block, &[]);
+
+            b.switch_to_block(fast_block);
+            b.seal_block(fast_block);
+            b.ins().jump(cont_block, &[BlockArg::Value(data_ptr)]);
+
+            b.switch_to_block(grow_block);
+            b.seal_block(grow_block);
+            let alloc = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let memcpy = unsafe { (&mut *module_ptr).declare_func_in_func(memcpy_id, func) };
+            let two = b.ins().iconst(types::I64, 2);
+            let (new_cap, ovf) = b.ins().smul_overflow(cap, two);
+            b.ins().trapnz(ovf, TrapCode::INTEGER_OVERFLOW);
+            let bytes = b.ins().ishl_imm(new_cap, 3);
+            let align = b.ins().iconst(types::I64, 8);
+            let new_data_call = b.ins().call(alloc, &[bytes, align]);
+            let new_data_ptr = b.inst_results(new_data_call)[0];
+            let old_bytes = b.ins().ishl_imm(len, 3);
+            let _ = b.ins().call(memcpy, &[new_data_ptr, data_ptr, old_bytes]);
+            b.ins()
+                .store(MemFlags::new(), new_data_ptr, header_ptr, LIST_PTR_OFFSET);
+            b.ins()
+                .store(MemFlags::new(), new_cap, header_ptr, LIST_CAP_OFFSET);
+            b.ins().jump(cont_block, &[BlockArg::Value(new_data_ptr)]);
+
+            b.switch_to_block(cont_block);
+            b.seal_block(cont_block);
+            let active_data_ptr = b.block_params(cont_block)[0];
+
+            let loop_block = b.create_block();
+            let body_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(loop_block, types::I64);
+            b.ins().jump(loop_block, &[BlockArg::Value(len)]);
+
+            b.switch_to_block(loop_block);
+            let cur = b.block_params(loop_block)[0];
+            let should_shift = b.ins().icmp(IntCC::UnsignedGreaterThan, cur, idx);
+            b.ins().brif(should_shift, body_block, &[], done_block, &[]);
+
+            b.switch_to_block(body_block);
+            b.seal_block(body_block);
+            let src_index = b.ins().iadd_imm(cur, -1);
+            let src_off = b.ins().ishl_imm(src_index, 3);
+            let dst_off = b.ins().ishl_imm(cur, 3);
+            let src_ptr = b.ins().iadd(active_data_ptr, src_off);
+            let dst_ptr = b.ins().iadd(active_data_ptr, dst_off);
+            let moved = b.ins().load(types::I64, MemFlags::new(), src_ptr, 0);
+            b.ins().store(MemFlags::new(), moved, dst_ptr, 0);
+            b.ins().jump(loop_block, &[BlockArg::Value(src_index)]);
+
+            b.switch_to_block(done_block);
+            b.seal_block(done_block);
+            b.seal_block(loop_block);
+            let insert_off = b.ins().ishl_imm(idx, 3);
+            let insert_ptr = b.ins().iadd(active_data_ptr, insert_off);
+            b.ins().store(MemFlags::new(), value, insert_ptr, 0);
+            let new_len = b.ins().iadd_imm(len, 1);
+            b.ins()
+                .store(MemFlags::new(), new_len, header_ptr, LIST_LEN_OFFSET);
+            b.ins().return_(&[list]);
+        },
+    );
+}
+
+fn define_rt_list_set(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    to_i64_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let header_ptr = rt_payload_for_tag(b, p[0], VALUE_TAG_LIST);
+            let to_i64 = unsafe { (&mut *module_ptr).declare_func_in_func(to_i64_id, func) };
+            let idx_call = b.ins().call(to_i64, &[p[1]]);
+            let idx = b.inst_results(idx_call)[0];
+            let non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, idx, 0);
+            b.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let len = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_LEN_OFFSET);
+            let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            b.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let data_ptr = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_PTR_OFFSET);
+            let off = b.ins().ishl_imm(idx, 3);
+            let elem_ptr = b.ins().iadd(data_ptr, off);
+            b.ins().store(MemFlags::new(), p[2], elem_ptr, 0);
+            b.ins().return_(&[p[2]]);
+        },
+    );
+}
+
+fn define_rt_list_swap(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    to_i64_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let header_ptr = rt_payload_for_tag(b, p[0], VALUE_TAG_LIST);
+            let to_i64 = unsafe { (&mut *module_ptr).declare_func_in_func(to_i64_id, func) };
+            let i_call = b.ins().call(to_i64, &[p[1]]);
+            let i = b.inst_results(i_call)[0];
+            let j_call = b.ins().call(to_i64, &[p[2]]);
+            let j = b.inst_results(j_call)[0];
+
+            let i_non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, i, 0);
+            b.ins().trapz(i_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let j_non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, j, 0);
+            b.ins().trapz(j_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+            let len = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_LEN_OFFSET);
+            let i_in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, i, len);
+            b.ins().trapz(i_in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let j_in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, j, len);
+            b.ins().trapz(j_in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+            let data_ptr = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_PTR_OFFSET);
+            let i_off = b.ins().ishl_imm(i, 3);
+            let i_ptr = b.ins().iadd(data_ptr, i_off);
+            let j_off = b.ins().ishl_imm(j, 3);
+            let j_ptr = b.ins().iadd(data_ptr, j_off);
+            let i_value = b.ins().load(types::I64, MemFlags::new(), i_ptr, 0);
+            let j_value = b.ins().load(types::I64, MemFlags::new(), j_ptr, 0);
+            b.ins().store(MemFlags::new(), j_value, i_ptr, 0);
+            b.ins().store(MemFlags::new(), i_value, j_ptr, 0);
+            b.ins().return_(&[p[0]]);
+        },
+    );
 }
 
 fn define_rt_list_copy(

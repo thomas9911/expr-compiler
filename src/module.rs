@@ -735,8 +735,11 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
             "print"
                 | "list_new"
                 | "list_push"
+                | "list_insert"
                 | "list_len"
                 | "list_get"
+                | "list_set"
+                | "list_swap"
                 | "list_pop"
                 | "list_copy"
                 | "list_print"
@@ -749,6 +752,15 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             if !names.contains(name) {
                 names.push(name.clone());
             }
+            collect_var_names(value, names);
+        }
+        Ast::IndexAssign {
+            collection,
+            index,
+            value,
+        } => {
+            collect_var_names(collection, names);
+            collect_var_names(index, names);
             collect_var_names(value, names);
         }
         Ast::If {
@@ -796,6 +808,19 @@ fn call_binary(
 ) -> Value {
     let func_ref = require_func(func_refs, name);
     let call = builder.ins().call(func_ref, &[lhs, rhs]);
+    builder.inst_results(call)[0]
+}
+
+fn call_ternary(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    a: Value,
+    b: Value,
+    c: Value,
+) -> Value {
+    let func_ref = require_func(func_refs, name);
+    let call = builder.ins().call(func_ref, &[a, b, c]);
     builder.inst_results(call)[0]
 }
 
@@ -851,6 +876,23 @@ fn compile_ast(
                 "list_get",
                 collection_value,
                 index_value,
+            )
+        }
+        Ast::IndexAssign {
+            collection,
+            index,
+            value,
+        } => {
+            let collection_value = compile_ast(builder, collection, vars, func_refs);
+            let index_value = compile_ast(builder, index, vars, func_refs);
+            let value = compile_ast(builder, value, vars, func_refs);
+            call_ternary(
+                builder,
+                func_refs,
+                "list_set",
+                collection_value,
+                index_value,
+                value,
             )
         }
         Ast::Expression(ExpressionAst { function, args }) => {
@@ -1222,6 +1264,46 @@ fn jit_index_syntax_works() {
 }
 
 #[test]
+fn jit_list_set_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    list_set(xs, 1, 9)\n    xs[1]\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 9);
+}
+
+#[test]
+fn jit_list_insert_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [1, 3]\n    list_insert(xs, 1, 2)\n    xs[0] + xs[1] + xs[2] + list_len(xs)\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 9);
+}
+
+#[test]
+fn jit_index_assignment_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1] = 9\n    xs[1]\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 9);
+}
+
+#[test]
+fn jit_list_swap_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    list_swap(xs, 0, 2)\n    xs[0] + xs[2]\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 4);
+}
+
+#[test]
 fn jit_list_pop_works() {
     crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    x = list_pop(xs)\n    x + list_len(xs)\nend";
@@ -1276,6 +1358,27 @@ fn llvm_jit_if_else_works() {
 fn llvm_jit_lists_work() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_set_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1] = 9\n    xs[1]\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 9);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_insert_works() {
+    let src = "fn main() do\n    xs = [1, 3]\n    list_insert(xs, 1, 2)\n    xs[0] + xs[1] + xs[2] + list_len(xs)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 9);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_swap_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    list_swap(xs, 0, 2)\n    xs[0] + xs[2]\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 4);
 }
 
 #[cfg(feature = "llvm-backend")]

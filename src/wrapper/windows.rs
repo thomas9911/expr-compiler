@@ -281,6 +281,44 @@ pub extern "C" fn __expr_list_push_host(handle: i64, value: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_insert_host(handle: i64, index: i64, value: i64) -> i64 {
+    unsafe {
+        let header = &*as_list_header_ptr(handle);
+        let idx_raw = as_int(index);
+        if idx_raw < 0 {
+            runtime_abort();
+        }
+        let idx = idx_raw as usize;
+        if idx > header.len {
+            runtime_abort();
+        }
+        if header.len == header.cap {
+            let new_cap = match header.cap.checked_mul(2) {
+                Some(v) => v,
+                None => runtime_abort(),
+            };
+            let new_ptr = arena_alloc(
+                new_cap * core::mem::size_of::<i64>(),
+                core::mem::align_of::<i64>(),
+            ) as *mut i64;
+            core::ptr::copy_nonoverlapping(header.ptr, new_ptr, header.len);
+            let header_mut = &mut *as_list_header_ptr(handle);
+            header_mut.ptr = new_ptr;
+            header_mut.cap = new_cap;
+        }
+        let header = &mut *as_list_header_ptr(handle);
+        let mut pos = header.len;
+        while pos > idx {
+            *header.ptr.add(pos) = *header.ptr.add(pos - 1);
+            pos -= 1;
+        }
+        *header.ptr.add(idx) = value;
+        header.len += 1;
+        handle
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_list_len_host(handle: i64) -> i64 {
     unsafe {
         let header = &*as_list_header_ptr(handle);
@@ -301,6 +339,42 @@ pub extern "C" fn __expr_list_get_host(handle: i64, index: i64) -> i64 {
             runtime_abort();
         }
         *header.ptr.add(idx)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_set_host(handle: i64, index: i64, value: i64) -> i64 {
+    unsafe {
+        let header = &mut *as_list_header_ptr(handle);
+        let idx_raw = as_int(index);
+        if idx_raw < 0 {
+            runtime_abort();
+        }
+        let idx = idx_raw as usize;
+        if idx >= header.len {
+            runtime_abort();
+        }
+        *header.ptr.add(idx) = value;
+        value
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_swap_host(handle: i64, index_a: i64, index_b: i64) -> i64 {
+    unsafe {
+        let header = &mut *as_list_header_ptr(handle);
+        let idx_a_raw = as_int(index_a);
+        let idx_b_raw = as_int(index_b);
+        if idx_a_raw < 0 || idx_b_raw < 0 {
+            runtime_abort();
+        }
+        let idx_a = idx_a_raw as usize;
+        let idx_b = idx_b_raw as usize;
+        if idx_a >= header.len || idx_b >= header.len {
+            runtime_abort();
+        }
+        core::ptr::swap(header.ptr.add(idx_a), header.ptr.add(idx_b));
+        handle
     }
 }
 

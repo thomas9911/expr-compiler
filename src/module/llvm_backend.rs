@@ -179,11 +179,26 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "__expr_list_push_host",
                 vec![i64_type.into(), i64_type.into()],
             ),
+            (
+                "list_insert",
+                "__expr_list_insert_host",
+                vec![i64_type.into(), i64_type.into(), i64_type.into()],
+            ),
             ("list_len", "__expr_list_len_host", vec![i64_type.into()]),
             (
                 "list_get",
                 "__expr_list_get_host",
                 vec![i64_type.into(), i64_type.into()],
+            ),
+            (
+                "list_set",
+                "__expr_list_set_host",
+                vec![i64_type.into(), i64_type.into(), i64_type.into()],
+            ),
+            (
+                "list_swap",
+                "__expr_list_swap_host",
+                vec![i64_type.into(), i64_type.into(), i64_type.into()],
             ),
             ("list_pop", "__expr_list_pop_host", vec![i64_type.into()]),
             ("list_copy", "__expr_list_copy_host", vec![i64_type.into()]),
@@ -298,6 +313,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 let collection = self.compile_ast(collection, vars, function);
                 let index = self.compile_ast(index, vars, function);
                 self.call_func("list_get", &[collection, index], "list_get")
+            }
+            Ast::IndexAssign {
+                collection,
+                index,
+                value,
+            } => {
+                let collection = self.compile_ast(collection, vars, function);
+                let index = self.compile_ast(index, vars, function);
+                let value = self.compile_ast(value, vars, function);
+                self.call_func("list_set", &[collection, index, value], "list_set")
             }
             Ast::Expression(ExpressionAst {
                 function: name,
@@ -948,8 +973,14 @@ fn install_runtime_mappings<'ctx>(
         ),
         ("list_new", crate::runtime::__expr_list_new_host as usize),
         ("list_push", crate::runtime::__expr_list_push_host as usize),
+        (
+            "list_insert",
+            crate::runtime::__expr_list_insert_host as usize,
+        ),
         ("list_len", crate::runtime::__expr_list_len_host as usize),
         ("list_get", crate::runtime::__expr_list_get_host as usize),
+        ("list_set", crate::runtime::__expr_list_set_host as usize),
+        ("list_swap", crate::runtime::__expr_list_swap_host as usize),
         ("list_pop", crate::runtime::__expr_list_pop_host as usize),
         ("list_copy", crate::runtime::__expr_list_copy_host as usize),
     ];

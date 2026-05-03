@@ -379,6 +379,33 @@ pub extern "C" fn __expr_list_push_host(list: i64, value: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_insert_host(list: i64, index: i64, value: i64) -> i64 {
+    let index = raw_to_index(expect_int(index));
+    let header = list_header_ref(list);
+    if index > header.len {
+        runtime_trap("list index out of bounds");
+    }
+    if header.len == header.cap {
+        let new_cap = header
+            .cap
+            .checked_mul(2)
+            .unwrap_or_else(|| runtime_trap("integer overflow"));
+        list_grow(list, new_cap);
+    }
+
+    let header = list_header_mut(list);
+    unsafe {
+        let dst = header.ptr.add(index + 1);
+        let src = header.ptr.add(index);
+        let count = header.len - index;
+        std::ptr::copy(src, dst, count);
+        *header.ptr.add(index) = value;
+    }
+    header.len += 1;
+    list
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_list_len_host(list: i64) -> i64 {
     new_int(usize_to_i64(list_header_ref(list).len))
 }
@@ -391,6 +418,35 @@ pub extern "C" fn __expr_list_get_host(list: i64, index: i64) -> i64 {
         runtime_trap("list index out of bounds");
     }
     unsafe { *header.ptr.add(index) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_set_host(list: i64, index: i64, value: i64) -> i64 {
+    let index = raw_to_index(expect_int(index));
+    let header = list_header_mut(list);
+    if index >= header.len {
+        runtime_trap("list index out of bounds");
+    }
+    unsafe {
+        *header.ptr.add(index) = value;
+    }
+    value
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_swap_host(list: i64, index_a: i64, index_b: i64) -> i64 {
+    let index_a = raw_to_index(expect_int(index_a));
+    let index_b = raw_to_index(expect_int(index_b));
+    let header = list_header_mut(list);
+    if index_a >= header.len || index_b >= header.len {
+        runtime_trap("list index out of bounds");
+    }
+    unsafe {
+        let ptr_a = header.ptr.add(index_a);
+        let ptr_b = header.ptr.add(index_b);
+        std::ptr::swap(ptr_a, ptr_b);
+    }
+    list
 }
 
 #[unsafe(no_mangle)]
