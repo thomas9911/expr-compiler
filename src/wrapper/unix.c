@@ -5,6 +5,7 @@
 
 #define VALUE_TAG_INT 1
 #define VALUE_TAG_LIST 2
+#define VALUE_TAG_STRING 3
 
 typedef struct Value {
     uint8_t tag;
@@ -13,7 +14,7 @@ typedef struct Value {
 } Value;
 
 typedef struct ListHeader {
-    int64_t *ptr;
+    Value *ptr;
     size_t len;
     size_t cap;
 } ListHeader;
@@ -32,8 +33,7 @@ static const Value *value_ptr(int64_t handle) {
     return (const Value *)(uintptr_t)handle;
 }
 
-static void print_value_inner(int64_t handle) {
-    const Value *value = value_ptr(handle);
+static void print_value_ref(const Value *value) {
     if (value->tag == VALUE_TAG_INT) {
         printf("%" PRId64, value->payload);
         return;
@@ -45,12 +45,20 @@ static void print_value_inner(int64_t handle) {
             if (i != 0) {
                 printf(", ");
             }
-            print_value_inner(header->ptr[i]);
+            print_value_ref(&header->ptr[i]);
         }
         putchar(']');
         return;
     }
+    if (value->tag == VALUE_TAG_STRING) {
+        runtime_trap("string values are not supported yet");
+    }
     runtime_trap("unknown value tag");
+}
+
+static void print_value_inner(int64_t handle) {
+    const Value *value = value_ptr(handle);
+    print_value_ref(value);
 }
 
 int64_t __expr_print_host(int64_t handle) {

@@ -1491,7 +1491,7 @@ fn expect_int(value: i64) -> i64 {
 
 #[cfg(test)]
 fn boxed_int(value: i64) -> i64 {
-    crate::runtime::__expr_value_int_host(value)
+    crate::runtime::boxed_int_for_test(value)
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -1771,6 +1771,16 @@ fn jit_list_copy_works() {
 }
 
 #[test]
+fn jit_nested_list_works() {
+    crate::runtime::reset_runtime_arena();
+    let src = "fn main() do\n    xs = [[1, 2], [3, 4, 5]]\n    list_len(xs) + list_len(xs[1])\nend";
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit.get_fn_ptr("main");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(expect_int(func()), 5);
+}
+
+#[test]
 fn jit_list_print_returns_zero() {
     crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [4, 5, 6]\n    list_print(xs)\nend";
@@ -1805,6 +1815,13 @@ fn llvm_jit_if_else_works() {
 fn llvm_jit_lists_work() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_nested_list_works() {
+    let src = "fn main() do\n    xs = [[1, 2], [3, 4, 5]]\n    list_len(xs) + list_len(xs[1])\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 5);
 }
 
 #[cfg(feature = "llvm-backend")]

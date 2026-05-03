@@ -893,101 +893,15 @@ fn define_rt_box_value(
         &[types::I64, types::I64],
         |b, p, func| {
             let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
-            let self_ref = unsafe { (&mut *module_ptr).declare_func_in_func(id, func) };
             let size = b.ins().iconst(types::I64, VALUE_SIZE);
             let align = b.ins().iconst(types::I64, 8);
-            let int_block = b.create_block();
-            let list_block = b.create_block();
-            let done_block = b.create_block();
-            b.append_block_param(done_block, types::I64);
-
-            let is_int = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_INT);
-            b.ins().brif(is_int, int_block, &[], list_block, &[]);
-
-            b.switch_to_block(int_block);
-            b.seal_block(int_block);
             let call = b.ins().call(alloc_ref, &[size, align]);
             let ptr = b.inst_results(call)[0];
             let tag = b.ins().ireduce(types::I8, p[0]);
             b.ins().store(MemFlags::new(), tag, ptr, 0);
             b.ins()
                 .store(MemFlags::new(), p[1], ptr, VALUE_PAYLOAD_OFFSET);
-            b.ins().jump(done_block, &[BlockArg::Value(ptr)]);
-
-            b.switch_to_block(list_block);
-            b.seal_block(list_block);
-            let is_list = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_LIST);
-            b.ins().trapz(is_list, TrapCode::BAD_CONVERSION_TO_INTEGER);
-            let src_header = p[1];
-            let len = b
-                .ins()
-                .load(types::I64, MemFlags::new(), src_header, LIST_LEN_OFFSET);
-            let cap = b
-                .ins()
-                .load(types::I64, MemFlags::new(), src_header, LIST_CAP_OFFSET);
-            let src_data = b
-                .ins()
-                .load(types::I64, MemFlags::new(), src_header, LIST_PTR_OFFSET);
-
-            let handle_bytes = b.ins().ishl_imm(cap, 3);
-            let data_call = b.ins().call(alloc_ref, &[handle_bytes, align]);
-            let data_ptr = b.inst_results(data_call)[0];
-            let header_size = b.ins().iconst(types::I64, LIST_HEADER_SIZE);
-            let header_call = b.ins().call(alloc_ref, &[header_size, align]);
-            let header_ptr = b.inst_results(header_call)[0];
-            b.ins()
-                .store(MemFlags::new(), data_ptr, header_ptr, LIST_PTR_OFFSET);
-            b.ins()
-                .store(MemFlags::new(), len, header_ptr, LIST_LEN_OFFSET);
-            b.ins()
-                .store(MemFlags::new(), cap, header_ptr, LIST_CAP_OFFSET);
-
-            let loop_block = b.create_block();
-            let body_block = b.create_block();
-            let after_block = b.create_block();
-            b.append_block_param(loop_block, types::I64);
-            let zero = b.ins().iconst(types::I64, 0);
-            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
-
-            b.switch_to_block(loop_block);
-            let i = b.block_params(loop_block)[0];
-            let more = b.ins().icmp(IntCC::UnsignedLessThan, i, len);
-            b.ins().brif(more, body_block, &[], after_block, &[]);
-
-            b.switch_to_block(body_block);
-            b.seal_block(body_block);
-            let src_off = b.ins().ishl_imm(i, 4);
-            let src_elem_ptr = b.ins().iadd(src_data, src_off);
-            let elem_tag = b.ins().load(types::I64, MemFlags::new(), src_elem_ptr, 0);
-            let elem_payload = b.ins().load(
-                types::I64,
-                MemFlags::new(),
-                src_elem_ptr,
-                VALUE_PAYLOAD_OFFSET,
-            );
-            let boxed_elem_call = b.ins().call(self_ref, &[elem_tag, elem_payload]);
-            let boxed_elem = b.inst_results(boxed_elem_call)[0];
-            let dst_off = b.ins().ishl_imm(i, 3);
-            let dst_ptr = b.ins().iadd(data_ptr, dst_off);
-            b.ins().store(MemFlags::new(), boxed_elem, dst_ptr, 0);
-            let next = b.ins().iadd_imm(i, 1);
-            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
-
-            b.switch_to_block(after_block);
-            b.seal_block(after_block);
-            b.seal_block(loop_block);
-            let value_call = b.ins().call(alloc_ref, &[size, align]);
-            let value_ptr = b.inst_results(value_call)[0];
-            let list_tag = b.ins().iconst(types::I8, TAG_LIST);
-            b.ins().store(MemFlags::new(), list_tag, value_ptr, 0);
-            b.ins()
-                .store(MemFlags::new(), header_ptr, value_ptr, VALUE_PAYLOAD_OFFSET);
-            b.ins().jump(done_block, &[BlockArg::Value(value_ptr)]);
-
-            b.switch_to_block(done_block);
-            b.seal_block(done_block);
-            let out = b.block_params(done_block)[0];
-            b.ins().return_(&[out]);
+            b.ins().return_(&[ptr]);
         },
     );
 }

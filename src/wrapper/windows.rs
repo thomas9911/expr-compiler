@@ -31,6 +31,7 @@ enum ValueTag {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct Value {
     tag: ValueTag,
     _padding: [u8; 7],
@@ -39,7 +40,7 @@ struct Value {
 
 #[repr(C)]
 struct ListHeader {
-    ptr: *mut i64,
+    ptr: *mut Value,
     len: usize,
     cap: usize,
 }
@@ -158,25 +159,29 @@ fn write_i64(n: i64) {
 }
 
 fn print_value_inner(handle: i64) {
-    unsafe {
-        let ptr = value_ptr(handle);
-        match (*ptr).tag {
-            ValueTag::Int => write_i64((*ptr).payload),
+    unsafe fn print_inline_value(value: &Value) {
+        match value.tag {
+            ValueTag::Int => write_i64(value.payload),
             ValueTag::List => {
-                let header = &*((*ptr).payload as usize as *const ListHeader);
+                let header = &*(value.payload as usize as *const ListHeader);
                 write_stdout(b"[");
                 let mut i = 0usize;
                 while i < header.len {
                     if i != 0 {
                         write_stdout(b", ");
                     }
-                    print_value_inner(*header.ptr.add(i));
+                    print_inline_value(&*header.ptr.add(i));
                     i += 1;
                 }
                 write_stdout(b"]");
             }
             ValueTag::String => runtime_abort(),
         }
+    }
+
+    unsafe {
+        let ptr = value_ptr(handle);
+        print_inline_value(&*ptr);
     }
 }
 
@@ -231,11 +236,6 @@ pub extern "C" fn __CxxFrameHandler3() -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn __expr_value_int_host(raw: i64) -> i64 {
-    new_int(raw)
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn __expr_alloc_host(size: i64, align: i64) -> i64 {
     let size = usize::try_from(size).unwrap_or_else(|_| runtime_abort());
     let align = usize::try_from(align).unwrap_or_else(|_| runtime_abort());
@@ -266,9 +266,9 @@ pub extern "C" fn __expr_print_host(handle: i64) -> i64 {
 pub extern "C" fn __expr_list_new_host() -> i64 {
     unsafe {
         let data_ptr = arena_alloc(
-            LIST_INITIAL_CAPACITY * core::mem::size_of::<i64>(),
-            core::mem::align_of::<i64>(),
-        ) as *mut i64;
+            LIST_INITIAL_CAPACITY * core::mem::size_of::<Value>(),
+            core::mem::align_of::<Value>(),
+        ) as *mut Value;
         let header_ptr = arena_alloc(
             core::mem::size_of::<ListHeader>(),
             core::mem::align_of::<ListHeader>(),
@@ -290,14 +290,14 @@ pub extern "C" fn __expr_list_push_host(handle: i64, value: i64) -> i64 {
                 None => runtime_abort(),
             };
             let new_ptr = arena_alloc(
-                new_cap * core::mem::size_of::<i64>(),
-                core::mem::align_of::<i64>(),
-            ) as *mut i64;
+                new_cap * core::mem::size_of::<Value>(),
+                core::mem::align_of::<Value>(),
+            ) as *mut Value;
             core::ptr::copy_nonoverlapping(header.ptr, new_ptr, header.len);
             header.ptr = new_ptr;
             header.cap = new_cap;
         }
-        *header.ptr.add(header.len) = value;
+        *header.ptr.add(header.len) = *value_ptr(value);
         header.len += 1;
         handle
     }
@@ -321,9 +321,9 @@ pub extern "C" fn __expr_list_insert_host(handle: i64, index: i64, value: i64) -
                 None => runtime_abort(),
             };
             let new_ptr = arena_alloc(
-                new_cap * core::mem::size_of::<i64>(),
-                core::mem::align_of::<i64>(),
-            ) as *mut i64;
+                new_cap * core::mem::size_of::<Value>(),
+                core::mem::align_of::<Value>(),
+            ) as *mut Value;
             core::ptr::copy_nonoverlapping(header.ptr, new_ptr, header.len);
             let header_mut = &mut *as_list_header_ptr(handle);
             header_mut.ptr = new_ptr;
@@ -335,7 +335,7 @@ pub extern "C" fn __expr_list_insert_host(handle: i64, index: i64, value: i64) -
             *header.ptr.add(pos) = *header.ptr.add(pos - 1);
             pos -= 1;
         }
-        *header.ptr.add(idx) = value;
+        *header.ptr.add(idx) = *value_ptr(value);
         header.len += 1;
         handle
     }
@@ -361,7 +361,8 @@ pub extern "C" fn __expr_list_get_host(handle: i64, index: i64) -> i64 {
         if idx >= header.len {
             runtime_abort();
         }
-        *header.ptr.add(idx)
+        let value = *header.ptr.add(idx);
+        alloc_value(value.tag, value.payload)
     }
 }
 
@@ -377,8 +378,9 @@ pub extern "C" fn __expr_list_set_host(handle: i64, index: i64, value: i64) -> i
         if idx >= header.len {
             runtime_abort();
         }
+        let value = *value_ptr(value);
         *header.ptr.add(idx) = value;
-        value
+        alloc_value(value.tag, value.payload)
     }
 }
 
@@ -409,7 +411,8 @@ pub extern "C" fn __expr_list_pop_host(handle: i64) -> i64 {
             runtime_abort();
         }
         header.len -= 1;
-        *header.ptr.add(header.len)
+        let value = *header.ptr.add(header.len);
+        alloc_value(value.tag, value.payload)
     }
 }
 
@@ -423,9 +426,9 @@ pub extern "C" fn __expr_list_copy_host(handle: i64) -> i64 {
             src.cap
         };
         let data_ptr = arena_alloc(
-            cap * core::mem::size_of::<i64>(),
-            core::mem::align_of::<i64>(),
-        ) as *mut i64;
+            cap * core::mem::size_of::<Value>(),
+            core::mem::align_of::<Value>(),
+        ) as *mut Value;
         if src.len > 0 {
             core::ptr::copy_nonoverlapping(src.ptr, data_ptr, src.len);
         }
