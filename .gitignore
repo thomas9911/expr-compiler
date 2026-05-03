@@ -10,3 +10,4 @@
 !/examples/*/
 
 __pycache__/
+local_test.sh

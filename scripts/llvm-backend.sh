@@ -49,10 +49,10 @@ esac
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-default_llvm_root="/f/Rust/llvm-project-20.1.8.src/llvm-project-20.1.8.src/build"
 
 if [[ -z "$llvm_root" ]]; then
-    llvm_root="$default_llvm_root"
+    echo "LLVM root not configured. Set LLVM_SYS_201_PREFIX or pass --llvm-root." >&2
+    exit 1
 fi
 
 llvm_bin="$llvm_root/bin"

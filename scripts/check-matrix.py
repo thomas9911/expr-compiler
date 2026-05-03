@@ -16,10 +16,6 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 MAX_NATIVE_BINARY_SIZE = 50 * 1024
-DEFAULT_LLVM_ROOT_WINDOWS = Path(
-    "F:/Rust/llvm-project-20.1.8.src/llvm-project-20.1.8.src/build"
-)
-DEFAULT_LLVM_ROOT_UNIX = Path("/home/thomas/llvm-project-20.1.8.src/build")
 
 
 @dataclass
@@ -96,16 +92,13 @@ def resolve_examples(values: Iterable[str]) -> list[Path]:
     return resolved
 
 
-def default_llvm_root() -> Path:
-    return DEFAULT_LLVM_ROOT_WINDOWS if os.name == "nt" else DEFAULT_LLVM_ROOT_UNIX
-
-
 def llvm_env(llvm_root_arg: str | None) -> dict[str, str]:
-    llvm_root = Path(
-        llvm_root_arg
-        or os.environ.get("LLVM_SYS_201_PREFIX", "")
-        or default_llvm_root()
-    )
+    llvm_root_value = llvm_root_arg or os.environ.get("LLVM_SYS_201_PREFIX", "")
+    if not llvm_root_value:
+        raise SystemExit(
+            "LLVM root not configured. Set LLVM_SYS_201_PREFIX or pass --llvm-root."
+        )
+    llvm_root = Path(llvm_root_value)
     llvm_bin = llvm_root / "bin"
     llvm_config = llvm_bin / "llvm-config"
     if os.name == "nt" and not llvm_config.exists():
