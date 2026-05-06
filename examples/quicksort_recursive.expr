@@ -1,0 +1,42 @@
+# Recursive quicksort using lists
+fn partition(xs, pivot, index, less, greater):
+    if index == list_len(xs):
+        0
+    else:
+        value = xs[index]
+        if value < pivot:
+            list_push(less, value)
+            partition(xs, pivot, index + 1, less, greater)
+        else:
+            list_push(greater, value)
+            partition(xs, pivot, index + 1, less, greater)
+
+fn append_items(src, dst, index):
+    if index == list_len(src):
+        dst
+    else:
+        list_push(dst, src[index])
+        append_items(src, dst, index + 1)
+
+fn quicksort(xs):
+    if list_len(xs) < 2:
+        list_copy(xs)
+    else:
+        pivot = xs[0]
+        less = []
+        greater = []
+        partition(xs, pivot, 1, less, greater)
+
+        sorted_less = quicksort(less)
+        sorted_greater = quicksort(greater)
+
+        out = []
+        append_items(sorted_less, out, 0)
+        list_push(out, pivot)
+        append_items(sorted_greater, out, 0)
+
+fn main():
+    xs = [9, 1, 5, 3, 8, 2, 7, 4, 6]
+    sorted = quicksort(xs)
+    print(sorted)
+    0

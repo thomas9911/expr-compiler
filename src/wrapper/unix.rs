@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::convert::TryFrom;
 use core::panic::PanicInfo;
 use core::ptr;
 
@@ -20,9 +21,11 @@ const LIST_INITIAL_CAPACITY: usize = 1024;
 enum ValueTag {
     Int = 1,
     List = 2,
+    String = 3,
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct Value {
     tag: ValueTag,
     _padding: [u8; 7],
@@ -31,7 +34,7 @@ struct Value {
 
 #[repr(C)]
 struct ListHeader {
-    ptr: *mut i64,
+    ptr: *mut Value,
     len: usize,
     cap: usize,
 }
@@ -160,24 +163,29 @@ fn write_i64(n: i64) {
 }
 
 fn print_value_inner(handle: i64) {
-    unsafe {
-        let ptr = value_ptr(handle);
-        match (*ptr).tag {
-            ValueTag::Int => write_i64((*ptr).payload),
+    unsafe fn print_inline_value(value: &Value) {
+        match value.tag {
+            ValueTag::Int => write_i64(value.payload),
             ValueTag::List => {
-                let header = &*((*ptr).payload as usize as *const ListHeader);
+                let header = &*(value.payload as usize as *const ListHeader);
                 write_stdout(b"[");
                 let mut i = 0usize;
                 while i < header.len {
                     if i != 0 {
                         write_stdout(b", ");
                     }
-                    print_value_inner(*header.ptr.add(i));
+                    print_inline_value(&*header.ptr.add(i));
                     i += 1;
                 }
                 write_stdout(b"]");
             }
+            ValueTag::String => runtime_abort(),
         }
+    }
+
+    unsafe {
+        let ptr = value_ptr(handle);
+        print_inline_value(&*ptr);
     }
 }
 
@@ -230,8 +238,23 @@ pub extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 pub extern "C" fn rust_eh_personality() {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn __expr_value_int_host(raw: i64) -> i64 {
-    new_int(raw)
+pub extern "C" fn __expr_alloc_host(size: i64, align: i64) -> i64 {
+    let size = usize::try_from(size).unwrap_or_else(|_| runtime_abort());
+    let align = usize::try_from(align).unwrap_or_else(|_| runtime_abort());
+    if align == 0 || !align.is_power_of_two() {
+        runtime_abort();
+    }
+    unsafe { arena_alloc(size, align) as usize as i64 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
+    match tag {
+        1 => unsafe { alloc_value(ValueTag::Int, payload) },
+        2 => unsafe { alloc_value(ValueTag::List, payload) },
+        3 => unsafe { alloc_value(ValueTag::String, payload) },
+        _ => runtime_abort(),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -245,9 +268,9 @@ pub extern "C" fn __expr_print_host(handle: i64) -> i64 {
 pub extern "C" fn __expr_list_new_host() -> i64 {
     unsafe {
         let data_ptr = arena_alloc(
-            LIST_INITIAL_CAPACITY * core::mem::size_of::<i64>(),
-            core::mem::align_of::<i64>(),
-        ) as *mut i64;
+            LIST_INITIAL_CAPACITY * core::mem::size_of::<Value>(),
+            core::mem::align_of::<Value>(),
+        ) as *mut Value;
         let header_ptr = arena_alloc(
             core::mem::size_of::<ListHeader>(),
             core::mem::align_of::<ListHeader>(),
@@ -269,14 +292,52 @@ pub extern "C" fn __expr_list_push_host(handle: i64, value: i64) -> i64 {
                 None => runtime_trap("integer overflow"),
             };
             let new_ptr = arena_alloc(
-                new_cap * core::mem::size_of::<i64>(),
-                core::mem::align_of::<i64>(),
-            ) as *mut i64;
+                new_cap * core::mem::size_of::<Value>(),
+                core::mem::align_of::<Value>(),
+            ) as *mut Value;
             ptr::copy_nonoverlapping(header.ptr, new_ptr, header.len);
             header.ptr = new_ptr;
             header.cap = new_cap;
         }
-        *header.ptr.add(header.len) = value;
+        *header.ptr.add(header.len) = *value_ptr(value);
+        header.len += 1;
+        handle
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_insert_host(handle: i64, index: i64, value: i64) -> i64 {
+    let raw_index = as_int(index);
+    if raw_index < 0 {
+        runtime_trap("list index out of bounds");
+    }
+    let idx = raw_index as usize;
+    unsafe {
+        let header = &*as_list_header_ptr(handle);
+        if idx > header.len {
+            runtime_trap("list index out of bounds");
+        }
+        if header.len == header.cap {
+            let new_cap = match header.cap.checked_mul(2) {
+                Some(v) => v,
+                None => runtime_trap("integer overflow"),
+            };
+            let new_ptr = arena_alloc(
+                new_cap * core::mem::size_of::<Value>(),
+                core::mem::align_of::<Value>(),
+            ) as *mut Value;
+            ptr::copy_nonoverlapping(header.ptr, new_ptr, header.len);
+            let header_mut = &mut *as_list_header_ptr(handle);
+            header_mut.ptr = new_ptr;
+            header_mut.cap = new_cap;
+        }
+        let header = &mut *as_list_header_ptr(handle);
+        let mut pos = header.len;
+        while pos > idx {
+            *header.ptr.add(pos) = *header.ptr.add(pos - 1);
+            pos -= 1;
+        }
+        *header.ptr.add(idx) = *value_ptr(value);
         header.len += 1;
         handle
     }
@@ -302,7 +363,47 @@ pub extern "C" fn __expr_list_get_host(handle: i64, index: i64) -> i64 {
     if idx >= header.len {
         runtime_trap("list index out of bounds");
     }
-    unsafe { *header.ptr.add(idx) }
+    unsafe {
+        let value = *header.ptr.add(idx);
+        alloc_value(value.tag, value.payload)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_set_host(handle: i64, index: i64, value: i64) -> i64 {
+    let raw_index = as_int(index);
+    if raw_index < 0 {
+        runtime_trap("list index out of bounds");
+    }
+    let idx = raw_index as usize;
+    let header = unsafe { &mut *as_list_header_ptr(handle) };
+    if idx >= header.len {
+        runtime_trap("list index out of bounds");
+    }
+    unsafe {
+        let value = *value_ptr(value);
+        *header.ptr.add(idx) = value;
+        alloc_value(value.tag, value.payload)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_swap_host(handle: i64, index_a: i64, index_b: i64) -> i64 {
+    let raw_index_a = as_int(index_a);
+    let raw_index_b = as_int(index_b);
+    if raw_index_a < 0 || raw_index_b < 0 {
+        runtime_trap("list index out of bounds");
+    }
+    let idx_a = raw_index_a as usize;
+    let idx_b = raw_index_b as usize;
+    let header = unsafe { &mut *as_list_header_ptr(handle) };
+    if idx_a >= header.len || idx_b >= header.len {
+        runtime_trap("list index out of bounds");
+    }
+    unsafe {
+        ptr::swap(header.ptr.add(idx_a), header.ptr.add(idx_b));
+    }
+    handle
 }
 
 #[unsafe(no_mangle)]
@@ -312,7 +413,10 @@ pub extern "C" fn __expr_list_pop_host(handle: i64) -> i64 {
         runtime_trap("list pop on empty list");
     }
     header.len -= 1;
-    unsafe { *header.ptr.add(header.len) }
+    unsafe {
+        let value = *header.ptr.add(header.len);
+        alloc_value(value.tag, value.payload)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -320,9 +424,9 @@ pub extern "C" fn __expr_list_copy_host(handle: i64) -> i64 {
     unsafe {
         let src = &*as_list_header_ptr(handle);
         let data_ptr = arena_alloc(
-            src.cap * core::mem::size_of::<i64>(),
-            core::mem::align_of::<i64>(),
-        ) as *mut i64;
+            src.cap * core::mem::size_of::<Value>(),
+            core::mem::align_of::<Value>(),
+        ) as *mut Value;
         if src.len > 0 {
             ptr::copy_nonoverlapping(src.ptr, data_ptr, src.len);
         }
@@ -345,13 +449,12 @@ pub extern "C" fn __expr_list_print_host(handle: i64) -> i64 {
 }
 
 unsafe extern "C" {
-    fn __expr_main() -> i64;
+    fn __expr_main_i64() -> i64;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
-    let code = unsafe { __expr_main() };
-    let int_code = as_int(code);
+    let int_code = unsafe { __expr_main_i64() };
     if int_code < i32::MIN as i64 || int_code > i32::MAX as i64 {
         1
     } else {

@@ -183,13 +183,18 @@ fn main() {
                 std::process::exit(1);
             })
         };
-        let ptr = jit.get_fn_ptr(func_name);
-        let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-        let result = func();
-        let int_result = decode_int(result).unwrap_or_else(|| {
-            eprintln!("runtime error: main returned non-integer value");
-            std::process::exit(1);
-        });
+        let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(func_name) {
+            let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+            func()
+        } else {
+            let ptr = jit.get_fn_ptr(func_name);
+            let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+            let result = func();
+            decode_int(result).unwrap_or_else(|| {
+                eprintln!("runtime error: main returned non-integer value");
+                std::process::exit(1);
+            })
+        };
         std::process::exit(int_result as i32);
     }
 

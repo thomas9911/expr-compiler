@@ -45,6 +45,9 @@ impl Interpreter {
             Ast::Index { .. } => {
                 panic!("index expressions are not supported by the interpreter");
             }
+            Ast::IndexAssign { .. } => {
+                panic!("index assignments are not supported by the interpreter");
+            }
             Ast::Variable(name) => {
                 if let Some(value) = self.lookup_variable(&name).cloned() {
                     self.output = value;
