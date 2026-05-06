@@ -1,4 +1,5 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
+use crate::value::TAG_INT;
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
@@ -38,6 +39,18 @@ pub fn llvm_backend_available() -> bool {
 
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
+}
+
+#[derive(Clone, Copy)]
+struct CompiledValue {
+    tag: Value,
+    payload: Value,
+}
+
+#[derive(Clone, Copy)]
+struct LocalValueVar {
+    tag: Variable,
+    payload: Variable,
 }
 
 impl Module {
@@ -123,7 +136,7 @@ impl Module {
         let mut cranelift_module = JITModule::new(jit_builder);
 
         let (arena_base_addr, arena_offset_addr) = crate::runtime::jit_arena_addresses();
-        let mut func_ids = runtime_ir::setup_builtins_jit(
+        let builtin_ids = runtime_ir::setup_builtins_jit(
             &mut cranelift_module,
             &isa,
             &flags,
@@ -132,15 +145,17 @@ impl Module {
             arena_base_addr,
             arena_offset_addr,
         );
+        let mut internal_func_ids = builtin_ids.clone();
+        let mut int_result_func_ids = HashMap::new();
         for func_def in &self.functions {
-            let id = declare_function_sig(
+            let internal_id = declare_internal_function_sig(
                 &mut cranelift_module,
                 &isa,
                 func_def,
-                &func_def.name,
-                Linkage::Export,
+                &internal_symbol_name(&func_def.name),
+                Linkage::Local,
             );
-            func_ids.insert(func_def.name.clone(), id);
+            internal_func_ids.insert(func_def.name.clone(), internal_id);
         }
         for func_def in &self.functions {
             define_function_body(
@@ -148,16 +163,34 @@ impl Module {
                 isa.clone(),
                 &flags,
                 func_def,
-                func_ids[&func_def.name],
-                &func_ids,
+                internal_func_ids[&func_def.name],
+                &internal_func_ids,
             );
+            if func_def.inputs.is_empty() {
+                let scalar_id = declare_zero_arg_int_result_sig(
+                    &mut cranelift_module,
+                    &isa,
+                    &int_result_symbol_name(&func_def.name),
+                    Linkage::Local,
+                );
+                define_zero_arg_int_result_wrapper(
+                    &mut cranelift_module,
+                    isa.clone(),
+                    &flags,
+                    scalar_id,
+                    internal_func_ids[&func_def.name],
+                );
+                int_result_func_ids.insert(func_def.name.clone(), scalar_id);
+            }
         }
 
         cranelift_module.finalize_definitions().unwrap();
 
         CraneliftJitModule {
             module: cranelift_module,
-            func_ids,
+            func_ids: internal_func_ids.clone(),
+            internal_func_ids,
+            int_result_func_ids,
         }
     }
 
@@ -172,16 +205,17 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "ir", default_libcall_names()).unwrap(),
         );
 
-        let mut func_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let mut internal_func_ids = builtin_ids.clone();
         for func_def in &self.functions {
-            let id = declare_function_sig(
+            let id = declare_internal_function_sig(
                 &mut cranelift_module,
                 &isa,
                 func_def,
-                &func_def.name,
-                Linkage::Export,
+                &internal_symbol_name(&func_def.name),
+                Linkage::Local,
             );
-            func_ids.insert(func_def.name.clone(), id);
+            internal_func_ids.insert(func_def.name.clone(), id);
         }
 
         let mut out = String::new();
@@ -190,11 +224,12 @@ impl Module {
         // functions (printf), so we emit a pure-IR stub that returns its argument.
         // This means print() won't produce output in --run-ir mode but won't crash,
         // and the "printed" value surfaces as the function's return value.
-        let print_func_id = func_ids["print"].as_u32();
+        let print_func_id = builtin_ids["print"].as_u32();
         let print_stub = format!(
             "; builtin: print (interpreter stub — no I/O; use --run-jit for real output)\n\
-             function u0:{print_func_id}(i64) -> i64 system_v {{\n\
-             block0(v0: i64):\n    v1 = iconst.i64 0\n    return v1\n}}\n\n"
+             function u0:{print_func_id}(i64, i64) -> i64, i64 system_v {{\n\
+             block0(v0: i64, v1: i64):\n    v2 = iconst.i64 {tag_int}\n    v3 = iconst.i64 0\n    return v2, v3\n}}\n\n",
+            tag_int = TAG_INT
         );
         out.push_str(&print_stub);
 
@@ -204,8 +239,8 @@ impl Module {
                 isa.clone(),
                 &flags,
                 func_def,
-                func_ids[&func_def.name],
-                &func_ids,
+                internal_func_ids[&func_def.name],
+                &internal_func_ids,
             );
             out.push_str(&ir);
             out.push('\n');
@@ -248,16 +283,17 @@ impl Module {
             ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap(),
         );
 
-        let mut func_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let mut internal_func_ids = builtin_ids.clone();
         for func_def in &self.functions {
-            let id = declare_function_sig(
+            let internal_id = declare_internal_function_sig(
                 &mut cranelift_module,
                 &isa,
                 func_def,
-                &func_def.name,
-                Linkage::Export,
+                &internal_symbol_name(&func_def.name),
+                Linkage::Local,
             );
-            func_ids.insert(func_def.name.clone(), id);
+            internal_func_ids.insert(func_def.name.clone(), internal_id);
         }
         for func_def in &self.functions {
             define_function_body(
@@ -265,8 +301,8 @@ impl Module {
                 isa.clone(),
                 &flags,
                 func_def,
-                func_ids[&func_def.name],
-                &func_ids,
+                internal_func_ids[&func_def.name],
+                &internal_func_ids,
             );
         }
         cranelift_module.finish().emit().unwrap()
@@ -307,37 +343,45 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "exe", default_libcall_names()).unwrap(),
         );
 
-        let mut all_funcs = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
-        let mut expr_main_id: Option<FuncId> = None;
-        #[cfg(windows)]
-        let expr_main_symbol = "expr_main_entry";
-        #[cfg(not(windows))]
-        let expr_main_symbol = "__expr_main";
+        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let mut internal_func_ids = builtin_ids.clone();
+        let mut expr_main_int_id: Option<FuncId> = None;
         for func_def in &self.functions {
             if func_def.name == "main" {
-                let main_linkage = if cfg!(windows) {
-                    Linkage::Export
-                } else {
-                    Linkage::Local
-                };
-                let id = declare_function_sig(
+                let internal_id = declare_internal_function_sig(
                     &mut cranelift_module,
                     &isa,
                     func_def,
-                    expr_main_symbol,
-                    main_linkage,
-                );
-                all_funcs.insert("main".to_string(), id);
-                expr_main_id = Some(id);
-            } else {
-                let id = declare_function_sig(
-                    &mut cranelift_module,
-                    &isa,
-                    func_def,
-                    &func_def.name,
+                    &internal_symbol_name(&func_def.name),
                     Linkage::Local,
                 );
-                all_funcs.insert(func_def.name.clone(), id);
+                internal_func_ids.insert("main".to_string(), internal_id);
+                if func_def.inputs.is_empty() {
+                    #[cfg(windows)]
+                    let int_symbol = "expr_main_entry_int";
+                    #[cfg(not(windows))]
+                    let int_symbol = &int_result_symbol_name(&func_def.name);
+                    let int_id = declare_zero_arg_int_result_sig(
+                        &mut cranelift_module,
+                        &isa,
+                        int_symbol,
+                        if cfg!(windows) {
+                            Linkage::Export
+                        } else {
+                            Linkage::Local
+                        },
+                    );
+                    expr_main_int_id = Some(int_id);
+                }
+            } else {
+                let internal_id = declare_internal_function_sig(
+                    &mut cranelift_module,
+                    &isa,
+                    func_def,
+                    &internal_symbol_name(&func_def.name),
+                    Linkage::Local,
+                );
+                internal_func_ids.insert(func_def.name.clone(), internal_id);
             }
         }
         for func_def in &self.functions {
@@ -346,26 +390,24 @@ impl Module {
                 isa.clone(),
                 &flags,
                 func_def,
-                all_funcs[&func_def.name],
-                &all_funcs,
+                internal_func_ids[&func_def.name],
+                &internal_func_ids,
             );
+            if func_def.name == "main" && func_def.inputs.is_empty() {
+                define_zero_arg_int_result_wrapper(
+                    &mut cranelift_module,
+                    isa.clone(),
+                    &flags,
+                    expr_main_int_id.expect("main int wrapper id should exist"),
+                    internal_func_ids[&func_def.name],
+                );
+            }
         }
 
         #[cfg(not(windows))]
-        if let Some(id) = expr_main_id {
-            generate_c_main(
-                &mut cranelift_module,
-                isa.clone(),
-                &flags,
-                id,
-                all_funcs["__value_to_i64"],
-            );
+        if let Some(id) = expr_main_int_id {
+            generate_c_main(&mut cranelift_module, isa.clone(), &flags, id);
         }
-        #[cfg(windows)]
-        if true {
-            _ = expr_main_id;
-        }
-
         let bytes = cranelift_module.finish().emit().unwrap();
 
         #[cfg(windows)]
@@ -514,11 +556,29 @@ impl JitArtifact {
             Self::Llvm(module) => module.user_function_names().collect::<Vec<_>>().into_iter(),
         }
     }
+
+    pub fn get_internal_fn_ptr(&self, name: &str) -> Option<*const u8> {
+        match self {
+            Self::Cranelift(module) => module.get_internal_fn_ptr(name),
+            #[cfg(feature = "llvm-backend")]
+            Self::Llvm(_) => None,
+        }
+    }
+
+    pub fn get_int_result_fn_ptr(&self, name: &str) -> Option<*const u8> {
+        match self {
+            Self::Cranelift(module) => module.get_int_result_fn_ptr(name),
+            #[cfg(feature = "llvm-backend")]
+            Self::Llvm(module) => module.get_int_result_fn_ptr(name),
+        }
+    }
 }
 
 pub struct CraneliftJitModule {
     module: JITModule,
     func_ids: HashMap<String, FuncId>,
+    internal_func_ids: HashMap<String, FuncId>,
+    int_result_func_ids: HashMap<String, FuncId>,
 }
 
 impl CraneliftJitModule {
@@ -528,6 +588,18 @@ impl CraneliftJitModule {
 
     pub fn has_function(&self, name: &str) -> bool {
         self.func_ids.contains_key(name)
+    }
+
+    pub fn get_internal_fn_ptr(&self, name: &str) -> Option<*const u8> {
+        self.internal_func_ids
+            .get(name)
+            .map(|id| self.module.get_finalized_function(*id))
+    }
+
+    pub fn get_int_result_fn_ptr(&self, name: &str) -> Option<*const u8> {
+        self.int_result_func_ids
+            .get(name)
+            .map(|id| self.module.get_finalized_function(*id))
     }
 
     pub fn user_function_names(&self) -> impl Iterator<Item = &str> {
@@ -562,7 +634,7 @@ fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
     wrapper
 }
 
-fn declare_function_sig(
+fn declare_internal_function_sig(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     func_def: &FunctionDefAst,
@@ -571,9 +643,30 @@ fn declare_function_sig(
 ) -> FuncId {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
     for _ in &func_def.inputs {
         sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
     }
+    module.declare_function(name, linkage, &sig).unwrap()
+}
+
+fn internal_symbol_name(name: &str) -> String {
+    format!("__expr_internal_{name}")
+}
+
+fn int_result_symbol_name(name: &str) -> String {
+    format!("__expr_i64_{name}")
+}
+
+fn declare_zero_arg_int_result_sig(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    name: &str,
+    linkage: Linkage,
+) -> FuncId {
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.returns.push(AbiParam::new(types::I64));
     module.declare_function(name, linkage, &sig).unwrap()
 }
 
@@ -587,7 +680,9 @@ fn define_function_body(
 ) -> String {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
     for _ in &func_def.inputs {
+        sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
     }
 
@@ -608,16 +703,25 @@ fn define_function_body(
         builder.switch_to_block(block0);
         builder.seal_block(block0);
 
-        let mut vars: HashMap<String, Variable> = HashMap::new();
+        let mut vars: HashMap<String, LocalValueVar> = HashMap::new();
         for (i, name) in func_def.inputs.iter().enumerate() {
-            let var = builder.declare_var(types::I64);
-            let param_val = builder.block_params(block0)[i];
-            builder.def_var(var, param_val);
-            vars.insert(name.clone(), var);
+            let tag = builder.declare_var(types::I64);
+            let payload = builder.declare_var(types::I64);
+            let param_tag = builder.block_params(block0)[i * 2];
+            let param_payload = builder.block_params(block0)[i * 2 + 1];
+            builder.def_var(tag, param_tag);
+            builder.def_var(payload, param_payload);
+            vars.insert(name.clone(), LocalValueVar { tag, payload });
         }
         for name in local_var_names(&func_def.block) {
             if !vars.contains_key(&name) {
-                vars.insert(name, builder.declare_var(types::I64));
+                vars.insert(
+                    name,
+                    LocalValueVar {
+                        tag: builder.declare_var(types::I64),
+                        payload: builder.declare_var(types::I64),
+                    },
+                );
             }
         }
 
@@ -627,7 +731,7 @@ fn define_function_body(
         }
 
         if let Some(val) = last_val {
-            builder.ins().return_(&[val]);
+            builder.ins().return_(&[val.tag, val.payload]);
         }
 
         builder.finalize();
@@ -644,13 +748,54 @@ fn define_function_body(
     ir
 }
 
+fn define_zero_arg_int_result_wrapper(
+    module: &mut impl CraneliftModule,
+    isa: OwnedTargetIsa,
+    flags: &settings::Flags,
+    wrapper_id: FuncId,
+    internal_id: FuncId,
+) {
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.returns.push(AbiParam::new(types::I64));
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = sig;
+    ctx.func.name = UserFuncName::user(0, wrapper_id.as_u32());
+
+    let internal_ref = module.declare_func_in_func(internal_id, &mut ctx.func);
+
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+        let block0 = builder.create_block();
+        builder.switch_to_block(block0);
+        builder.seal_block(block0);
+
+        let internal_call = builder.ins().call(internal_ref, &[]);
+        let result_tag = builder.inst_results(internal_call)[0];
+        let result_payload = builder.inst_results(internal_call)[1];
+        let is_int = builder.ins().icmp_imm(IntCC::Equal, result_tag, TAG_INT);
+        builder
+            .ins()
+            .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+        builder.ins().return_(&[result_payload]);
+        builder.finalize();
+    }
+
+    let res = verify_function(&ctx.func, flags);
+    if let Err(errors) = res {
+        panic!("{}", errors);
+    }
+    module.define_function(wrapper_id, &mut ctx).unwrap();
+    module.clear_context(&mut ctx);
+}
+
 #[cfg(not(windows))]
 fn generate_c_main(
     module: &mut impl CraneliftModule,
     isa: OwnedTargetIsa,
     flags: &settings::Flags,
     expr_main_id: FuncId,
-    value_to_i64_id: FuncId,
 ) {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I32));
@@ -666,7 +811,6 @@ fn generate_c_main(
     ctx.func.name = UserFuncName::user(0, main_id.as_u32());
 
     let expr_main_ref = module.declare_func_in_func(expr_main_id, &mut ctx.func);
-    let value_to_i64_ref = module.declare_func_in_func(value_to_i64_id, &mut ctx.func);
 
     let mut fn_builder_ctx = FunctionBuilderContext::new();
     {
@@ -680,9 +824,7 @@ fn generate_c_main(
         builder.switch_to_block(block_entry);
 
         let call = builder.ins().call(expr_main_ref, &[]);
-        let result = builder.inst_results(call)[0];
-        let decode_call = builder.ins().call(value_to_i64_ref, &[result]);
-        let int_result = builder.inst_results(decode_call)[0];
+        let int_result = builder.inst_results(call)[0];
 
         let min = builder.ins().iconst(types::I64, i32::MIN as i64);
         let max = builder.ins().iconst(types::I64, i32::MAX as i64);
@@ -788,14 +930,14 @@ fn require_func(func_refs: &HashMap<String, FuncRef>, name: &str) -> FuncRef {
         .unwrap_or_else(|| panic!("builtin function '{name}' is missing"))
 }
 
-fn call_unary(
+fn call_unary_scalar(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
     name: &str,
-    arg: Value,
+    arg: CompiledValue,
 ) -> Value {
     let func_ref = require_func(func_refs, name);
-    let call = builder.ins().call(func_ref, &[arg]);
+    let call = builder.ins().call(func_ref, &[arg.tag, arg.payload]);
     builder.inst_results(call)[0]
 }
 
@@ -803,56 +945,66 @@ fn call_binary(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
     name: &str,
-    lhs: Value,
-    rhs: Value,
-) -> Value {
+    lhs: CompiledValue,
+    rhs: CompiledValue,
+) -> CompiledValue {
     let func_ref = require_func(func_refs, name);
-    let call = builder.ins().call(func_ref, &[lhs, rhs]);
-    builder.inst_results(call)[0]
+    let call = builder
+        .ins()
+        .call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
+    let results = builder.inst_results(call);
+    CompiledValue {
+        tag: results[0],
+        payload: results[1],
+    }
 }
 
 fn call_ternary(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
     name: &str,
-    a: Value,
-    b: Value,
-    c: Value,
-) -> Value {
+    a: CompiledValue,
+    b: CompiledValue,
+    c: CompiledValue,
+) -> CompiledValue {
     let func_ref = require_func(func_refs, name);
-    let call = builder.ins().call(func_ref, &[a, b, c]);
-    builder.inst_results(call)[0]
+    let call = builder.ins().call(
+        func_ref,
+        &[a.tag, a.payload, b.tag, b.payload, c.tag, c.payload],
+    );
+    let results = builder.inst_results(call);
+    CompiledValue {
+        tag: results[0],
+        payload: results[1],
+    }
 }
 
-fn boxed_int_const(
-    builder: &mut FunctionBuilder,
-    func_refs: &HashMap<String, FuncRef>,
-    value: i64,
-) -> Value {
-    let raw = builder.ins().iconst(types::I64, value);
-    call_unary(builder, func_refs, "__value_int", raw)
+fn boxed_int_const(builder: &mut FunctionBuilder, value: i64) -> CompiledValue {
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: builder.ins().iconst(types::I64, value),
+    }
 }
 
 fn compile_list_literal(
     builder: &mut FunctionBuilder,
     items: &[Ast],
-    vars: &HashMap<String, Variable>,
+    vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
-) -> Value {
+) -> CompiledValue {
     let list_new_ref = *func_refs
         .get("list_new")
         .expect("builtin function 'list_new' is missing");
-    let list_push_ref = *func_refs
-        .get("list_push")
-        .expect("builtin function 'list_push' is missing");
-
     let create_call = builder.ins().call(list_new_ref, &[]);
-    let handle = builder.inst_results(create_call)[0];
+    let created = builder.inst_results(create_call);
+    let handle = CompiledValue {
+        tag: created[0],
+        payload: created[1],
+    };
 
     for item in items {
         let value = compile_ast(builder, item, vars, func_refs);
-        let push_call = builder.ins().call(list_push_ref, &[handle, value]);
-        let _ = builder.inst_results(push_call)[0];
+        let _ = call_binary(builder, func_refs, "list_push", handle, value);
     }
 
     handle
@@ -861,11 +1013,11 @@ fn compile_list_literal(
 fn compile_ast(
     builder: &mut FunctionBuilder,
     ast: &Ast,
-    vars: &HashMap<String, Variable>,
+    vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
-) -> cranelift::prelude::Value {
+) -> CompiledValue {
     match ast {
-        Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, func_refs, *n),
+        Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, *n),
         Ast::ListLiteral(items) => compile_list_literal(builder, items, vars, func_refs),
         Ast::Index { collection, index } => {
             let collection_value = compile_ast(builder, collection, vars, func_refs);
@@ -935,8 +1087,17 @@ fn compile_ast(
                     let func_ref = func_refs
                         .get(name)
                         .unwrap_or_else(|| panic!("undefined function: {name}"));
-                    let call = builder.ins().call(*func_ref, &compiled);
-                    builder.inst_results(call)[0]
+                    let mut args = Vec::with_capacity(compiled.len() * 2);
+                    for value in &compiled {
+                        args.push(value.tag);
+                        args.push(value.payload);
+                    }
+                    let call = builder.ins().call(*func_ref, &args);
+                    let results = builder.inst_results(call);
+                    CompiledValue {
+                        tag: results[0],
+                        payload: results[1],
+                    }
                 }
             }
         }
@@ -951,14 +1112,18 @@ fn compile_ast(
             let var = vars
                 .get(name)
                 .unwrap_or_else(|| panic!("undefined variable: {name}"));
-            builder.use_var(*var)
+            CompiledValue {
+                tag: builder.use_var(var.tag),
+                payload: builder.use_var(var.payload),
+            }
         }
         Ast::Assign { name, value } => {
             let val = compile_ast(builder, value, vars, func_refs);
             let var = vars
                 .get(name)
                 .unwrap_or_else(|| panic!("undeclared variable: {name}"));
-            builder.def_var(*var, val);
+            builder.def_var(var.tag, val.tag);
+            builder.def_var(var.payload, val.payload);
             val
         }
         Ast::If {
@@ -967,11 +1132,12 @@ fn compile_ast(
             else_,
         } => {
             let cond_val = compile_ast(builder, condition, vars, func_refs);
-            let truth_value = call_unary(builder, func_refs, "__value_is_truthy", cond_val);
+            let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
             let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
 
             let then_block = builder.create_block();
             let merge_block = builder.create_block();
+            builder.append_block_param(merge_block, types::I64);
             builder.append_block_param(merge_block, types::I64);
 
             if let Some(else_block_ast) = else_ {
@@ -982,47 +1148,66 @@ fn compile_ast(
 
                 builder.switch_to_block(then_block);
                 builder.seal_block(then_block);
-                let mut then_val = boxed_int_const(builder, func_refs, 0);
+                let mut then_val = boxed_int_const(builder, 0);
                 for line in &then.lines {
                     then_val = compile_ast(builder, line, vars, func_refs);
                 }
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(then_val)]);
+                builder.ins().jump(
+                    merge_block,
+                    &[
+                        BlockArg::Value(then_val.tag),
+                        BlockArg::Value(then_val.payload),
+                    ],
+                );
 
                 builder.switch_to_block(else_block);
                 builder.seal_block(else_block);
-                let mut else_val = boxed_int_const(builder, func_refs, 0);
+                let mut else_val = boxed_int_const(builder, 0);
                 for line in &else_block_ast.lines {
                     else_val = compile_ast(builder, line, vars, func_refs);
                 }
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(else_val)]);
+                builder.ins().jump(
+                    merge_block,
+                    &[
+                        BlockArg::Value(else_val.tag),
+                        BlockArg::Value(else_val.payload),
+                    ],
+                );
             } else {
-                let boxed_zero = boxed_int_const(builder, func_refs, 0);
+                let boxed_zero = boxed_int_const(builder, 0);
                 builder.ins().brif(
                     cond_non_zero,
                     then_block,
                     &[],
                     merge_block,
-                    &[BlockArg::Value(boxed_zero)],
+                    &[
+                        BlockArg::Value(boxed_zero.tag),
+                        BlockArg::Value(boxed_zero.payload),
+                    ],
                 );
 
                 builder.switch_to_block(then_block);
                 builder.seal_block(then_block);
-                let mut then_val = boxed_int_const(builder, func_refs, 0);
+                let mut then_val = boxed_int_const(builder, 0);
                 for line in &then.lines {
                     then_val = compile_ast(builder, line, vars, func_refs);
                 }
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(then_val)]);
+                builder.ins().jump(
+                    merge_block,
+                    &[
+                        BlockArg::Value(then_val.tag),
+                        BlockArg::Value(then_val.payload),
+                    ],
+                );
             }
 
             builder.switch_to_block(merge_block);
             builder.seal_block(merge_block);
-            builder.block_params(merge_block)[0]
+            let params = builder.block_params(merge_block);
+            CompiledValue {
+                tag: params[0],
+                payload: params[1],
+            }
         }
         Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
     }
@@ -1038,31 +1223,31 @@ fn windows_temp_exe_path(base: &str) -> std::path::PathBuf {
 }
 
 #[cfg(test)]
-fn expect_int(value: i64) -> i64 {
-    crate::runtime::decode_int(value).expect("expected boxed integer")
-}
-
-#[cfg(test)]
-fn boxed_int(value: i64) -> i64 {
-    crate::runtime::__expr_value_int_host(value)
+fn assert_cranelift_jit_result(src: &str, expected: i64) {
+    crate::runtime::reset_runtime_arena();
+    let jit = Module::from_source(src).compile_to_jit();
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("cranelift int-result wrapper should exist");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), expected);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
 fn assert_jit_backend_result(src: &str, backend: CodegenBackend, expected: i64) {
     crate::runtime::reset_runtime_arena();
     let jit = Module::from_source(src).compile_to_jit_with_backend(backend);
-    let ptr = jit.get_fn_ptr("main");
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), expected);
+    assert_eq!(func(), expected);
 }
 
 #[test]
 fn jit_python_style_multi_function() {
     let src = "fn double(a):\n    a + a\n\nfn square(a):\n    a * a\n\nfn main():\n    square(25) / double(4)\n";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 78); // square(25)/double(4) = 625/8 = 78
+    assert_cranelift_jit_result(src, 78); // square(25)/double(4) = 625/8 = 78
 }
 
 #[test]
@@ -1076,58 +1261,23 @@ fn text_to_native_execute() {
     let ast = Ast::from_lexer(&mut lexer).unwrap();
 
     let jit = Module::from_ast(ast).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("cranelift int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-
-    assert_eq!(expect_int(func()), 8);
+    assert_eq!(func(), 8);
 }
 
 #[test]
 fn text_to_native_execute_with_params() {
-    use crate::parser::ParseLexer;
-    use crate::tokenizer::{self, Logos};
-
-    let src = "fn add(x, y) do\n    x + y\nend";
-    let lex = tokenizer::Token::lexer(src);
-    let mut lexer = ParseLexer::new(lex);
-    let ast = Ast::from_lexer(&mut lexer).unwrap();
-
-    let jit = Module::from_ast(ast).compile_to_jit();
-    let ptr = jit.get_fn_ptr("add");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
-
-    assert_eq!(expect_int(func(boxed_int(3), boxed_int(5))), 8);
-    assert_eq!(expect_int(func(boxed_int(10), boxed_int(-4))), 6);
+    let src = "fn add(x, y) do\n    x + y\nend\nfn main() do\n    add(10, 4)\nend";
+    assert_cranelift_jit_result(src, 14);
 }
 
 #[test]
 fn call_user_defined_function() {
-    use crate::parser::ParseLexer;
-    use crate::tokenizer::{self, Logos};
-
     let src = "fn double(x) do\n    x + x\nend\nfn main() do\n    double(21)\nend";
-    let lex = tokenizer::Token::lexer(src);
-    let mut lexer = ParseLexer::new(lex);
-
-    // parse both functions from sequential Ast::from_lexer calls
-    let ast1 = Ast::from_lexer(&mut lexer).unwrap();
-    let ast2 = Ast::from_lexer(&mut lexer).unwrap();
-
-    let mut module = Module::new();
-    module.add_function(match ast1 {
-        Ast::FunctionDef(f) => f,
-        _ => panic!(),
-    });
-    module.add_function(match ast2 {
-        Ast::FunctionDef(f) => f,
-        _ => panic!(),
-    });
-
-    let jit = module.compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-
-    assert_eq!(expect_int(func()), 42); // double(21) = 42
+    assert_cranelift_jit_result(src, 42); // double(21) = 42
 }
 
 #[test]
@@ -1191,38 +1341,26 @@ fn compile_parsed_function() {
 #[test]
 fn local_variable_assignment() {
     let src = "fn main() do\n    x = 10\n    y = x + 5\n    y * 2\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 30); // x=10, y=15, 15*2=30
+    assert_cranelift_jit_result(src, 30); // x=10, y=15, 15*2=30
 }
 
 #[test]
 fn if_without_else() {
     // returns then-value when true, 0 when false
     let src = "fn main() do\n    if 10 > 5 do\n        42\n    end\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 42);
+    assert_cranelift_jit_result(src, 42);
 }
 
 #[test]
 fn if_with_else() {
     let src = "fn main() do\n    if 3 > 5 do\n        1\n    else\n        99\n    end\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 99);
+    assert_cranelift_jit_result(src, 99);
 }
 
 #[test]
 fn if_python_style() {
     let src = "fn main():\n    x = 10\n    if x > 5:\n        x * 2\n    else:\n        x\n";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 20);
+    assert_cranelift_jit_result(src, 20);
 }
 
 #[test]
@@ -1235,102 +1373,68 @@ fn ir_contains_overflow_trap_for_add() {
 
 #[test]
 fn jit_list_builtins_work() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = list_new()\n    list_push(xs, 10)\n    list_push(xs, 32)\n    list_get(xs, 0) + list_get(xs, 1) + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 44);
+    assert_cranelift_jit_result(src, 44);
 }
 
 #[test]
 fn jit_list_literal_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [10, 32]\n    list_get(xs, 0) + list_get(xs, 1) + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 44);
+    assert_cranelift_jit_result(src, 44);
 }
 
 #[test]
 fn jit_index_syntax_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 2);
+    assert_cranelift_jit_result(src, 2);
 }
 
 #[test]
 fn jit_list_set_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    list_set(xs, 1, 9)\n    xs[1]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 9);
+    assert_cranelift_jit_result(src, 9);
 }
 
 #[test]
 fn jit_list_insert_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 3]\n    list_insert(xs, 1, 2)\n    xs[0] + xs[1] + xs[2] + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 9);
+    assert_cranelift_jit_result(src, 9);
 }
 
 #[test]
 fn jit_index_assignment_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1] = 9\n    xs[1]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 9);
+    assert_cranelift_jit_result(src, 9);
 }
 
 #[test]
 fn jit_list_swap_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    list_swap(xs, 0, 2)\n    xs[0] + xs[2]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 4);
+    assert_cranelift_jit_result(src, 4);
 }
 
 #[test]
 fn jit_list_pop_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    x = list_pop(xs)\n    x + list_len(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 5);
+    assert_cranelift_jit_result(src, 5);
 }
 
 #[test]
 fn jit_list_copy_works() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 8);
+    assert_cranelift_jit_result(src, 8);
+}
+
+#[test]
+fn jit_nested_list_works() {
+    let src = "fn main() do\n    xs = [[1, 2], [3, 4, 5]]\n    list_len(xs) + list_len(xs[1])\nend";
+    assert_cranelift_jit_result(src, 5);
 }
 
 #[test]
 fn jit_list_print_returns_zero() {
-    crate::runtime::reset_runtime_arena();
     let src = "fn main() do\n    xs = [4, 5, 6]\n    list_print(xs)\nend";
-    let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit.get_fn_ptr("main");
-    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-    assert_eq!(expect_int(func()), 0);
+    assert_cranelift_jit_result(src, 0);
 }
 
 #[cfg(feature = "llvm-backend")]
@@ -1362,6 +1466,13 @@ fn llvm_jit_lists_work() {
 
 #[cfg(feature = "llvm-backend")]
 #[test]
+fn llvm_jit_nested_list_works() {
+    let src = "fn main() do\n    xs = [[1, 2], [3, 4, 5]]\n    list_len(xs) + list_len(xs[1])\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 5);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
 fn llvm_jit_list_set_works() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1] = 9\n    xs[1]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 9);
@@ -1386,6 +1497,30 @@ fn llvm_jit_list_swap_works() {
 fn llvm_jit_list_print_returns_zero() {
     let src = "fn main() do\n    xs = [4, 5, 6]\n    list_print(xs)\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_int_result_wrapper_works() {
+    let src = "fn main() do\n    7 + 5 - 4\nend";
+    let jit = Module::from_source(src).compile_to_jit_with_backend(CodegenBackend::Llvm);
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("llvm int-result wrapper should exist");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn cranelift_jit_int_result_wrapper_works() {
+    let src = "fn main() do\n    7 + 5 - 4\nend";
+    let jit = Module::from_source(src).compile_to_jit_with_backend(CodegenBackend::Cranelift);
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("cranelift int-result wrapper should exist");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 8);
 }
 
 #[cfg(all(feature = "llvm-backend", windows))]

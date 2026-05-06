@@ -1,0 +1,45 @@
+pub const TAG_INT: i64 = 1;
+pub const TAG_LIST: i64 = 2;
+pub const TAG_STRING: i64 = 3;
+
+pub const VALUE_SIZE: i64 = 16;
+pub const VALUE_PAYLOAD_OFFSET: i32 = 8;
+pub const LIST_HEADER_SIZE: i64 = 24;
+pub const LIST_PTR_OFFSET: i32 = 0;
+pub const LIST_LEN_OFFSET: i32 = 8;
+pub const LIST_CAP_OFFSET: i32 = 16;
+
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ValueTag {
+    Int = TAG_INT as u8,
+    List = TAG_LIST as u8,
+    String = TAG_STRING as u8,
+}
+
+impl ValueTag {
+    pub fn from_raw(raw: u8) -> Option<Self> {
+        match raw as i64 {
+            TAG_INT => Some(Self::Int),
+            TAG_LIST => Some(Self::List),
+            TAG_STRING => Some(Self::String),
+            _ => None,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct Value {
+    pub tag: ValueTag,
+    pub padding: [u8; 7],
+    pub payload: i64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct ListHeader<T> {
+    pub ptr: *mut T,
+    pub len: usize,
+    pub cap: usize,
+}

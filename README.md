@@ -1,6 +1,20 @@
 # another programming language (or expression thing)
 
-Concept, have a interpreter and a 'compiled' output.
+Concept, have an interpreter and compiled output.
+
+## Runtime model
+
+The current runtime value model is:
+
+- internal compiled values are carried as `(tag, payload)` pairs
+- list elements are stored inline as full `Value` records
+- host printing is still a runtime boundary, but normal computation is pair-native
+
+Current tag usage:
+
+- `Int`
+- `List`
+- `String` is reserved in the value model, but not implemented as a language feature yet
 
 ## LLVM backend
 
