@@ -27,7 +27,23 @@ pub struct LlvmJitModule {
 pub(super) enum LlvmOutputMode {
     Jit,
     Executable,
+    Wasm,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LlvmRuntimeMode {
+    Native,
+    Wasm,
+}
+
+#[derive(Clone, Copy)]
+enum LlvmTargetKind {
+    Host,
+    Wasm,
+}
+
+const WASM_ARENA_BYTES: u32 = 16 * 1024 * 1024;
+const WASM_ARENA_BASE: u32 = 8 * 1024 * 1024;
 
 impl LlvmJitModule {
     pub fn get_fn_ptr(&self, name: &str) -> *const u8 {
@@ -69,7 +85,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
     Target::initialize_native(&InitializationConfig::default())
         .unwrap_or_else(|e| panic!("failed to initialize LLVM native target: {e}"));
 
-    let (context, module, _machine) = create_codegen_context("expr");
+    let (context, module, _machine) = create_codegen_context("expr", LlvmTargetKind::Host);
 
     let int_result_function_names = expr_module
         .functions
@@ -79,7 +95,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
         .collect::<HashSet<_>>();
 
     let functions = {
-        let mut compiler = LlvmCompiler::new(context, module);
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Jit);
         compiler.define_user_functions(&expr_module.functions);
@@ -113,9 +129,9 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
     Target::initialize_native(&InitializationConfig::default())
         .unwrap_or_else(|e| panic!("failed to initialize LLVM native target: {e}"));
 
-    let (context, module, machine) = create_codegen_context(name);
+    let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Host);
     {
-        let mut compiler = LlvmCompiler::new(context, module);
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Executable);
         compiler.define_user_functions(&expr_module.functions);
@@ -132,8 +148,31 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
     buffer.as_slice().to_vec()
 }
 
+pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u8> {
+    Target::initialize_webassembly(&InitializationConfig::default());
+
+    let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
+    {
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Wasm);
+        compiler.declare_runtime_functions();
+        compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Wasm);
+        compiler.define_user_functions(&expr_module.functions);
+        compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::Wasm);
+    }
+
+    module
+        .verify()
+        .unwrap_or_else(|e| panic!("invalid LLVM module: {e}"));
+
+    let buffer = machine
+        .write_to_memory_buffer(module, FileType::Assembly)
+        .unwrap_or_else(|e| panic!("failed to emit LLVM wasm assembly: {e}"));
+    buffer.as_slice().to_vec()
+}
+
 fn create_codegen_context(
     module_name: &str,
+    target_kind: LlvmTargetKind,
 ) -> (
     &'static Context,
     &'static LlvmModule<'static>,
@@ -142,7 +181,10 @@ fn create_codegen_context(
     let context = Box::leak(Box::new(Context::create()));
     let module = Box::leak(Box::new(context.create_module(module_name)));
 
-    let triple = TargetMachine::get_default_triple();
+    let triple = match target_kind {
+        LlvmTargetKind::Host => TargetMachine::get_default_triple(),
+        LlvmTargetKind::Wasm => inkwell::targets::TargetTriple::create("wasm32-unknown-unknown"),
+    };
     module.set_triple(&triple);
     let target = Target::from_triple(&triple).expect("host triple should be supported");
     let machine = target
@@ -165,6 +207,7 @@ struct LlvmCompiler<'ctx> {
     module: &'ctx LlvmModule<'ctx>,
     builder: Builder<'ctx>,
     i64_type: IntType<'ctx>,
+    runtime_mode: LlvmRuntimeMode,
     functions: HashMap<String, FunctionValue<'ctx>>,
 }
 
@@ -175,12 +218,17 @@ struct CompiledValue<'ctx> {
 }
 
 impl<'ctx> LlvmCompiler<'ctx> {
-    fn new(context: &'ctx Context, module: &'ctx LlvmModule<'ctx>) -> Self {
+    fn new(
+        context: &'ctx Context,
+        module: &'ctx LlvmModule<'ctx>,
+        runtime_mode: LlvmRuntimeMode,
+    ) -> Self {
         Self {
             context,
             module,
             builder: context.create_builder(),
             i64_type: context.i64_type(),
+            runtime_mode,
             functions: HashMap::new(),
         }
     }
@@ -191,30 +239,53 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
     fn declare_runtime_functions(&mut self) {
         let i64_type = self.i64_type;
-        let runtime = [
-            ("print", "__expr_print_host", vec![i64_type.into()]),
-            (
-                "list_print",
-                "__expr_list_print_host",
-                vec![i64_type.into()],
-            ),
-            (
-                "__box_value",
-                "__expr_box_value_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__alloc",
-                "__expr_alloc_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-        ];
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                let runtime = [
+                    ("print", "__expr_print_host", vec![i64_type.into()]),
+                    (
+                        "list_print",
+                        "__expr_list_print_host",
+                        vec![i64_type.into()],
+                    ),
+                    (
+                        "__box_value",
+                        "__expr_box_value_host",
+                        vec![i64_type.into(), i64_type.into()],
+                    ),
+                    (
+                        "__alloc",
+                        "__expr_alloc_host",
+                        vec![i64_type.into(), i64_type.into()],
+                    ),
+                ];
 
-        for (name, symbol, params) in runtime {
-            let function =
-                self.module
-                    .add_function(symbol, self.i64_type.fn_type(&params, false), None);
-            self.functions.insert(name.to_string(), function);
+                for (name, symbol, params) in runtime {
+                    let function =
+                        self.module
+                            .add_function(symbol, self.i64_type.fn_type(&params, false), None);
+                    self.functions.insert(name.to_string(), function);
+                }
+            }
+            LlvmRuntimeMode::Wasm => {
+                let runtime = [
+                    ("print", "__expr_wasm_print_host"),
+                    ("list_print", "__expr_wasm_list_print_host"),
+                ];
+
+                for (name, symbol) in runtime {
+                    let function = self.module.add_function(
+                        symbol,
+                        self.context
+                            .void_type()
+                            .fn_type(&[i64_type.into(), i64_type.into()], false),
+                        None,
+                    );
+                    self.functions.insert(name.to_string(), function);
+                }
+
+                self.define_wasm_allocator("__alloc", "llvm_wasm_alloc");
+            }
         }
 
         self.define_value_to_i64();
@@ -230,13 +301,25 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.define_runtime_compare("__op_lte", "llvm_rt_lte", IntPredicate::SLE);
         self.define_runtime_compare("__op_eq", "llvm_rt_eq", IntPredicate::EQ);
         self.define_runtime_compare("__op_ne", "llvm_rt_ne", IntPredicate::NE);
-        self.define_boxed_runtime_pair_wrapper("__rt_print", "llvm_rt_print", "print", 1);
-        self.define_boxed_runtime_pair_wrapper(
-            "__rt_list_print",
-            "llvm_rt_list_print",
-            "list_print",
-            1,
-        );
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                self.define_boxed_runtime_pair_wrapper("__rt_print", "llvm_rt_print", "print", 1);
+                self.define_boxed_runtime_pair_wrapper(
+                    "__rt_list_print",
+                    "llvm_rt_list_print",
+                    "list_print",
+                    1,
+                );
+            }
+            LlvmRuntimeMode::Wasm => {
+                self.define_direct_pair_print_wrapper("__rt_print", "llvm_rt_print", "print");
+                self.define_direct_pair_print_wrapper(
+                    "__rt_list_print",
+                    "llvm_rt_list_print",
+                    "list_print",
+                );
+            }
+        }
         self.define_pair_list_new("__rt_list_new", "llvm_rt_list_new");
         self.define_pair_list_push("__rt_list_push", "llvm_rt_list_push");
         self.define_pair_list_insert("__rt_list_insert", "llvm_rt_list_insert");
@@ -957,14 +1040,31 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_data_ptr_ptr"),
             )
             .expect("failed to build list data ptr gep");
-        self.builder
-            .build_load(
-                self.context.ptr_type(Default::default()),
-                data_ptr_ptr,
-                &format!("{label}_data_ptr"),
-            )
-            .expect("failed to load list data ptr")
-            .into_pointer_value()
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => self
+                .builder
+                .build_load(
+                    self.context.ptr_type(Default::default()),
+                    data_ptr_ptr,
+                    &format!("{label}_data_ptr"),
+                )
+                .expect("failed to load list data ptr")
+                .into_pointer_value(),
+            LlvmRuntimeMode::Wasm => {
+                let raw = self
+                    .builder
+                    .build_load(self.i64_type, data_ptr_ptr, &format!("{label}_data_raw"))
+                    .expect("failed to load wasm list data ptr")
+                    .into_int_value();
+                self.builder
+                    .build_int_to_ptr(
+                        raw,
+                        self.context.ptr_type(Default::default()),
+                        &format!("{label}_data_ptr"),
+                    )
+                    .expect("failed to convert wasm list data ptr")
+            }
+        }
     }
 
     fn build_list_data_ptr_store(
@@ -982,9 +1082,22 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_data_ptr_ptr"),
             )
             .expect("failed to build list data ptr gep");
-        self.builder
-            .build_store(data_ptr_ptr, data_ptr)
-            .expect("failed to store list data ptr");
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                self.builder
+                    .build_store(data_ptr_ptr, data_ptr)
+                    .expect("failed to store list data ptr");
+            }
+            LlvmRuntimeMode::Wasm => {
+                let raw = self
+                    .builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, &format!("{label}_data_raw"))
+                    .expect("failed to convert wasm list data ptr");
+                self.builder
+                    .build_store(data_ptr_ptr, raw)
+                    .expect("failed to store wasm list data ptr");
+            }
+        }
     }
 
     fn build_list_value_ptr(
@@ -1003,6 +1116,24 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     &format!("{label}_value_ptr"),
                 )
                 .expect("failed to build list value gep")
+        }
+    }
+
+    fn build_list_value_ptr_from_data_ptr(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        label: &str,
+    ) -> PointerValue<'ctx> {
+        unsafe {
+            self.builder
+                .build_gep(
+                    self.value_type(),
+                    data_ptr,
+                    &[index],
+                    &format!("{label}_value_ptr"),
+                )
+                .expect("failed to build list value gep from data ptr")
         }
     }
 
@@ -1025,6 +1156,25 @@ impl<'ctx> LlvmCompiler<'ctx> {
         CompiledValue { tag, payload }
     }
 
+    fn build_list_value_load_from_data_ptr(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let value_ptr = self.build_list_value_ptr_from_data_ptr(data_ptr, index, label);
+        let tag = self
+            .builder
+            .build_int_z_extend(
+                self.build_value_tag_load(value_ptr, label),
+                self.i64_type,
+                &format!("{label}_tag_i64"),
+            )
+            .expect("failed to extend list value tag");
+        let payload = self.build_value_payload_load(value_ptr, label);
+        CompiledValue { tag, payload }
+    }
+
     fn build_list_value_store(
         &self,
         payload: IntValue<'ctx>,
@@ -1033,6 +1183,43 @@ impl<'ctx> LlvmCompiler<'ctx> {
         label: &str,
     ) {
         let value_ptr = self.build_list_value_ptr(payload, index, label);
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(self.value_type(), value_ptr, 0, &format!("{label}_tag_ptr"))
+            .expect("failed to build list value tag gep");
+        let payload_ptr = self
+            .builder
+            .build_struct_gep(
+                self.value_type(),
+                value_ptr,
+                2,
+                &format!("{label}_payload_ptr"),
+            )
+            .expect("failed to build list value payload gep");
+        let tag = self
+            .builder
+            .build_int_truncate(
+                value.tag,
+                self.context.i8_type(),
+                &format!("{label}_tag_i8"),
+            )
+            .expect("failed to truncate list value tag");
+        self.builder
+            .build_store(tag_ptr, tag)
+            .expect("failed to store list value tag");
+        self.builder
+            .build_store(payload_ptr, value.payload)
+            .expect("failed to store list value payload");
+    }
+
+    fn build_list_value_store_from_data_ptr(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        value: CompiledValue<'ctx>,
+        label: &str,
+    ) {
+        let value_ptr = self.build_list_value_ptr_from_data_ptr(data_ptr, index, label);
         let tag_ptr = self
             .builder
             .build_struct_gep(self.value_type(), value_ptr, 0, &format!("{label}_tag_ptr"))
@@ -1100,14 +1287,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
     }
 
     fn list_header_type(&self) -> inkwell::types::StructType<'ctx> {
-        self.context.struct_type(
-            &[
-                self.context.ptr_type(Default::default()).into(),
-                self.i64_type.into(),
-                self.i64_type.into(),
-            ],
-            false,
-        )
+        let data_ptr_field = match self.runtime_mode {
+            LlvmRuntimeMode::Native => self.context.ptr_type(Default::default()).into(),
+            LlvmRuntimeMode::Wasm => self.i64_type.into(),
+        };
+        self.context
+            .struct_type(&[data_ptr_field, self.i64_type.into(), self.i64_type.into()], false)
     }
 
     fn build_value_tag_load(&self, value_ptr: PointerValue<'ctx>, label: &str) -> IntValue<'ctx> {
@@ -1500,6 +1685,33 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to return boxed runtime pair wrapper");
     }
 
+    fn define_direct_pair_print_wrapper(&mut self, name: &str, symbol: &str, import_name: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type()
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let tag = function.get_first_param().unwrap().into_int_value();
+        let payload = function.get_nth_param(1).unwrap().into_int_value();
+        let import_fn = self.require_func(import_name);
+        self.builder
+            .build_call(import_fn, &[tag.into(), payload.into()], "wasm_print")
+            .expect("failed to call wasm print import");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_INT as u64, false),
+                self.i64_type.const_zero(),
+                &format!("{symbol}_result"),
+            )))
+            .expect("failed to return direct print wrapper");
+    }
+
     fn define_pair_list_len(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
@@ -1630,6 +1842,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(grow_block);
         let alloc = self.require_func("__alloc");
         let two = self.i64_type.const_int(2, false);
+        let old_data_ptr = self.build_list_data_ptr_load(list_payload, "list_push_old_data");
         let new_cap = self
             .builder
             .build_int_mul(cap, two, "list_push_new_cap")
@@ -1675,12 +1888,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to branch list push copy loop");
 
         self.builder.position_at_end(copy_body_block);
-        let moved = self.build_list_value_load(list_payload, copy_idx, "list_push_old");
-        let new_data_payload = self
-            .builder
-            .build_ptr_to_int(new_data_ptr, self.i64_type, "list_push_new_data_payload")
-            .expect("failed to convert new data ptr");
-        self.build_list_value_store(new_data_payload, copy_idx, moved, "list_push_new");
+        let moved =
+            self.build_list_value_load_from_data_ptr(old_data_ptr, copy_idx, "list_push_old");
+        self.build_list_value_store_from_data_ptr(new_data_ptr, copy_idx, moved, "list_push_new");
         let next = self
             .builder
             .build_int_add(
@@ -1889,6 +2099,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(grow_block);
         let alloc = self.require_func("__alloc");
+        let old_data_ptr = self.build_list_data_ptr_load(list_payload, "list_insert_old_data");
         let new_cap = self
             .builder
             .build_int_mul(
@@ -1938,12 +2149,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to branch insert copy loop");
 
         self.builder.position_at_end(copy_body_block);
-        let moved = self.build_list_value_load(list_payload, copy_idx, "list_insert_old");
-        let new_data_payload = self
-            .builder
-            .build_ptr_to_int(new_data_ptr, self.i64_type, "list_insert_new_data_payload")
-            .expect("failed to convert insert data ptr");
-        self.build_list_value_store(new_data_payload, copy_idx, moved, "list_insert_new");
+        let moved = self.build_list_value_load_from_data_ptr(
+            old_data_ptr,
+            copy_idx,
+            "list_insert_old",
+        );
+        self.build_list_value_store_from_data_ptr(
+            new_data_ptr,
+            copy_idx,
+            moved,
+            "list_insert_new",
+        );
         let next = self
             .builder
             .build_int_add(
@@ -2201,7 +2417,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(body_block);
         let value = self.build_list_value_load(list_payload, idx, "list_copy_src");
-        self.build_list_value_store(new_header_raw, idx, value, "list_copy_dst");
+        self.build_list_value_store_from_data_ptr(new_data_ptr, idx, value, "list_copy_dst");
         let next = self
             .builder
             .build_int_add(idx, self.i64_type.const_int(1, false), "list_copy_next")
@@ -2219,6 +2435,88 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "list_copy_result",
             )))
             .expect("failed to return list_copy");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    fn define_wasm_allocator(&mut self, name: &str, symbol: &str) {
+        let offset = self
+            .module
+            .add_global(self.i64_type, None, "__llvm_wasm_arena_offset");
+        offset.set_linkage(Linkage::Internal);
+        offset.set_initializer(&self.i64_type.const_int(WASM_ARENA_BASE as u64, false));
+        let _ = offset.set_alignment(8);
+
+        let function = self.module.add_function(
+            symbol,
+            self.i64_type
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let size = function.get_first_param().unwrap().into_int_value();
+        let align = function.get_nth_param(1).unwrap().into_int_value();
+        let zero = self.i64_type.const_zero();
+        let align_non_zero = self
+            .builder
+            .build_int_compare(IntPredicate::NE, align, zero, "alloc_align_non_zero")
+            .expect("failed to compare wasm alloc align");
+        let old_offset = self
+            .builder
+            .build_load(self.i64_type, offset.as_pointer_value(), "alloc_old_offset")
+            .expect("failed to load wasm alloc offset")
+            .into_int_value();
+        let align_minus_one = self
+            .builder
+            .build_int_sub(align, self.i64_type.const_int(1, false), "alloc_align_minus_one")
+            .expect("failed to compute wasm alloc align");
+        let start_plus = self
+            .builder
+            .build_int_add(old_offset, align_minus_one, "alloc_start_plus")
+            .expect("failed to compute wasm alloc start");
+        let mask = self
+            .builder
+            .build_not(align_minus_one, "alloc_mask")
+            .expect("failed to compute wasm alloc mask");
+        let aligned = self
+            .builder
+            .build_and(start_plus, mask, "alloc_aligned")
+            .expect("failed to align wasm alloc");
+        let end = self
+            .builder
+            .build_int_add(aligned, size, "alloc_end")
+            .expect("failed to compute wasm alloc end");
+        let fits = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULE,
+                end,
+                self.i64_type.const_int(WASM_ARENA_BYTES as u64, false),
+                "alloc_fits",
+            )
+            .expect("failed to compare wasm alloc bounds");
+        let ok = self
+            .builder
+            .build_and(align_non_zero, fits, "alloc_ok")
+            .expect("failed to build wasm alloc guard");
+        self.builder
+            .build_conditional_branch(ok, ok_block, trap_block)
+            .expect("failed to branch in wasm allocator");
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_store(offset.as_pointer_value(), end)
+            .expect("failed to store wasm alloc offset");
+        self.builder
+            .build_return(Some(&aligned))
+            .expect("failed to return wasm alloc ptr");
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();
@@ -2360,6 +2658,10 @@ fn int_result_symbol_name(name: &str, mode: LlvmOutputMode) -> String {
         {
             return "__expr_main_i64".to_string();
         }
+    }
+
+    if name == "main" && matches!(mode, LlvmOutputMode::Wasm) {
+        return "__expr_main_i64".to_string();
     }
 
     format!("__expr_i64_{name}")

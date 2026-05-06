@@ -25,6 +25,7 @@ The repo has an optional LLVM backend behind the Cargo feature `llvm-backend`.
 - LLVM modes currently used in this repo:
   - JIT: `--run-jit --backend llvm`
   - Native compile: `--backend llvm`
+  - Core Wasm module: `--backend llvm -o out.wasm`
 
 ### Bash helper
 
@@ -36,6 +37,43 @@ bash scripts/llvm-backend.sh build
 bash scripts/llvm-backend.sh example --input fib
 bash scripts/llvm-backend.sh run --input examples/fib.expr
 bash scripts/llvm-backend.sh compile --input examples/fib.expr
+
+### LLVM core Wasm output
+
+You can emit a core WebAssembly module with the LLVM backend by choosing a
+`.wasm` output path:
+
+```bash
+cargo run --release --features llvm-backend -- examples/fib.expr --backend llvm -o fib.wasm
+```
+
+Current behavior:
+
+- emits a core Wasm module targeting `wasm32-unknown-unknown`
+- exports `__expr_main_i64`
+- exports linear memory
+- leaves print functions as imports:
+  - `__expr_wasm_print_host`
+  - `__expr_wasm_list_print_host`
+
+Tooling requirements:
+
+- `wasm-ld` must be available
+- lookup order is:
+  - `WASM_LD`
+  - `LLVM_SYS_201_PREFIX/bin/wasm-ld`
+  - `wasm-ld` from `PATH`
+
+To run a generated module under Node.js:
+
+```bash
+node scripts/run-wasm.js fib.wasm
+```
+
+Optional export override:
+
+```bash
+node scripts/run-wasm.js fib.wasm --export __expr_main_i64
 ```
 
 Equivalent `just` commands:
@@ -46,8 +84,26 @@ just llvm-build
 just llvm-example fib
 just llvm-run examples/fib.expr
 just compile-llvm-examples
+just compile-wasm-examples
+just run-wasm fib.wasm
 just run-llvm-examples
 just check-matrix
+```
+
+`just check-matrix` includes the LLVM Wasm mode and runs generated `.wasm`
+files through `scripts/run-wasm.js`.
+
+If your non-interactive shell does not expose the JavaScript runtime in `PATH`,
+you can override it explicitly:
+
+```bash
+JS_RUNTIME=node just check-matrix
+```
+
+or on systems where the executable is named differently:
+
+```bash
+JS_RUNTIME=nodejs just check-matrix
 ```
 
 ### Local test script
