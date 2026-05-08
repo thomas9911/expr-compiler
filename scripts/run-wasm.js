@@ -75,28 +75,6 @@ function printValue(tag, payload, memory) {
   console.log(renderValue(tag, payload, memory));
 }
 
-function toSigned128(low, high) {
-  const mask64 = (1n << 64n) - 1n;
-  const unsigned = (BigInt(high) << 64n) | (BigInt(low) & mask64);
-  const signBit = 1n << 127n;
-  const modulus = 1n << 128n;
-  return (unsigned & signBit) !== 0n ? unsigned - modulus : unsigned;
-}
-
-function writeSigned128(memory, ptr, value) {
-  const mem = new DataView(memory.buffer);
-  const modulus = 1n << 128n;
-  const mask64 = (1n << 64n) - 1n;
-  let normalized = value % modulus;
-  if (normalized < 0) {
-    normalized += modulus;
-  }
-  const low = normalized & mask64;
-  const high = (normalized >> 64n) & mask64;
-  mem.setBigUint64(ptr + 0, low, true);
-  mem.setBigUint64(ptr + 8, high, true);
-}
-
 async function main() {
   const { wasmPath, exportName } = parseArgs(process.argv.slice(2));
   const bytes = fs.readFileSync(wasmPath);
@@ -110,11 +88,6 @@ async function main() {
       },
       __expr_wasm_list_print_host(tag, payload) {
         printValue(Number(tag), BigInt(payload), memoryRef);
-      },
-      __multi3(dstPtr, lhsLow, lhsHigh, rhsLow, rhsHigh) {
-        const lhs = toSigned128(lhsLow, lhsHigh);
-        const rhs = toSigned128(rhsLow, rhsHigh);
-        writeSigned128(memoryRef, Number(dstPtr), lhs * rhs);
       },
     },
   };

@@ -28,6 +28,12 @@ compile-wasm-examples:
         cargo run --release --features llvm-backend -- "$file" --backend llvm -o "${file%.expr}.wasm"; \
     done
 
+compile-component-examples:
+    for file in examples/*.expr; do \
+        echo "$file"; \
+        cargo run --release --features llvm-backend,wasi -- "$file" --backend llvm -o "${file%.expr}.component.wasm"; \
+    done
+
 run-examples:
     for file in examples/*.exe; do \
         if [ -f "$file" ]; then echo "$file"; "$file"; fi; \
@@ -46,9 +52,20 @@ run-wasm file:
 
 run-wasm-examples:
     for file in examples/*.wasm; do \
-        if [ -f "$file" ]; then \
+        if [ -f "$file" ] && [ "${file%.component.wasm}" = "$file" ]; then \
             echo "$file"; \
             node scripts/run-wasm.js "$file"; \
+        fi; \
+    done
+
+run-component file:
+    wasmtime run {{ file }}
+
+run-component-examples:
+    for file in examples/*.component.wasm; do \
+        if [ -f "$file" ]; then \
+            echo "$file"; \
+            wasmtime run "$file"; \
         fi; \
     done
 

@@ -120,8 +120,18 @@ fn main() {
         .and_then(|path| path.extension())
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"));
+    let wants_component = cli
+        .output
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".component.wasm"));
     if wants_wasm && cli.backend != CodegenBackend::Llvm {
-        eprintln!("core wasm output currently supports only --backend llvm");
+        eprintln!("wasm output currently supports only --backend llvm");
+        std::process::exit(1);
+    }
+    if wants_component && !cfg!(feature = "wasi") {
+        eprintln!("component wasm output requires building with the `wasi` cargo feature");
         std::process::exit(1);
     }
 

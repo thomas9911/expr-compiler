@@ -313,6 +313,29 @@ impl Module {
     }
 
     pub fn compile_to_executable_with_backend(self, output: &Path, backend: CodegenBackend) {
+        if is_component_wasm_output(output) {
+            match backend {
+                CodegenBackend::Llvm => {
+                    #[cfg(all(feature = "llvm-backend", feature = "wasi"))]
+                    {
+                        self.compile_to_llvm_component(output);
+                        return;
+                    }
+                    #[cfg(not(all(feature = "llvm-backend", feature = "wasi")))]
+                    {
+                        let _ = output;
+                        let _ = self;
+                        panic!(
+                            "component wasm output requires the `wasi` cargo feature (which also enables `llvm-backend`)"
+                        );
+                    }
+                }
+                CodegenBackend::Cranelift => {
+                    panic!("component wasm output currently supports only the llvm backend");
+                }
+            }
+        }
+
         if is_wasm_output(output) {
             match backend {
                 CodegenBackend::Llvm => {
@@ -599,6 +622,70 @@ impl Module {
         }
         assert!(status.success(), "wasm linker failed with: {status}");
     }
+
+    #[cfg(all(feature = "llvm-backend", feature = "wasi"))]
+    fn compile_to_llvm_component(self, output: &Path) {
+        let has_zero_arg_main = self
+            .functions
+            .iter()
+            .any(|func| func.name == "main" && func.inputs.is_empty());
+        assert!(
+            has_zero_arg_main,
+            "llvm component output requires a zero-argument main function"
+        );
+
+        let asm = llvm_backend::compile_to_wasm_preview1_command_assembly(self, "llvm_component");
+        let asm_tmp = output.with_extension("component.s");
+        let obj_tmp = output.with_extension("component.o");
+        let core_tmp = output.with_extension("core.wasm");
+        std::fs::write(&asm_tmp, &asm).unwrap();
+
+        let assemble_status = Command::new(find_llvm_tool("llvm-mc"))
+            .arg("-triple=wasm32-unknown-unknown")
+            .arg("-filetype=obj")
+            .arg(&asm_tmp)
+            .arg("-o")
+            .arg(&obj_tmp)
+            .status()
+            .expect("llvm-mc not found");
+        assert!(
+            assemble_status.success(),
+            "wasm assembler failed with: {assemble_status}"
+        );
+
+        let link_status = Command::new(find_wasm_ld())
+            .arg(&obj_tmp)
+            .arg("--no-entry")
+            .arg("--export=_start")
+            .arg("--export-memory")
+            .arg(format!("--initial-memory={}", 16 * 1024 * 1024))
+            .arg("--import-undefined")
+            .arg("-o")
+            .arg(&core_tmp)
+            .status()
+            .expect("wasm-ld not found");
+        assert!(link_status.success(), "wasm linker failed with: {link_status}");
+
+        let core_bytes = std::fs::read(&core_tmp).expect("failed to read intermediate core wasm");
+        let component_bytes = wit_component::ComponentEncoder::default()
+            .module(&core_bytes)
+            .expect("failed to load core wasm into component encoder")
+            .adapter(
+                "wasi_snapshot_preview1",
+                wasi_preview1_component_adapter_provider::WASI_SNAPSHOT_PREVIEW1_COMMAND_ADAPTER,
+            )
+            .expect("failed to attach wasi preview1 command adapter")
+            .validate(true)
+            .encode()
+            .expect("failed to encode wasi component");
+        std::fs::write(output, component_bytes).expect("failed to write component output");
+
+        if output.exists() {
+            std::fs::remove_file(&asm_tmp).ok();
+            std::fs::remove_file(&obj_tmp).ok();
+            std::fs::remove_file(&core_tmp).ok();
+        }
+    }
 }
 
 pub enum JitArtifact {
@@ -716,10 +803,18 @@ fn is_wasm_output(output: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
 }
 
+fn is_component_wasm_output(output: &Path) -> bool {
+    output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".component.wasm"))
+}
+
 #[cfg(feature = "llvm-backend")]
 fn find_wasm_ld() -> std::path::PathBuf {
     find_llvm_tool("wasm-ld")
 }
+
 
 #[cfg(feature = "llvm-backend")]
 fn find_llvm_tool(tool: &str) -> std::path::PathBuf {

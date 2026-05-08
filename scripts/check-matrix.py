@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
             "llvm-jit",
             "llvm-native",
             "llvm-wasm",
+            "llvm-component",
         ],
         default=[
             "cranelift-jit",
@@ -57,6 +58,7 @@ def parse_args() -> argparse.Namespace:
             "llvm-jit",
             "llvm-native",
             "llvm-wasm",
+            "llvm-component",
         ],
         help="Modes to execute",
     )
@@ -156,6 +158,15 @@ def cargo_run_args_llvm(release: bool, extra: list[str]) -> list[str]:
     return args
 
 
+def cargo_run_args_llvm_wasi(release: bool, extra: list[str]) -> list[str]:
+    args = ["cargo", "run"]
+    if release:
+        args.append("--release")
+    args.extend(["-q", "--features", "llvm-backend,wasi", "--"])
+    args.extend(extra)
+    return args
+
+
 def binary_path_for(staging_dir: Path, example: Path) -> Path:
     stem = example.stem
     if os.name == "nt":
@@ -182,6 +193,18 @@ def js_runtime() -> str:
         "No JavaScript runtime found. Set JS_RUNTIME or ensure one of "
         "'node', 'nodejs', or 'bun' is in PATH."
     )
+
+
+def wasmtime_runtime() -> str:
+    configured = os.environ.get("WASMTIME", "")
+    if configured:
+        return configured
+
+    resolved = shutil.which("wasmtime")
+    if resolved:
+        return resolved
+
+    raise SystemExit("No Wasmtime runtime found. Set WASMTIME or ensure 'wasmtime' is in PATH.")
 
 
 def normalize_output(text: str) -> str:
@@ -303,6 +326,27 @@ def run_llvm_wasm(
     run_proc = run_command(
         "llvm-wasm-run",
         [js_runtime(), str(REPO_ROOT / "scripts" / "run-wasm.js"), str(output)],
+        env=os.environ.copy(),
+    )
+    return run_proc, output.stat().st_size
+
+
+def run_llvm_component(
+    example: Path, release: bool, llvm_root: str | None, staging_dir: Path
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    output = staging_dir / f"{example.stem}.component.wasm"
+    compile_proc = run_command(
+        "llvm-component-compile",
+        cargo_run_args_llvm_wasi(
+            release, [str(example), "--backend", "llvm", "-o", str(output)]
+        ),
+        env=llvm_env(llvm_root),
+    )
+    if compile_proc.returncode != 0:
+        return compile_proc, 0
+    run_proc = run_command(
+        "llvm-component-run",
+        [wasmtime_runtime(), "run", str(output)],
         env=os.environ.copy(),
     )
     return run_proc, output.stat().st_size
@@ -436,6 +480,25 @@ def main() -> int:
                     )
                 elif mode == "llvm-wasm":
                     proc, size = run_llvm_wasm(
+                        example, args.release, args.llvm_root, temp_dir
+                    )
+                    ok, detail = compare_to_baseline(
+                        proc,
+                        baseline_stdout=baseline_stdout,
+                        baseline_returncode=baseline.returncode,
+                    )
+                    result = RunResult(
+                        example=example.stem,
+                        name=name,
+                        ok=ok,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                        binary_size=size if proc.returncode == 0 else None,
+                        detail=detail,
+                    )
+                elif mode == "llvm-component":
+                    proc, size = run_llvm_component(
                         example, args.release, args.llvm_root, temp_dir
                     )
                     ok, detail = compare_to_baseline(

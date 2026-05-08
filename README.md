@@ -26,6 +26,7 @@ The repo has an optional LLVM backend behind the Cargo feature `llvm-backend`.
   - JIT: `--run-jit --backend llvm`
   - Native compile: `--backend llvm`
   - Core Wasm module: `--backend llvm -o out.wasm`
+  - WASI Preview 2 command component: `--features llvm-backend,wasi --backend llvm -o out.component.wasm`
 
 ### Bash helper
 
@@ -56,6 +57,36 @@ Current behavior:
   - `__expr_wasm_print_host`
   - `__expr_wasm_list_print_host`
 
+### WASI Preview 2 command component output
+
+You can emit a runnable `wasi:cli/command` component with the LLVM backend by
+choosing a `.component.wasm` output path:
+
+```bash
+cargo run --release --features llvm-backend,wasi -- examples/fib.expr --backend llvm -o fib.component.wasm
+```
+
+Current behavior:
+
+- first builds a Preview 1-style core Wasm command module
+- then wraps it into a Preview 2 component in-process via `wit-component`
+- exports a runnable `wasi:cli/command` component intended for:
+  - `wasmtime run fib.component.wasm`
+
+Additional tooling requirements:
+
+- the Cargo feature `wasi` must be enabled
+- `wasmtime` is needed if you want to run the resulting component locally
+
+The Preview 1 command adapter is embedded through the Rust crate
+`wasi-preview1-component-adapter-provider`, so no external adapter file is needed.
+
+Run with Wasmtime:
+
+```bash
+wasmtime run fib.component.wasm
+```
+
 Tooling requirements:
 
 - `wasm-ld` must be available
@@ -85,13 +116,17 @@ just llvm-example fib
 just llvm-run examples/fib.expr
 just compile-llvm-examples
 just compile-wasm-examples
+just compile-component-examples
 just run-wasm fib.wasm
+just run-component fib.component.wasm
 just run-llvm-examples
 just check-matrix
 ```
 
-`just check-matrix` includes the LLVM Wasm mode and runs generated `.wasm`
-files through `scripts/run-wasm.js`.
+`just check-matrix` includes:
+
+- LLVM core Wasm mode, run through `scripts/run-wasm.js`
+- LLVM `wasi:cli/command` component mode, run through `wasmtime run`
 
 If your non-interactive shell does not expose the JavaScript runtime in `PATH`,
 you can override it explicitly:
@@ -104,6 +139,12 @@ or on systems where the executable is named differently:
 
 ```bash
 JS_RUNTIME=nodejs just check-matrix
+```
+
+If `wasmtime` is not in `PATH`, you can override that explicitly too:
+
+```bash
+WASMTIME=/path/to/wasmtime just check-matrix
 ```
 
 ### Local test script

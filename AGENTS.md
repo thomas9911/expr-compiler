@@ -47,9 +47,14 @@ From `Justfile`:
   - Compiles each `examples/*.expr` to a native executable.
 - `just compile-llvm-examples`
   - Compiles each `examples/*.expr` through `scripts/llvm-backend.sh`.
+- `just compile-wasm-examples`
+  - Compiles each `examples/*.expr` to a core LLVM `.wasm`.
+- `just compile-component-examples`
+  - Compiles each `examples/*.expr` to a LLVM `wasi:cli/command` component (`*.component.wasm`).
+  - Requires the Cargo feature `wasi`.
 - `just check-matrix`
   - Runs `scripts/check-matrix.py --release`.
-  - Uses Cranelift JIT as the baseline and compares Cranelift/LLVM runnable modes, including LLVM Wasm.
+  - Uses Cranelift JIT as the baseline and compares Cranelift/LLVM runnable modes, including LLVM Wasm and LLVM `wasi:cli/command` components.
   - Excludes `run-ir`, because that path does not support the same stdout behavior.
   - Fails native-mode checks if a compiled executable exceeds `50 KB`.
 - `just run-examples`
@@ -58,6 +63,10 @@ From `Justfile`:
   - Linux/Unix: executable files in `examples/` without an extension
 - `just run-llvm-examples`
   - Runs each `examples/*.expr` through LLVM JIT via `scripts/llvm-backend.sh`.
+- `just run-wasm <file>`
+  - Runs a core `.wasm` through `scripts/run-wasm.js`.
+- `just run-component <file>`
+  - Runs a `wasi:cli/command` component with `wasmtime run`.
 - `just clean-examples`
   - Removes compiled example binaries on both platforms:
   - Windows: `examples/*.exe`
@@ -72,6 +81,9 @@ From `Justfile`:
 - Arena data for native/object path is zero-init (`.bss`), not embedded initialized bytes.
 - Cranelift and LLVM both use pair-valued internal execution and inline list element storage.
 - Print/list_print are still host-runtime boundaries.
+- LLVM core Wasm keeps print/list_print as custom imports for the Node runner.
+- LLVM component output is behind the Cargo feature `wasi`.
+- LLVM component output builds a Preview 1-style core command module and then adapts it to a Preview 2 `wasi:cli/command` component using the embedded adapter from `wasi-preview1-component-adapter-provider`.
 - `__expr_value_int_host` is now a compatibility/test helper, not part of the main internal execution model.
 
 ## Platform Notes
