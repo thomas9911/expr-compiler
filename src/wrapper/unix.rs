@@ -22,6 +22,7 @@ enum ValueTag {
     Int = 1,
     List = 2,
     String = 3,
+    Function = 4,
 }
 
 #[repr(C)]
@@ -180,6 +181,7 @@ fn print_value_inner(handle: i64) {
                 write_stdout(b"]");
             }
             ValueTag::String => runtime_abort(),
+            ValueTag::Function => runtime_abort(),
         }
     }
 
@@ -253,6 +255,7 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         1 => unsafe { alloc_value(ValueTag::Int, payload) },
         2 => unsafe { alloc_value(ValueTag::List, payload) },
         3 => unsafe { alloc_value(ValueTag::String, payload) },
+        4 => unsafe { alloc_value(ValueTag::Function, payload) },
         _ => runtime_abort(),
     }
 }

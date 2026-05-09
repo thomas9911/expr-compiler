@@ -11,6 +11,7 @@ Guidance for coding agents working in this repository.
   - Native executable path (object + link step).
 - Value model is pair-valued internally: `(tag, payload)`.
 - Lists store inline `Value` elements, not boxed integer handles.
+- Function values exist as tagged values and are currently used by higher-order list builtins.
 - Runtime behavior is split between:
   - IR-defined runtime builtins in `src/module/runtime_ir.rs`.
   - Host runtime helpers in `src/runtime.rs`.
@@ -26,6 +27,18 @@ Guidance for coding agents working in this repository.
 - `src/wrapper/unix.c`: small Unix C wrapper used by the Cranelift native path.
 - `examples/*.expr`: language examples.
 - `Justfile`: helper commands.
+
+## Current Language Features
+
+- Anonymous functions are supported only in the no-capture form:
+  - `fn item -> item * 2 end`
+- Higher-order list builtins are available:
+  - `list_map(xs, callback)`
+  - `list_filter(xs, callback)`
+- Callbacks must currently have arity `1`.
+- Top-level named functions can be used as function values in expression position.
+- Function values can be stored in variables and passed around.
+- Generic direct function-value calls like `f(10)` are not implemented yet.
 
 ## Build and Test
 
@@ -80,6 +93,7 @@ From `Justfile`:
 - Runtime memcpy is IR-defined (`__rt_memcpy`) to avoid external relocation issues.
 - Arena data for native/object path is zero-init (`.bss`), not embedded initialized bytes.
 - Cranelift and LLVM both use pair-valued internal execution and inline list element storage.
+- Cranelift and LLVM both lower function references to `TAG_FUNCTION + ordinal`.
 - Print/list_print are still host-runtime boundaries.
 - LLVM core Wasm keeps print/list_print as custom imports for the Node runner.
 - LLVM component output is behind the Cargo feature `wasi`.

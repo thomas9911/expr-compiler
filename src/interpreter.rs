@@ -35,6 +35,12 @@ impl Interpreter {
                 self.functions.insert(name, function);
                 self.execute_literal(LiteralAst::Integer(0));
             }
+            Ast::Lambda { .. } => {
+                panic!("anonymous functions are not supported by the interpreter");
+            }
+            Ast::FunctionRef(_) => {
+                panic!("function references are not supported by the interpreter");
+            }
             Ast::Expression(expr) => {
                 self.execute_expression(expr);
             }

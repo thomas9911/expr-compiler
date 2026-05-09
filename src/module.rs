@@ -1,5 +1,5 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
-use crate::value::TAG_INT;
+use crate::value::{TAG_FUNCTION, TAG_INT};
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
@@ -41,6 +41,11 @@ pub struct Module {
     pub functions: Vec<FunctionDefAst>,
 }
 
+struct LambdaLifter {
+    next_id: usize,
+    lifted: Vec<FunctionDefAst>,
+}
+
 #[derive(Clone, Copy)]
 struct CompiledValue {
     tag: Value,
@@ -66,7 +71,7 @@ impl Module {
         use crate::parser::ParseLexer;
         use crate::tokenizer::{Logos, Token};
 
-        let mut module = Module::new();
+        let mut functions = vec![];
         let lex = Token::lexer(source);
         let mut lexer = ParseLexer::new(lex);
 
@@ -78,28 +83,32 @@ impl Module {
                 break;
             }
             match Ast::from_lexer(&mut lexer) {
-                Ok(Ast::FunctionDef(func)) => module.functions.push(func),
+                Ok(Ast::FunctionDef(func)) => functions.push(func),
                 Ok(_) | Err(_) => break,
             }
         }
 
-        module
+        Module {
+            functions: lift_anonymous_functions(functions),
+        }
     }
 
     pub fn from_ast(ast: Ast) -> Self {
-        let mut module = Module::new();
+        let mut functions = vec![];
         match ast {
-            Ast::FunctionDef(func) => module.functions.push(func),
+            Ast::FunctionDef(func) => functions.push(func),
             Ast::Block(block) => {
                 for line in block.lines {
                     if let Ast::FunctionDef(func) = line {
-                        module.functions.push(func);
+                        functions.push(func);
                     }
                 }
             }
             _ => {}
         }
-        module
+        Module {
+            functions: lift_anonymous_functions(functions),
+        }
     }
 
     pub fn compile_to_jit(self) -> JitArtifact {
@@ -145,6 +154,8 @@ impl Module {
             arena_base_addr,
             arena_offset_addr,
         );
+        let function_ordinals = function_ordinals(&self.functions);
+        let function_arities = function_arities(&self.functions);
         let mut internal_func_ids = builtin_ids.clone();
         let mut int_result_func_ids = HashMap::new();
         for func_def in &self.functions {
@@ -165,6 +176,8 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &function_ordinals,
+                &function_arities,
             );
             if func_def.inputs.is_empty() {
                 let scalar_id = declare_zero_arg_int_result_sig(
@@ -206,6 +219,8 @@ impl Module {
         );
 
         let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let function_ordinals = function_ordinals(&self.functions);
+        let function_arities = function_arities(&self.functions);
         let mut internal_func_ids = builtin_ids.clone();
         for func_def in &self.functions {
             let id = declare_internal_function_sig(
@@ -241,6 +256,8 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &function_ordinals,
+                &function_arities,
             );
             out.push_str(&ir);
             out.push('\n');
@@ -284,6 +301,8 @@ impl Module {
         );
 
         let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let function_ordinals = function_ordinals(&self.functions);
+        let function_arities = function_arities(&self.functions);
         let mut internal_func_ids = builtin_ids.clone();
         for func_def in &self.functions {
             let internal_id = declare_internal_function_sig(
@@ -303,6 +322,8 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &function_ordinals,
+                &function_arities,
             );
         }
         cranelift_module.finish().emit().unwrap()
@@ -390,6 +411,8 @@ impl Module {
         );
 
         let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let function_ordinals = function_ordinals(&self.functions);
+        let function_arities = function_arities(&self.functions);
         let mut internal_func_ids = builtin_ids.clone();
         let mut expr_main_int_id: Option<FuncId> = None;
         for func_def in &self.functions {
@@ -438,6 +461,8 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &function_ordinals,
+                &function_arities,
             );
             if func_def.name == "main" && func_def.inputs.is_empty() {
                 define_zero_arg_int_result_wrapper(
@@ -595,7 +620,10 @@ impl Module {
             .arg(&obj_tmp)
             .status()
             .expect("llvm-mc not found");
-        assert!(assemble_status.success(), "wasm assembler failed with: {assemble_status}");
+        assert!(
+            assemble_status.success(),
+            "wasm assembler failed with: {assemble_status}"
+        );
 
         let status = Command::new(find_wasm_ld())
             .arg(&obj_tmp)
@@ -664,7 +692,10 @@ impl Module {
             .arg(&core_tmp)
             .status()
             .expect("wasm-ld not found");
-        assert!(link_status.success(), "wasm linker failed with: {link_status}");
+        assert!(
+            link_status.success(),
+            "wasm linker failed with: {link_status}"
+        );
 
         let core_bytes = std::fs::read(&core_tmp).expect("failed to read intermediate core wasm");
         let component_bytes = wit_component::ComponentEncoder::default()
@@ -815,7 +846,6 @@ fn find_wasm_ld() -> std::path::PathBuf {
     find_llvm_tool("wasm-ld")
 }
 
-
 #[cfg(feature = "llvm-backend")]
 fn find_llvm_tool(tool: &str) -> std::path::PathBuf {
     #[cfg(windows)]
@@ -882,6 +912,26 @@ fn declare_zero_arg_int_result_sig(
     module.declare_function(name, linkage, &sig).unwrap()
 }
 
+fn function_ordinals(functions: &[FunctionDefAst]) -> HashMap<String, i64> {
+    functions
+        .iter()
+        .enumerate()
+        .map(|(index, func)| {
+            (
+                func.name.clone(),
+                i64::try_from(index).expect("too many functions to assign ordinals"),
+            )
+        })
+        .collect()
+}
+
+fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
+    functions
+        .iter()
+        .map(|func| (func.name.clone(), func.inputs.len()))
+        .collect()
+}
+
 fn define_function_body(
     module: &mut impl CraneliftModule,
     isa: OwnedTargetIsa,
@@ -889,6 +939,8 @@ fn define_function_body(
     func_def: &FunctionDefAst,
     func_id: FuncId,
     all_funcs: &HashMap<String, FuncId>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
 ) -> String {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I64));
@@ -939,7 +991,14 @@ fn define_function_body(
 
         let mut last_val = None;
         for line in &func_def.block.lines {
-            last_val = Some(compile_ast(&mut builder, line, &vars, &func_refs));
+            last_val = Some(compile_ast(
+                &mut builder,
+                line,
+                &vars,
+                &func_refs,
+                function_ordinals,
+                function_arities,
+            ));
         }
 
         if let Some(val) = last_val {
@@ -1096,12 +1155,163 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "list_swap"
                 | "list_pop"
                 | "list_copy"
+                | "list_map"
+                | "list_filter"
                 | "list_print"
         )
 }
 
+fn lift_anonymous_functions(functions: Vec<FunctionDefAst>) -> Vec<FunctionDefAst> {
+    let mut lifter = LambdaLifter {
+        next_id: 0,
+        lifted: vec![],
+    };
+    let mut transformed = Vec::with_capacity(functions.len());
+    for mut function in functions {
+        lifter.lift_block(&mut function.block);
+        transformed.push(function);
+    }
+    transformed.extend(lifter.lifted);
+    transformed
+}
+
+impl LambdaLifter {
+    fn fresh_name(&mut self) -> String {
+        self.next_id += 1;
+        format!("__lambda_{}", self.next_id)
+    }
+
+    fn lift_block(&mut self, block: &mut BlockAst) {
+        for line in &mut block.lines {
+            self.lift_ast(line);
+        }
+    }
+
+    fn lift_ast(&mut self, ast: &mut Ast) {
+        match ast {
+            Ast::Lambda { inputs, body } => {
+                self.lift_ast(body);
+                validate_lambda_no_captures(body, inputs);
+                let name = self.fresh_name();
+                self.lifted.push(FunctionDefAst {
+                    name: name.clone(),
+                    inputs: inputs.clone(),
+                    output: None,
+                    block: BlockAst {
+                        lines: vec![(**body).clone()],
+                    },
+                });
+                *ast = Ast::FunctionRef(name);
+            }
+            Ast::Block(block) => self.lift_block(block),
+            Ast::Expression(ExpressionAst { args, .. }) => {
+                for arg in args {
+                    self.lift_ast(arg);
+                }
+            }
+            Ast::ListLiteral(items) => {
+                for item in items {
+                    self.lift_ast(item);
+                }
+            }
+            Ast::Index { collection, index } => {
+                self.lift_ast(collection);
+                self.lift_ast(index);
+            }
+            Ast::IndexAssign {
+                collection,
+                index,
+                value,
+            } => {
+                self.lift_ast(collection);
+                self.lift_ast(index);
+                self.lift_ast(value);
+            }
+            Ast::Assign { value, .. } => self.lift_ast(value),
+            Ast::If {
+                condition,
+                then,
+                else_,
+            } => {
+                self.lift_ast(condition);
+                self.lift_block(then);
+                if let Some(else_block) = else_ {
+                    self.lift_block(else_block);
+                }
+            }
+            Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+            Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {}
+        }
+    }
+}
+
+fn validate_lambda_no_captures(ast: &Ast, allowed_names: &[String]) {
+    match ast {
+        Ast::Variable(name) => {
+            if !allowed_names.contains(name) {
+                panic!("closures with captured variables are not implemented yet: {name}");
+            }
+        }
+        Ast::Expression(ExpressionAst { args, .. }) => {
+            for arg in args {
+                validate_lambda_no_captures(arg, allowed_names);
+            }
+        }
+        Ast::ListLiteral(items) => {
+            for item in items {
+                validate_lambda_no_captures(item, allowed_names);
+            }
+        }
+        Ast::Index { collection, index } => {
+            validate_lambda_no_captures(collection, allowed_names);
+            validate_lambda_no_captures(index, allowed_names);
+        }
+        Ast::IndexAssign {
+            collection,
+            index,
+            value,
+        } => {
+            validate_lambda_no_captures(collection, allowed_names);
+            validate_lambda_no_captures(index, allowed_names);
+            validate_lambda_no_captures(value, allowed_names);
+        }
+        Ast::If {
+            condition,
+            then,
+            else_,
+        } => {
+            validate_lambda_no_captures(condition, allowed_names);
+            for line in &then.lines {
+                validate_lambda_no_captures(line, allowed_names);
+            }
+            if let Some(else_block) = else_ {
+                for line in &else_block.lines {
+                    validate_lambda_no_captures(line, allowed_names);
+                }
+            }
+        }
+        Ast::Lambda { inputs, body } => {
+            validate_lambda_no_captures(body, inputs);
+        }
+        Ast::Block(block) => {
+            for line in &block.lines {
+                validate_lambda_no_captures(line, allowed_names);
+            }
+        }
+        Ast::Literal(_) | Ast::FunctionRef(_) => {}
+        Ast::Assign { name, .. } => {
+            panic!("assignments are not supported in anonymous functions yet: {name}");
+        }
+        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+    }
+}
+
 fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
     match ast {
+        Ast::Lambda { body, .. } => {
+            collect_var_names(body, names);
+        }
+        Ast::FunctionRef(_) => {}
         Ast::Assign { name, value } => {
             if !names.contains(name) {
                 names.push(name.clone());
@@ -1203,6 +1413,8 @@ fn compile_list_literal(
     items: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
 ) -> CompiledValue {
     let list_new_ref = *func_refs
         .get("list_new")
@@ -1215,11 +1427,337 @@ fn compile_list_literal(
     };
 
     for item in items {
-        let value = compile_ast(builder, item, vars, func_refs);
+        let value = compile_ast(
+            builder,
+            item,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+        );
         let _ = call_binary(builder, func_refs, "list_push", handle, value);
     }
 
     handle
+}
+
+fn create_empty_list(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+) -> CompiledValue {
+    let list_new_ref = *func_refs
+        .get("list_new")
+        .expect("builtin function 'list_new' is missing");
+    let create_call = builder.ins().call(list_new_ref, &[]);
+    let created = builder.inst_results(create_call);
+    CompiledValue {
+        tag: created[0],
+        payload: created[1],
+    }
+}
+
+fn validate_unary_callback_ast(
+    ast: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    builtin: &str,
+) {
+    match ast {
+        Ast::FunctionRef(name) => {
+            if function_arities.get(name) != Some(&1usize) {
+                panic!("{builtin} callback must take exactly 1 argument");
+            }
+        }
+        Ast::Variable(name) if !vars.contains_key(name) && function_ordinals.contains_key(name) => {
+            if function_arities.get(name) != Some(&1usize) {
+                panic!("{builtin} callback must take exactly 1 argument");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn call_unary(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    arg: CompiledValue,
+) -> CompiledValue {
+    let func_ref = require_func(func_refs, name);
+    let call = builder.ins().call(func_ref, &[arg.tag, arg.payload]);
+    let results = builder.inst_results(call);
+    CompiledValue {
+        tag: results[0],
+        payload: results[1],
+    }
+}
+
+fn call_named_unary(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    arg: CompiledValue,
+) -> CompiledValue {
+    let func_ref = *func_refs
+        .get(name)
+        .unwrap_or_else(|| panic!("function '{name}' is missing"));
+    let call = builder.ins().call(func_ref, &[arg.tag, arg.payload]);
+    let results = builder.inst_results(call);
+    CompiledValue {
+        tag: results[0],
+        payload: results[1],
+    }
+}
+
+fn apply_unary_function_value(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    function_value: CompiledValue,
+    arg: CompiledValue,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+) -> CompiledValue {
+    let is_function = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, function_value.tag, TAG_FUNCTION);
+    builder
+        .ins()
+        .trapz(is_function, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let mut candidates: Vec<_> = function_ordinals
+        .iter()
+        .filter_map(|(name, &ordinal)| {
+            (function_arities.get(name) == Some(&1usize)).then_some((ordinal, name.as_str()))
+        })
+        .collect();
+    candidates.sort_by_key(|(ordinal, _)| *ordinal);
+    if candidates.is_empty() {
+        panic!("no unary functions are available for higher-order list builtins");
+    }
+
+    let entry_check = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    builder.append_block_param(merge_block, types::I64);
+    builder.ins().jump(entry_check, &[]);
+
+    let mut check_block = entry_check;
+    for (index, (ordinal, name)) in candidates.iter().enumerate() {
+        builder.switch_to_block(check_block);
+        let matched = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, function_value.payload, *ordinal);
+        let call_block = builder.create_block();
+        let next_block = if index + 1 == candidates.len() {
+            None
+        } else {
+            Some(builder.create_block())
+        };
+        match next_block {
+            Some(next) => {
+                builder.ins().brif(matched, call_block, &[], next, &[]);
+            }
+            None => {
+                builder
+                    .ins()
+                    .trapz(matched, TrapCode::BAD_CONVERSION_TO_INTEGER);
+                builder.ins().jump(call_block, &[]);
+            }
+        }
+
+        builder.switch_to_block(call_block);
+        let result = call_named_unary(builder, func_refs, name, arg);
+        builder.ins().jump(
+            merge_block,
+            &[BlockArg::Value(result.tag), BlockArg::Value(result.payload)],
+        );
+        builder.seal_block(call_block);
+        builder.seal_block(check_block);
+
+        if let Some(next) = next_block {
+            check_block = next;
+        }
+    }
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    let params = builder.block_params(merge_block);
+    CompiledValue {
+        tag: params[0],
+        payload: params[1],
+    }
+}
+
+fn compile_list_map(
+    builder: &mut FunctionBuilder,
+    args: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+) -> CompiledValue {
+    assert_eq!(args.len(), 2, "list_map expects 2 arguments");
+    validate_unary_callback_ast(
+        &args[1],
+        vars,
+        function_ordinals,
+        function_arities,
+        "list_map",
+    );
+    let input = compile_ast(
+        builder,
+        &args[0],
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+    );
+    let callback = compile_ast(
+        builder,
+        &args[1],
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+    );
+    let output = create_empty_list(builder, func_refs);
+    let len = call_unary(builder, func_refs, "list_len", input);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let exit_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let has_more = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, idx, len.payload);
+    builder
+        .ins()
+        .brif(has_more, body_block, &[], exit_block, &[]);
+
+    builder.switch_to_block(body_block);
+    let index_value = CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: idx,
+    };
+    let item = call_binary(builder, func_refs, "list_get", input, index_value);
+    let mapped = apply_unary_function_value(
+        builder,
+        func_refs,
+        callback,
+        item,
+        function_ordinals,
+        function_arities,
+    );
+    let _ = call_binary(builder, func_refs, "list_push", output, mapped);
+    let next = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(exit_block);
+    builder.seal_block(loop_block);
+    builder.seal_block(body_block);
+    builder.seal_block(exit_block);
+    output
+}
+
+fn compile_list_filter(
+    builder: &mut FunctionBuilder,
+    args: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+) -> CompiledValue {
+    assert_eq!(args.len(), 2, "list_filter expects 2 arguments");
+    validate_unary_callback_ast(
+        &args[1],
+        vars,
+        function_ordinals,
+        function_arities,
+        "list_filter",
+    );
+    let input = compile_ast(
+        builder,
+        &args[0],
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+    );
+    let callback = compile_ast(
+        builder,
+        &args[1],
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+    );
+    let output = create_empty_list(builder, func_refs);
+    let len = call_unary(builder, func_refs, "list_len", input);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let push_block = builder.create_block();
+    let skip_block = builder.create_block();
+    let continue_block = builder.create_block();
+    let exit_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let has_more = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, idx, len.payload);
+    builder
+        .ins()
+        .brif(has_more, body_block, &[], exit_block, &[]);
+
+    builder.switch_to_block(body_block);
+    let index_value = CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: idx,
+    };
+    let item = call_binary(builder, func_refs, "list_get", input, index_value);
+    let predicate = apply_unary_function_value(
+        builder,
+        func_refs,
+        callback,
+        item,
+        function_ordinals,
+        function_arities,
+    );
+    let truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", predicate);
+    let keep = builder.ins().icmp_imm(IntCC::NotEqual, truth, 0);
+    builder.ins().brif(keep, push_block, &[], skip_block, &[]);
+
+    builder.switch_to_block(push_block);
+    let _ = call_binary(builder, func_refs, "list_push", output, item);
+    builder.ins().jump(continue_block, &[]);
+
+    builder.switch_to_block(skip_block);
+    builder.ins().jump(continue_block, &[]);
+
+    builder.switch_to_block(continue_block);
+    let next = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(exit_block);
+    builder.seal_block(loop_block);
+    builder.seal_block(body_block);
+    builder.seal_block(push_block);
+    builder.seal_block(skip_block);
+    builder.seal_block(continue_block);
+    builder.seal_block(exit_block);
+    output
 }
 
 fn compile_ast(
@@ -1227,13 +1765,48 @@ fn compile_ast(
     ast: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
 ) -> CompiledValue {
     match ast {
         Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, *n),
-        Ast::ListLiteral(items) => compile_list_literal(builder, items, vars, func_refs),
+        Ast::Lambda { .. } => {
+            panic!("anonymous functions are not implemented by the compiler yet");
+        }
+        Ast::FunctionRef(name) => {
+            let ordinal = *function_ordinals.get(name).unwrap_or_else(|| {
+                panic!("missing function ordinal for function reference: {name}")
+            });
+            CompiledValue {
+                tag: builder.ins().iconst(types::I64, TAG_FUNCTION),
+                payload: builder.ins().iconst(types::I64, ordinal),
+            }
+        }
+        Ast::ListLiteral(items) => compile_list_literal(
+            builder,
+            items,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+        ),
         Ast::Index { collection, index } => {
-            let collection_value = compile_ast(builder, collection, vars, func_refs);
-            let index_value = compile_ast(builder, index, vars, func_refs);
+            let collection_value = compile_ast(
+                builder,
+                collection,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+            );
+            let index_value = compile_ast(
+                builder,
+                index,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+            );
             call_binary(
                 builder,
                 func_refs,
@@ -1247,9 +1820,30 @@ fn compile_ast(
             index,
             value,
         } => {
-            let collection_value = compile_ast(builder, collection, vars, func_refs);
-            let index_value = compile_ast(builder, index, vars, func_refs);
-            let value = compile_ast(builder, value, vars, func_refs);
+            let collection_value = compile_ast(
+                builder,
+                collection,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+            );
+            let index_value = compile_ast(
+                builder,
+                index,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+            );
+            let value = compile_ast(
+                builder,
+                value,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+            );
             call_ternary(
                 builder,
                 func_refs,
@@ -1260,9 +1854,38 @@ fn compile_ast(
             )
         }
         Ast::Expression(ExpressionAst { function, args }) => {
+            if function == "list_map" {
+                return compile_list_map(
+                    builder,
+                    args,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                );
+            }
+            if function == "list_filter" {
+                return compile_list_filter(
+                    builder,
+                    args,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                );
+            }
             let compiled: Vec<_> = args
                 .iter()
-                .map(|arg| compile_ast(builder, arg, vars, func_refs))
+                .map(|arg| {
+                    compile_ast(
+                        builder,
+                        arg,
+                        vars,
+                        func_refs,
+                        function_ordinals,
+                        function_arities,
+                    )
+                })
                 .collect();
             if function.is_empty() {
                 return compiled[0];
@@ -1316,21 +1939,41 @@ fn compile_ast(
         Ast::Block(block) => {
             let mut last = None;
             for line in &block.lines {
-                last = Some(compile_ast(builder, line, vars, func_refs));
+                last = Some(compile_ast(
+                    builder,
+                    line,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                ));
             }
             last.expect("empty block")
         }
         Ast::Variable(name) => {
-            let var = vars
-                .get(name)
-                .unwrap_or_else(|| panic!("undefined variable: {name}"));
-            CompiledValue {
-                tag: builder.use_var(var.tag),
-                payload: builder.use_var(var.payload),
+            if let Some(var) = vars.get(name) {
+                CompiledValue {
+                    tag: builder.use_var(var.tag),
+                    payload: builder.use_var(var.payload),
+                }
+            } else if let Some(&ordinal) = function_ordinals.get(name) {
+                CompiledValue {
+                    tag: builder.ins().iconst(types::I64, TAG_FUNCTION),
+                    payload: builder.ins().iconst(types::I64, ordinal),
+                }
+            } else {
+                panic!("undefined variable: {name}");
             }
         }
         Ast::Assign { name, value } => {
-            let val = compile_ast(builder, value, vars, func_refs);
+            let val = compile_ast(
+                builder,
+                value,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+            );
             let var = vars
                 .get(name)
                 .unwrap_or_else(|| panic!("undeclared variable: {name}"));
@@ -1343,7 +1986,14 @@ fn compile_ast(
             then,
             else_,
         } => {
-            let cond_val = compile_ast(builder, condition, vars, func_refs);
+            let cond_val = compile_ast(
+                builder,
+                condition,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+            );
             let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
             let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
 
@@ -1362,7 +2012,14 @@ fn compile_ast(
                 builder.seal_block(then_block);
                 let mut then_val = boxed_int_const(builder, 0);
                 for line in &then.lines {
-                    then_val = compile_ast(builder, line, vars, func_refs);
+                    then_val = compile_ast(
+                        builder,
+                        line,
+                        vars,
+                        func_refs,
+                        function_ordinals,
+                        function_arities,
+                    );
                 }
                 builder.ins().jump(
                     merge_block,
@@ -1376,7 +2033,14 @@ fn compile_ast(
                 builder.seal_block(else_block);
                 let mut else_val = boxed_int_const(builder, 0);
                 for line in &else_block_ast.lines {
-                    else_val = compile_ast(builder, line, vars, func_refs);
+                    else_val = compile_ast(
+                        builder,
+                        line,
+                        vars,
+                        func_refs,
+                        function_ordinals,
+                        function_arities,
+                    );
                 }
                 builder.ins().jump(
                     merge_block,
@@ -1402,7 +2066,14 @@ fn compile_ast(
                 builder.seal_block(then_block);
                 let mut then_val = boxed_int_const(builder, 0);
                 for line in &then.lines {
-                    then_val = compile_ast(builder, line, vars, func_refs);
+                    then_val = compile_ast(
+                        builder,
+                        line,
+                        vars,
+                        func_refs,
+                        function_ordinals,
+                        function_arities,
+                    );
                 }
                 builder.ins().jump(
                     merge_block,
@@ -1596,6 +2267,38 @@ fn jit_list_literal_works() {
 }
 
 #[test]
+fn jit_list_map_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, fn item -> item * 2 end)\n    ys[0] + ys[1] + ys[2]\nend";
+    assert_cranelift_jit_result(src, 12);
+}
+
+#[test]
+fn jit_list_map_accepts_function_values_in_variables() {
+    let src = "fn main() do\n    f = fn item -> item * 2 end\n    xs = [1, 2, 3]\n    ys = list_map(xs, f)\n    ys[0] + ys[1] + ys[2]\nend";
+    assert_cranelift_jit_result(src, 12);
+}
+
+#[test]
+fn jit_list_map_accepts_named_functions_as_values() {
+    let src = "fn double(item) do\n    item * 2\nend\nfn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, double)\n    ys[0] + ys[1] + ys[2]\nend";
+    assert_cranelift_jit_result(src, 12);
+}
+
+#[test]
+fn jit_list_filter_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3, 4]\n    ys = list_filter(xs, fn item -> item % 2 end)\n    list_len(ys)\nend";
+    assert_cranelift_jit_result(src, 2);
+}
+
+#[test]
+#[should_panic(expected = "list_map callback must take exactly 1 argument")]
+fn jit_list_map_rejects_non_unary_callbacks() {
+    let src =
+        "fn main() do\n    xs = [1, 2, 3]\n    list_map(xs, fn a, b -> a + b end)\n    0\nend";
+    let _ = Module::from_source(src).compile_to_jit();
+}
+
+#[test]
 fn jit_index_syntax_works() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    xs[1]\nend";
     assert_cranelift_jit_result(src, 2);
@@ -1649,6 +2352,31 @@ fn jit_list_print_returns_zero() {
     assert_cranelift_jit_result(src, 0);
 }
 
+#[test]
+fn anonymous_functions_are_lifted_into_hidden_functions() {
+    let module =
+        Module::from_source("fn main() do\n    list_map(xs, fn item -> item * 2 end)\nend");
+
+    assert_eq!(module.functions.len(), 2);
+    assert_eq!(module.functions[0].name, "main");
+    assert_eq!(module.functions[1].name, "__lambda_1");
+    assert_eq!(module.functions[1].inputs, vec!["item".to_string()]);
+
+    match &module.functions[0].block.lines[0] {
+        Ast::Expression(ExpressionAst { function, args }) => {
+            assert_eq!(function, "list_map");
+            assert!(matches!(args[1], Ast::FunctionRef(_)));
+        }
+        other => panic!("unexpected lifted main body: {other:?}"),
+    }
+}
+
+#[test]
+#[should_panic(expected = "closures with captured variables are not implemented yet: a")]
+fn anonymous_functions_reject_captures() {
+    let _ = Module::from_source("fn main() do\n    list_filter(xs, fn item -> item == a end)\nend");
+}
+
 #[cfg(feature = "llvm-backend")]
 #[test]
 fn llvm_jit_arithmetic_works() {
@@ -1674,6 +2402,34 @@ fn llvm_jit_if_else_works() {
 fn llvm_jit_lists_work() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_map_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, fn item -> item * 2 end)\n    ys[0] + ys[1] + ys[2]\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 12);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_map_accepts_function_values_in_variables() {
+    let src = "fn main() do\n    f = fn item -> item * 2 end\n    xs = [1, 2, 3]\n    ys = list_map(xs, f)\n    ys[0] + ys[1] + ys[2]\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 12);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_map_accepts_named_functions_as_values() {
+    let src = "fn double(item) do\n    item * 2\nend\nfn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, double)\n    ys[0] + ys[1] + ys[2]\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 12);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_filter_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3, 4]\n    ys = list_filter(xs, fn item -> item % 2 end)\n    list_len(ys)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 2);
 }
 
 #[cfg(feature = "llvm-backend")]

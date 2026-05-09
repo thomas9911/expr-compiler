@@ -1,6 +1,7 @@
 pub const TAG_INT: i64 = 1;
 pub const TAG_LIST: i64 = 2;
 pub const TAG_STRING: i64 = 3;
+pub const TAG_FUNCTION: i64 = 4;
 
 pub const VALUE_SIZE: i64 = 16;
 pub const VALUE_PAYLOAD_OFFSET: i32 = 8;
@@ -15,6 +16,7 @@ pub enum ValueTag {
     Int = TAG_INT as u8,
     List = TAG_LIST as u8,
     String = TAG_STRING as u8,
+    Function = TAG_FUNCTION as u8,
 }
 
 impl ValueTag {
@@ -23,6 +25,7 @@ impl ValueTag {
             TAG_INT => Some(Self::Int),
             TAG_LIST => Some(Self::List),
             TAG_STRING => Some(Self::String),
+            TAG_FUNCTION => Some(Self::Function),
             _ => None,
         }
     }
