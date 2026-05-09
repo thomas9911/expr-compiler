@@ -1,6 +1,8 @@
 use super::{Module, is_builtin_name, local_var_names};
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{TAG_INT, TAG_LIST};
+#[cfg(feature = "wasi")]
+use inkwell::attributes::AttributeLoc;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
@@ -27,7 +29,27 @@ pub struct LlvmJitModule {
 pub(super) enum LlvmOutputMode {
     Jit,
     Executable,
+    Wasm,
+    #[cfg(feature = "wasi")]
+    WasiPreview1Command,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LlvmRuntimeMode {
+    Native,
+    Wasm,
+    #[cfg(feature = "wasi")]
+    WasiPreview1Command,
+}
+
+#[derive(Clone, Copy)]
+enum LlvmTargetKind {
+    Host,
+    Wasm,
+}
+
+const WASM_ARENA_BYTES: u32 = 16 * 1024 * 1024;
+const WASM_ARENA_BASE: u32 = 8 * 1024 * 1024;
 
 impl LlvmJitModule {
     pub fn get_fn_ptr(&self, name: &str) -> *const u8 {
@@ -69,7 +91,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
     Target::initialize_native(&InitializationConfig::default())
         .unwrap_or_else(|e| panic!("failed to initialize LLVM native target: {e}"));
 
-    let (context, module, _machine) = create_codegen_context("expr");
+    let (context, module, _machine) = create_codegen_context("expr", LlvmTargetKind::Host);
 
     let int_result_function_names = expr_module
         .functions
@@ -79,7 +101,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
         .collect::<HashSet<_>>();
 
     let functions = {
-        let mut compiler = LlvmCompiler::new(context, module);
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Jit);
         compiler.define_user_functions(&expr_module.functions);
@@ -113,9 +135,9 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
     Target::initialize_native(&InitializationConfig::default())
         .unwrap_or_else(|e| panic!("failed to initialize LLVM native target: {e}"));
 
-    let (context, module, machine) = create_codegen_context(name);
+    let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Host);
     {
-        let mut compiler = LlvmCompiler::new(context, module);
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Executable);
         compiler.define_user_functions(&expr_module.functions);
@@ -132,8 +154,56 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
     buffer.as_slice().to_vec()
 }
 
+pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u8> {
+    Target::initialize_webassembly(&InitializationConfig::default());
+
+    let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
+    {
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Wasm);
+        compiler.declare_runtime_functions();
+        compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Wasm);
+        compiler.define_user_functions(&expr_module.functions);
+        compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::Wasm);
+    }
+
+    module
+        .verify()
+        .unwrap_or_else(|e| panic!("invalid LLVM module: {e}"));
+
+    let buffer = machine
+        .write_to_memory_buffer(module, FileType::Assembly)
+        .unwrap_or_else(|e| panic!("failed to emit LLVM wasm assembly: {e}"));
+    buffer.as_slice().to_vec()
+}
+
+#[cfg(feature = "wasi")]
+pub(super) fn compile_to_wasm_preview1_command_assembly(expr_module: Module, name: &str) -> Vec<u8> {
+    Target::initialize_webassembly(&InitializationConfig::default());
+
+    let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
+    {
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);
+        compiler.declare_runtime_functions();
+        compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::WasiPreview1Command);
+        compiler.define_user_functions(&expr_module.functions);
+        compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::WasiPreview1Command);
+        #[cfg(feature = "wasi")]
+        compiler.define_wasi_preview1_command_start_wrapper();
+    }
+
+    module
+        .verify()
+        .unwrap_or_else(|e| panic!("invalid LLVM module: {e}"));
+
+    let buffer = machine
+        .write_to_memory_buffer(module, FileType::Assembly)
+        .unwrap_or_else(|e| panic!("failed to emit LLVM preview1 command assembly: {e}"));
+    buffer.as_slice().to_vec()
+}
+
 fn create_codegen_context(
     module_name: &str,
+    target_kind: LlvmTargetKind,
 ) -> (
     &'static Context,
     &'static LlvmModule<'static>,
@@ -142,7 +212,10 @@ fn create_codegen_context(
     let context = Box::leak(Box::new(Context::create()));
     let module = Box::leak(Box::new(context.create_module(module_name)));
 
-    let triple = TargetMachine::get_default_triple();
+    let triple = match target_kind {
+        LlvmTargetKind::Host => TargetMachine::get_default_triple(),
+        LlvmTargetKind::Wasm => inkwell::targets::TargetTriple::create("wasm32-unknown-unknown"),
+    };
     module.set_triple(&triple);
     let target = Target::from_triple(&triple).expect("host triple should be supported");
     let machine = target
@@ -165,6 +238,7 @@ struct LlvmCompiler<'ctx> {
     module: &'ctx LlvmModule<'ctx>,
     builder: Builder<'ctx>,
     i64_type: IntType<'ctx>,
+    runtime_mode: LlvmRuntimeMode,
     functions: HashMap<String, FunctionValue<'ctx>>,
 }
 
@@ -175,12 +249,17 @@ struct CompiledValue<'ctx> {
 }
 
 impl<'ctx> LlvmCompiler<'ctx> {
-    fn new(context: &'ctx Context, module: &'ctx LlvmModule<'ctx>) -> Self {
+    fn new(
+        context: &'ctx Context,
+        module: &'ctx LlvmModule<'ctx>,
+        runtime_mode: LlvmRuntimeMode,
+    ) -> Self {
         Self {
             context,
             module,
             builder: context.create_builder(),
             i64_type: context.i64_type(),
+            runtime_mode,
             functions: HashMap::new(),
         }
     }
@@ -189,32 +268,97 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.functions
     }
 
+    #[cfg(feature = "wasi")]
+    fn declare_wasi_preview1_import(&mut self, name: &str, import_name: &str) {
+        let i32_type = self.context.i32_type();
+        let function = match import_name {
+            "fd_write" => self.module.add_function(
+                name,
+                i32_type.fn_type(
+                    &[
+                        i32_type.into(),
+                        i32_type.into(),
+                        i32_type.into(),
+                        i32_type.into(),
+                    ],
+                    false,
+                ),
+                None,
+            ),
+            "proc_exit" => self
+                .module
+                .add_function(name, self.context.void_type().fn_type(&[i32_type.into()], false), None),
+            other => panic!("unsupported WASI Preview 1 import: {other}"),
+        };
+
+        let import_module = self
+            .context
+            .create_string_attribute("wasm-import-module", "wasi_snapshot_preview1");
+        let import_name_attr = self
+            .context
+            .create_string_attribute("wasm-import-name", import_name);
+        function.add_attribute(AttributeLoc::Function, import_module);
+        function.add_attribute(AttributeLoc::Function, import_name_attr);
+        self.functions.insert(name.to_string(), function);
+    }
+
     fn declare_runtime_functions(&mut self) {
         let i64_type = self.i64_type;
-        let runtime = [
-            ("print", "__expr_print_host", vec![i64_type.into()]),
-            (
-                "list_print",
-                "__expr_list_print_host",
-                vec![i64_type.into()],
-            ),
-            (
-                "__box_value",
-                "__expr_box_value_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-            (
-                "__alloc",
-                "__expr_alloc_host",
-                vec![i64_type.into(), i64_type.into()],
-            ),
-        ];
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                let runtime = [
+                    ("print", "__expr_print_host", vec![i64_type.into()]),
+                    (
+                        "list_print",
+                        "__expr_list_print_host",
+                        vec![i64_type.into()],
+                    ),
+                    (
+                        "__box_value",
+                        "__expr_box_value_host",
+                        vec![i64_type.into(), i64_type.into()],
+                    ),
+                    (
+                        "__alloc",
+                        "__expr_alloc_host",
+                        vec![i64_type.into(), i64_type.into()],
+                    ),
+                ];
 
-        for (name, symbol, params) in runtime {
-            let function =
-                self.module
-                    .add_function(symbol, self.i64_type.fn_type(&params, false), None);
-            self.functions.insert(name.to_string(), function);
+                for (name, symbol, params) in runtime {
+                    let function =
+                        self.module
+                            .add_function(symbol, self.i64_type.fn_type(&params, false), None);
+                    self.functions.insert(name.to_string(), function);
+                }
+            }
+            LlvmRuntimeMode::Wasm => {
+                let runtime = [
+                    ("print", "__expr_wasm_print_host"),
+                    ("list_print", "__expr_wasm_list_print_host"),
+                ];
+
+                for (name, symbol) in runtime {
+                    let function = self.module.add_function(
+                        symbol,
+                        self.context
+                            .void_type()
+                            .fn_type(&[i64_type.into(), i64_type.into()], false),
+                        None,
+                    );
+                    self.functions.insert(name.to_string(), function);
+                }
+
+                self.define_wasm_allocator("__alloc", "llvm_wasm_alloc");
+                self.define_wasm_multi3();
+            }
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => {
+                self.declare_wasi_preview1_import("__wasi_fd_write", "fd_write");
+                self.declare_wasi_preview1_import("__wasi_proc_exit", "proc_exit");
+                self.define_wasm_allocator("__alloc", "llvm_wasm_alloc");
+                self.define_wasm_multi3();
+            }
         }
 
         self.define_value_to_i64();
@@ -230,13 +374,29 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.define_runtime_compare("__op_lte", "llvm_rt_lte", IntPredicate::SLE);
         self.define_runtime_compare("__op_eq", "llvm_rt_eq", IntPredicate::EQ);
         self.define_runtime_compare("__op_ne", "llvm_rt_ne", IntPredicate::NE);
-        self.define_boxed_runtime_pair_wrapper("__rt_print", "llvm_rt_print", "print", 1);
-        self.define_boxed_runtime_pair_wrapper(
-            "__rt_list_print",
-            "llvm_rt_list_print",
-            "list_print",
-            1,
-        );
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                self.define_boxed_runtime_pair_wrapper("__rt_print", "llvm_rt_print", "print", 1);
+                self.define_boxed_runtime_pair_wrapper(
+                    "__rt_list_print",
+                    "llvm_rt_list_print",
+                    "list_print",
+                    1,
+                );
+            }
+            LlvmRuntimeMode::Wasm => {
+                self.define_direct_pair_print_wrapper("__rt_print", "llvm_rt_print", "print");
+                self.define_direct_pair_print_wrapper(
+                    "__rt_list_print",
+                    "llvm_rt_list_print",
+                    "list_print",
+                );
+            }
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => {
+                self.define_wasi_preview1_print_runtime();
+            }
+        }
         self.define_pair_list_new("__rt_list_new", "llvm_rt_list_new");
         self.define_pair_list_push("__rt_list_push", "llvm_rt_list_push");
         self.define_pair_list_insert("__rt_list_insert", "llvm_rt_list_insert");
@@ -274,6 +434,50 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.define_int_result_wrapper(func, mode);
             }
         }
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_preview1_command_start_wrapper(&self) {
+        let _ = self
+            .functions
+            .get("main")
+            .copied()
+            .expect("missing main function for wasi command wrapper");
+        let int_wrapper_name = int_result_symbol_name("main", LlvmOutputMode::WasiPreview1Command);
+        let int_wrapper = self
+            .module
+            .get_function(&int_wrapper_name)
+            .unwrap_or_else(|| panic!("missing int-result wrapper: {int_wrapper_name}"));
+        let function = self.module.add_function(
+            "_start",
+            self.context.void_type().fn_type(&[], false),
+            Some(Linkage::External),
+        );
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let exit_code_i64 = self
+            .builder
+            .build_call(int_wrapper, &[], "wasi_main_exit_code")
+            .expect("failed to call int-result wrapper")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let exit_code = self
+            .builder
+            .build_int_truncate(
+                exit_code_i64,
+                self.context.i32_type(),
+                "wasi_main_exit_code_i32",
+            )
+            .expect("failed to truncate exit code");
+        let proc_exit = self.require_func("__wasi_proc_exit");
+        self.builder
+            .build_call(proc_exit, &[exit_code.into()], "wasi_proc_exit")
+            .expect("failed to call proc_exit");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from _start");
     }
 
     fn define_int_result_wrapper(&self, func_def: &FunctionDefAst, mode: LlvmOutputMode) {
@@ -796,6 +1000,70 @@ impl<'ctx> LlvmCompiler<'ctx> {
         CompiledValue { tag, payload }
     }
 
+    #[cfg(feature = "wasi")]
+    fn get_or_create_static_bytes_global(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> inkwell::values::GlobalValue<'ctx> {
+        if let Some(global) = self.module.get_global(name) {
+            return global;
+        }
+
+        let byte_type = self.context.i8_type();
+        let array_type = byte_type.array_type(bytes.len() as u32);
+        let global = self.module.add_global(array_type, None, name);
+        global.set_linkage(Linkage::Internal);
+        global.set_constant(true);
+        let values = bytes
+            .iter()
+            .map(|byte| byte_type.const_int(*byte as u64, false))
+            .collect::<Vec<_>>();
+        global.set_initializer(&byte_type.const_array(&values));
+        global
+    }
+
+    #[cfg(feature = "wasi")]
+    fn build_static_bytes_ptr(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        label: &str,
+    ) -> PointerValue<'ctx> {
+        let global = self.get_or_create_static_bytes_global(name, bytes);
+        let array_type = self.context.i8_type().array_type(bytes.len() as u32);
+        let zero = self.context.i32_type().const_zero();
+        unsafe {
+            self.builder
+                .build_gep(
+                    array_type,
+                    global.as_pointer_value(),
+                    &[zero, zero],
+                    &format!("{label}_ptr"),
+                )
+                .expect("failed to build static bytes ptr")
+        }
+    }
+
+    #[cfg(feature = "wasi")]
+    fn build_wasi_write_const(&self, global_name: &str, bytes: &[u8], label: &str) {
+        let write_bytes = self.require_func("__wasi_write_bytes");
+        let ptr = self.build_static_bytes_ptr(global_name, bytes, label);
+        self.builder
+            .build_call(
+                write_bytes,
+                &[
+                    ptr.into(),
+                    self.context
+                        .i32_type()
+                        .const_int(bytes.len() as u64, false)
+                        .into(),
+                ],
+                &format!("{label}_write"),
+            )
+            .expect("failed to write static bytes");
+    }
+
     fn expect_tag_payload(
         &self,
         value: CompiledValue<'ctx>,
@@ -957,14 +1225,46 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_data_ptr_ptr"),
             )
             .expect("failed to build list data ptr gep");
-        self.builder
-            .build_load(
-                self.context.ptr_type(Default::default()),
-                data_ptr_ptr,
-                &format!("{label}_data_ptr"),
-            )
-            .expect("failed to load list data ptr")
-            .into_pointer_value()
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => self
+                .builder
+                .build_load(
+                    self.context.ptr_type(Default::default()),
+                    data_ptr_ptr,
+                    &format!("{label}_data_ptr"),
+                )
+                .expect("failed to load list data ptr")
+                .into_pointer_value(),
+            LlvmRuntimeMode::Wasm => {
+                let raw = self
+                    .builder
+                    .build_load(self.i64_type, data_ptr_ptr, &format!("{label}_data_raw"))
+                    .expect("failed to load wasm list data ptr")
+                    .into_int_value();
+                self.builder
+                    .build_int_to_ptr(
+                        raw,
+                        self.context.ptr_type(Default::default()),
+                        &format!("{label}_data_ptr"),
+                    )
+                    .expect("failed to convert wasm list data ptr")
+            }
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => {
+                let raw = self
+                    .builder
+                    .build_load(self.i64_type, data_ptr_ptr, &format!("{label}_data_raw"))
+                    .expect("failed to load wasi list data ptr")
+                    .into_int_value();
+                self.builder
+                    .build_int_to_ptr(
+                        raw,
+                        self.context.ptr_type(Default::default()),
+                        &format!("{label}_data_ptr"),
+                    )
+                    .expect("failed to convert wasi list data ptr")
+            }
+        }
     }
 
     fn build_list_data_ptr_store(
@@ -982,9 +1282,32 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_data_ptr_ptr"),
             )
             .expect("failed to build list data ptr gep");
-        self.builder
-            .build_store(data_ptr_ptr, data_ptr)
-            .expect("failed to store list data ptr");
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                self.builder
+                    .build_store(data_ptr_ptr, data_ptr)
+                    .expect("failed to store list data ptr");
+            }
+            LlvmRuntimeMode::Wasm => {
+                let raw = self
+                    .builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, &format!("{label}_data_raw"))
+                    .expect("failed to convert wasm list data ptr");
+                self.builder
+                    .build_store(data_ptr_ptr, raw)
+                    .expect("failed to store wasm list data ptr");
+            }
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => {
+                let raw = self
+                    .builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, &format!("{label}_data_raw"))
+                    .expect("failed to convert wasi list data ptr");
+                self.builder
+                    .build_store(data_ptr_ptr, raw)
+                    .expect("failed to store wasi list data ptr");
+            }
+        }
     }
 
     fn build_list_value_ptr(
@@ -1003,6 +1326,24 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     &format!("{label}_value_ptr"),
                 )
                 .expect("failed to build list value gep")
+        }
+    }
+
+    fn build_list_value_ptr_from_data_ptr(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        label: &str,
+    ) -> PointerValue<'ctx> {
+        unsafe {
+            self.builder
+                .build_gep(
+                    self.value_type(),
+                    data_ptr,
+                    &[index],
+                    &format!("{label}_value_ptr"),
+                )
+                .expect("failed to build list value gep from data ptr")
         }
     }
 
@@ -1025,6 +1366,25 @@ impl<'ctx> LlvmCompiler<'ctx> {
         CompiledValue { tag, payload }
     }
 
+    fn build_list_value_load_from_data_ptr(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let value_ptr = self.build_list_value_ptr_from_data_ptr(data_ptr, index, label);
+        let tag = self
+            .builder
+            .build_int_z_extend(
+                self.build_value_tag_load(value_ptr, label),
+                self.i64_type,
+                &format!("{label}_tag_i64"),
+            )
+            .expect("failed to extend list value tag");
+        let payload = self.build_value_payload_load(value_ptr, label);
+        CompiledValue { tag, payload }
+    }
+
     fn build_list_value_store(
         &self,
         payload: IntValue<'ctx>,
@@ -1033,6 +1393,43 @@ impl<'ctx> LlvmCompiler<'ctx> {
         label: &str,
     ) {
         let value_ptr = self.build_list_value_ptr(payload, index, label);
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(self.value_type(), value_ptr, 0, &format!("{label}_tag_ptr"))
+            .expect("failed to build list value tag gep");
+        let payload_ptr = self
+            .builder
+            .build_struct_gep(
+                self.value_type(),
+                value_ptr,
+                2,
+                &format!("{label}_payload_ptr"),
+            )
+            .expect("failed to build list value payload gep");
+        let tag = self
+            .builder
+            .build_int_truncate(
+                value.tag,
+                self.context.i8_type(),
+                &format!("{label}_tag_i8"),
+            )
+            .expect("failed to truncate list value tag");
+        self.builder
+            .build_store(tag_ptr, tag)
+            .expect("failed to store list value tag");
+        self.builder
+            .build_store(payload_ptr, value.payload)
+            .expect("failed to store list value payload");
+    }
+
+    fn build_list_value_store_from_data_ptr(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        value: CompiledValue<'ctx>,
+        label: &str,
+    ) {
+        let value_ptr = self.build_list_value_ptr_from_data_ptr(data_ptr, index, label);
         let tag_ptr = self
             .builder
             .build_struct_gep(self.value_type(), value_ptr, 0, &format!("{label}_tag_ptr"))
@@ -1100,14 +1497,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
     }
 
     fn list_header_type(&self) -> inkwell::types::StructType<'ctx> {
-        self.context.struct_type(
-            &[
-                self.context.ptr_type(Default::default()).into(),
-                self.i64_type.into(),
-                self.i64_type.into(),
-            ],
-            false,
-        )
+        let data_ptr_field = match self.runtime_mode {
+            LlvmRuntimeMode::Native => self.context.ptr_type(Default::default()).into(),
+            LlvmRuntimeMode::Wasm => self.i64_type.into(),
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => self.i64_type.into(),
+        };
+        self.context
+            .struct_type(&[data_ptr_field, self.i64_type.into(), self.i64_type.into()], false)
     }
 
     fn build_value_tag_load(&self, value_ptr: PointerValue<'ctx>, label: &str) -> IntValue<'ctx> {
@@ -1500,6 +1897,745 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to return boxed runtime pair wrapper");
     }
 
+    fn define_direct_pair_print_wrapper(&mut self, name: &str, symbol: &str, import_name: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type()
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let tag = function.get_first_param().unwrap().into_int_value();
+        let payload = function.get_nth_param(1).unwrap().into_int_value();
+        let import_fn = self.require_func(import_name);
+        self.builder
+            .build_call(import_fn, &[tag.into(), payload.into()], "wasm_print")
+            .expect("failed to call wasm print import");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_INT as u64, false),
+                self.i64_type.const_zero(),
+                &format!("{symbol}_result"),
+            )))
+            .expect("failed to return direct print wrapper");
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_preview1_print_runtime(&mut self) {
+        let ptr_type = self.context.ptr_type(Default::default());
+        let void_type = self.context.void_type();
+
+        let write_bytes = self.module.add_function(
+            "llvm_wasi_write_bytes",
+            void_type.fn_type(&[ptr_type.into(), self.context.i32_type().into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions
+            .insert("__wasi_write_bytes".to_string(), write_bytes);
+
+        let write_i64 = self.module.add_function(
+            "llvm_wasi_write_i64",
+            void_type.fn_type(&[self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert("__wasi_write_i64".to_string(), write_i64);
+
+        let write_value = self.module.add_function(
+            "llvm_wasi_write_value",
+            void_type.fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions
+            .insert("__wasi_write_value".to_string(), write_value);
+
+        let write_list = self.module.add_function(
+            "llvm_wasi_write_list",
+            void_type.fn_type(&[self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert("__wasi_write_list".to_string(), write_list);
+
+        self.define_wasi_write_bytes_body(write_bytes);
+        self.define_wasi_write_i64_body(write_i64);
+        self.define_wasi_write_value_body(write_value);
+        self.define_wasi_write_list_body(write_list);
+        self.define_wasi_preview1_pair_print_wrapper("__rt_print", "llvm_rt_print");
+        self.define_wasi_preview1_pair_print_wrapper("__rt_list_print", "llvm_rt_list_print");
+    }
+
+    fn define_wasm_multi3(&mut self) {
+        let ptr_type = self.context.ptr_type(Default::default());
+        let void_type = self.context.void_type();
+        let function = self.module.add_function(
+            "__multi3",
+            void_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                ],
+                false,
+            ),
+            Some(Linkage::Internal),
+        );
+        self.functions.insert("__multi3".to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let dst = function.get_first_param().unwrap().into_pointer_value();
+        let a_lo = function.get_nth_param(1).unwrap().into_int_value();
+        let a_hi = function.get_nth_param(2).unwrap().into_int_value();
+        let b_lo = function.get_nth_param(3).unwrap().into_int_value();
+        let b_hi = function.get_nth_param(4).unwrap().into_int_value();
+
+        let (lo, carry) = self.build_u64_mul_wide(a_lo, b_lo, "multi3_ll");
+        let mid1 = self
+            .builder
+            .build_int_mul(a_lo, b_hi, "multi3_mid1")
+            .expect("failed to multiply multi3 mid1");
+        let mid2 = self
+            .builder
+            .build_int_mul(a_hi, b_lo, "multi3_mid2")
+            .expect("failed to multiply multi3 mid2");
+        let high = self
+            .builder
+            .build_int_add(carry, mid1, "multi3_high_partial")
+            .expect("failed to add multi3 carry/mid1");
+        let high = self
+            .builder
+            .build_int_add(high, mid2, "multi3_high")
+            .expect("failed to add multi3 mid2");
+
+        let i64_ptr = self
+            .builder
+            .build_pointer_cast(
+                dst,
+                self.context.ptr_type(Default::default()),
+                "multi3_i64_ptr",
+            )
+            .expect("failed to cast multi3 dst ptr");
+        let zero32 = self.context.i32_type().const_zero();
+        let one32 = self.context.i32_type().const_int(1, false);
+        let lo_ptr = unsafe {
+            self.builder
+                .build_gep(self.i64_type, i64_ptr, &[zero32], "multi3_lo_ptr")
+                .expect("failed to gep multi3 lo ptr")
+        };
+        let hi_ptr = unsafe {
+            self.builder
+                .build_gep(self.i64_type, i64_ptr, &[one32], "multi3_hi_ptr")
+                .expect("failed to gep multi3 hi ptr")
+        };
+        self.builder
+            .build_store(lo_ptr, lo)
+            .expect("failed to store multi3 lo");
+        self.builder
+            .build_store(hi_ptr, high)
+            .expect("failed to store multi3 hi");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from multi3");
+    }
+
+    fn build_u64_mul_wide(
+        &self,
+        lhs: IntValue<'ctx>,
+        rhs: IntValue<'ctx>,
+        label: &str,
+    ) -> (IntValue<'ctx>, IntValue<'ctx>) {
+        let mask32 = self.i64_type.const_int(0xffff_ffff, false);
+        let a0 = self
+            .builder
+            .build_and(lhs, mask32, &format!("{label}_a0"))
+            .expect("failed to mask lhs lo32");
+        let a1 = self
+            .builder
+            .build_right_shift(
+                lhs,
+                self.i64_type.const_int(32, false),
+                false,
+                &format!("{label}_a1"),
+            )
+            .expect("failed to shift lhs hi32");
+        let b0 = self
+            .builder
+            .build_and(rhs, mask32, &format!("{label}_b0"))
+            .expect("failed to mask rhs lo32");
+        let b1 = self
+            .builder
+            .build_right_shift(
+                rhs,
+                self.i64_type.const_int(32, false),
+                false,
+                &format!("{label}_b1"),
+            )
+            .expect("failed to shift rhs hi32");
+
+        let p0 = self
+            .builder
+            .build_int_mul(a0, b0, &format!("{label}_p0"))
+            .expect("failed to mul p0");
+        let p1 = self
+            .builder
+            .build_int_mul(a0, b1, &format!("{label}_p1"))
+            .expect("failed to mul p1");
+        let p2 = self
+            .builder
+            .build_int_mul(a1, b0, &format!("{label}_p2"))
+            .expect("failed to mul p2");
+        let p3 = self
+            .builder
+            .build_int_mul(a1, b1, &format!("{label}_p3"))
+            .expect("failed to mul p3");
+
+        let p0_hi = self
+            .builder
+            .build_right_shift(
+                p0,
+                self.i64_type.const_int(32, false),
+                false,
+                &format!("{label}_p0_hi"),
+            )
+            .expect("failed to shift p0 hi");
+        let p1_lo = self
+            .builder
+            .build_and(p1, mask32, &format!("{label}_p1_lo"))
+            .expect("failed to mask p1 lo");
+        let p2_lo = self
+            .builder
+            .build_and(p2, mask32, &format!("{label}_p2_lo"))
+            .expect("failed to mask p2 lo");
+        let middle = self
+            .builder
+            .build_int_add(p0_hi, p1_lo, &format!("{label}_middle_1"))
+            .expect("failed to add middle 1");
+        let middle = self
+            .builder
+            .build_int_add(middle, p2_lo, &format!("{label}_middle"))
+            .expect("failed to add middle 2");
+
+        let low_lo = self
+            .builder
+            .build_and(p0, mask32, &format!("{label}_low_lo"))
+            .expect("failed to mask low lo");
+        let middle_lo = self
+            .builder
+            .build_and(middle, mask32, &format!("{label}_middle_lo"))
+            .expect("failed to mask middle lo");
+        let middle_lo_shifted = self
+            .builder
+            .build_left_shift(
+                middle_lo,
+                self.i64_type.const_int(32, false),
+                &format!("{label}_middle_lo_shifted"),
+            )
+            .expect("failed to shift middle lo");
+        let low = self
+            .builder
+            .build_or(low_lo, middle_lo_shifted, &format!("{label}_low"))
+            .expect("failed to build low");
+
+        let p1_hi = self
+            .builder
+            .build_right_shift(
+                p1,
+                self.i64_type.const_int(32, false),
+                false,
+                &format!("{label}_p1_hi"),
+            )
+            .expect("failed to shift p1 hi");
+        let p2_hi = self
+            .builder
+            .build_right_shift(
+                p2,
+                self.i64_type.const_int(32, false),
+                false,
+                &format!("{label}_p2_hi"),
+            )
+            .expect("failed to shift p2 hi");
+        let middle_hi = self
+            .builder
+            .build_right_shift(
+                middle,
+                self.i64_type.const_int(32, false),
+                false,
+                &format!("{label}_middle_hi"),
+            )
+            .expect("failed to shift middle hi");
+        let high = self
+            .builder
+            .build_int_add(p3, p1_hi, &format!("{label}_high_1"))
+            .expect("failed to add high 1");
+        let high = self
+            .builder
+            .build_int_add(high, p2_hi, &format!("{label}_high_2"))
+            .expect("failed to add high 2");
+        let high = self
+            .builder
+            .build_int_add(high, middle_hi, &format!("{label}_high"))
+            .expect("failed to add high 3");
+
+        (low, high)
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_preview1_pair_print_wrapper(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type()
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let tag = function.get_first_param().unwrap().into_int_value();
+        let payload = function.get_nth_param(1).unwrap().into_int_value();
+        let write_value = self.require_func("__wasi_write_value");
+        self.builder
+            .build_call(write_value, &[tag.into(), payload.into()], "wasi_write_value")
+            .expect("failed to call preview1 write_value");
+        self.build_wasi_write_const("__wasi_newline", b"\n", "preview1_newline");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_INT as u64, false),
+                self.i64_type.const_zero(),
+                &format!("{symbol}_result"),
+            )))
+            .expect("failed to return preview1 print wrapper");
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_write_bytes_body(&self, function: FunctionValue<'ctx>) {
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let ptr = function.get_first_param().unwrap().into_pointer_value();
+        let len = function.get_nth_param(1).unwrap().into_int_value();
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(Default::default());
+        let iovec_type = self.context.struct_type(&[ptr_type.into(), i32_type.into()], false);
+        let iovec_ptr = self
+            .builder
+            .build_alloca(iovec_type, "wasi_iovec")
+            .expect("failed to allocate wasi iovec");
+        let nwritten_ptr = self
+            .builder
+            .build_alloca(i32_type, "wasi_nwritten")
+            .expect("failed to allocate wasi nwritten");
+        let buf_ptr = self
+            .builder
+            .build_struct_gep(iovec_type, iovec_ptr, 0, "wasi_iovec_buf")
+            .expect("failed to build iovec buf gep");
+        let len_ptr = self
+            .builder
+            .build_struct_gep(iovec_type, iovec_ptr, 1, "wasi_iovec_len")
+            .expect("failed to build iovec len gep");
+        self.builder
+            .build_store(buf_ptr, ptr)
+            .expect("failed to store iovec buf");
+        self.builder
+            .build_store(len_ptr, len)
+            .expect("failed to store iovec len");
+
+        let fd_write = self.require_func("__wasi_fd_write");
+        let iovec_raw = self
+            .builder
+            .build_ptr_to_int(iovec_ptr, i32_type, "wasi_iovec_raw")
+            .expect("failed to convert iovec ptr");
+        let nwritten_raw = self
+            .builder
+            .build_ptr_to_int(nwritten_ptr, i32_type, "wasi_nwritten_raw")
+            .expect("failed to convert nwritten ptr");
+        let status = self
+            .builder
+            .build_call(
+                fd_write,
+                &[
+                    i32_type.const_int(1, false).into(),
+                    iovec_raw.into(),
+                    i32_type.const_int(1, false).into(),
+                    nwritten_raw.into(),
+                ],
+                "wasi_fd_write",
+            )
+            .expect("failed to call fd_write")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let success = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                status,
+                i32_type.const_zero(),
+                "wasi_fd_write_ok",
+            )
+            .expect("failed to compare fd_write status");
+        self.builder
+            .build_conditional_branch(success, ok_block, trap_block)
+            .expect("failed to branch on fd_write status");
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_return(None)
+            .expect("failed to return from write_bytes");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_write_i64_body(&self, function: FunctionValue<'ctx>) {
+        let entry = self.context.append_basic_block(function, "entry");
+        let zero_block = self.context.append_basic_block(function, "zero");
+        let non_zero_block = self.context.append_basic_block(function, "non_zero");
+        let sign_check_block = self.context.append_basic_block(function, "sign_check");
+        let loop_block = self.context.append_basic_block(function, "loop");
+        let done_block = self.context.append_basic_block(function, "done");
+        self.builder.position_at_end(entry);
+
+        let value = function.get_first_param().unwrap().into_int_value();
+        let zero = self.i64_type.const_zero();
+        let is_zero = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, value, zero, "wasi_i64_is_zero")
+            .expect("failed to compare i64 zero");
+        self.builder
+            .build_conditional_branch(is_zero, zero_block, non_zero_block)
+            .expect("failed to branch on i64 zero");
+
+        self.builder.position_at_end(zero_block);
+        self.build_wasi_write_const("__wasi_digit_zero", b"0", "wasi_zero");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from zero i64 writer");
+
+        self.builder.position_at_end(non_zero_block);
+        let buffer_type = self.context.i8_type().array_type(32);
+        let buffer = self
+            .builder
+            .build_alloca(buffer_type, "wasi_i64_buffer")
+            .expect("failed to allocate i64 buffer");
+        let idx_ptr = self
+            .builder
+            .build_alloca(self.context.i32_type(), "wasi_i64_idx")
+            .expect("failed to allocate i64 idx");
+        let current_ptr = self
+            .builder
+            .build_alloca(self.i64_type, "wasi_i64_current")
+            .expect("failed to allocate i64 current");
+        self.builder
+            .build_store(idx_ptr, self.context.i32_type().const_int(32, false))
+            .expect("failed to store initial i64 idx");
+        self.builder
+            .build_unconditional_branch(sign_check_block)
+            .expect("failed to branch to sign check");
+
+        self.builder.position_at_end(sign_check_block);
+        let is_negative = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, value, zero, "wasi_i64_is_negative")
+            .expect("failed to compare i64 sign");
+        let neg_block = self.context.append_basic_block(function, "negative");
+        let pos_block = self.context.append_basic_block(function, "positive");
+        self.builder
+            .build_conditional_branch(is_negative, neg_block, pos_block)
+            .expect("failed to branch on i64 sign");
+
+        self.builder.position_at_end(neg_block);
+        self.build_wasi_write_const("__wasi_minus", b"-", "wasi_minus");
+        let magnitude = self
+            .builder
+            .build_int_sub(zero, value, "wasi_i64_magnitude")
+            .expect("failed to compute i64 magnitude");
+        self.builder
+            .build_store(current_ptr, magnitude)
+            .expect("failed to store negative magnitude");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to i64 loop");
+
+        self.builder.position_at_end(pos_block);
+        self.builder
+            .build_store(current_ptr, value)
+            .expect("failed to store positive i64");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to i64 loop");
+
+        self.builder.position_at_end(loop_block);
+        let current = self
+            .builder
+            .build_load(self.i64_type, current_ptr, "wasi_i64_current_load")
+            .expect("failed to load current i64")
+            .into_int_value();
+        let quotient = self
+            .builder
+            .build_int_unsigned_div(
+                current,
+                self.i64_type.const_int(10, false),
+                "wasi_i64_quotient",
+            )
+            .expect("failed to divide current i64");
+        let remainder = self
+            .builder
+            .build_int_unsigned_rem(
+                current,
+                self.i64_type.const_int(10, false),
+                "wasi_i64_remainder",
+            )
+            .expect("failed to mod current i64");
+        let idx = self
+            .builder
+            .build_load(self.context.i32_type(), idx_ptr, "wasi_i64_idx_load")
+            .expect("failed to load i64 idx")
+            .into_int_value();
+        let next_idx = self
+            .builder
+            .build_int_sub(idx, self.context.i32_type().const_int(1, false), "wasi_i64_next_idx")
+            .expect("failed to decrement i64 idx");
+        self.builder
+            .build_store(idx_ptr, next_idx)
+            .expect("failed to store next i64 idx");
+        let digit = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_int_truncate(remainder, self.context.i8_type(), "wasi_i64_digit_raw")
+                    .expect("failed to truncate digit"),
+                self.context.i8_type().const_int(b'0' as u64, false),
+                "wasi_i64_digit",
+            )
+            .expect("failed to build digit");
+        let zero32 = self.context.i32_type().const_zero();
+        let digit_ptr = unsafe {
+            self.builder
+                .build_gep(buffer_type, buffer, &[zero32, next_idx], "wasi_i64_digit_ptr")
+                .expect("failed to build digit ptr")
+        };
+        self.builder
+            .build_store(digit_ptr, digit)
+            .expect("failed to store digit");
+        self.builder
+            .build_store(current_ptr, quotient)
+            .expect("failed to store quotient");
+        let more = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                quotient,
+                zero,
+                "wasi_i64_more_digits",
+            )
+            .expect("failed to compare quotient");
+        self.builder
+            .build_conditional_branch(more, loop_block, done_block)
+            .expect("failed to branch in i64 loop");
+
+        self.builder.position_at_end(done_block);
+        let final_idx = self
+            .builder
+            .build_load(self.context.i32_type(), idx_ptr, "wasi_i64_final_idx")
+            .expect("failed to load final i64 idx")
+            .into_int_value();
+        let start_ptr = unsafe {
+            self.builder
+                .build_gep(buffer_type, buffer, &[zero32, final_idx], "wasi_i64_start_ptr")
+                .expect("failed to build start ptr")
+        };
+        let len = self
+            .builder
+            .build_int_sub(
+                self.context.i32_type().const_int(32, false),
+                final_idx,
+                "wasi_i64_len",
+            )
+            .expect("failed to compute i64 len");
+        let write_bytes = self.require_func("__wasi_write_bytes");
+        self.builder
+            .build_call(write_bytes, &[start_ptr.into(), len.into()], "wasi_write_digits")
+            .expect("failed to write digit buffer");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from i64 writer");
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_write_value_body(&self, function: FunctionValue<'ctx>) {
+        let entry = self.context.append_basic_block(function, "entry");
+        let int_block = self.context.append_basic_block(function, "int");
+        let list_block = self.context.append_basic_block(function, "list");
+        let string_block = self.context.append_basic_block(function, "string");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let tag = function.get_first_param().unwrap().into_int_value();
+        let payload = function.get_nth_param(1).unwrap().into_int_value();
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.i64_type.const_int(TAG_INT as u64, false),
+                "wasi_value_is_int",
+            )
+            .expect("failed to compare value tag int");
+        let tag_dispatch = self.context.append_basic_block(function, "dispatch");
+        self.builder
+            .build_conditional_branch(is_int, int_block, tag_dispatch)
+            .expect("failed to branch on int tag");
+
+        self.builder.position_at_end(tag_dispatch);
+        let is_list = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.i64_type.const_int(TAG_LIST as u64, false),
+                "wasi_value_is_list",
+            )
+            .expect("failed to compare value tag list");
+        let string_tag = self.i64_type.const_int(3, false);
+        let is_string = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, tag, string_tag, "wasi_value_is_string")
+            .expect("failed to compare value tag string");
+        let after_list = self.context.append_basic_block(function, "after_list");
+        self.builder
+            .build_conditional_branch(is_list, list_block, after_list)
+            .expect("failed to branch on list tag");
+
+        self.builder.position_at_end(after_list);
+        self.builder
+            .build_conditional_branch(is_string, string_block, trap_block)
+            .expect("failed to branch on string tag");
+
+        self.builder.position_at_end(int_block);
+        let write_i64 = self.require_func("__wasi_write_i64");
+        self.builder
+            .build_call(write_i64, &[payload.into()], "wasi_write_i64")
+            .expect("failed to call write_i64");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from value int writer");
+
+        self.builder.position_at_end(list_block);
+        let write_list = self.require_func("__wasi_write_list");
+        self.builder
+            .build_call(write_list, &[payload.into()], "wasi_write_list")
+            .expect("failed to call write_list");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from value list writer");
+
+        self.builder.position_at_end(string_block);
+        self.build_wasi_write_const("__wasi_string_placeholder", b"<string>", "wasi_string");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from value string writer");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_write_list_body(&self, function: FunctionValue<'ctx>) {
+        let entry = self.context.append_basic_block(function, "entry");
+        let loop_check = self.context.append_basic_block(function, "loop_check");
+        let loop_body = self.context.append_basic_block(function, "loop_body");
+        let separator_block = self.context.append_basic_block(function, "separator");
+        let element_block = self.context.append_basic_block(function, "element");
+        let done_block = self.context.append_basic_block(function, "done");
+        self.builder.position_at_end(entry);
+
+        let payload = function.get_first_param().unwrap().into_int_value();
+        self.build_wasi_write_const("__wasi_list_open", b"[", "wasi_list_open");
+        let len = self.build_list_len_load(payload, "wasi_list_len");
+        let idx_ptr = self
+            .builder
+            .build_alloca(self.i64_type, "wasi_list_idx")
+            .expect("failed to allocate list idx");
+        self.builder
+            .build_store(idx_ptr, self.i64_type.const_zero())
+            .expect("failed to init list idx");
+        self.builder
+            .build_unconditional_branch(loop_check)
+            .expect("failed to branch to list loop");
+
+        self.builder.position_at_end(loop_check);
+        let idx = self
+            .builder
+            .build_load(self.i64_type, idx_ptr, "wasi_list_idx_load")
+            .expect("failed to load list idx")
+            .into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len, "wasi_list_more")
+            .expect("failed to compare list idx");
+        self.builder
+            .build_conditional_branch(more, loop_body, done_block)
+            .expect("failed to branch on list idx");
+
+        self.builder.position_at_end(loop_body);
+        let is_first = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                idx,
+                self.i64_type.const_zero(),
+                "wasi_list_is_first",
+            )
+            .expect("failed to compare first list element");
+        self.builder
+            .build_conditional_branch(is_first, element_block, separator_block)
+            .expect("failed to branch on first list element");
+
+        self.builder.position_at_end(separator_block);
+        self.build_wasi_write_const("__wasi_list_separator", b", ", "wasi_list_sep");
+        self.builder
+            .build_unconditional_branch(element_block)
+            .expect("failed to branch to list element");
+
+        self.builder.position_at_end(element_block);
+        let value = self.build_list_value_load(payload, idx, "wasi_list_value");
+        let write_value = self.require_func("__wasi_write_value");
+        self.builder
+            .build_call(
+                write_value,
+                &[value.tag.into(), value.payload.into()],
+                "wasi_list_write_value",
+            )
+            .expect("failed to write list element");
+        let next = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), "wasi_list_next")
+            .expect("failed to increment list idx");
+        self.builder
+            .build_store(idx_ptr, next)
+            .expect("failed to store next list idx");
+        self.builder
+            .build_unconditional_branch(loop_check)
+            .expect("failed to loop over list");
+
+        self.builder.position_at_end(done_block);
+        self.build_wasi_write_const("__wasi_list_close", b"]", "wasi_list_close");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from list writer");
+    }
+
     fn define_pair_list_len(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
@@ -1630,6 +2766,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(grow_block);
         let alloc = self.require_func("__alloc");
         let two = self.i64_type.const_int(2, false);
+        let old_data_ptr = self.build_list_data_ptr_load(list_payload, "list_push_old_data");
         let new_cap = self
             .builder
             .build_int_mul(cap, two, "list_push_new_cap")
@@ -1675,12 +2812,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to branch list push copy loop");
 
         self.builder.position_at_end(copy_body_block);
-        let moved = self.build_list_value_load(list_payload, copy_idx, "list_push_old");
-        let new_data_payload = self
-            .builder
-            .build_ptr_to_int(new_data_ptr, self.i64_type, "list_push_new_data_payload")
-            .expect("failed to convert new data ptr");
-        self.build_list_value_store(new_data_payload, copy_idx, moved, "list_push_new");
+        let moved =
+            self.build_list_value_load_from_data_ptr(old_data_ptr, copy_idx, "list_push_old");
+        self.build_list_value_store_from_data_ptr(new_data_ptr, copy_idx, moved, "list_push_new");
         let next = self
             .builder
             .build_int_add(
@@ -1889,6 +3023,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(grow_block);
         let alloc = self.require_func("__alloc");
+        let old_data_ptr = self.build_list_data_ptr_load(list_payload, "list_insert_old_data");
         let new_cap = self
             .builder
             .build_int_mul(
@@ -1938,12 +3073,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to branch insert copy loop");
 
         self.builder.position_at_end(copy_body_block);
-        let moved = self.build_list_value_load(list_payload, copy_idx, "list_insert_old");
-        let new_data_payload = self
-            .builder
-            .build_ptr_to_int(new_data_ptr, self.i64_type, "list_insert_new_data_payload")
-            .expect("failed to convert insert data ptr");
-        self.build_list_value_store(new_data_payload, copy_idx, moved, "list_insert_new");
+        let moved = self.build_list_value_load_from_data_ptr(
+            old_data_ptr,
+            copy_idx,
+            "list_insert_old",
+        );
+        self.build_list_value_store_from_data_ptr(
+            new_data_ptr,
+            copy_idx,
+            moved,
+            "list_insert_new",
+        );
         let next = self
             .builder
             .build_int_add(
@@ -2201,7 +3341,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(body_block);
         let value = self.build_list_value_load(list_payload, idx, "list_copy_src");
-        self.build_list_value_store(new_header_raw, idx, value, "list_copy_dst");
+        self.build_list_value_store_from_data_ptr(new_data_ptr, idx, value, "list_copy_dst");
         let next = self
             .builder
             .build_int_add(idx, self.i64_type.const_int(1, false), "list_copy_next")
@@ -2219,6 +3359,88 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "list_copy_result",
             )))
             .expect("failed to return list_copy");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    fn define_wasm_allocator(&mut self, name: &str, symbol: &str) {
+        let offset = self
+            .module
+            .add_global(self.i64_type, None, "__llvm_wasm_arena_offset");
+        offset.set_linkage(Linkage::Internal);
+        offset.set_initializer(&self.i64_type.const_int(WASM_ARENA_BASE as u64, false));
+        let _ = offset.set_alignment(8);
+
+        let function = self.module.add_function(
+            symbol,
+            self.i64_type
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let size = function.get_first_param().unwrap().into_int_value();
+        let align = function.get_nth_param(1).unwrap().into_int_value();
+        let zero = self.i64_type.const_zero();
+        let align_non_zero = self
+            .builder
+            .build_int_compare(IntPredicate::NE, align, zero, "alloc_align_non_zero")
+            .expect("failed to compare wasm alloc align");
+        let old_offset = self
+            .builder
+            .build_load(self.i64_type, offset.as_pointer_value(), "alloc_old_offset")
+            .expect("failed to load wasm alloc offset")
+            .into_int_value();
+        let align_minus_one = self
+            .builder
+            .build_int_sub(align, self.i64_type.const_int(1, false), "alloc_align_minus_one")
+            .expect("failed to compute wasm alloc align");
+        let start_plus = self
+            .builder
+            .build_int_add(old_offset, align_minus_one, "alloc_start_plus")
+            .expect("failed to compute wasm alloc start");
+        let mask = self
+            .builder
+            .build_not(align_minus_one, "alloc_mask")
+            .expect("failed to compute wasm alloc mask");
+        let aligned = self
+            .builder
+            .build_and(start_plus, mask, "alloc_aligned")
+            .expect("failed to align wasm alloc");
+        let end = self
+            .builder
+            .build_int_add(aligned, size, "alloc_end")
+            .expect("failed to compute wasm alloc end");
+        let fits = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULE,
+                end,
+                self.i64_type.const_int(WASM_ARENA_BYTES as u64, false),
+                "alloc_fits",
+            )
+            .expect("failed to compare wasm alloc bounds");
+        let ok = self
+            .builder
+            .build_and(align_non_zero, fits, "alloc_ok")
+            .expect("failed to build wasm alloc guard");
+        self.builder
+            .build_conditional_branch(ok, ok_block, trap_block)
+            .expect("failed to branch in wasm allocator");
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_store(offset.as_pointer_value(), end)
+            .expect("failed to store wasm alloc offset");
+        self.builder
+            .build_return(Some(&aligned))
+            .expect("failed to return wasm alloc ptr");
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();
@@ -2360,6 +3582,15 @@ fn int_result_symbol_name(name: &str, mode: LlvmOutputMode) -> String {
         {
             return "__expr_main_i64".to_string();
         }
+    }
+
+    if name == "main" && matches!(mode, LlvmOutputMode::Wasm) {
+        return "__expr_main_i64".to_string();
+    }
+
+    #[cfg(feature = "wasi")]
+    if name == "main" && matches!(mode, LlvmOutputMode::WasiPreview1Command) {
+        return "__expr_main_i64".to_string();
     }
 
     format!("__expr_i64_{name}")

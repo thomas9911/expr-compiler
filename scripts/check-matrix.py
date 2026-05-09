@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
             "cranelift-emit-ir",
             "llvm-jit",
             "llvm-native",
+            "llvm-wasm",
+            "llvm-component",
         ],
         default=[
             "cranelift-jit",
@@ -55,6 +57,8 @@ def parse_args() -> argparse.Namespace:
             "cranelift-emit-ir",
             "llvm-jit",
             "llvm-native",
+            "llvm-wasm",
+            "llvm-component",
         ],
         help="Modes to execute",
     )
@@ -154,6 +158,15 @@ def cargo_run_args_llvm(release: bool, extra: list[str]) -> list[str]:
     return args
 
 
+def cargo_run_args_llvm_wasi(release: bool, extra: list[str]) -> list[str]:
+    args = ["cargo", "run"]
+    if release:
+        args.append("--release")
+    args.extend(["-q", "--features", "llvm-backend,wasi", "--"])
+    args.extend(extra)
+    return args
+
+
 def binary_path_for(staging_dir: Path, example: Path) -> Path:
     stem = example.stem
     if os.name == "nt":
@@ -164,6 +177,34 @@ def binary_path_for(staging_dir: Path, example: Path) -> Path:
 def run_binary(name: str, path: Path) -> subprocess.CompletedProcess[str]:
     argv = [str(path)]
     return subprocess.run(argv, text=True, capture_output=True)
+
+
+def js_runtime() -> str:
+    configured = os.environ.get("JS_RUNTIME", "")
+    if configured:
+        return configured
+
+    for candidate in ("node", "nodejs", "bun"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    raise SystemExit(
+        "No JavaScript runtime found. Set JS_RUNTIME or ensure one of "
+        "'node', 'nodejs', or 'bun' is in PATH."
+    )
+
+
+def wasmtime_runtime() -> str:
+    configured = os.environ.get("WASMTIME", "")
+    if configured:
+        return configured
+
+    resolved = shutil.which("wasmtime")
+    if resolved:
+        return resolved
+
+    raise SystemExit("No Wasmtime runtime found. Set WASMTIME or ensure 'wasmtime' is in PATH.")
 
 
 def normalize_output(text: str) -> str:
@@ -266,6 +307,48 @@ def run_llvm_native(
     if compile_proc.returncode != 0:
         return compile_proc, 0
     run_proc = run_binary("llvm-native-run", output)
+    return run_proc, output.stat().st_size
+
+
+def run_llvm_wasm(
+    example: Path, release: bool, llvm_root: str | None, staging_dir: Path
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    output = staging_dir / f"{example.stem}.wasm"
+    compile_proc = run_command(
+        "llvm-wasm-compile",
+        cargo_run_args_llvm(
+            release, [str(example), "--backend", "llvm", "-o", str(output)]
+        ),
+        env=llvm_env(llvm_root),
+    )
+    if compile_proc.returncode != 0:
+        return compile_proc, 0
+    run_proc = run_command(
+        "llvm-wasm-run",
+        [js_runtime(), str(REPO_ROOT / "scripts" / "run-wasm.js"), str(output)],
+        env=os.environ.copy(),
+    )
+    return run_proc, output.stat().st_size
+
+
+def run_llvm_component(
+    example: Path, release: bool, llvm_root: str | None, staging_dir: Path
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    output = staging_dir / f"{example.stem}.component.wasm"
+    compile_proc = run_command(
+        "llvm-component-compile",
+        cargo_run_args_llvm_wasi(
+            release, [str(example), "--backend", "llvm", "-o", str(output)]
+        ),
+        env=llvm_env(llvm_root),
+    )
+    if compile_proc.returncode != 0:
+        return compile_proc, 0
+    run_proc = run_command(
+        "llvm-component-run",
+        [wasmtime_runtime(), "run", str(output)],
+        env=os.environ.copy(),
+    )
     return run_proc, output.stat().st_size
 
 
@@ -385,6 +468,44 @@ def main() -> int:
                     )
                     if ok and proc.returncode == 0:
                         ok, detail = check_binary_size(size)
+                    result = RunResult(
+                        example=example.stem,
+                        name=name,
+                        ok=ok,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                        binary_size=size if proc.returncode == 0 else None,
+                        detail=detail,
+                    )
+                elif mode == "llvm-wasm":
+                    proc, size = run_llvm_wasm(
+                        example, args.release, args.llvm_root, temp_dir
+                    )
+                    ok, detail = compare_to_baseline(
+                        proc,
+                        baseline_stdout=baseline_stdout,
+                        baseline_returncode=baseline.returncode,
+                    )
+                    result = RunResult(
+                        example=example.stem,
+                        name=name,
+                        ok=ok,
+                        returncode=proc.returncode,
+                        stdout=proc.stdout,
+                        stderr=proc.stderr,
+                        binary_size=size if proc.returncode == 0 else None,
+                        detail=detail,
+                    )
+                elif mode == "llvm-component":
+                    proc, size = run_llvm_component(
+                        example, args.release, args.llvm_root, temp_dir
+                    )
+                    ok, detail = compare_to_baseline(
+                        proc,
+                        baseline_stdout=baseline_stdout,
+                        baseline_returncode=baseline.returncode,
+                    )
                     result = RunResult(
                         example=example.stem,
                         name=name,
