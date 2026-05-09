@@ -1155,6 +1155,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "list_swap"
                 | "list_pop"
                 | "list_copy"
+                | "list_range"
                 | "list_map"
                 | "list_filter"
                 | "list_print"
@@ -1191,7 +1192,9 @@ impl LambdaLifter {
         match ast {
             Ast::Lambda { inputs, body } => {
                 self.lift_ast(body);
-                validate_lambda_no_captures(body, inputs);
+                let mut allowed = inputs.clone();
+                collect_var_names(body, &mut allowed);
+                validate_lambda_no_captures(body, &allowed);
                 let name = self.fresh_name();
                 self.lifted.push(FunctionDefAst {
                     name: name.clone(),
@@ -1291,7 +1294,9 @@ fn validate_lambda_no_captures(ast: &Ast, allowed_names: &[String]) {
             }
         }
         Ast::Lambda { inputs, body } => {
-            validate_lambda_no_captures(body, inputs);
+            let mut nested_allowed = inputs.clone();
+            collect_var_names(body, &mut nested_allowed);
+            validate_lambda_no_captures(body, &nested_allowed);
         }
         Ast::Block(block) => {
             for line in &block.lines {
@@ -1299,8 +1304,8 @@ fn validate_lambda_no_captures(ast: &Ast, allowed_names: &[String]) {
             }
         }
         Ast::Literal(_) | Ast::FunctionRef(_) => {}
-        Ast::Assign { name, .. } => {
-            panic!("assignments are not supported in anonymous functions yet: {name}");
+        Ast::Assign { value, .. } => {
+            validate_lambda_no_captures(value, allowed_names);
         }
         Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
     }
@@ -1310,6 +1315,11 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
     match ast {
         Ast::Lambda { body, .. } => {
             collect_var_names(body, names);
+        }
+        Ast::Block(block) => {
+            for line in &block.lines {
+                collect_var_names(line, names);
+            }
         }
         Ast::FunctionRef(_) => {}
         Ast::Assign { name, value } => {
@@ -1406,6 +1416,14 @@ fn boxed_int_const(builder: &mut FunctionBuilder, value: i64) -> CompiledValue {
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: builder.ins().iconst(types::I64, value),
     }
+}
+
+fn expect_int_payload(builder: &mut FunctionBuilder, value: CompiledValue) -> Value {
+    let is_int = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    value.payload
 }
 
 fn compile_list_literal(
@@ -1760,6 +1778,65 @@ fn compile_list_filter(
     output
 }
 
+fn compile_list_range(
+    builder: &mut FunctionBuilder,
+    args: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+) -> CompiledValue {
+    assert_eq!(args.len(), 2, "list_range expects 2 arguments");
+    let start_value = compile_ast(
+        builder,
+        &args[0],
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+    );
+    let end_value = compile_ast(
+        builder,
+        &args[1],
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+    );
+    let start = expect_int_payload(builder, start_value);
+    let end = expect_int_payload(builder, end_value);
+    let output = create_empty_list(builder, func_refs);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let exit_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+
+    builder.ins().jump(loop_block, &[BlockArg::Value(start)]);
+
+    builder.switch_to_block(loop_block);
+    let current = builder.block_params(loop_block)[0];
+    let has_more = builder.ins().icmp(IntCC::SignedLessThan, current, end);
+    builder
+        .ins()
+        .brif(has_more, body_block, &[], exit_block, &[]);
+
+    builder.switch_to_block(body_block);
+    let current_value = CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: current,
+    };
+    let _ = call_binary(builder, func_refs, "list_push", output, current_value);
+    let next = builder.ins().iadd_imm(current, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(exit_block);
+    builder.seal_block(loop_block);
+    builder.seal_block(body_block);
+    builder.seal_block(exit_block);
+    output
+}
+
 fn compile_ast(
     builder: &mut FunctionBuilder,
     ast: &Ast,
@@ -1866,6 +1943,16 @@ fn compile_ast(
             }
             if function == "list_filter" {
                 return compile_list_filter(
+                    builder,
+                    args,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                );
+            }
+            if function == "list_range" {
+                return compile_list_range(
                     builder,
                     args,
                     vars,
@@ -2273,6 +2360,18 @@ fn jit_list_map_works() {
 }
 
 #[test]
+fn jit_list_map_works_with_multiline_lambda() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, fn item ->\n        item * 2\n    end)\n    ys[0] + ys[1] + ys[2]\nend";
+    assert_cranelift_jit_result(src, 12);
+}
+
+#[test]
+fn jit_list_map_lambda_allows_local_assignments() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, fn x ->\n        tmp = [x, x, x]\n        tmp[0] + tmp[1] + tmp[2]\n    end)\n    ys[1]\nend";
+    assert_cranelift_jit_result(src, 6);
+}
+
+#[test]
 fn jit_list_map_accepts_function_values_in_variables() {
     let src = "fn main() do\n    f = fn item -> item * 2 end\n    xs = [1, 2, 3]\n    ys = list_map(xs, f)\n    ys[0] + ys[1] + ys[2]\nend";
     assert_cranelift_jit_result(src, 12);
@@ -2288,6 +2387,12 @@ fn jit_list_map_accepts_named_functions_as_values() {
 fn jit_list_filter_works() {
     let src = "fn main() do\n    xs = [1, 2, 3, 4]\n    ys = list_filter(xs, fn item -> item % 2 end)\n    list_len(ys)\nend";
     assert_cranelift_jit_result(src, 2);
+}
+
+#[test]
+fn jit_list_range_works() {
+    let src = "fn main() do\n    xs = list_range(2, 6)\n    xs[0] + xs[1] + xs[2] + xs[3] + list_len(xs)\nend";
+    assert_cranelift_jit_result(src, 18);
 }
 
 #[test]
@@ -2430,6 +2535,13 @@ fn llvm_jit_list_map_accepts_named_functions_as_values() {
 fn llvm_jit_list_filter_works() {
     let src = "fn main() do\n    xs = [1, 2, 3, 4]\n    ys = list_filter(xs, fn item -> item % 2 end)\n    list_len(ys)\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 2);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_range_works() {
+    let src = "fn main() do\n    xs = list_range(2, 6)\n    xs[0] + xs[1] + xs[2] + xs[3] + list_len(xs)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 18);
 }
 
 #[cfg(feature = "llvm-backend")]

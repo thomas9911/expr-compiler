@@ -937,6 +937,87 @@ impl<'ctx> LlvmCompiler<'ctx> {
         output
     }
 
+    fn compile_list_range(
+        &self,
+        args: &[Ast],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        assert_eq!(args.len(), 2, "list_range expects 2 arguments");
+        let start_value = self.compile_ast(&args[0], vars, function);
+        let end_value = self.compile_ast(&args[1], vars, function);
+        let start = self.build_internal_scalar_call(
+            self.require_func("__value_to_i64"),
+            &[start_value],
+            "list_range_start",
+        );
+        let end = self.build_internal_scalar_call(
+            self.require_func("__value_to_i64"),
+            &[end_value],
+            "list_range_end",
+        );
+        let output =
+            self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_range_new");
+
+        let loop_block = self.context.append_basic_block(function, "list_range_loop");
+        let body_block = self.context.append_basic_block(function, "list_range_body");
+        let latch_block = self
+            .context
+            .append_basic_block(function, "list_range_latch");
+        let exit_block = self.context.append_basic_block(function, "list_range_exit");
+        let entry_block = self
+            .builder
+            .get_insert_block()
+            .expect("missing list_range entry block");
+
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to list_range loop");
+
+        self.builder.position_at_end(loop_block);
+        let current_phi = self
+            .builder
+            .build_phi(self.i64_type, "list_range_current")
+            .expect("failed to build list_range current phi");
+        current_phi.add_incoming(&[(&start, entry_block)]);
+        let current = current_phi.as_basic_value().into_int_value();
+        let has_more = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, current, end, "list_range_has_more")
+            .expect("failed to compare list_range bounds");
+        self.builder
+            .build_conditional_branch(has_more, body_block, exit_block)
+            .expect("failed to branch in list_range loop");
+
+        self.builder.position_at_end(body_block);
+        let current_value = self.int_value(current);
+        let _ = self.build_internal_call(
+            self.require_func("__rt_list_push"),
+            &[output, current_value],
+            "list_range_push",
+        );
+        self.builder
+            .build_unconditional_branch(latch_block)
+            .expect("failed to branch to list_range latch");
+
+        self.builder.position_at_end(latch_block);
+        let next = self
+            .builder
+            .build_int_add(
+                current,
+                self.i64_type.const_int(1, false),
+                "list_range_next",
+            )
+            .expect("failed to increment list_range value");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to jump to list_range loop");
+        current_phi.add_incoming(&[(&next, latch_block)]);
+
+        self.builder.position_at_end(exit_block);
+        output
+    }
+
     fn compile_ast(
         &self,
         ast: &Ast,
@@ -1004,6 +1085,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 }
                 if name == "list_filter" {
                     return self.compile_list_filter(args, vars, function);
+                }
+                if name == "list_range" {
+                    return self.compile_list_range(args, vars, function);
                 }
                 let compiled = args
                     .iter()

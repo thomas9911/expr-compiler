@@ -1,0 +1,20 @@
+
+fn inc(x):
+    x + 1
+
+fn dec(x):
+    x - 1
+
+fn square(x):
+    x * x
+
+fn main():
+    xs = list_range(1, 6)
+    transformed = list_map(xs, fn x ->
+        ys = [dec(x), x, inc(x)]
+        list_map(ys, fn y ->
+            square(dec(y)) + y
+        end)
+    end)
+
+    print(transformed)

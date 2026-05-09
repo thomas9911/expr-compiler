@@ -403,11 +403,16 @@ fn parse_lambda<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         }
     }
 
-    let body = parse_expr(lex, 0)?;
-    trim_newlines(lex);
-    if lex.next() != Some(Ok(Token::EndBlock)) {
-        return Err(ParseError::unexpected(lex));
-    }
+    let body = if lex.peek() == Some(&Ok(Token::Newline)) {
+        Ast::Block(parse_block_body_until_end(lex)?)
+    } else {
+        let body = parse_expr(lex, 0)?;
+        trim_newlines(lex);
+        if lex.next() != Some(Ok(Token::EndBlock)) {
+            return Err(ParseError::unexpected(lex));
+        }
+        body
+    };
 
     Ok(Ast::Lambda {
         inputs,
@@ -1055,6 +1060,44 @@ fn parse_lambda_expression() {
                                 Variable("item".to_string()),
                                 Literal(LiteralAst::Integer(2)),
                             ],
+                        })),
+                    },
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_multiline_lambda_expression() {
+    use Ast::*;
+
+    let text = "fn main() do\n    list_map(xs, fn item ->\n        item * 2\n    end)\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "list_map".to_string(),
+                args: vec![
+                    Variable("xs".to_string()),
+                    Lambda {
+                        inputs: vec!["item".to_string()],
+                        body: Box::new(Block(BlockAst {
+                            lines: vec![Expression(ExpressionAst {
+                                function: "multiply".to_string(),
+                                args: vec![
+                                    Variable("item".to_string()),
+                                    Literal(LiteralAst::Integer(2)),
+                                ],
+                            })],
                         })),
                     },
                 ],

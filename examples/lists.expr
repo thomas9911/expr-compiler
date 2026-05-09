@@ -9,5 +9,5 @@ fn consume(xs, count, total):
         consume(xs, count + 1, total + x)
 
 fn main():
-    xs = [1, 4, 9, 16]
+    xs = list_map(list_range(1, 5), fn x -> x * x end)
     consume(xs, 0, 0)
