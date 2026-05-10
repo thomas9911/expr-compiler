@@ -1,0 +1,49 @@
+fn main() do
+    factor = 3
+    add_factor = fn x -> x + factor end
+
+    xs = list_range(1, 5)
+    mapped = list_map(xs, fn item -> item * factor end)
+    filtered = list_filter(mapped, fn item -> item > 6 end)
+
+    # Assignment inside a closure currently shadows the outer binding.
+    # It does not mutate the outer integer or outer list.
+    n = 10
+    reassign_int = fn x ->
+        n = x + 1
+        n
+    end
+
+    original = [1, 2]
+    reassign_list = fn x ->
+        original = [x, x + 1]
+        original
+    end
+
+    shared = [1, 2, 3]
+    mutate_shared = fn x ->
+        shared[1] = x
+        shared
+    end
+
+    # If you do not want shared mutation, copy the list first.
+    isolated = [4, 5, 6]
+    mutate_copy = fn x ->
+        local = list_copy(isolated)
+        local[1] = x
+        local
+    end
+
+    print(add_factor(4))
+    print(xs)
+    print(mapped)
+    print(filtered)
+    print(reassign_int(4))
+    print(n)
+    print(reassign_list(7))
+    print(original)
+    print(mutate_shared(99))
+    print(shared)
+    print(mutate_copy(77))
+    print(isolated)
+end

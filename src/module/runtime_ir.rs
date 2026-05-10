@@ -98,11 +98,12 @@ pub(super) fn setup_builtins_jit(
 
 fn build_builtin_map(
     print_id: FuncId,
-    list_print_id: FuncId,
+    _list_print_id: FuncId,
     runtime: RuntimeBuiltins,
 ) -> HashMap<String, FuncId> {
     let mut builtins = HashMap::new();
     builtins.insert("print".to_string(), print_id);
+    builtins.insert("__alloc".to_string(), runtime.alloc);
     builtins.insert("__box_value".to_string(), runtime.box_value);
     builtins.insert("__value_int".to_string(), runtime.value_int);
     builtins.insert("__value_to_i64".to_string(), runtime.value_to_i64);
@@ -127,11 +128,11 @@ fn build_builtin_map(
     builtins.insert("list_swap".to_string(), runtime.list_swap);
     builtins.insert("list_pop".to_string(), runtime.list_pop);
     builtins.insert("list_copy".to_string(), runtime.list_copy);
-    builtins.insert("list_print".to_string(), list_print_id);
     builtins
 }
 
 struct RuntimeBuiltins {
+    alloc: FuncId,
     box_value: FuncId,
     value_int: FuncId,
     value_to_i64: FuncId,
@@ -373,6 +374,7 @@ fn declare_runtime_function_ids(
         alloc,
         memcpy,
         builtins: RuntimeBuiltins {
+            alloc,
             box_value,
             value_int,
             value_to_i64,

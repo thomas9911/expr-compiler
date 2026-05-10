@@ -19,14 +19,15 @@ Current tag usage:
 
 ## Higher-order list functions
 
-The language now supports no-capture anonymous functions and higher-order list
-operations.
+The language supports anonymous functions, captured closures, and higher-order
+list operations.
 
 Supported forms:
 
 ```text
 list_map(xs, fn item -> item * 2 end)
 list_filter(xs, fn item -> item > 2 end)
+list_filter(xs, fn item -> item == limit end)
 ```
 
 Named top-level functions can also be used as function values:
@@ -39,17 +40,27 @@ end
 fn main() do
     xs = [1, 2, 3]
     ys = list_map(xs, double)
-    list_print(ys)
+    print(ys)
+end
+```
+
+Function values can be stored in variables and called directly:
+
+```text
+fn main() do
+    factor = 3
+    f = fn x -> x * factor end
+    f(10)
 end
 ```
 
 Current constraints:
 
-- anonymous functions must not capture outer variables
 - `list_map` and `list_filter` currently require unary callbacks
 - function values can be stored in variables and passed to `list_map` /
   `list_filter`
-- generic direct function-value calls like `f(10)` are not implemented yet
+- direct function-value calls currently use identifier callees such as `f(10)`
+- strings are still not implemented as a language feature
 
 ## LLVM backend
 

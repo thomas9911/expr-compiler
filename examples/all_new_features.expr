@@ -1,0 +1,29 @@
+# Demonstrates the current higher-order and closure feature set.
+
+fn double(x) do
+    x * 2
+end
+
+fn main() do
+    factor = 3
+
+    xs = list_range(1, 6)
+    doubled = list_map(xs, double)
+
+    add_factor = fn x -> x + factor end
+    print(add_factor(10))
+
+    expanded = list_map(xs, fn x ->
+        tmp = [x, x]
+        tmp[0] + tmp[1]
+    end)
+
+    greater_than_factor = list_filter(xs, fn item -> item > factor end)
+
+    print(xs)
+    print(doubled)
+    print(expanded)
+    print(greater_than_factor)
+
+    0
+end

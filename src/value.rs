@@ -5,6 +5,9 @@ pub const TAG_FUNCTION: i64 = 4;
 
 pub const VALUE_SIZE: i64 = 16;
 pub const VALUE_PAYLOAD_OFFSET: i32 = 8;
+pub const CLOSURE_SIZE: i64 = 16;
+pub const CLOSURE_FUNCTION_ORDINAL_OFFSET: i32 = 0;
+pub const CLOSURE_ENV_PTR_OFFSET: i32 = 8;
 pub const LIST_HEADER_SIZE: i64 = 24;
 pub const LIST_PTR_OFFSET: i32 = 0;
 pub const LIST_LEN_OFFSET: i32 = 8;

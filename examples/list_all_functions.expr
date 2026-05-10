@@ -10,7 +10,7 @@ fn main():
     list_swap(xs, 0, 3)
 
     ys = list_copy(xs)
-    list_print(xs)
+    print(xs)
 
     print(list_len(xs))
     print(list_get(xs, 0))
