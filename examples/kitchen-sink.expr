@@ -1,0 +1,68 @@
+# Kitchen sink example for the currently supported language features.
+
+fn square(x) do
+    x * x
+end
+
+fn sum_to(n) do
+    if n == 0 do
+        0
+    else
+        n + sum_to(n - 1)
+    end
+end
+
+fn main() do
+    bias = 3
+
+    # Arithmetic, comparisons, recursion, and if/else.
+    print(sum_to(5))
+
+    # Lists, range generation, copying, indexing, mutation, and list builtins.
+    xs = list_range(1, 6)
+    work = list_copy(xs)
+    list_insert(work, 1, 99)
+    work[0] = 42
+    list_swap(work, 0, 2)
+    print(list_len(work))
+    print(work[1])
+    print(list_pop(work))
+    print(work)
+
+    manual = list_new()
+    list_push(manual, 10)
+    list_push(manual, 20)
+    list_set(manual, 1, 22)
+    print(manual)
+
+    # Named functions as values and direct function-value calls.
+    named_fn = square
+    print(named_fn(7))
+
+    # Anonymous functions, higher-order list functions, captured closures,
+    # multiline lambdas, and local assignments inside lambdas.
+    doubled = list_map(xs, named_fn)
+    shifted = list_map(xs, fn x -> x + bias end)
+    grouped = list_map(xs, fn x ->
+        tmp = [x, x + 1]
+        tmp[0] + tmp[1]
+    end)
+    evens = list_filter(xs, fn x -> x % 2 == 0 end)
+    gt_bias = list_filter(xs, fn x -> x > bias end)
+
+    # Nested closures and direct inner closure calls.
+    nested = list_map(xs, fn x ->
+        inner = fn y -> y + bias end
+        inner(x)
+    end)
+
+    print(xs)
+    print(doubled)
+    print(shifted)
+    print(grouped)
+    print(evens)
+    print(gt_bias)
+    print(nested)
+
+    0
+end
