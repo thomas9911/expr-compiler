@@ -57,6 +57,8 @@ pub enum Token {
     Integer(i64),
     #[token("+")]
     Add,
+    #[token("->")]
+    Arrow,
     #[token("-")]
     Subtract,
     #[token("*")]
@@ -114,6 +116,7 @@ impl Token {
             Token::Newline => TokenKind::Newline,
             Token::Integer(_) => TokenKind::Integer,
             Token::Add => TokenKind::InfixOperator,
+            Token::Arrow => TokenKind::Arrow,
             Token::Subtract => TokenKind::InfixOperator,
             Token::Multiply => TokenKind::InfixOperator,
             Token::Divide => TokenKind::InfixOperator,
@@ -148,6 +151,7 @@ pub enum TokenKind {
     Newline,
     Integer,
     InfixOperator,
+    Arrow,
     OpenBracket,
     CloseBracket,
     OpenSquareBracket,
@@ -228,6 +232,25 @@ fn main():
     assert_eq!(result.unwrap(), expected);
 
     // Both block styles are currently accepted: `do ... end` and `: + indentation`.
+}
+
+#[test]
+fn tokenize_lambda_arrow() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("fn item -> item * 2 end").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            DefineFunction,
+            Symbol("item".to_string()),
+            Arrow,
+            Symbol("item".to_string()),
+            Multiply,
+            Integer(2),
+            EndBlock,
+        ]
+    );
 }
 
 #[test]

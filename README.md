@@ -15,6 +15,52 @@ Current tag usage:
 - `Int`
 - `List`
 - `String` is reserved in the value model, but not implemented as a language feature yet
+- `Function`
+
+## Higher-order list functions
+
+The language supports anonymous functions, captured closures, and higher-order
+list operations.
+
+Supported forms:
+
+```text
+list_map(xs, fn item -> item * 2 end)
+list_filter(xs, fn item -> item > 2 end)
+list_filter(xs, fn item -> item == limit end)
+```
+
+Named top-level functions can also be used as function values:
+
+```text
+fn double(item) do
+    item * 2
+end
+
+fn main() do
+    xs = [1, 2, 3]
+    ys = list_map(xs, double)
+    print(ys)
+end
+```
+
+Function values can be stored in variables and called directly:
+
+```text
+fn main() do
+    factor = 3
+    f = fn x -> x * factor end
+    f(10)
+end
+```
+
+Current constraints:
+
+- `list_map` and `list_filter` currently require unary callbacks
+- function values can be stored in variables and passed to `list_map` /
+  `list_filter`
+- direct function-value calls currently use identifier callees such as `f(10)`
+- strings are still not implemented as a language feature
 
 ## LLVM backend
 
@@ -127,6 +173,9 @@ just check-matrix
 
 - LLVM core Wasm mode, run through `scripts/run-wasm.js`
 - LLVM `wasi:cli/command` component mode, run through `wasmtime run`
+- expected-failure examples are supported too:
+  - Cranelift JIT defines the baseline stdout and success/failure class
+  - non-zero failure codes do not have to match exactly across native, Wasm, and component runners
 
 If your non-interactive shell does not expose the JavaScript runtime in `PATH`,
 you can override it explicitly:
@@ -145,6 +194,12 @@ If `wasmtime` is not in `PATH`, you can override that explicitly too:
 
 ```bash
 WASMTIME=/path/to/wasmtime just check-matrix
+```
+
+Arena exhaustion now reports explicitly across the main runnable backends as:
+
+```text
+runtime error: out of arena memory
 ```
 
 ### Local test script

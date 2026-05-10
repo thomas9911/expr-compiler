@@ -1,6 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
-use crate::value::{ListHeader, TAG_INT, TAG_LIST, TAG_STRING, Value, ValueTag};
+use crate::value::{ListHeader, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_STRING, Value, ValueTag};
 
 const DEFAULT_ARENA_BYTES: usize = 16 * 1024 * 1024;
 const LIST_INITIAL_CAPACITY: usize = 1024;
@@ -118,6 +118,7 @@ fn print_value_ref(value: &Value) {
             print!("]");
         }
         ValueTag::String => runtime_trap("string values are not supported yet"),
+        ValueTag::Function => runtime_trap("function values are not supported here yet"),
     }
 }
 
@@ -151,6 +152,11 @@ pub fn jit_arena_addresses() -> (i64, i64) {
         let offset = (&mut arena.offset as *mut usize) as usize as i64;
         (base, offset)
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_runtime_oom_host() -> i64 {
+    runtime_trap("out of arena memory");
 }
 
 #[unsafe(no_mangle)]
@@ -249,6 +255,7 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         TAG_INT => new_int(payload),
         TAG_LIST => with_arena(|arena| alloc_value(arena, ValueTag::List, payload)),
         TAG_STRING => with_arena(|arena| alloc_value(arena, ValueTag::String, payload)),
+        TAG_FUNCTION => with_arena(|arena| alloc_value(arena, ValueTag::Function, payload)),
         _ => runtime_trap("unknown value tag"),
     }
 }

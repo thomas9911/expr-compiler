@@ -6,6 +6,7 @@
 #define VALUE_TAG_INT 1
 #define VALUE_TAG_LIST 2
 #define VALUE_TAG_STRING 3
+#define VALUE_TAG_FUNCTION 4
 
 typedef struct Value {
     uint8_t tag;
@@ -53,6 +54,9 @@ static void print_value_ref(const Value *value) {
     if (value->tag == VALUE_TAG_STRING) {
         runtime_trap("string values are not supported yet");
     }
+    if (value->tag == VALUE_TAG_FUNCTION) {
+        runtime_trap("function values are not supported yet");
+    }
     runtime_trap("unknown value tag");
 }
 
@@ -71,4 +75,8 @@ int64_t __expr_list_print_host(int64_t handle) {
     print_value_inner(handle);
     putchar('\n');
     return (int64_t)(uintptr_t)&PRINT_ZERO;
+}
+
+int64_t __expr_runtime_oom_host(void) {
+    runtime_trap("out of arena memory");
 }

@@ -1,10 +1,12 @@
-use super::{Module, is_builtin_name, local_var_names};
+use super::{
+    ClosureMetadata, Module, function_arities, function_ordinals, is_builtin_name, local_var_names,
+};
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
-use crate::value::{TAG_INT, TAG_LIST};
-#[cfg(feature = "wasi")]
-use inkwell::attributes::AttributeLoc;
+use crate::value::{CLOSURE_SIZE, TAG_FUNCTION, TAG_INT, TAG_LIST, VALUE_SIZE};
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
+#[cfg(feature = "wasi")]
+use inkwell::attributes::AttributeLoc;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
@@ -102,6 +104,9 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
 
     let functions = {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
+        compiler.function_ordinals = function_ordinals(&expr_module.functions);
+        compiler.function_arities = function_arities(&expr_module.functions);
+        compiler.closure_metadata = expr_module.closure_metadata.clone();
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Jit);
         compiler.define_user_functions(&expr_module.functions);
@@ -138,6 +143,9 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Host);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
+        compiler.function_ordinals = function_ordinals(&expr_module.functions);
+        compiler.function_arities = function_arities(&expr_module.functions);
+        compiler.closure_metadata = expr_module.closure_metadata.clone();
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Executable);
         compiler.define_user_functions(&expr_module.functions);
@@ -160,6 +168,9 @@ pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Wasm);
+        compiler.function_ordinals = function_ordinals(&expr_module.functions);
+        compiler.function_arities = function_arities(&expr_module.functions);
+        compiler.closure_metadata = expr_module.closure_metadata.clone();
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Wasm);
         compiler.define_user_functions(&expr_module.functions);
@@ -177,16 +188,26 @@ pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u
 }
 
 #[cfg(feature = "wasi")]
-pub(super) fn compile_to_wasm_preview1_command_assembly(expr_module: Module, name: &str) -> Vec<u8> {
+pub(super) fn compile_to_wasm_preview1_command_assembly(
+    expr_module: Module,
+    name: &str,
+) -> Vec<u8> {
     Target::initialize_webassembly(&InitializationConfig::default());
 
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);
+        compiler.function_ordinals = function_ordinals(&expr_module.functions);
+        compiler.function_arities = function_arities(&expr_module.functions);
+        compiler.closure_metadata = expr_module.closure_metadata.clone();
         compiler.declare_runtime_functions();
-        compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::WasiPreview1Command);
+        compiler
+            .declare_user_functions(&expr_module.functions, LlvmOutputMode::WasiPreview1Command);
         compiler.define_user_functions(&expr_module.functions);
-        compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::WasiPreview1Command);
+        compiler.define_int_result_wrappers(
+            &expr_module.functions,
+            LlvmOutputMode::WasiPreview1Command,
+        );
         #[cfg(feature = "wasi")]
         compiler.define_wasi_preview1_command_start_wrapper();
     }
@@ -240,6 +261,9 @@ struct LlvmCompiler<'ctx> {
     i64_type: IntType<'ctx>,
     runtime_mode: LlvmRuntimeMode,
     functions: HashMap<String, FunctionValue<'ctx>>,
+    function_ordinals: HashMap<String, i64>,
+    function_arities: HashMap<String, usize>,
+    closure_metadata: HashMap<String, ClosureMetadata>,
 }
 
 #[derive(Clone, Copy)]
@@ -261,6 +285,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             i64_type: context.i64_type(),
             runtime_mode,
             functions: HashMap::new(),
+            function_ordinals: HashMap::new(),
+            function_arities: HashMap::new(),
+            closure_metadata: HashMap::new(),
         }
     }
 
@@ -285,9 +312,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 ),
                 None,
             ),
-            "proc_exit" => self
-                .module
-                .add_function(name, self.context.void_type().fn_type(&[i32_type.into()], false), None),
+            "proc_exit" => self.module.add_function(
+                name,
+                self.context.void_type().fn_type(&[i32_type.into()], false),
+                None,
+            ),
             other => panic!("unsupported WASI Preview 1 import: {other}"),
         };
 
@@ -326,9 +355,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 ];
 
                 for (name, symbol, params) in runtime {
-                    let function =
-                        self.module
-                            .add_function(symbol, self.i64_type.fn_type(&params, false), None);
+                    let function = self.module.add_function(
+                        symbol,
+                        self.i64_type.fn_type(&params, false),
+                        None,
+                    );
                     self.functions.insert(name.to_string(), function);
                 }
             }
@@ -411,7 +442,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
     fn declare_user_functions(&mut self, functions: &[FunctionDefAst], mode: LlvmOutputMode) {
         let _ = mode;
         for func in functions {
-            let internal_params = vec![self.i64_type.into(); func.inputs.len() * 2];
+            let mut internal_params: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
+                vec![self.i64_type.into()];
+            for _ in 0..(func.inputs.len() * 2) {
+                internal_params.push(self.i64_type.into());
+            }
             let internal_symbol = internal_symbol_name(&func.name);
             let internal = self.module.add_function(
                 &internal_symbol,
@@ -492,7 +527,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let trap_block = self.context.append_basic_block(function, "trap");
         self.builder.position_at_end(entry);
 
-        let value = self.build_internal_call(internal, &[], "int_result_value");
+        let value = self.build_user_call(
+            internal,
+            self.i64_type.const_zero(),
+            &[],
+            "int_result_value",
+        );
         let is_int = self
             .builder
             .build_int_compare(
@@ -518,20 +558,41 @@ impl<'ctx> LlvmCompiler<'ctx> {
     fn define_user_function(&self, func_def: &FunctionDefAst) {
         let function = self.require_func(&func_def.name);
         let entry = self.context.append_basic_block(function, "entry");
+        let loop_block = self.context.append_basic_block(function, "loop");
         self.builder.position_at_end(entry);
 
         let mut vars = HashMap::new();
+        let capture_slots: HashMap<String, usize> = self
+            .closure_metadata
+            .get(&func_def.name)
+            .map(|metadata| {
+                metadata
+                    .captures
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| (name.clone(), index))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let env_slot = self
+            .builder
+            .build_alloca(self.i64_type, "env")
+            .expect("failed to allocate env slot");
+        let initial_env = function.get_first_param().unwrap().into_int_value();
+        self.builder
+            .build_store(env_slot, initial_env)
+            .expect("failed to store initial env");
         for (index, name) in func_def.inputs.iter().enumerate() {
             let ptr = self
                 .builder
                 .build_alloca(self.pair_type(), name)
                 .expect("failed to allocate function param");
             let tag = function
-                .get_nth_param((index * 2) as u32)
+                .get_nth_param((index * 2 + 1) as u32)
                 .unwrap_or_else(|| panic!("missing tag param {index} for {}", func_def.name))
                 .into_int_value();
             let payload = function
-                .get_nth_param((index * 2 + 1) as u32)
+                .get_nth_param((index * 2 + 2) as u32)
                 .unwrap_or_else(|| panic!("missing payload param {index} for {}", func_def.name))
                 .into_int_value();
             self.builder
@@ -548,28 +609,666 @@ impl<'ctx> LlvmCompiler<'ctx> {
             });
         }
 
-        let mut last_val = None;
-        for line in &func_def.block.lines {
-            last_val = Some(self.compile_ast(line, &vars, function));
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to user loop");
+
+        self.builder.position_at_end(loop_block);
+        self.compile_tail_block(
+            &func_def.block,
+            &vars,
+            &capture_slots,
+            env_slot,
+            loop_block,
+            function,
+            &func_def.name,
+            &func_def.inputs,
+        );
+    }
+
+    fn apply_function_value(
+        &self,
+        callback: CompiledValue<'ctx>,
+        args: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let trap_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_trap"));
+        let merge_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_merge"));
+
+        let is_function = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                callback.tag,
+                self.i64_type.const_int(TAG_FUNCTION as u64, false),
+                &format!("{label}_is_function"),
+            )
+            .expect("failed to compare callback tag");
+
+        let mut candidates: Vec<_> = self
+            .function_ordinals
+            .iter()
+            .filter_map(|(name, &ordinal)| {
+                (self.function_arities.get(name) == Some(&args.len()))
+                    .then_some((ordinal, name.as_str()))
+            })
+            .collect();
+        candidates.sort_by_key(|(ordinal, _)| *ordinal);
+        if candidates.is_empty() {
+            panic!("no unary functions are available for higher-order list builtins");
         }
 
-        if let Some(value) = last_val {
+        let first_check = self
+            .context
+            .append_basic_block(function, &format!("{label}_check0"));
+        self.builder
+            .build_conditional_branch(is_function, first_check, trap_block)
+            .expect("failed to branch on callback tag");
+
+        self.builder.position_at_end(first_check);
+        let closure_raw_ptr = self
+            .builder
+            .build_int_to_ptr(
+                callback.payload,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_closure_ptr"),
+            )
+            .expect("failed to convert closure ptr");
+        let ordinal_ptr = self
+            .builder
+            .build_struct_gep(
+                self.closure_type(),
+                closure_raw_ptr,
+                0,
+                &format!("{label}_ordinal_ptr"),
+            )
+            .expect("failed to build closure ordinal ptr");
+        let env_ptr_ptr = self
+            .builder
+            .build_struct_gep(
+                self.closure_type(),
+                closure_raw_ptr,
+                1,
+                &format!("{label}_env_ptr_ptr"),
+            )
+            .expect("failed to build closure env ptr ptr");
+        let closure_ordinal = self
+            .builder
+            .build_load(self.i64_type, ordinal_ptr, &format!("{label}_ordinal"))
+            .expect("failed to load closure ordinal")
+            .into_int_value();
+        let closure_env = self
+            .builder
+            .build_load(self.i64_type, env_ptr_ptr, &format!("{label}_env"))
+            .expect("failed to load closure env")
+            .into_int_value();
+
+        let mut current_check = first_check;
+        let mut incomings = Vec::with_capacity(candidates.len());
+        for (index, (ordinal, name)) in candidates.iter().enumerate() {
+            if index != 0 {
+                self.builder.position_at_end(current_check);
+            }
+            let matched = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    closure_ordinal,
+                    self.i64_type.const_int(*ordinal as u64, true),
+                    &format!("{label}_match_{index}"),
+                )
+                .expect("failed to compare callback ordinal");
+            let call_block = self
+                .context
+                .append_basic_block(function, &format!("{label}_call_{index}"));
+            let next_block = if index + 1 == candidates.len() {
+                trap_block
+            } else {
+                self.context
+                    .append_basic_block(function, &format!("{label}_check_{}", index + 1))
+            };
             self.builder
-                .build_return(Some(&self.make_pair_value(
-                    value.tag,
-                    value.payload,
-                    "return_pair",
-                )))
-                .expect("failed to build return");
-        } else {
+                .build_conditional_branch(matched, call_block, next_block)
+                .expect("failed to branch on callback ordinal");
+
+            self.builder.position_at_end(call_block);
+            let result = self.build_user_call(
+                self.require_func(name),
+                closure_env,
+                args,
+                &format!("{label}_apply_{index}"),
+            );
+            self.builder
+                .build_unconditional_branch(merge_block)
+                .expect("failed to branch to callback merge");
+            let result_block = self
+                .builder
+                .get_insert_block()
+                .expect("missing callback result block");
+            incomings.push((result, result_block));
+
+            current_check = next_block;
+        }
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(merge_block);
+        let tag_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_tag"))
+            .expect("failed to build callback tag phi");
+        let payload_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_payload"))
+            .expect("failed to build callback payload phi");
+        let tag_incoming: Vec<(&dyn inkwell::values::BasicValue<'ctx>, _)> = incomings
+            .iter()
+            .map(|(value, block)| (&value.tag as &dyn inkwell::values::BasicValue<'ctx>, *block))
+            .collect();
+        let payload_incoming: Vec<(&dyn inkwell::values::BasicValue<'ctx>, _)> = incomings
+            .iter()
+            .map(|(value, block)| {
+                (
+                    &value.payload as &dyn inkwell::values::BasicValue<'ctx>,
+                    *block,
+                )
+            })
+            .collect();
+        tag_phi.add_incoming(&tag_incoming);
+        payload_phi.add_incoming(&payload_incoming);
+        CompiledValue {
+            tag: tag_phi.as_basic_value().into_int_value(),
+            payload: payload_phi.as_basic_value().into_int_value(),
+        }
+    }
+
+    fn validate_unary_callback_ast(
+        &self,
+        ast: &Ast,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        builtin: &str,
+    ) {
+        match ast {
+            Ast::FunctionRef(name) => {
+                if self.function_arities.get(name) != Some(&1usize) {
+                    panic!("{builtin} callback must take exactly 1 argument");
+                }
+            }
+            Ast::Variable(name)
+                if !vars.contains_key(name) && self.function_ordinals.contains_key(name) =>
+            {
+                if self.function_arities.get(name) != Some(&1usize) {
+                    panic!("{builtin} callback must take exactly 1 argument");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn compile_list_map(
+        &self,
+        args: &[Ast],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        assert_eq!(args.len(), 2, "list_map expects 2 arguments");
+        self.validate_unary_callback_ast(&args[1], vars, "list_map");
+        let input = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+        let callback = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+        let output =
+            self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_map_new");
+        let len =
+            self.build_internal_call(self.require_func("__rt_list_len"), &[input], "list_map_len");
+
+        let loop_block = self.context.append_basic_block(function, "list_map_loop");
+        let body_block = self.context.append_basic_block(function, "list_map_body");
+        let latch_block = self.context.append_basic_block(function, "list_map_latch");
+        let exit_block = self.context.append_basic_block(function, "list_map_exit");
+        let entry_block = self
+            .builder
+            .get_insert_block()
+            .expect("missing list_map entry block");
+
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to list_map loop");
+
+        self.builder.position_at_end(loop_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "list_map_idx")
+            .expect("failed to build list_map idx phi");
+        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_block)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let has_more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len.payload, "list_map_has_more")
+            .expect("failed to compare list_map idx");
+        self.builder
+            .build_conditional_branch(has_more, body_block, exit_block)
+            .expect("failed to branch in list_map loop");
+
+        self.builder.position_at_end(body_block);
+        let index_value = self.int_value(idx);
+        let item = self.build_internal_call(
+            self.require_func("__rt_list_get"),
+            &[input, index_value],
+            "list_map_get",
+        );
+        let mapped = self.apply_function_value(callback, &[item], function, "list_map");
+        let _ = self.build_internal_call(
+            self.require_func("__rt_list_push"),
+            &[output, mapped],
+            "list_map_push",
+        );
+        self.builder
+            .build_unconditional_branch(latch_block)
+            .expect("failed to branch to list_map latch");
+
+        self.builder.position_at_end(latch_block);
+        let next = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), "list_map_next")
+            .expect("failed to increment list_map idx");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to jump to list_map loop");
+        idx_phi.add_incoming(&[(&next, latch_block)]);
+
+        self.builder.position_at_end(exit_block);
+        output
+    }
+
+    fn compile_list_filter(
+        &self,
+        args: &[Ast],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        assert_eq!(args.len(), 2, "list_filter expects 2 arguments");
+        self.validate_unary_callback_ast(&args[1], vars, "list_filter");
+        let input = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+        let callback = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+        let output =
+            self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_filter_new");
+        let len = self.build_internal_call(
+            self.require_func("__rt_list_len"),
+            &[input],
+            "list_filter_len",
+        );
+
+        let loop_block = self
+            .context
+            .append_basic_block(function, "list_filter_loop");
+        let body_block = self
+            .context
+            .append_basic_block(function, "list_filter_body");
+        let push_block = self
+            .context
+            .append_basic_block(function, "list_filter_push");
+        let skip_block = self
+            .context
+            .append_basic_block(function, "list_filter_skip");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "list_filter_continue");
+        let latch_block = self
+            .context
+            .append_basic_block(function, "list_filter_latch");
+        let exit_block = self
+            .context
+            .append_basic_block(function, "list_filter_exit");
+        let entry_block = self
+            .builder
+            .get_insert_block()
+            .expect("missing list_filter entry block");
+
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to list_filter loop");
+
+        self.builder.position_at_end(loop_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "list_filter_idx")
+            .expect("failed to build list_filter idx phi");
+        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_block)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let has_more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len.payload, "list_filter_has_more")
+            .expect("failed to compare list_filter idx");
+        self.builder
+            .build_conditional_branch(has_more, body_block, exit_block)
+            .expect("failed to branch in list_filter loop");
+
+        self.builder.position_at_end(body_block);
+        let index_value = self.int_value(idx);
+        let item = self.build_internal_call(
+            self.require_func("__rt_list_get"),
+            &[input, index_value],
+            "list_filter_get",
+        );
+        let predicate = self.apply_function_value(callback, &[item], function, "list_filter");
+        let truth = self.build_internal_scalar_call(
+            self.require_func("__value_is_truthy"),
+            &[predicate],
+            "list_filter_truth",
+        );
+        let keep = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                truth,
+                self.i64_type.const_zero(),
+                "list_filter_keep",
+            )
+            .expect("failed to compare list_filter truth");
+        self.builder
+            .build_conditional_branch(keep, push_block, skip_block)
+            .expect("failed to branch in list_filter body");
+
+        self.builder.position_at_end(push_block);
+        let _ = self.build_internal_call(
+            self.require_func("__rt_list_push"),
+            &[output, item],
+            "list_filter_push",
+        );
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .expect("failed to branch from list_filter push");
+
+        self.builder.position_at_end(skip_block);
+        self.builder
+            .build_unconditional_branch(continue_block)
+            .expect("failed to branch from list_filter skip");
+
+        self.builder.position_at_end(continue_block);
+        self.builder
+            .build_unconditional_branch(latch_block)
+            .expect("failed to branch to list_filter latch");
+
+        self.builder.position_at_end(latch_block);
+        let next = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), "list_filter_next")
+            .expect("failed to increment list_filter idx");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to jump to list_filter loop");
+        idx_phi.add_incoming(&[(&next, latch_block)]);
+
+        self.builder.position_at_end(exit_block);
+        output
+    }
+
+    fn compile_list_range(
+        &self,
+        args: &[Ast],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        assert_eq!(args.len(), 2, "list_range expects 2 arguments");
+        let start_value = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+        let end_value = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+        let start = self.build_internal_scalar_call(
+            self.require_func("__value_to_i64"),
+            &[start_value],
+            "list_range_start",
+        );
+        let end = self.build_internal_scalar_call(
+            self.require_func("__value_to_i64"),
+            &[end_value],
+            "list_range_end",
+        );
+        let output =
+            self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_range_new");
+
+        let loop_block = self.context.append_basic_block(function, "list_range_loop");
+        let body_block = self.context.append_basic_block(function, "list_range_body");
+        let latch_block = self
+            .context
+            .append_basic_block(function, "list_range_latch");
+        let exit_block = self.context.append_basic_block(function, "list_range_exit");
+        let entry_block = self
+            .builder
+            .get_insert_block()
+            .expect("missing list_range entry block");
+
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to list_range loop");
+
+        self.builder.position_at_end(loop_block);
+        let current_phi = self
+            .builder
+            .build_phi(self.i64_type, "list_range_current")
+            .expect("failed to build list_range current phi");
+        current_phi.add_incoming(&[(&start, entry_block)]);
+        let current = current_phi.as_basic_value().into_int_value();
+        let has_more = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, current, end, "list_range_has_more")
+            .expect("failed to compare list_range bounds");
+        self.builder
+            .build_conditional_branch(has_more, body_block, exit_block)
+            .expect("failed to branch in list_range loop");
+
+        self.builder.position_at_end(body_block);
+        let current_value = self.int_value(current);
+        let _ = self.build_internal_call(
+            self.require_func("__rt_list_push"),
+            &[output, current_value],
+            "list_range_push",
+        );
+        self.builder
+            .build_unconditional_branch(latch_block)
+            .expect("failed to branch to list_range latch");
+
+        self.builder.position_at_end(latch_block);
+        let next = self
+            .builder
+            .build_int_add(
+                current,
+                self.i64_type.const_int(1, false),
+                "list_range_next",
+            )
+            .expect("failed to increment list_range value");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to jump to list_range loop");
+        current_phi.add_incoming(&[(&next, latch_block)]);
+
+        self.builder.position_at_end(exit_block);
+        output
+    }
+
+    fn compile_tail_block(
+        &self,
+        block: &crate::parser::BlockAst,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_slot: PointerValue<'ctx>,
+        loop_block: inkwell::basic_block::BasicBlock<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+        current_function_inputs: &[String],
+    ) {
+        if block.lines.is_empty() {
             let zero = self.int_value(self.i64_type.const_zero());
             self.builder
                 .build_return(Some(&self.make_pair_value(
                     zero.tag,
                     zero.payload,
-                    "empty_pair",
+                    "empty_tail_pair",
                 )))
-                .expect("failed to build empty return");
+                .expect("failed to return empty tail value");
+            return;
+        }
+
+        for line in &block.lines[..block.lines.len() - 1] {
+            let current_env = self
+                .builder
+                .build_load(self.i64_type, env_slot, "tail_env")
+                .expect("failed to load tail env")
+                .into_int_value();
+            let _ = self.compile_ast(line, vars, capture_slots, current_env, function);
+        }
+
+        let current_env = self
+            .builder
+            .build_load(self.i64_type, env_slot, "tail_last_env")
+            .expect("failed to load tail env")
+            .into_int_value();
+        self.compile_tail_ast(
+            &block.lines[block.lines.len() - 1],
+            vars,
+            capture_slots,
+            env_slot,
+            current_env,
+            loop_block,
+            function,
+            current_function_name,
+            current_function_inputs,
+        );
+    }
+
+    fn compile_tail_ast(
+        &self,
+        ast: &Ast,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_slot: PointerValue<'ctx>,
+        env_ptr: IntValue<'ctx>,
+        loop_block: inkwell::basic_block::BasicBlock<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+        current_function_inputs: &[String],
+    ) {
+        match ast {
+            Ast::Expression(ExpressionAst {
+                function: name,
+                args,
+            }) if name == current_function_name && !is_builtin_name(name) => {
+                let compiled = args
+                    .iter()
+                    .map(|arg| self.compile_ast(arg, vars, capture_slots, env_ptr, function))
+                    .collect::<Vec<_>>();
+                for (index, value) in compiled.iter().enumerate() {
+                    let ptr = vars
+                        .get(&current_function_inputs[index])
+                        .unwrap_or_else(|| {
+                            panic!("missing param slot {index} for {current_function_name}")
+                        });
+                    self.builder
+                        .build_store(
+                            *ptr,
+                            self.make_pair_value(
+                                value.tag,
+                                value.payload,
+                                &format!("tail_arg_{index}"),
+                            ),
+                        )
+                        .expect("failed to store tail arg");
+                }
+                self.builder
+                    .build_unconditional_branch(loop_block)
+                    .expect("failed to branch to llvm tail loop");
+            }
+            Ast::If {
+                condition,
+                then,
+                else_,
+            } => {
+                let cond_value =
+                    self.compile_ast(condition, vars, capture_slots, env_ptr, function);
+                let truth = self.build_internal_scalar_call(
+                    self.require_func("__value_is_truthy"),
+                    &[cond_value],
+                    "tail_truthy",
+                );
+                let cond = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        truth,
+                        self.i64_type.const_zero(),
+                        "tail_if_cond",
+                    )
+                    .expect("failed to build tail if condition");
+                let then_block = self.context.append_basic_block(function, "tail_then");
+                let else_block = self.context.append_basic_block(function, "tail_else");
+                self.builder
+                    .build_conditional_branch(cond, then_block, else_block)
+                    .expect("failed to branch in tail if");
+
+                self.builder.position_at_end(then_block);
+                self.compile_tail_block(
+                    then,
+                    vars,
+                    capture_slots,
+                    env_slot,
+                    loop_block,
+                    function,
+                    current_function_name,
+                    current_function_inputs,
+                );
+
+                self.builder.position_at_end(else_block);
+                if let Some(else_block_ast) = else_ {
+                    self.compile_tail_block(
+                        else_block_ast,
+                        vars,
+                        capture_slots,
+                        env_slot,
+                        loop_block,
+                        function,
+                        current_function_name,
+                        current_function_inputs,
+                    );
+                } else {
+                    let zero = self.int_value(self.i64_type.const_zero());
+                    self.builder
+                        .build_return(Some(&self.make_pair_value(
+                            zero.tag,
+                            zero.payload,
+                            "tail_else_zero",
+                        )))
+                        .expect("failed to return tail else zero");
+                }
+            }
+            Ast::Block(block) => self.compile_tail_block(
+                block,
+                vars,
+                capture_slots,
+                env_slot,
+                loop_block,
+                function,
+                current_function_name,
+                current_function_inputs,
+            ),
+            _ => {
+                let value = self.compile_ast(ast, vars, capture_slots, env_ptr, function);
+                self.builder
+                    .build_return(Some(&self.make_pair_value(
+                        value.tag,
+                        value.payload,
+                        "tail_return_pair",
+                    )))
+                    .expect("failed to return tail value");
+            }
         }
     }
 
@@ -577,17 +1276,25 @@ impl<'ctx> LlvmCompiler<'ctx> {
         &self,
         ast: &Ast,
         vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
         match ast {
             Ast::Literal(LiteralAst::Integer(n)) => {
                 self.int_value(self.i64_type.const_int(*n as u64, true))
             }
+            Ast::Lambda { .. } => {
+                panic!("anonymous functions are not implemented by the llvm backend yet");
+            }
+            Ast::FunctionRef(name) => {
+                self.allocate_closure_for_function(name, vars, capture_slots, env_ptr, function)
+            }
             Ast::ListLiteral(items) => {
                 let list =
                     self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_new");
                 for item in items {
-                    let value = self.compile_ast(item, vars, function);
+                    let value = self.compile_ast(item, vars, capture_slots, env_ptr, function);
                     let _ = self.build_internal_call(
                         self.require_func("__rt_list_push"),
                         &[list, value],
@@ -597,8 +1304,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 list
             }
             Ast::Index { collection, index } => {
-                let collection = self.compile_ast(collection, vars, function);
-                let index = self.compile_ast(index, vars, function);
+                let collection =
+                    self.compile_ast(collection, vars, capture_slots, env_ptr, function);
+                let index = self.compile_ast(index, vars, capture_slots, env_ptr, function);
                 self.build_internal_call(
                     self.require_func("__rt_list_get"),
                     &[collection, index],
@@ -610,9 +1318,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 index,
                 value,
             } => {
-                let collection = self.compile_ast(collection, vars, function);
-                let index = self.compile_ast(index, vars, function);
-                let value = self.compile_ast(value, vars, function);
+                let collection =
+                    self.compile_ast(collection, vars, capture_slots, env_ptr, function);
+                let index = self.compile_ast(index, vars, capture_slots, env_ptr, function);
+                let value = self.compile_ast(value, vars, capture_slots, env_ptr, function);
                 self.build_internal_call(
                     self.require_func("__rt_list_set"),
                     &[collection, index, value],
@@ -623,9 +1332,18 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 function: name,
                 args,
             }) => {
+                if name == "list_map" {
+                    return self.compile_list_map(args, vars, capture_slots, env_ptr, function);
+                }
+                if name == "list_filter" {
+                    return self.compile_list_filter(args, vars, capture_slots, env_ptr, function);
+                }
+                if name == "list_range" {
+                    return self.compile_list_range(args, vars, capture_slots, env_ptr, function);
+                }
                 let compiled = args
                     .iter()
-                    .map(|arg| self.compile_ast(arg, vars, function))
+                    .map(|arg| self.compile_ast(arg, vars, capture_slots, env_ptr, function))
                     .collect::<Vec<_>>();
                 if name.is_empty() {
                     return compiled[0];
@@ -691,11 +1409,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
                         &compiled,
                         "print",
                     ),
-                    "list_print" => self.build_internal_call(
-                        self.require_func("__rt_list_print"),
-                        &compiled,
-                        "list_print",
-                    ),
                     "list_new" => self.build_internal_call(
                         self.require_func("__rt_list_new"),
                         &compiled,
@@ -742,6 +1455,24 @@ impl<'ctx> LlvmCompiler<'ctx> {
                         "list_copy",
                     ),
                     other => {
+                        if vars.contains_key(other) || capture_slots.contains_key(other) {
+                            let callee = self.resolve_named_value(
+                                other,
+                                vars,
+                                capture_slots,
+                                env_ptr,
+                                function,
+                            );
+                            return self.apply_function_value(callee, &compiled, function, other);
+                        }
+                        if self.function_ordinals.contains_key(other) {
+                            return self.build_user_call(
+                                self.require_func(other),
+                                self.i64_type.const_zero(),
+                                &compiled,
+                                other,
+                            );
+                        }
                         let callee = self.require_func(other);
                         self.build_internal_call(callee, &compiled, other)
                     }
@@ -750,18 +1481,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::Block(block) => {
                 let mut last = None;
                 for line in &block.lines {
-                    last = Some(self.compile_ast(line, vars, function));
+                    last = Some(self.compile_ast(line, vars, capture_slots, env_ptr, function));
                 }
                 last.expect("empty block")
             }
             Ast::Variable(name) => {
-                let ptr = vars
-                    .get(name)
-                    .unwrap_or_else(|| panic!("undefined variable: {name}"));
-                self.load_compiled_value(*ptr, name)
+                self.resolve_named_value(name, vars, capture_slots, env_ptr, function)
             }
             Ast::Assign { name, value } => {
-                let value = self.compile_ast(value, vars, function);
+                let value = self.compile_ast(value, vars, capture_slots, env_ptr, function);
                 let ptr = vars
                     .get(name)
                     .unwrap_or_else(|| panic!("undeclared variable: {name}"));
@@ -775,7 +1503,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 then,
                 else_,
             } => {
-                let cond_value = self.compile_ast(condition, vars, function);
+                let cond_value =
+                    self.compile_ast(condition, vars, capture_slots, env_ptr, function);
                 let truth = self.build_internal_scalar_call(
                     self.require_func("__value_is_truthy"),
                     &[cond_value],
@@ -801,7 +1530,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.builder.position_at_end(then_block);
                 let mut then_value = self.int_value(self.i64_type.const_zero());
                 for line in &then.lines {
-                    then_value = self.compile_ast(line, vars, function);
+                    then_value = self.compile_ast(line, vars, capture_slots, env_ptr, function);
                 }
                 self.builder
                     .build_unconditional_branch(merge_block)
@@ -815,7 +1544,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 let mut else_value = self.int_value(self.i64_type.const_zero());
                 if let Some(else_block_ast) = else_ {
                     for line in &else_block_ast.lines {
-                        else_value = self.compile_ast(line, vars, function);
+                        else_value = self.compile_ast(line, vars, capture_slots, env_ptr, function);
                     }
                 }
                 self.builder
@@ -899,6 +1628,39 @@ impl<'ctx> LlvmCompiler<'ctx> {
         CompiledValue { tag, payload }
     }
 
+    fn build_user_call(
+        &self,
+        function: FunctionValue<'ctx>,
+        env_ptr: IntValue<'ctx>,
+        args: &[CompiledValue<'ctx>],
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let mut call_args = Vec::with_capacity(1 + args.len() * 2);
+        call_args.push(BasicMetadataValueEnum::from(env_ptr));
+        for value in args {
+            call_args.push(BasicMetadataValueEnum::from(value.tag));
+            call_args.push(BasicMetadataValueEnum::from(value.payload));
+        }
+        let pair = self
+            .builder
+            .build_call(function, &call_args, label)
+            .expect("failed to build user call")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_struct_value();
+        let tag = self
+            .builder
+            .build_extract_value(pair, 0, &format!("{label}_tag"))
+            .expect("failed to extract user-call tag")
+            .into_int_value();
+        let payload = self
+            .builder
+            .build_extract_value(pair, 1, &format!("{label}_payload"))
+            .expect("failed to extract user-call payload")
+            .into_int_value();
+        CompiledValue { tag, payload }
+    }
+
     fn build_internal_scalar_call(
         &self,
         function: FunctionValue<'ctx>,
@@ -974,6 +1736,141 @@ impl<'ctx> LlvmCompiler<'ctx> {
         CompiledValue { tag, payload }
     }
 
+    fn load_value_from_env(
+        &self,
+        env_ptr: IntValue<'ctx>,
+        slot: usize,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let env_raw = self
+            .builder
+            .build_int_to_ptr(
+                env_ptr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_env_ptr"),
+            )
+            .expect("failed to convert env ptr");
+        let index = self.i64_type.const_int(slot as u64, false);
+        self.build_list_value_load_from_data_ptr(env_raw, index, label)
+    }
+
+    fn allocate_closure_for_function(
+        &self,
+        name: &str,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        current_env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let captures = self
+            .closure_metadata
+            .get(name)
+            .map(|metadata| metadata.captures.as_slice())
+            .unwrap_or(&[]);
+        let alloc = self.require_func("__alloc");
+        let env_raw = if captures.is_empty() {
+            self.i64_type.const_zero()
+        } else {
+            let env_bytes = self
+                .i64_type
+                .const_int((captures.len() as i64 * VALUE_SIZE) as u64, false);
+            let align = self
+                .i64_type
+                .const_int(std::mem::align_of::<i64>() as u64, false);
+            let env_ptr = self.build_boxed_call(alloc, &[env_bytes, align], "closure_env_alloc");
+            let env_data_ptr = self
+                .builder
+                .build_int_to_ptr(
+                    env_ptr,
+                    self.context.ptr_type(Default::default()),
+                    "closure_env_data_ptr",
+                )
+                .expect("failed to convert closure env ptr");
+            for (index, capture_name) in captures.iter().enumerate() {
+                let value = self.resolve_named_value(
+                    capture_name,
+                    vars,
+                    capture_slots,
+                    current_env_ptr,
+                    function,
+                );
+                self.build_list_value_store_from_data_ptr(
+                    env_data_ptr,
+                    self.i64_type.const_int(index as u64, false),
+                    value,
+                    &format!("closure_capture_{index}"),
+                );
+            }
+            env_ptr
+        };
+
+        let closure_size = self.i64_type.const_int(CLOSURE_SIZE as u64, false);
+        let closure_align = self
+            .i64_type
+            .const_int(std::mem::align_of::<i64>() as u64, false);
+        let closure_ptr =
+            self.build_boxed_call(alloc, &[closure_size, closure_align], "closure_alloc");
+        let closure_raw_ptr = self
+            .builder
+            .build_int_to_ptr(
+                closure_ptr,
+                self.context.ptr_type(Default::default()),
+                "closure_raw_ptr",
+            )
+            .expect("failed to convert closure ptr");
+        let ordinal_ptr = self
+            .builder
+            .build_struct_gep(
+                self.closure_type(),
+                closure_raw_ptr,
+                0,
+                "closure_ordinal_ptr",
+            )
+            .expect("failed to build closure ordinal ptr");
+        let env_ptr_ptr = self
+            .builder
+            .build_struct_gep(
+                self.closure_type(),
+                closure_raw_ptr,
+                1,
+                "closure_env_ptr_ptr",
+            )
+            .expect("failed to build closure env ptr ptr");
+        let ordinal = *self
+            .function_ordinals
+            .get(name)
+            .unwrap_or_else(|| panic!("missing function ordinal for function reference: {name}"));
+        self.builder
+            .build_store(ordinal_ptr, self.i64_type.const_int(ordinal as u64, true))
+            .expect("failed to store closure ordinal");
+        self.builder
+            .build_store(env_ptr_ptr, env_raw)
+            .expect("failed to store closure env ptr");
+        CompiledValue {
+            tag: self.i64_type.const_int(TAG_FUNCTION as u64, false),
+            payload: closure_ptr,
+        }
+    }
+
+    fn resolve_named_value(
+        &self,
+        name: &str,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        if let Some(ptr) = vars.get(name) {
+            self.load_compiled_value(*ptr, name)
+        } else if let Some(&slot) = capture_slots.get(name) {
+            self.load_value_from_env(env_ptr, slot, name)
+        } else if self.function_ordinals.contains_key(name) {
+            self.allocate_closure_for_function(name, vars, capture_slots, env_ptr, function)
+        } else {
+            panic!("undefined variable: {name}");
+        }
+    }
+
     fn box_compiled_value(&self, value: CompiledValue<'ctx>, label: &str) -> IntValue<'ctx> {
         let box_fn = self.require_func("__box_value");
         self.build_boxed_call(box_fn, &[value.tag, value.payload], label)
@@ -1024,12 +1921,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
     }
 
     #[cfg(feature = "wasi")]
-    fn build_static_bytes_ptr(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        label: &str,
-    ) -> PointerValue<'ctx> {
+    fn build_static_bytes_ptr(&self, name: &str, bytes: &[u8], label: &str) -> PointerValue<'ctx> {
         let global = self.get_or_create_static_bytes_global(name, bytes);
         let array_type = self.context.i8_type().array_type(bytes.len() as u32);
         let zero = self.context.i32_type().const_zero();
@@ -1496,6 +2388,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         )
     }
 
+    fn closure_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context
+            .struct_type(&[self.i64_type.into(), self.i64_type.into()], false)
+    }
+
     fn list_header_type(&self) -> inkwell::types::StructType<'ctx> {
         let data_ptr_field = match self.runtime_mode {
             LlvmRuntimeMode::Native => self.context.ptr_type(Default::default()).into(),
@@ -1503,8 +2400,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             #[cfg(feature = "wasi")]
             LlvmRuntimeMode::WasiPreview1Command => self.i64_type.into(),
         };
-        self.context
-            .struct_type(&[data_ptr_field, self.i64_type.into(), self.i64_type.into()], false)
+        self.context.struct_type(
+            &[data_ptr_field, self.i64_type.into(), self.i64_type.into()],
+            false,
+        )
     }
 
     fn build_value_tag_load(&self, value_ptr: PointerValue<'ctx>, label: &str) -> IntValue<'ctx> {
@@ -1942,7 +2841,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             void_type.fn_type(&[self.i64_type.into()], false),
             Some(Linkage::Private),
         );
-        self.functions.insert("__wasi_write_i64".to_string(), write_i64);
+        self.functions
+            .insert("__wasi_write_i64".to_string(), write_i64);
 
         let write_value = self.module.add_function(
             "llvm_wasi_write_value",
@@ -1957,7 +2857,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             void_type.fn_type(&[self.i64_type.into()], false),
             Some(Linkage::Private),
         );
-        self.functions.insert("__wasi_write_list".to_string(), write_list);
+        self.functions
+            .insert("__wasi_write_list".to_string(), write_list);
 
         self.define_wasi_write_bytes_body(write_bytes);
         self.define_wasi_write_i64_body(write_i64);
@@ -2202,7 +3103,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let payload = function.get_nth_param(1).unwrap().into_int_value();
         let write_value = self.require_func("__wasi_write_value");
         self.builder
-            .build_call(write_value, &[tag.into(), payload.into()], "wasi_write_value")
+            .build_call(
+                write_value,
+                &[tag.into(), payload.into()],
+                "wasi_write_value",
+            )
             .expect("failed to call preview1 write_value");
         self.build_wasi_write_const("__wasi_newline", b"\n", "preview1_newline");
         self.builder
@@ -2225,7 +3130,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let len = function.get_nth_param(1).unwrap().into_int_value();
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(Default::default());
-        let iovec_type = self.context.struct_type(&[ptr_type.into(), i32_type.into()], false);
+        let iovec_type = self
+            .context
+            .struct_type(&[ptr_type.into(), i32_type.into()], false);
         let iovec_ptr = self
             .builder
             .build_alloca(iovec_type, "wasi_iovec")
@@ -2404,7 +3311,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .into_int_value();
         let next_idx = self
             .builder
-            .build_int_sub(idx, self.context.i32_type().const_int(1, false), "wasi_i64_next_idx")
+            .build_int_sub(
+                idx,
+                self.context.i32_type().const_int(1, false),
+                "wasi_i64_next_idx",
+            )
             .expect("failed to decrement i64 idx");
         self.builder
             .build_store(idx_ptr, next_idx)
@@ -2422,7 +3333,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let zero32 = self.context.i32_type().const_zero();
         let digit_ptr = unsafe {
             self.builder
-                .build_gep(buffer_type, buffer, &[zero32, next_idx], "wasi_i64_digit_ptr")
+                .build_gep(
+                    buffer_type,
+                    buffer,
+                    &[zero32, next_idx],
+                    "wasi_i64_digit_ptr",
+                )
                 .expect("failed to build digit ptr")
         };
         self.builder
@@ -2433,12 +3349,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to store quotient");
         let more = self
             .builder
-            .build_int_compare(
-                IntPredicate::NE,
-                quotient,
-                zero,
-                "wasi_i64_more_digits",
-            )
+            .build_int_compare(IntPredicate::NE, quotient, zero, "wasi_i64_more_digits")
             .expect("failed to compare quotient");
         self.builder
             .build_conditional_branch(more, loop_block, done_block)
@@ -2452,7 +3363,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .into_int_value();
         let start_ptr = unsafe {
             self.builder
-                .build_gep(buffer_type, buffer, &[zero32, final_idx], "wasi_i64_start_ptr")
+                .build_gep(
+                    buffer_type,
+                    buffer,
+                    &[zero32, final_idx],
+                    "wasi_i64_start_ptr",
+                )
                 .expect("failed to build start ptr")
         };
         let len = self
@@ -2465,7 +3381,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to compute i64 len");
         let write_bytes = self.require_func("__wasi_write_bytes");
         self.builder
-            .build_call(write_bytes, &[start_ptr.into(), len.into()], "wasi_write_digits")
+            .build_call(
+                write_bytes,
+                &[start_ptr.into(), len.into()],
+                "wasi_write_digits",
+            )
             .expect("failed to write digit buffer");
         self.builder
             .build_return(None)
@@ -3073,17 +3993,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to branch insert copy loop");
 
         self.builder.position_at_end(copy_body_block);
-        let moved = self.build_list_value_load_from_data_ptr(
-            old_data_ptr,
-            copy_idx,
-            "list_insert_old",
-        );
-        self.build_list_value_store_from_data_ptr(
-            new_data_ptr,
-            copy_idx,
-            moved,
-            "list_insert_new",
-        );
+        let moved =
+            self.build_list_value_load_from_data_ptr(old_data_ptr, copy_idx, "list_insert_old");
+        self.build_list_value_store_from_data_ptr(new_data_ptr, copy_idx, moved, "list_insert_new");
         let next = self
             .builder
             .build_int_add(
@@ -3399,7 +4311,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .into_int_value();
         let align_minus_one = self
             .builder
-            .build_int_sub(align, self.i64_type.const_int(1, false), "alloc_align_minus_one")
+            .build_int_sub(
+                align,
+                self.i64_type.const_int(1, false),
+                "alloc_align_minus_one",
+            )
             .expect("failed to compute wasm alloc align");
         let start_plus = self
             .builder

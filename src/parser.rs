@@ -24,6 +24,14 @@ impl<'a> ParseLexer<'a> {
         self.buf.front()
     }
 
+    pub fn peek_n(&mut self, index: usize) -> Option<&Result<Token, LexingError>> {
+        while self.buf.len() <= index {
+            let token = self.lexer.next()?;
+            self.buf.push_back(token);
+        }
+        self.buf.get(index)
+    }
+
     pub fn push_back(&mut self, token: Result<Token, LexingError>) {
         self.buf.push_front(token);
     }
@@ -60,6 +68,11 @@ impl<'a> ParseError<'a> {
 pub enum Ast {
     Block(BlockAst),
     FunctionDef(FunctionDefAst),
+    Lambda {
+        inputs: Vec<String>,
+        body: Box<Ast>,
+    },
+    FunctionRef(String),
     Expression(ExpressionAst),
     Literal(LiteralAst),
     ListLiteral(Vec<Ast>),
@@ -138,7 +151,11 @@ impl Ast {
 
         match lex.peek() {
             Some(&Ok(Token::DefineFunction)) => {
-                Ok(Ast::FunctionDef(FunctionDefAst::from_lexer(lex)?))
+                if is_lambda_start(lex) {
+                    parse_expr(lex, 0)
+                } else {
+                    Ok(Ast::FunctionDef(FunctionDefAst::from_lexer(lex)?))
+                }
             }
             Some(&Ok(Token::If)) => {
                 lex.next();
@@ -341,7 +358,73 @@ fn parse_expr<'a>(lex: &mut ParseLexer<'a>, min_prec: u8) -> Result<Ast, ParseEr
     Ok(lhs)
 }
 
+fn is_lambda_start<'a>(lex: &mut ParseLexer<'a>) -> bool {
+    if lex.peek() != Some(&Ok(Token::DefineFunction)) {
+        return false;
+    }
+
+    let mut index = 1;
+    let mut expect_symbol = true;
+    loop {
+        match lex.peek_n(index) {
+            Some(Ok(Token::Symbol(_))) if expect_symbol => {
+                expect_symbol = false;
+                index += 1;
+            }
+            Some(Ok(Token::Comma)) if !expect_symbol => {
+                expect_symbol = true;
+                index += 1;
+            }
+            Some(Ok(Token::Arrow)) if !expect_symbol => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn parse_lambda<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    assert!(lex.next() == Some(Ok(Token::DefineFunction)));
+    let mut inputs = vec![];
+
+    loop {
+        match lex.next() {
+            Some(Ok(Token::Symbol(name))) => inputs.push(name),
+            _ => return Err(ParseError::unexpected(lex)),
+        }
+
+        match lex.peek() {
+            Some(Ok(Token::Comma)) => {
+                lex.next();
+            }
+            Some(Ok(Token::Arrow)) => {
+                lex.next();
+                break;
+            }
+            _ => return Err(ParseError::unexpected(lex)),
+        }
+    }
+
+    let body = if lex.peek() == Some(&Ok(Token::Newline)) {
+        Ast::Block(parse_block_body_until_end(lex)?)
+    } else {
+        let body = parse_expr(lex, 0)?;
+        trim_newlines(lex);
+        if lex.next() != Some(Ok(Token::EndBlock)) {
+            return Err(ParseError::unexpected(lex));
+        }
+        body
+    };
+
+    Ok(Ast::Lambda {
+        inputs,
+        body: Box::new(body),
+    })
+}
+
 fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    if is_lambda_start(lex) {
+        return parse_lambda(lex);
+    }
+
     let lhs = match lex.peek() {
         Some(Ok(x)) if x.kind() == TokenKind::Integer => Ast::Literal(LiteralAst::from_lexer(lex)?),
         Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
@@ -945,6 +1028,80 @@ fn parse_index_assignment_expression() {
                     value: Box::new(Literal(LiteralAst::Integer(9))),
                 },
             ],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_lambda_expression() {
+    use Ast::*;
+
+    let text = "fn main() do\n    list_map(xs, fn item -> item * 2 end)\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "list_map".to_string(),
+                args: vec![
+                    Variable("xs".to_string()),
+                    Lambda {
+                        inputs: vec!["item".to_string()],
+                        body: Box::new(Expression(ExpressionAst {
+                            function: "multiply".to_string(),
+                            args: vec![
+                                Variable("item".to_string()),
+                                Literal(LiteralAst::Integer(2)),
+                            ],
+                        })),
+                    },
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_multiline_lambda_expression() {
+    use Ast::*;
+
+    let text = "fn main() do\n    list_map(xs, fn item ->\n        item * 2\n    end)\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "list_map".to_string(),
+                args: vec![
+                    Variable("xs".to_string()),
+                    Lambda {
+                        inputs: vec!["item".to_string()],
+                        body: Box::new(Block(BlockAst {
+                            lines: vec![Expression(ExpressionAst {
+                                function: "multiply".to_string(),
+                                args: vec![
+                                    Variable("item".to_string()),
+                                    Literal(LiteralAst::Integer(2)),
+                                ],
+                            })],
+                        })),
+                    },
+                ],
+            })],
         },
     });
 

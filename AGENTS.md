@@ -11,6 +11,7 @@ Guidance for coding agents working in this repository.
   - Native executable path (object + link step).
 - Value model is pair-valued internally: `(tag, payload)`.
 - Lists store inline `Value` elements, not boxed integer handles.
+- Function values exist as tagged values and are currently used by higher-order list builtins.
 - Runtime behavior is split between:
   - IR-defined runtime builtins in `src/module/runtime_ir.rs`.
   - Host runtime helpers in `src/runtime.rs`.
@@ -26,6 +27,19 @@ Guidance for coding agents working in this repository.
 - `src/wrapper/unix.c`: small Unix C wrapper used by the Cranelift native path.
 - `examples/*.expr`: language examples.
 - `Justfile`: helper commands.
+
+## Current Language Features
+
+- Anonymous functions support captures:
+  - `fn item -> item * factor end`
+- Higher-order list builtins are available:
+  - `list_map(xs, callback)`
+  - `list_filter(xs, callback)`
+- Callbacks must currently have arity `1`.
+- Top-level named functions can be used as function values in expression position.
+- Function values can be stored in variables and passed around.
+- Generic direct function-value calls are supported:
+  - `f(10)`
 
 ## Build and Test
 
@@ -55,6 +69,8 @@ From `Justfile`:
 - `just check-matrix`
   - Runs `scripts/check-matrix.py --release`.
   - Uses Cranelift JIT as the baseline and compares Cranelift/LLVM runnable modes, including LLVM Wasm and LLVM `wasi:cli/command` components.
+  - The baseline defines expected stdout and success/failure class.
+  - Expected-failure examples are allowed; exact non-zero exit codes do not need to match across native, Wasm, and component runners.
   - Excludes `run-ir`, because that path does not support the same stdout behavior.
   - Fails native-mode checks if a compiled executable exceeds `50 KB`.
 - `just run-examples`
@@ -80,10 +96,15 @@ From `Justfile`:
 - Runtime memcpy is IR-defined (`__rt_memcpy`) to avoid external relocation issues.
 - Arena data for native/object path is zero-init (`.bss`), not embedded initialized bytes.
 - Cranelift and LLVM both use pair-valued internal execution and inline list element storage.
+- Cranelift and LLVM both lower function values as closure objects:
+  - `TAG_FUNCTION`
+  - payload = pointer to `{ function_ordinal, env_ptr }`
 - Print/list_print are still host-runtime boundaries.
 - LLVM core Wasm keeps print/list_print as custom imports for the Node runner.
 - LLVM component output is behind the Cargo feature `wasi`.
 - LLVM component output builds a Preview 1-style core command module and then adapts it to a Preview 2 `wasi:cli/command` component using the embedded adapter from `wasi-preview1-component-adapter-provider`.
+- Arena exhaustion is expected to report explicitly as:
+  - `runtime error: out of arena memory`
 - `__expr_value_int_host` is now a compatibility/test helper, not part of the main internal execution model.
 
 ## Platform Notes
