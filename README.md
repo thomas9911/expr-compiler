@@ -173,6 +173,9 @@ just check-matrix
 
 - LLVM core Wasm mode, run through `scripts/run-wasm.js`
 - LLVM `wasi:cli/command` component mode, run through `wasmtime run`
+- expected-failure examples are supported too:
+  - Cranelift JIT defines the baseline stdout and success/failure class
+  - non-zero failure codes do not have to match exactly across native, Wasm, and component runners
 
 If your non-interactive shell does not expose the JavaScript runtime in `PATH`,
 you can override it explicitly:
@@ -191,6 +194,12 @@ If `wasmtime` is not in `PATH`, you can override that explicitly too:
 
 ```bash
 WASMTIME=/path/to/wasmtime just check-matrix
+```
+
+Arena exhaustion now reports explicitly across the main runnable backends as:
+
+```text
+runtime error: out of arena memory
 ```
 
 ### Local test script

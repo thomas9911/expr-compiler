@@ -69,6 +69,8 @@ From `Justfile`:
 - `just check-matrix`
   - Runs `scripts/check-matrix.py --release`.
   - Uses Cranelift JIT as the baseline and compares Cranelift/LLVM runnable modes, including LLVM Wasm and LLVM `wasi:cli/command` components.
+  - The baseline defines expected stdout and success/failure class.
+  - Expected-failure examples are allowed; exact non-zero exit codes do not need to match across native, Wasm, and component runners.
   - Excludes `run-ir`, because that path does not support the same stdout behavior.
   - Fails native-mode checks if a compiled executable exceeds `50 KB`.
 - `just run-examples`
@@ -101,6 +103,8 @@ From `Justfile`:
 - LLVM core Wasm keeps print/list_print as custom imports for the Node runner.
 - LLVM component output is behind the Cargo feature `wasi`.
 - LLVM component output builds a Preview 1-style core command module and then adapts it to a Preview 2 `wasi:cli/command` component using the embedded adapter from `wasi-preview1-component-adapter-provider`.
+- Arena exhaustion is expected to report explicitly as:
+  - `runtime error: out of arena memory`
 - `__expr_value_int_host` is now a compatibility/test helper, not part of the main internal execution model.
 
 ## Platform Notes
