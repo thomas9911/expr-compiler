@@ -19,6 +19,7 @@ extern "system" {
 }
 
 const STD_OUTPUT_HANDLE: i32 = -11;
+const STD_ERROR_HANDLE: i32 = -12;
 const ARENA_BYTES: usize = 16 * 1024 * 1024;
 const LIST_INITIAL_CAPACITY: usize = 1024;
 
@@ -256,6 +257,35 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         4 => unsafe { alloc_value(ValueTag::Function, payload) },
         _ => runtime_abort(),
     }
+}
+
+fn write_stderr(buf: &[u8]) {
+    unsafe {
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if handle.is_null() {
+            return;
+        }
+        let mut written: u32 = 0;
+        let _ = WriteFile(
+            handle,
+            buf.as_ptr(),
+            buf.len() as u32,
+            &mut written as *mut u32,
+            ptr::null_mut(),
+        );
+    }
+}
+
+fn runtime_trap(message: &str) -> ! {
+    write_stderr(b"runtime error: ");
+    write_stderr(message.as_bytes());
+    write_stderr(b"\n");
+    runtime_abort()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn __expr_runtime_oom_host() -> i64 {
+    runtime_trap("out of arena memory");
 }
 
 #[unsafe(no_mangle)]

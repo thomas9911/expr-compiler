@@ -23,7 +23,8 @@ pub(super) fn setup_builtins(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
 ) -> HashMap<String, FuncId> {
-    let runtime = define_runtime_ir(module, isa, flags);
+    let oom_host_id = declare_host_builtin(module, isa, "__expr_runtime_oom_host", &[]);
+    let runtime = define_runtime_ir(module, isa, flags, oom_host_id);
     let print_host_id = declare_host_builtin(module, isa, "__expr_print_host", &[types::I64]);
     let list_print_host_id =
         declare_host_builtin(module, isa, "__expr_list_print_host", &[types::I64]);
@@ -63,7 +64,14 @@ pub(super) fn setup_builtins_jit(
     arena_base_addr: i64,
     arena_offset_addr: i64,
 ) -> HashMap<String, FuncId> {
-    let runtime = define_runtime_ir_jit(module, isa, flags, arena_base_addr, arena_offset_addr);
+    let runtime = define_runtime_ir_jit(
+        module,
+        isa,
+        flags,
+        arena_base_addr,
+        arena_offset_addr,
+        crate::runtime::__expr_runtime_oom_host as usize as i64,
+    );
     let print_host_id = declare_local_builtin(module, isa, "__rt_print_host_scalar", &[types::I64]);
     let list_print_host_id =
         declare_local_builtin(module, isa, "__rt_list_print_host_scalar", &[types::I64]);
@@ -166,6 +174,7 @@ struct RuntimeData {
 
 struct RuntimeFunctionIds {
     alloc: FuncId,
+    oom: FuncId,
     memcpy: FuncId,
     builtins: RuntimeBuiltins,
 }
@@ -230,6 +239,7 @@ fn declare_runtime_function_ids(
     isa: &OwnedTargetIsa,
 ) -> RuntimeFunctionIds {
     let alloc = declare_local_builtin(module, isa, "__rt_alloc", &[types::I64, types::I64]);
+    let oom = declare_local_builtin(module, isa, "__rt_runtime_oom_host", &[]);
     let memcpy = declare_local_builtin(
         module,
         isa,
@@ -372,6 +382,7 @@ fn declare_runtime_function_ids(
 
     RuntimeFunctionIds {
         alloc,
+        oom,
         memcpy,
         builtins: RuntimeBuiltins {
             alloc,
@@ -584,10 +595,12 @@ fn define_runtime_ir(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
+    oom_host_id: FuncId,
 ) -> RuntimeBuiltins {
     let data = init_runtime_data(module);
     let ids = declare_runtime_function_ids(module, isa);
-    define_rt_alloc(module, isa, flags, ids.alloc, &data);
+    define_rt_host_oom_import_wrapper(module, isa, flags, ids.oom, oom_host_id);
+    define_rt_alloc(module, isa, flags, ids.alloc, ids.oom, &data);
     define_runtime_operations(module, isa, flags, &ids);
     ids.builtins
 }
@@ -682,13 +695,16 @@ fn define_runtime_ir_jit(
     flags: &settings::Flags,
     arena_base_addr: i64,
     arena_offset_addr: i64,
+    oom_host_addr: i64,
 ) -> RuntimeBuiltins {
     let ids = declare_runtime_function_ids(module, isa);
+    define_rt_host_oom_shim(module, isa, flags, ids.oom, oom_host_addr);
     define_rt_alloc_from_addrs(
         module,
         isa,
         flags,
         ids.alloc,
+        ids.oom,
         arena_base_addr,
         arena_offset_addr,
     );
@@ -707,6 +723,38 @@ fn define_rt_host_print_shim(
         let sig_ref = func.import_signature(runtime_sig(isa, &[types::I64]));
         let callee = b.ins().iconst(types::I64, host_addr);
         let call = b.ins().call_indirect(sig_ref, callee, &[p[0]]);
+        let out = b.inst_results(call)[0];
+        b.ins().return_(&[out]);
+    });
+}
+
+fn define_rt_host_oom_shim(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    host_addr: i64,
+) {
+    define_runtime_scalar_fn(module, isa, flags, id, &[], |b, _p, func| {
+        let sig_ref = func.import_signature(runtime_sig(isa, &[]));
+        let callee = b.ins().iconst(types::I64, host_addr);
+        let call = b.ins().call_indirect(sig_ref, callee, &[]);
+        let out = b.inst_results(call)[0];
+        b.ins().return_(&[out]);
+    });
+}
+
+fn define_rt_host_oom_import_wrapper(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    host_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_scalar_fn(module, isa, flags, id, &[], |b, _p, func| {
+        let host_ref = unsafe { (&mut *module_ptr).declare_func_in_func(host_id, func) };
+        let call = b.ins().call(host_ref, &[]);
         let out = b.inst_results(call)[0];
         b.ins().return_(&[out]);
     });
@@ -763,6 +811,7 @@ fn define_rt_alloc(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     id: FuncId,
+    oom_id: FuncId,
     data: &RuntimeData,
 ) {
     let module_ptr: *mut _ = module;
@@ -791,7 +840,18 @@ fn define_rt_alloc(
             let new_off = b.ins().iadd(rel, size);
             let max = b.ins().iconst(types::I64, ARENA_BYTES);
             let ok = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_off, max);
-            b.ins().trapz(ok, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let ok_block = b.create_block();
+            let oom_block = b.create_block();
+            b.ins().brif(ok, ok_block, &[], oom_block, &[]);
+
+            b.switch_to_block(oom_block);
+            b.seal_block(oom_block);
+            let oom_ref = unsafe { (&mut *module_ptr).declare_func_in_func(oom_id, func) };
+            let _ = b.ins().call(oom_ref, &[]);
+            b.ins().trap(TrapCode::HEAP_OUT_OF_BOUNDS);
+
+            b.switch_to_block(ok_block);
+            b.seal_block(ok_block);
             b.ins().store(MemFlags::new(), new_off, off_addr, 0);
             b.ins().return_(&[aligned]);
         },
@@ -803,16 +863,18 @@ fn define_rt_alloc_from_addrs(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     id: FuncId,
+    oom_id: FuncId,
     arena_base_addr: i64,
     arena_offset_addr: i64,
 ) {
+    let module_ptr: *mut _ = module;
     define_runtime_scalar_fn(
         module,
         isa,
         flags,
         id,
         &[types::I64, types::I64],
-        |b, p, _| {
+        |b, p, func| {
             let size = p[0];
             let align = p[1];
             let base = b.ins().iconst(types::I64, arena_base_addr);
@@ -829,7 +891,18 @@ fn define_rt_alloc_from_addrs(
             let new_off = b.ins().iadd(rel, size);
             let max = b.ins().iconst(types::I64, ARENA_BYTES);
             let ok = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new_off, max);
-            b.ins().trapz(ok, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let ok_block = b.create_block();
+            let oom_block = b.create_block();
+            b.ins().brif(ok, ok_block, &[], oom_block, &[]);
+
+            b.switch_to_block(oom_block);
+            b.seal_block(oom_block);
+            let oom_ref = unsafe { (&mut *module_ptr).declare_func_in_func(oom_id, func) };
+            let _ = b.ins().call(oom_ref, &[]);
+            b.ins().trap(TrapCode::HEAP_OUT_OF_BOUNDS);
+
+            b.switch_to_block(ok_block);
+            b.seal_block(ok_block);
             b.ins().store(MemFlags::new(), new_off, off_addr, 0);
             b.ins().return_(&[aligned]);
         },

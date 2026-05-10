@@ -558,8 +558,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
     fn define_user_function(&self, func_def: &FunctionDefAst) {
         let function = self.require_func(&func_def.name);
         let entry = self.context.append_basic_block(function, "entry");
+        let loop_block = self.context.append_basic_block(function, "loop");
         self.builder.position_at_end(entry);
-        let env_ptr = function.get_first_param().unwrap().into_int_value();
 
         let mut vars = HashMap::new();
         let capture_slots: HashMap<String, usize> = self
@@ -574,6 +574,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     .collect()
             })
             .unwrap_or_default();
+        let env_slot = self
+            .builder
+            .build_alloca(self.i64_type, "env")
+            .expect("failed to allocate env slot");
+        let initial_env = function.get_first_param().unwrap().into_int_value();
+        self.builder
+            .build_store(env_slot, initial_env)
+            .expect("failed to store initial env");
         for (index, name) in func_def.inputs.iter().enumerate() {
             let ptr = self
                 .builder
@@ -601,29 +609,21 @@ impl<'ctx> LlvmCompiler<'ctx> {
             });
         }
 
-        let mut last_val = None;
-        for line in &func_def.block.lines {
-            last_val = Some(self.compile_ast(line, &vars, &capture_slots, env_ptr, function));
-        }
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to user loop");
 
-        if let Some(value) = last_val {
-            self.builder
-                .build_return(Some(&self.make_pair_value(
-                    value.tag,
-                    value.payload,
-                    "return_pair",
-                )))
-                .expect("failed to build return");
-        } else {
-            let zero = self.int_value(self.i64_type.const_zero());
-            self.builder
-                .build_return(Some(&self.make_pair_value(
-                    zero.tag,
-                    zero.payload,
-                    "empty_pair",
-                )))
-                .expect("failed to build empty return");
-        }
+        self.builder.position_at_end(loop_block);
+        self.compile_tail_block(
+            &func_def.block,
+            &vars,
+            &capture_slots,
+            env_slot,
+            loop_block,
+            function,
+            &func_def.name,
+            &func_def.inputs,
+        );
     }
 
     fn apply_function_value(
@@ -1093,6 +1093,183 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(exit_block);
         output
+    }
+
+    fn compile_tail_block(
+        &self,
+        block: &crate::parser::BlockAst,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_slot: PointerValue<'ctx>,
+        loop_block: inkwell::basic_block::BasicBlock<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+        current_function_inputs: &[String],
+    ) {
+        if block.lines.is_empty() {
+            let zero = self.int_value(self.i64_type.const_zero());
+            self.builder
+                .build_return(Some(&self.make_pair_value(
+                    zero.tag,
+                    zero.payload,
+                    "empty_tail_pair",
+                )))
+                .expect("failed to return empty tail value");
+            return;
+        }
+
+        for line in &block.lines[..block.lines.len() - 1] {
+            let current_env = self
+                .builder
+                .build_load(self.i64_type, env_slot, "tail_env")
+                .expect("failed to load tail env")
+                .into_int_value();
+            let _ = self.compile_ast(line, vars, capture_slots, current_env, function);
+        }
+
+        let current_env = self
+            .builder
+            .build_load(self.i64_type, env_slot, "tail_last_env")
+            .expect("failed to load tail env")
+            .into_int_value();
+        self.compile_tail_ast(
+            &block.lines[block.lines.len() - 1],
+            vars,
+            capture_slots,
+            env_slot,
+            current_env,
+            loop_block,
+            function,
+            current_function_name,
+            current_function_inputs,
+        );
+    }
+
+    fn compile_tail_ast(
+        &self,
+        ast: &Ast,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_slot: PointerValue<'ctx>,
+        env_ptr: IntValue<'ctx>,
+        loop_block: inkwell::basic_block::BasicBlock<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+        current_function_inputs: &[String],
+    ) {
+        match ast {
+            Ast::Expression(ExpressionAst {
+                function: name,
+                args,
+            }) if name == current_function_name && !is_builtin_name(name) => {
+                let compiled = args
+                    .iter()
+                    .map(|arg| self.compile_ast(arg, vars, capture_slots, env_ptr, function))
+                    .collect::<Vec<_>>();
+                for (index, value) in compiled.iter().enumerate() {
+                    let ptr = vars
+                        .get(&current_function_inputs[index])
+                        .unwrap_or_else(|| {
+                            panic!("missing param slot {index} for {current_function_name}")
+                        });
+                    self.builder
+                        .build_store(
+                            *ptr,
+                            self.make_pair_value(
+                                value.tag,
+                                value.payload,
+                                &format!("tail_arg_{index}"),
+                            ),
+                        )
+                        .expect("failed to store tail arg");
+                }
+                self.builder
+                    .build_unconditional_branch(loop_block)
+                    .expect("failed to branch to llvm tail loop");
+            }
+            Ast::If {
+                condition,
+                then,
+                else_,
+            } => {
+                let cond_value =
+                    self.compile_ast(condition, vars, capture_slots, env_ptr, function);
+                let truth = self.build_internal_scalar_call(
+                    self.require_func("__value_is_truthy"),
+                    &[cond_value],
+                    "tail_truthy",
+                );
+                let cond = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        truth,
+                        self.i64_type.const_zero(),
+                        "tail_if_cond",
+                    )
+                    .expect("failed to build tail if condition");
+                let then_block = self.context.append_basic_block(function, "tail_then");
+                let else_block = self.context.append_basic_block(function, "tail_else");
+                self.builder
+                    .build_conditional_branch(cond, then_block, else_block)
+                    .expect("failed to branch in tail if");
+
+                self.builder.position_at_end(then_block);
+                self.compile_tail_block(
+                    then,
+                    vars,
+                    capture_slots,
+                    env_slot,
+                    loop_block,
+                    function,
+                    current_function_name,
+                    current_function_inputs,
+                );
+
+                self.builder.position_at_end(else_block);
+                if let Some(else_block_ast) = else_ {
+                    self.compile_tail_block(
+                        else_block_ast,
+                        vars,
+                        capture_slots,
+                        env_slot,
+                        loop_block,
+                        function,
+                        current_function_name,
+                        current_function_inputs,
+                    );
+                } else {
+                    let zero = self.int_value(self.i64_type.const_zero());
+                    self.builder
+                        .build_return(Some(&self.make_pair_value(
+                            zero.tag,
+                            zero.payload,
+                            "tail_else_zero",
+                        )))
+                        .expect("failed to return tail else zero");
+                }
+            }
+            Ast::Block(block) => self.compile_tail_block(
+                block,
+                vars,
+                capture_slots,
+                env_slot,
+                loop_block,
+                function,
+                current_function_name,
+                current_function_inputs,
+            ),
+            _ => {
+                let value = self.compile_ast(ast, vars, capture_slots, env_ptr, function);
+                self.builder
+                    .build_return(Some(&self.make_pair_value(
+                        value.tag,
+                        value.payload,
+                        "tail_return_pair",
+                    )))
+                    .expect("failed to return tail value");
+            }
+        }
     }
 
     fn compile_ast(

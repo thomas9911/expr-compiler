@@ -996,11 +996,18 @@ fn define_function_body(
     let mut fn_builder_ctx = FunctionBuilderContext::new();
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
-        let block0 = builder.create_block();
-        builder.append_block_params_for_function_params(block0);
-        builder.switch_to_block(block0);
-        builder.seal_block(block0);
-        let env_ptr = builder.block_params(block0)[0];
+        let entry_block = builder.create_block();
+        let loop_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        builder.append_block_params_for_function_params(loop_block);
+        builder.switch_to_block(entry_block);
+        let entry_params = builder.block_params(entry_block).to_vec();
+        let loop_args: Vec<_> = entry_params.iter().copied().map(BlockArg::Value).collect();
+        builder.ins().jump(loop_block, &loop_args);
+        builder.seal_block(entry_block);
+
+        builder.switch_to_block(loop_block);
+        let env_ptr = builder.block_params(loop_block)[0];
 
         let mut vars: HashMap<String, LocalValueVar> = HashMap::new();
         let capture_slots: HashMap<String, usize> = closure_metadata
@@ -1017,8 +1024,8 @@ fn define_function_body(
         for (i, name) in func_def.inputs.iter().enumerate() {
             let tag = builder.declare_var(types::I64);
             let payload = builder.declare_var(types::I64);
-            let param_tag = builder.block_params(block0)[i * 2 + 1];
-            let param_payload = builder.block_params(block0)[i * 2 + 2];
+            let param_tag = builder.block_params(loop_block)[i * 2 + 1];
+            let param_payload = builder.block_params(loop_block)[i * 2 + 2];
             builder.def_var(tag, param_tag);
             builder.def_var(payload, param_payload);
             vars.insert(name.clone(), LocalValueVar { tag, payload });
@@ -1035,25 +1042,21 @@ fn define_function_body(
             }
         }
 
-        let mut last_val = None;
-        for line in &func_def.block.lines {
-            last_val = Some(compile_ast(
-                &mut builder,
-                line,
-                &vars,
-                &func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                &capture_slots,
-                env_ptr,
-            ));
-        }
+        compile_tail_block(
+            &mut builder,
+            &func_def.block,
+            &vars,
+            &func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            &capture_slots,
+            env_ptr,
+            &func_def.name,
+            loop_block,
+        );
 
-        if let Some(val) = last_val {
-            builder.ins().return_(&[val.tag, val.payload]);
-        }
-
+        builder.seal_block(loop_block);
         builder.finalize();
     }
 
@@ -2107,6 +2110,187 @@ fn compile_list_range(
     output
 }
 
+fn compile_tail_block(
+    builder: &mut FunctionBuilder,
+    block: &BlockAst,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    current_function_name: &str,
+    loop_block: Block,
+) {
+    if block.lines.is_empty() {
+        let zero = boxed_int_const(builder, 0);
+        builder.ins().return_(&[zero.tag, zero.payload]);
+        return;
+    }
+
+    for line in &block.lines[..block.lines.len() - 1] {
+        let _ = compile_ast(
+            builder,
+            line,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+
+    compile_tail_ast(
+        builder,
+        &block.lines[block.lines.len() - 1],
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+        current_function_name,
+        loop_block,
+    );
+}
+
+fn compile_tail_ast(
+    builder: &mut FunctionBuilder,
+    ast: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    current_function_name: &str,
+    loop_block: Block,
+) {
+    match ast {
+        Ast::Expression(ExpressionAst { function, args })
+            if function == current_function_name && !is_builtin_name(function) =>
+        {
+            let compiled_args: Vec<_> = args
+                .iter()
+                .map(|arg| {
+                    compile_ast(
+                        builder,
+                        arg,
+                        vars,
+                        func_refs,
+                        function_ordinals,
+                        function_arities,
+                        closure_metadata,
+                        capture_slots,
+                        env_ptr,
+                    )
+                })
+                .collect();
+            let mut jump_args = Vec::with_capacity(1 + compiled_args.len() * 2);
+            jump_args.push(BlockArg::Value(env_ptr));
+            for value in compiled_args {
+                jump_args.push(BlockArg::Value(value.tag));
+                jump_args.push(BlockArg::Value(value.payload));
+            }
+            builder.ins().jump(loop_block, &jump_args);
+        }
+        Ast::If {
+            condition,
+            then,
+            else_,
+        } => {
+            let cond_val = compile_ast(
+                builder,
+                condition,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
+            let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
+
+            let then_block = builder.create_block();
+            let else_block = builder.create_block();
+            builder
+                .ins()
+                .brif(cond_non_zero, then_block, &[], else_block, &[]);
+
+            builder.switch_to_block(then_block);
+            compile_tail_block(
+                builder,
+                then,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+                current_function_name,
+                loop_block,
+            );
+            builder.seal_block(then_block);
+
+            builder.switch_to_block(else_block);
+            if let Some(else_block_ast) = else_ {
+                compile_tail_block(
+                    builder,
+                    else_block_ast,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                    current_function_name,
+                    loop_block,
+                );
+            } else {
+                let zero = boxed_int_const(builder, 0);
+                builder.ins().return_(&[zero.tag, zero.payload]);
+            }
+            builder.seal_block(else_block);
+        }
+        Ast::Block(block) => compile_tail_block(
+            builder,
+            block,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            current_function_name,
+            loop_block,
+        ),
+        _ => {
+            let val = compile_ast(
+                builder,
+                ast,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            builder.ins().return_(&[val.tag, val.payload]);
+        }
+    }
+}
+
 fn compile_ast(
     builder: &mut FunctionBuilder,
     ast: &Ast,
@@ -2847,6 +3031,12 @@ fn jit_nested_closures_work() {
     assert_cranelift_jit_result(src, 5);
 }
 
+#[test]
+fn jit_self_tail_recursion_works() {
+    let src = "fn sum(n, acc) do\n    if n == 0 do\n        acc\n    else\n        sum(n - 1, acc + n)\n    end\nend\n\nfn main() do\n    sum(10000, 0)\nend";
+    assert_cranelift_jit_result(src, 50005000);
+}
+
 #[cfg(feature = "llvm-backend")]
 #[test]
 fn llvm_jit_arithmetic_works() {
@@ -2921,6 +3111,13 @@ fn llvm_jit_function_value_calls_support_closures() {
 fn llvm_jit_nested_closures_work() {
     let src = "fn main() do\n    a = 2\n    xs = [1, 2, 3]\n    ys = list_map(xs, fn x ->\n        inner = fn y -> y + a end\n        inner(x)\n    end)\n    ys[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 5);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_self_tail_recursion_works() {
+    let src = "fn sum(n, acc) do\n    if n == 0 do\n        acc\n    else\n        sum(n - 1, acc + n)\n    end\nend\n\nfn main() do\n    sum(10000, 0)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 50005000);
 }
 
 #[cfg(feature = "llvm-backend")]

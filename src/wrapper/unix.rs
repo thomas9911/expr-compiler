@@ -261,6 +261,11 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_runtime_oom_host() -> i64 {
+    runtime_trap("out of arena memory");
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_print_host(handle: i64) -> i64 {
     print_value_inner(handle);
     write_stdout(b"\n");

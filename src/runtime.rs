@@ -155,6 +155,11 @@ pub fn jit_arena_addresses() -> (i64, i64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_runtime_oom_host() -> i64 {
+    runtime_trap("out of arena memory");
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_alloc_host(size: i64, align: i64) -> i64 {
     let size = usize::try_from(size).unwrap_or_else(|_| runtime_trap("allocation size overflow"));
     let align =

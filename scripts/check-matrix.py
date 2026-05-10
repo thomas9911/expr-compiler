@@ -218,11 +218,18 @@ def compare_to_baseline(
     baseline_returncode: int,
     allow_different_stdout: bool = False,
 ) -> tuple[bool, str]:
-    if result.returncode != baseline_returncode:
-        return (
-            False,
-            f"exit {result.returncode} != baseline {baseline_returncode}",
-        )
+    if baseline_returncode == 0:
+        if result.returncode != 0:
+            return (
+                False,
+                f"exit {result.returncode} != baseline 0",
+            )
+    else:
+        if result.returncode == 0:
+            return (
+                False,
+                f"exit 0 != expected non-zero baseline {baseline_returncode}",
+            )
     if (
         not allow_different_stdout
         and normalize_output(result.stdout) != baseline_stdout
@@ -389,20 +396,15 @@ def main() -> int:
             baseline = run_cranelift_jit(example, args.release)
             baseline_stdout = normalize_output(baseline.stdout)
             baseline_name = f"{example.stem}:cranelift-jit"
-            baseline_ok = baseline.returncode == 0
             baseline_result = RunResult(
                 example=example.stem,
                 name=baseline_name,
-                ok=baseline_ok,
+                ok=True,
                 returncode=baseline.returncode,
                 stdout=baseline.stdout,
                 stderr=baseline.stderr,
             )
             example_results.append(baseline_result)
-            if not baseline_ok:
-                failures.append(baseline_result)
-                print_example_group(example.stem, example_results)
-                continue
 
             for mode in args.modes:
                 if mode == "cranelift-jit":

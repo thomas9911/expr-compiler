@@ -76,3 +76,7 @@ int64_t __expr_list_print_host(int64_t handle) {
     putchar('\n');
     return (int64_t)(uintptr_t)&PRINT_ZERO;
 }
+
+int64_t __expr_runtime_oom_host(void) {
+    runtime_trap("out of arena memory");
+}
