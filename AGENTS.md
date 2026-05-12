@@ -31,6 +31,7 @@ Guidance for coding agents working in this repository.
 ## Current Language Features
 
 - BigInt values are supported:
+  - `123n`
   - `bigint_from_int(x)`
   - `bigint_compare(a, b)`
   - `bigint_add(a, b)`

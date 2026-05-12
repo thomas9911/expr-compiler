@@ -283,6 +283,9 @@ impl Interpreter {
     }
 
     fn execute_literal(&mut self, literal: LiteralAst) {
+        if matches!(literal, LiteralAst::BigInt(_)) {
+            panic!("bigint literals are not supported by the interpreter");
+        }
         self.output = Ast::Literal(literal);
     }
 

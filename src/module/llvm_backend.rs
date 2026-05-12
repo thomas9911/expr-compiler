@@ -1373,6 +1373,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::Literal(LiteralAst::Integer(n)) => {
                 self.int_value(self.i64_type.const_int(*n as u64, true))
             }
+            Ast::Literal(LiteralAst::BigInt(digits)) => {
+                self.build_bigint_literal(digits, "bigint_literal")
+            }
             Ast::Lambda { .. } => {
                 panic!("anonymous functions are not implemented by the llvm backend yet");
             }
@@ -1719,6 +1722,43 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to extract payload")
             .into_int_value();
         CompiledValue { tag, payload }
+    }
+
+    fn build_bigint_literal(&self, digits: &str, label: &str) -> CompiledValue<'ctx> {
+        let zero = self.int_value(self.i64_type.const_zero());
+        let mut acc = self.build_internal_call(
+            self.require_func("bigint_from_int"),
+            &[zero],
+            &format!("{label}_init"),
+        );
+        let ten = self.build_internal_call(
+            self.require_func("bigint_from_int"),
+            &[self.int_value(self.i64_type.const_int(10, false))],
+            &format!("{label}_ten"),
+        );
+
+        for (index, ch) in digits.chars().enumerate() {
+            acc = self.build_internal_call(
+                self.require_func("bigint_multiply"),
+                &[acc, ten],
+                &format!("{label}_mul_{index}"),
+            );
+            let digit = self.build_internal_call(
+                self.require_func("bigint_from_int"),
+                &[self.int_value(
+                    self.i64_type
+                        .const_int(ch.to_digit(10).unwrap() as u64, false),
+                )],
+                &format!("{label}_digit_{index}"),
+            );
+            acc = self.build_internal_call(
+                self.require_func("bigint_add"),
+                &[acc, digit],
+                &format!("{label}_add_{index}"),
+            );
+        }
+
+        acc
     }
 
     fn build_promote_value_to_bigint(

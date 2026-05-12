@@ -66,10 +66,10 @@ fn main() do
 
     # BigInt construction and arithmetic.
     big_a = bigint_from_int(2147483647)
-    big_b = bigint_from_int(2147483647)
+    big_b = 2147483647n
     print(big_a)
     print(big_a + big_b)
-    print(bigint_subtract(big_b, bigint_from_int(10)))
+    print(bigint_subtract(big_b, 10))
 
     0
 end

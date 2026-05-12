@@ -1104,6 +1104,9 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
         }
         Ast::Block(block) => collect_used_features_from_block(block, features),
         Ast::FunctionDef(func) => collect_used_features_from_block(&func.block, features),
+        Ast::Literal(LiteralAst::BigInt(_)) => {
+            features.bigint = true;
+        }
         Ast::Literal(_) | Ast::Variable(_) | Ast::Lambda { .. } | Ast::FunctionRef(_) => {}
     }
 }
@@ -1725,6 +1728,68 @@ fn boxed_int_const(builder: &mut FunctionBuilder, value: i64) -> CompiledValue {
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: builder.ins().iconst(types::I64, value),
     }
+}
+
+fn compile_bigint_literal(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    digits: &str,
+) -> CompiledValue {
+    let bigint_from_int = require_func(func_refs, "bigint_from_int");
+    let bigint_multiply = require_func(func_refs, "bigint_multiply");
+    let bigint_add = require_func(func_refs, "bigint_add");
+
+    let zero = boxed_int_const(builder, 0);
+    let init = builder
+        .ins()
+        .call(bigint_from_int, &[zero.tag, zero.payload]);
+    let init_results = builder.inst_results(init);
+    let mut acc = CompiledValue {
+        tag: init_results[0],
+        payload: init_results[1],
+    };
+    let ten_int = boxed_int_const(builder, 10);
+    let ten_call = builder
+        .ins()
+        .call(bigint_from_int, &[ten_int.tag, ten_int.payload]);
+    let ten_results = builder.inst_results(ten_call);
+    let ten = CompiledValue {
+        tag: ten_results[0],
+        payload: ten_results[1],
+    };
+
+    for ch in digits.chars() {
+        let mul = builder.ins().call(
+            bigint_multiply,
+            &[acc.tag, acc.payload, ten.tag, ten.payload],
+        );
+        let mul_results = builder.inst_results(mul);
+        acc = CompiledValue {
+            tag: mul_results[0],
+            payload: mul_results[1],
+        };
+
+        let digit_int = boxed_int_const(builder, ch.to_digit(10).unwrap() as i64);
+        let digit_call = builder
+            .ins()
+            .call(bigint_from_int, &[digit_int.tag, digit_int.payload]);
+        let digit_results = builder.inst_results(digit_call);
+        let digit = CompiledValue {
+            tag: digit_results[0],
+            payload: digit_results[1],
+        };
+        let add = builder.ins().call(
+            bigint_add,
+            &[acc.tag, acc.payload, digit.tag, digit.payload],
+        );
+        let add_results = builder.inst_results(add);
+        acc = CompiledValue {
+            tag: add_results[0],
+            payload: add_results[1],
+        };
+    }
+
+    acc
 }
 
 fn load_value_from_env(
@@ -2530,6 +2595,9 @@ fn compile_ast(
 ) -> CompiledValue {
     match ast {
         Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, *n),
+        Ast::Literal(LiteralAst::BigInt(digits)) => {
+            compile_bigint_literal(builder, func_refs, digits)
+        }
         Ast::Lambda { .. } => {
             panic!("anonymous functions are not implemented by the compiler yet");
         }
@@ -3191,6 +3259,12 @@ fn bigint_from_int_prints() {
 }
 
 #[test]
+fn bigint_literal_prints() {
+    let src = "fn main() do\n    print(123456789012345678901234567890n)\nend";
+    assert_cranelift_executable_output(src, "123456789012345678901234567890\n", 0);
+}
+
+#[test]
 fn bigint_add_handles_limb_carry() {
     let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a + b)\nend";
     assert_cranelift_executable_output(src, "4294967297\n", 0);
@@ -3249,6 +3323,18 @@ fn bigint_builtins_accept_mixed_int_and_bigint_operands() {
 fn llvm_bigint_add_handles_limb_carry() {
     let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a + b)\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "4294967297\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_literal_prints() {
+    let src = "fn main() do\n    print(123456789012345678901234567890n)\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "123456789012345678901234567890\n",
+        0,
+    );
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]

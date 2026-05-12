@@ -1,9 +1,10 @@
 # Demonstrates the current BigInt feature set.
 
 fn main() do
-    a = bigint_from_int(2147483647)
-    b = bigint_from_int(2147483647)
-    c = bigint_from_int(10)
+    a = 2147483647n
+    b = 2147483647n
+    ten = 10
+    c = bigint_from_int(ten)
     d = bigint_from_int(25)
     e = bigint_from_int(100)
     f = bigint_from_int(7)

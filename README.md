@@ -26,8 +26,8 @@ The language has a `BigInt` runtime type backed by a dedicated heap object with
 Current construction and arithmetic surface:
 
 ```text
-a = bigint_from_int(2147483647)
-b = bigint_from_int(2147483647)
+a = 2147483647n
+b = 2147483647n
 c = bigint_from_int(100)
 d = bigint_from_int(7)
 
@@ -42,6 +42,7 @@ print(bigint_subtract(b, a))
 Current behavior:
 
 - `bigint_from_int(x)` constructs a bigint from an `Int`
+- `123n` is a bigint literal
 - `bigint_compare(a, b)` returns `-1`, `0`, or `1`
 - `bigint_add(a, b)`, `bigint_subtract(a, b)`, `bigint_multiply(a, b)`,
   `bigint_divide(a, b)`, and `bigint_modulo(a, b)` are available as builtins
