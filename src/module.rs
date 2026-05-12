@@ -43,6 +43,7 @@ pub fn llvm_backend_available() -> bool {
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
     closure_metadata: HashMap<String, ClosureMetadata>,
+    used_features: UsedFeatures,
 }
 
 struct LambdaLifter {
@@ -68,11 +69,19 @@ struct LocalValueVar {
     payload: Variable,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct UsedFeatures {
+    bigint: bool,
+    lists: bool,
+    list_mutation: bool,
+}
+
 impl Module {
     pub fn new() -> Self {
         Module {
             functions: vec![],
             closure_metadata: HashMap::new(),
+            used_features: UsedFeatures::default(),
         }
     }
 
@@ -102,9 +111,11 @@ impl Module {
         }
 
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
+        let used_features = collect_used_features(&functions);
         Module {
             functions,
             closure_metadata,
+            used_features,
         }
     }
 
@@ -122,10 +133,27 @@ impl Module {
             _ => {}
         }
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
+        let used_features = collect_used_features(&functions);
         Module {
             functions,
             closure_metadata,
+            used_features,
         }
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_bigint(&self) -> bool {
+        self.used_features.bigint
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_lists(&self) -> bool {
+        self.used_features.lists
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_list_mutation(&self) -> bool {
+        self.used_features.list_mutation
     }
 
     pub fn compile_to_jit(self) -> JitArtifact {
@@ -166,6 +194,9 @@ impl Module {
             &mut cranelift_module,
             &isa,
             &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
             crate::runtime::__expr_print_host as usize as i64,
             crate::runtime::__expr_list_print_host as usize as i64,
             arena_base_addr,
@@ -238,7 +269,14 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "ir", default_libcall_names()).unwrap(),
         );
 
-        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(
+            &mut cranelift_module,
+            &isa,
+            &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
+        );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
@@ -323,7 +361,14 @@ impl Module {
             ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap(),
         );
 
-        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(
+            &mut cranelift_module,
+            &isa,
+            &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
+        );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
@@ -436,7 +481,14 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "exe", default_libcall_names()).unwrap(),
         );
 
-        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(
+            &mut cranelift_module,
+            &isa,
+            &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
+        );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
@@ -962,6 +1014,97 @@ fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
         .iter()
         .map(|func| (func.name.clone(), func.inputs.len()))
         .collect()
+}
+
+fn collect_used_features(functions: &[FunctionDefAst]) -> UsedFeatures {
+    let mut features = UsedFeatures::default();
+    for function in functions {
+        collect_used_features_from_block(&function.block, &mut features);
+    }
+    features
+}
+
+fn collect_used_features_from_block(block: &BlockAst, features: &mut UsedFeatures) {
+    for line in &block.lines {
+        collect_used_features_from_ast(line, features);
+    }
+}
+
+fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
+    match ast {
+        Ast::Expression(ExpressionAst { function, args }) => {
+            if matches!(
+                function.as_str(),
+                "bigint_from_int"
+                    | "bigint_compare"
+                    | "bigint_add"
+                    | "bigint_subtract"
+                    | "bigint_multiply"
+                    | "bigint_divide"
+            ) {
+                features.bigint = true;
+            }
+            if matches!(
+                function.as_str(),
+                "list_new"
+                    | "list_push"
+                    | "list_len"
+                    | "list_get"
+                    | "list_range"
+                    | "list_map"
+                    | "list_filter"
+            ) {
+                features.lists = true;
+            }
+            if matches!(
+                function.as_str(),
+                "list_insert" | "list_set" | "list_swap" | "list_pop" | "list_copy"
+            ) {
+                features.lists = true;
+                features.list_mutation = true;
+            }
+            for arg in args {
+                collect_used_features_from_ast(arg, features);
+            }
+        }
+        Ast::ListLiteral(items) => {
+            features.lists = true;
+            for item in items {
+                collect_used_features_from_ast(item, features);
+            }
+        }
+        Ast::Index { collection, index } => {
+            features.lists = true;
+            collect_used_features_from_ast(collection, features);
+            collect_used_features_from_ast(index, features);
+        }
+        Ast::IndexAssign {
+            collection,
+            index,
+            value,
+        } => {
+            features.lists = true;
+            features.list_mutation = true;
+            collect_used_features_from_ast(collection, features);
+            collect_used_features_from_ast(index, features);
+            collect_used_features_from_ast(value, features);
+        }
+        Ast::Assign { value, .. } => collect_used_features_from_ast(value, features),
+        Ast::If {
+            condition,
+            then,
+            else_,
+        } => {
+            collect_used_features_from_ast(condition, features);
+            collect_used_features_from_block(then, features);
+            if let Some(else_block) = else_ {
+                collect_used_features_from_block(else_block, features);
+            }
+        }
+        Ast::Block(block) => collect_used_features_from_block(block, features),
+        Ast::FunctionDef(func) => collect_used_features_from_block(&func.block, features),
+        Ast::Literal(_) | Ast::Variable(_) | Ast::Lambda { .. } | Ast::FunctionRef(_) => {}
+    }
 }
 
 fn define_function_body(

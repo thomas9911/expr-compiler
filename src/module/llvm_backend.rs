@@ -107,6 +107,9 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
 
     let functions = {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
+        compiler.bigint_enabled = expr_module.uses_bigint();
+        compiler.list_enabled = expr_module.uses_lists();
+        compiler.list_mutation_enabled = expr_module.uses_list_mutation();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -146,6 +149,9 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Host);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
+        compiler.bigint_enabled = expr_module.uses_bigint();
+        compiler.list_enabled = expr_module.uses_lists();
+        compiler.list_mutation_enabled = expr_module.uses_list_mutation();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -171,6 +177,9 @@ pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Wasm);
+        compiler.bigint_enabled = expr_module.uses_bigint();
+        compiler.list_enabled = expr_module.uses_lists();
+        compiler.list_mutation_enabled = expr_module.uses_list_mutation();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -200,6 +209,9 @@ pub(super) fn compile_to_wasm_preview1_command_assembly(
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);
+        compiler.bigint_enabled = expr_module.uses_bigint();
+        compiler.list_enabled = expr_module.uses_lists();
+        compiler.list_mutation_enabled = expr_module.uses_list_mutation();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -263,6 +275,9 @@ struct LlvmCompiler<'ctx> {
     builder: Builder<'ctx>,
     i64_type: IntType<'ctx>,
     runtime_mode: LlvmRuntimeMode,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
     functions: HashMap<String, FunctionValue<'ctx>>,
     function_ordinals: HashMap<String, i64>,
     function_arities: HashMap<String, usize>,
@@ -287,6 +302,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             builder: context.create_builder(),
             i64_type: context.i64_type(),
             runtime_mode,
+            bigint_enabled: false,
+            list_enabled: false,
+            list_mutation_enabled: false,
             functions: HashMap::new(),
             function_ordinals: HashMap::new(),
             function_arities: HashMap::new(),
@@ -397,72 +415,74 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.define_value_to_i64();
         self.define_value_is_truthy();
-        self.define_pair_bigint_from_int("__rt_bigint_from_int", "llvm_rt_bigint_from_int");
-        self.define_pair_bigint_compare("__rt_bigint_compare", "llvm_rt_bigint_compare");
-        self.define_pair_bigint_add("__rt_bigint_add", "llvm_rt_bigint_add");
-        self.define_pair_bigint_subtract("__rt_bigint_subtract", "llvm_rt_bigint_subtract");
-        self.define_pair_bigint_multiply("__rt_bigint_multiply", "llvm_rt_bigint_multiply");
-        self.define_pair_bigint_divide("__rt_bigint_divide", "llvm_rt_bigint_divide");
+        if self.bigint_enabled {
+            self.define_pair_bigint_from_int("__rt_bigint_from_int", "llvm_rt_bigint_from_int");
+            self.define_pair_bigint_compare("__rt_bigint_compare", "llvm_rt_bigint_compare");
+            self.define_pair_bigint_add("__rt_bigint_add", "llvm_rt_bigint_add");
+            self.define_pair_bigint_subtract("__rt_bigint_subtract", "llvm_rt_bigint_subtract");
+            self.define_pair_bigint_multiply("__rt_bigint_multiply", "llvm_rt_bigint_multiply");
+            self.define_pair_bigint_divide("__rt_bigint_divide", "llvm_rt_bigint_divide");
+        }
         self.define_runtime_operation(
             "__op_add",
             "llvm_rt_add",
             BinaryArithOp::Add,
-            Some("__rt_bigint_add"),
+            self.bigint_enabled.then_some("__rt_bigint_add"),
         );
         self.define_runtime_operation(
             "__op_subtract",
             "llvm_rt_subtract",
             BinaryArithOp::Subtract,
-            Some("__rt_bigint_subtract"),
+            self.bigint_enabled.then_some("__rt_bigint_subtract"),
         );
         self.define_runtime_operation(
             "__op_multiply",
             "llvm_rt_multiply",
             BinaryArithOp::Multiply,
-            Some("__rt_bigint_multiply"),
+            self.bigint_enabled.then_some("__rt_bigint_multiply"),
         );
         self.define_runtime_operation(
             "__op_divide",
             "llvm_rt_divide",
             BinaryArithOp::Divide,
-            Some("__rt_bigint_divide"),
+            self.bigint_enabled.then_some("__rt_bigint_divide"),
         );
         self.define_runtime_operation("__op_modulo", "llvm_rt_modulo", BinaryArithOp::Modulo, None);
         self.define_runtime_compare(
             "__op_gt",
             "llvm_rt_gt",
             IntPredicate::SGT,
-            Some("__rt_bigint_compare"),
+            self.bigint_enabled.then_some("__rt_bigint_compare"),
         );
         self.define_runtime_compare(
             "__op_lt",
             "llvm_rt_lt",
             IntPredicate::SLT,
-            Some("__rt_bigint_compare"),
+            self.bigint_enabled.then_some("__rt_bigint_compare"),
         );
         self.define_runtime_compare(
             "__op_gte",
             "llvm_rt_gte",
             IntPredicate::SGE,
-            Some("__rt_bigint_compare"),
+            self.bigint_enabled.then_some("__rt_bigint_compare"),
         );
         self.define_runtime_compare(
             "__op_lte",
             "llvm_rt_lte",
             IntPredicate::SLE,
-            Some("__rt_bigint_compare"),
+            self.bigint_enabled.then_some("__rt_bigint_compare"),
         );
         self.define_runtime_compare(
             "__op_eq",
             "llvm_rt_eq",
             IntPredicate::EQ,
-            Some("__rt_bigint_compare"),
+            self.bigint_enabled.then_some("__rt_bigint_compare"),
         );
         self.define_runtime_compare(
             "__op_ne",
             "llvm_rt_ne",
             IntPredicate::NE,
-            Some("__rt_bigint_compare"),
+            self.bigint_enabled.then_some("__rt_bigint_compare"),
         );
         match self.runtime_mode {
             LlvmRuntimeMode::Native => {
@@ -487,15 +507,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.define_wasi_preview1_print_runtime();
             }
         }
-        self.define_pair_list_new("__rt_list_new", "llvm_rt_list_new");
-        self.define_pair_list_push("__rt_list_push", "llvm_rt_list_push");
-        self.define_pair_list_insert("__rt_list_insert", "llvm_rt_list_insert");
-        self.define_pair_list_len("__rt_list_len", "llvm_rt_list_len");
-        self.define_pair_list_get("__rt_list_get", "llvm_rt_list_get");
-        self.define_pair_list_set("__rt_list_set", "llvm_rt_list_set");
-        self.define_pair_list_swap("__rt_list_swap", "llvm_rt_list_swap");
-        self.define_pair_list_pop("__rt_list_pop", "llvm_rt_list_pop");
-        self.define_pair_list_copy("__rt_list_copy", "llvm_rt_list_copy");
+        if self.list_enabled {
+            self.define_pair_list_new("__rt_list_new", "llvm_rt_list_new");
+            self.define_pair_list_push("__rt_list_push", "llvm_rt_list_push");
+            self.define_pair_list_len("__rt_list_len", "llvm_rt_list_len");
+            self.define_pair_list_get("__rt_list_get", "llvm_rt_list_get");
+        }
+        if self.list_mutation_enabled {
+            self.define_pair_list_insert("__rt_list_insert", "llvm_rt_list_insert");
+            self.define_pair_list_set("__rt_list_set", "llvm_rt_list_set");
+            self.define_pair_list_swap("__rt_list_swap", "llvm_rt_list_swap");
+            self.define_pair_list_pop("__rt_list_pop", "llvm_rt_list_pop");
+            self.define_pair_list_copy("__rt_list_copy", "llvm_rt_list_copy");
+        }
     }
 
     fn declare_user_functions(&mut self, functions: &[FunctionDefAst], mode: LlvmOutputMode) {

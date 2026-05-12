@@ -24,9 +24,20 @@ pub(super) fn setup_builtins(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> HashMap<String, FuncId> {
     let oom_host_id = declare_host_builtin(module, isa, "__expr_runtime_oom_host", &[]);
-    let runtime = define_runtime_ir(module, isa, flags, oom_host_id);
+    let runtime = define_runtime_ir(
+        module,
+        isa,
+        flags,
+        oom_host_id,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     let print_host_id = declare_host_builtin(module, isa, "__expr_print_host", &[types::I64]);
     let list_print_host_id =
         declare_host_builtin(module, isa, "__expr_list_print_host", &[types::I64]);
@@ -54,13 +65,23 @@ pub(super) fn setup_builtins(
         list_print_host_id,
         runtime.box_value,
     );
-    build_builtin_map(print_id, list_print_id, runtime)
+    build_builtin_map(
+        print_id,
+        list_print_id,
+        runtime,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    )
 }
 
 pub(super) fn setup_builtins_jit(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
     print_host_addr: i64,
     list_print_host_addr: i64,
     arena_base_addr: i64,
@@ -73,6 +94,9 @@ pub(super) fn setup_builtins_jit(
         arena_base_addr,
         arena_offset_addr,
         crate::runtime::__expr_runtime_oom_host as usize as i64,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
     );
     let print_host_id = declare_local_builtin(module, isa, "__rt_print_host_scalar", &[types::I64]);
     let list_print_host_id =
@@ -103,13 +127,23 @@ pub(super) fn setup_builtins_jit(
         list_print_host_id,
         runtime.box_value,
     );
-    build_builtin_map(print_id, list_print_id, runtime)
+    build_builtin_map(
+        print_id,
+        list_print_id,
+        runtime,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    )
 }
 
 fn build_builtin_map(
     print_id: FuncId,
     _list_print_id: FuncId,
     runtime: RuntimeBuiltins,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> HashMap<String, FuncId> {
     let mut builtins = HashMap::new();
     builtins.insert("print".to_string(), print_id);
@@ -129,21 +163,27 @@ fn build_builtin_map(
     builtins.insert("__op_lte".to_string(), runtime.op_lte);
     builtins.insert("__op_eq".to_string(), runtime.op_eq);
     builtins.insert("__op_ne".to_string(), runtime.op_ne);
-    builtins.insert("bigint_compare".to_string(), runtime.bigint_compare);
-    builtins.insert("bigint_from_int".to_string(), runtime.bigint_from_int);
-    builtins.insert("bigint_add".to_string(), runtime.bigint_add);
-    builtins.insert("bigint_subtract".to_string(), runtime.bigint_subtract);
-    builtins.insert("bigint_multiply".to_string(), runtime.bigint_multiply);
-    builtins.insert("bigint_divide".to_string(), runtime.bigint_divide);
-    builtins.insert("list_new".to_string(), runtime.list_new);
-    builtins.insert("list_push".to_string(), runtime.list_push);
-    builtins.insert("list_insert".to_string(), runtime.list_insert);
-    builtins.insert("list_len".to_string(), runtime.list_len);
-    builtins.insert("list_get".to_string(), runtime.list_get);
-    builtins.insert("list_set".to_string(), runtime.list_set);
-    builtins.insert("list_swap".to_string(), runtime.list_swap);
-    builtins.insert("list_pop".to_string(), runtime.list_pop);
-    builtins.insert("list_copy".to_string(), runtime.list_copy);
+    if bigint_enabled {
+        builtins.insert("bigint_compare".to_string(), runtime.bigint_compare.unwrap());
+        builtins.insert("bigint_from_int".to_string(), runtime.bigint_from_int.unwrap());
+        builtins.insert("bigint_add".to_string(), runtime.bigint_add.unwrap());
+        builtins.insert("bigint_subtract".to_string(), runtime.bigint_subtract.unwrap());
+        builtins.insert("bigint_multiply".to_string(), runtime.bigint_multiply.unwrap());
+        builtins.insert("bigint_divide".to_string(), runtime.bigint_divide.unwrap());
+    }
+    if list_enabled {
+        builtins.insert("list_new".to_string(), runtime.list_new.unwrap());
+        builtins.insert("list_push".to_string(), runtime.list_push.unwrap());
+        builtins.insert("list_len".to_string(), runtime.list_len.unwrap());
+        builtins.insert("list_get".to_string(), runtime.list_get.unwrap());
+    }
+    if list_mutation_enabled {
+        builtins.insert("list_insert".to_string(), runtime.list_insert.unwrap());
+        builtins.insert("list_set".to_string(), runtime.list_set.unwrap());
+        builtins.insert("list_swap".to_string(), runtime.list_swap.unwrap());
+        builtins.insert("list_pop".to_string(), runtime.list_pop.unwrap());
+        builtins.insert("list_copy".to_string(), runtime.list_copy.unwrap());
+    }
     builtins
 }
 
@@ -164,21 +204,21 @@ struct RuntimeBuiltins {
     op_lte: FuncId,
     op_eq: FuncId,
     op_ne: FuncId,
-    bigint_compare: FuncId,
-    bigint_from_int: FuncId,
-    bigint_add: FuncId,
-    bigint_subtract: FuncId,
-    bigint_multiply: FuncId,
-    bigint_divide: FuncId,
-    list_new: FuncId,
-    list_push: FuncId,
-    list_insert: FuncId,
-    list_len: FuncId,
-    list_get: FuncId,
-    list_set: FuncId,
-    list_swap: FuncId,
-    list_pop: FuncId,
-    list_copy: FuncId,
+    bigint_compare: Option<FuncId>,
+    bigint_from_int: Option<FuncId>,
+    bigint_add: Option<FuncId>,
+    bigint_subtract: Option<FuncId>,
+    bigint_multiply: Option<FuncId>,
+    bigint_divide: Option<FuncId>,
+    list_new: Option<FuncId>,
+    list_push: Option<FuncId>,
+    list_insert: Option<FuncId>,
+    list_len: Option<FuncId>,
+    list_get: Option<FuncId>,
+    list_set: Option<FuncId>,
+    list_swap: Option<FuncId>,
+    list_pop: Option<FuncId>,
+    list_copy: Option<FuncId>,
 }
 
 struct RuntimeData {
@@ -251,6 +291,9 @@ fn init_runtime_data(module: &mut impl CraneliftModule) -> RuntimeData {
 fn declare_runtime_function_ids(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> RuntimeFunctionIds {
     let alloc = declare_local_builtin(module, isa, "__rt_alloc", &[types::I64, types::I64]);
     let oom = declare_local_builtin(module, isa, "__rt_runtime_oom_host", &[]);
@@ -335,100 +378,120 @@ fn declare_runtime_function_ids(
         "__rt_ne",
         &[types::I64, types::I64, types::I64, types::I64],
     );
-    let bigint_from_int = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_bigint_from_int",
-        &[types::I64, types::I64],
-    );
-    let bigint_compare = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_bigint_compare",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let bigint_add = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_bigint_add",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let bigint_subtract = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_bigint_subtract",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let bigint_multiply = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_bigint_multiply",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let bigint_divide = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_bigint_divide",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let list_new = declare_local_pair_builtin(module, isa, "__rt_list_new", &[]);
-    let list_push = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_push",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let list_insert = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_insert",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-    );
-    let list_len =
-        declare_local_pair_builtin(module, isa, "__rt_list_len", &[types::I64, types::I64]);
-    let list_get = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_get",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let list_set = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_set",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-    );
-    let list_swap = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_swap",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-    );
-    let list_pop =
-        declare_local_pair_builtin(module, isa, "__rt_list_pop", &[types::I64, types::I64]);
-    let list_copy =
-        declare_local_pair_builtin(module, isa, "__rt_list_copy", &[types::I64, types::I64]);
+    let bigint_from_int = bigint_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_bigint_from_int", &[types::I64, types::I64])
+    });
+    let bigint_compare = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_compare",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_add = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_add",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_subtract = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_subtract",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_multiply = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_multiply",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_divide = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_divide",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let list_new = list_enabled.then(|| declare_local_pair_builtin(module, isa, "__rt_list_new", &[]));
+    let list_push = list_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_push",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let list_insert = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_insert",
+            &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+            ],
+        )
+    });
+    let list_len = list_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_list_len", &[types::I64, types::I64])
+    });
+    let list_get = list_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_get",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let list_set = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_set",
+            &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+            ],
+        )
+    });
+    let list_swap = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_swap",
+            &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+            ],
+        )
+    });
+    let list_pop = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_list_pop", &[types::I64, types::I64])
+    });
+    let list_copy = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_list_copy", &[types::I64, types::I64])
+    });
 
     RuntimeFunctionIds {
         alloc,
@@ -475,6 +538,9 @@ fn define_runtime_operations(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     ids: &RuntimeFunctionIds,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) {
     define_rt_memcpy(module, isa, flags, ids.memcpy);
     define_rt_box_value(module, isa, flags, ids.builtins.box_value, ids.alloc);
@@ -488,7 +554,7 @@ fn define_runtime_operations(
         ids.builtins.op_add,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_add),
+        ids.builtins.bigint_add,
         "add",
     );
     define_rt_binary_op(
@@ -498,7 +564,7 @@ fn define_runtime_operations(
         ids.builtins.op_subtract,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_subtract),
+        ids.builtins.bigint_subtract,
         "subtract",
     );
     define_rt_binary_op(
@@ -508,7 +574,7 @@ fn define_runtime_operations(
         ids.builtins.op_multiply,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_multiply),
+        ids.builtins.bigint_multiply,
         "multiply",
     );
     define_rt_binary_op(
@@ -518,7 +584,7 @@ fn define_runtime_operations(
         ids.builtins.op_divide,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_divide),
+        ids.builtins.bigint_divide,
         "divide",
     );
     define_rt_binary_op(
@@ -531,18 +597,44 @@ fn define_runtime_operations(
         None,
         "modulo",
     );
-    define_rt_bigint_from_int(module, isa, flags, ids.builtins.bigint_from_int, ids.alloc);
-    define_rt_bigint_compare(
-        module,
-        isa,
-        flags,
-        ids.builtins.bigint_compare,
-        ids.builtins.value_int,
-    );
-    define_rt_bigint_add(module, isa, flags, ids.builtins.bigint_add, ids.alloc);
-    define_rt_bigint_subtract(module, isa, flags, ids.builtins.bigint_subtract, ids.alloc);
-    define_rt_bigint_multiply(module, isa, flags, ids.builtins.bigint_multiply, ids.alloc);
-    define_rt_bigint_divide(module, isa, flags, ids.builtins.bigint_divide, ids.alloc);
+    if bigint_enabled {
+        define_rt_bigint_from_int(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_from_int.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_compare(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_compare.unwrap(),
+            ids.builtins.value_int,
+        );
+        define_rt_bigint_add(module, isa, flags, ids.builtins.bigint_add.unwrap(), ids.alloc);
+        define_rt_bigint_subtract(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_subtract.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_multiply(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_multiply.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_divide(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_divide.unwrap(),
+            ids.alloc,
+        );
+    }
     define_rt_compare_op(
         module,
         isa,
@@ -550,7 +642,7 @@ fn define_runtime_operations(
         ids.builtins.op_gt,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_compare),
+        ids.builtins.bigint_compare,
         IntCC::SignedGreaterThan,
     );
     define_rt_compare_op(
@@ -560,7 +652,7 @@ fn define_runtime_operations(
         ids.builtins.op_lt,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_compare),
+        ids.builtins.bigint_compare,
         IntCC::SignedLessThan,
     );
     define_rt_compare_op(
@@ -570,7 +662,7 @@ fn define_runtime_operations(
         ids.builtins.op_gte,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_compare),
+        ids.builtins.bigint_compare,
         IntCC::SignedGreaterThanOrEqual,
     );
     define_rt_compare_op(
@@ -580,7 +672,7 @@ fn define_runtime_operations(
         ids.builtins.op_lte,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_compare),
+        ids.builtins.bigint_compare,
         IntCC::SignedLessThanOrEqual,
     );
     define_rt_compare_op(
@@ -590,7 +682,7 @@ fn define_runtime_operations(
         ids.builtins.op_eq,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_compare),
+        ids.builtins.bigint_compare,
         IntCC::Equal,
     );
     define_rt_compare_op(
@@ -600,74 +692,78 @@ fn define_runtime_operations(
         ids.builtins.op_ne,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        Some(ids.builtins.bigint_compare),
+        ids.builtins.bigint_compare,
         IntCC::NotEqual,
     );
-    define_rt_list_new(module, isa, flags, ids.builtins.list_new, ids.alloc);
-    define_rt_list_push(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_push,
-        ids.alloc,
-        ids.memcpy,
-        ids.builtins.box_value,
-    );
-    define_rt_list_insert(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_insert,
-        ids.builtins.value_to_i64,
-        ids.alloc,
-        ids.memcpy,
-        ids.builtins.box_value,
-    );
-    define_rt_list_len(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_len,
-        ids.builtins.value_int,
-    );
-    define_rt_list_get(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_get,
-        ids.builtins.value_to_i64,
-    );
-    define_rt_list_set(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_set,
-        ids.builtins.value_to_i64,
-        ids.builtins.box_value,
-    );
-    define_rt_list_swap(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_swap,
-        ids.builtins.value_to_i64,
-    );
-    define_rt_list_pop(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_pop,
-        ids.builtins.value_to_i64,
-    );
-    define_rt_list_copy(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_copy,
-        ids.builtins.value_to_i64,
-        ids.alloc,
-        ids.memcpy,
-    );
+    if list_enabled {
+        define_rt_list_new(module, isa, flags, ids.builtins.list_new.unwrap(), ids.alloc);
+        define_rt_list_push(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_push.unwrap(),
+            ids.alloc,
+            ids.memcpy,
+            ids.builtins.box_value,
+        );
+        define_rt_list_len(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_len.unwrap(),
+            ids.builtins.value_int,
+        );
+        define_rt_list_get(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_get.unwrap(),
+            ids.builtins.value_to_i64,
+        );
+    }
+    if list_mutation_enabled {
+        define_rt_list_insert(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_insert.unwrap(),
+            ids.builtins.value_to_i64,
+            ids.alloc,
+            ids.memcpy,
+            ids.builtins.box_value,
+        );
+        define_rt_list_set(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_set.unwrap(),
+            ids.builtins.value_to_i64,
+            ids.builtins.box_value,
+        );
+        define_rt_list_swap(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_swap.unwrap(),
+            ids.builtins.value_to_i64,
+        );
+        define_rt_list_pop(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_pop.unwrap(),
+            ids.builtins.value_to_i64,
+        );
+        define_rt_list_copy(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_copy.unwrap(),
+            ids.builtins.value_to_i64,
+            ids.alloc,
+            ids.memcpy,
+        );
+    }
 }
 
 fn define_runtime_ir(
@@ -675,12 +771,29 @@ fn define_runtime_ir(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     oom_host_id: FuncId,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> RuntimeBuiltins {
     let data = init_runtime_data(module);
-    let ids = declare_runtime_function_ids(module, isa);
+    let ids = declare_runtime_function_ids(
+        module,
+        isa,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     define_rt_host_oom_import_wrapper(module, isa, flags, ids.oom, oom_host_id);
     define_rt_alloc(module, isa, flags, ids.alloc, ids.oom, &data);
-    define_runtime_operations(module, isa, flags, &ids);
+    define_runtime_operations(
+        module,
+        isa,
+        flags,
+        &ids,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     ids.builtins
 }
 
@@ -1519,8 +1632,17 @@ fn define_runtime_ir_jit(
     arena_base_addr: i64,
     arena_offset_addr: i64,
     oom_host_addr: i64,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> RuntimeBuiltins {
-    let ids = declare_runtime_function_ids(module, isa);
+    let ids = declare_runtime_function_ids(
+        module,
+        isa,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     define_rt_host_oom_shim(module, isa, flags, ids.oom, oom_host_addr);
     define_rt_alloc_from_addrs(
         module,
@@ -1531,7 +1653,15 @@ fn define_runtime_ir_jit(
         arena_base_addr,
         arena_offset_addr,
     );
-    define_runtime_operations(module, isa, flags, &ids);
+    define_runtime_operations(
+        module,
+        isa,
+        flags,
+        &ids,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     ids.builtins
 }
 
