@@ -1,6 +1,9 @@
 use std::sync::{Mutex, OnceLock};
 
-use crate::value::{ListHeader, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_STRING, Value, ValueTag};
+use crate::value::{
+    BigIntHeader, ListHeader, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_STRING, Value,
+    ValueTag,
+};
 
 const DEFAULT_ARENA_BYTES: usize = 16 * 1024 * 1024;
 const LIST_INITIAL_CAPACITY: usize = 1024;
@@ -102,6 +105,42 @@ fn new_int(value: i64) -> i64 {
     with_arena(|arena| alloc_value(arena, ValueTag::Int, value))
 }
 
+fn print_bigint_ref(header: &BigIntHeader) {
+    if header.sign == 0 || header.len == 0 {
+        print!("0");
+        return;
+    }
+
+    let limbs = unsafe { std::slice::from_raw_parts(header.ptr, header.len) };
+    let mut work = limbs.to_vec();
+    let mut chunks = Vec::new();
+    const BASE10: u64 = 1_000_000_000;
+
+    while !work.is_empty() {
+        let mut rem = 0u64;
+        for limb in work.iter_mut().rev() {
+            let cur = (rem << 32) | u64::from(*limb);
+            *limb = (cur / BASE10) as u32;
+            rem = cur % BASE10;
+        }
+        chunks.push(rem as u32);
+        while work.last() == Some(&0) {
+            work.pop();
+        }
+    }
+
+    if header.sign < 0 {
+        print!("-");
+    }
+    let mut iter = chunks.iter().rev();
+    if let Some(first) = iter.next() {
+        print!("{first}");
+    }
+    for chunk in iter {
+        print!("{chunk:09}");
+    }
+}
+
 fn print_value_ref(value: &Value) {
     match value.tag {
         ValueTag::Int => print!("{}", value.payload),
@@ -119,6 +158,10 @@ fn print_value_ref(value: &Value) {
         }
         ValueTag::String => runtime_trap("string values are not supported yet"),
         ValueTag::Function => runtime_trap("function values are not supported here yet"),
+        ValueTag::BigInt => {
+            let header = unsafe { &*(value.payload as usize as *const BigIntHeader) };
+            print_bigint_ref(header);
+        }
     }
 }
 
@@ -256,6 +299,7 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         TAG_LIST => with_arena(|arena| alloc_value(arena, ValueTag::List, payload)),
         TAG_STRING => with_arena(|arena| alloc_value(arena, ValueTag::String, payload)),
         TAG_FUNCTION => with_arena(|arena| alloc_value(arena, ValueTag::Function, payload)),
+        TAG_BIGINT => with_arena(|arena| alloc_value(arena, ValueTag::BigInt, payload)),
         _ => runtime_trap("unknown value tag"),
     }
 }

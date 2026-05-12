@@ -14,8 +14,42 @@ Current tag usage:
 
 - `Int`
 - `List`
+- `BigInt`
 - `String` is reserved in the value model, but not implemented as a language feature yet
 - `Function`
+
+## BigInt
+
+The language has a `BigInt` runtime type backed by a dedicated heap object with
+`u32` limbs.
+
+Current construction and arithmetic surface:
+
+```text
+a = bigint_from_int(2147483647)
+b = bigint_from_int(2147483647)
+c = bigint_from_int(100)
+d = bigint_from_int(7)
+
+print(bigint_compare(a, b))
+print(a < b)
+print(a + b)
+print(a * bigint_from_int(2))
+print(c / d)
+print(bigint_subtract(b, a))
+```
+
+Current behavior:
+
+- `bigint_from_int(x)` constructs a bigint from an `Int`
+- `bigint_compare(a, b)` returns `-1`, `0`, or `1`
+- `bigint_add(a, b)`, `bigint_subtract(a, b)`, `bigint_multiply(a, b)`, and
+  `bigint_divide(a, b)` are available as builtins
+- comparison operators also work for `BigInt` values when both operands are bigint:
+  - `==`, `!=`, `<`, `<=`, `>`, `>=`
+- `+`, `-`, `*`, and `/` also work for `BigInt` values when both operands are bigint
+- mixed `Int` / `BigInt` arithmetic is rejected for now
+- bigint arithmetic is implemented in Cranelift IR and LLVM IR, not in Rust runtime helpers
 
 ## Higher-order list functions
 
@@ -61,6 +95,7 @@ Current constraints:
   `list_filter`
 - direct function-value calls currently use identifier callees such as `f(10)`
 - strings are still not implemented as a language feature
+- mixed `Int` / `BigInt` arithmetic is still rejected
 
 ## LLVM backend
 

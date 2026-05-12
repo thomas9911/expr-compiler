@@ -64,5 +64,12 @@ fn main() do
     print(gt_bias)
     print(nested)
 
+    # BigInt construction and arithmetic.
+    big_a = bigint_from_int(2147483647)
+    big_b = bigint_from_int(2147483647)
+    print(big_a)
+    print(big_a + big_b)
+    print(bigint_subtract(big_b, bigint_from_int(10)))
+
     0
 end

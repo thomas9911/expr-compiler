@@ -1211,6 +1211,12 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "list_range"
                 | "list_map"
                 | "list_filter"
+                | "bigint_compare"
+                | "bigint_from_int"
+                | "bigint_add"
+                | "bigint_subtract"
+                | "bigint_multiply"
+                | "bigint_divide"
         )
 }
 
@@ -2728,6 +2734,40 @@ fn assert_cranelift_jit_result(src: &str, expected: i64) {
     assert_eq!(func(), expected);
 }
 
+#[cfg(test)]
+fn assert_cranelift_executable_output(src: &str, expected_stdout: &str, expected_exit: i32) {
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Cranelift,
+        expected_stdout,
+        expected_exit,
+    );
+}
+
+#[cfg(test)]
+fn assert_backend_executable_output(
+    src: &str,
+    backend: CodegenBackend,
+    expected_stdout: &str,
+    expected_exit: i32,
+) {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    #[cfg(windows)]
+    let output = windows_temp_exe_path(&format!("__expr_compiler_bigint_test_{unique}"));
+    #[cfg(not(windows))]
+    let output = std::env::temp_dir().join(format!("__expr_compiler_bigint_test_{unique}"));
+
+    Module::from_source(src).compile_to_executable_with_backend(&output, backend);
+    let out = Command::new(&output).output().expect("run failed");
+    std::fs::remove_file(&output).ok();
+
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected_stdout);
+    assert_eq!(out.status.code(), Some(expected_exit));
+}
+
 #[cfg(all(test, feature = "llvm-backend"))]
 fn assert_jit_backend_result(src: &str, backend: CodegenBackend, expected: i64) {
     crate::runtime::reset_runtime_arena();
@@ -2918,6 +2958,83 @@ fn jit_list_filter_works() {
 fn jit_list_range_works() {
     let src = "fn main() do\n    xs = list_range(2, 6)\n    xs[0] + xs[1] + xs[2] + xs[3] + list_len(xs)\nend";
     assert_cranelift_jit_result(src, 18);
+}
+
+#[test]
+fn bigint_from_int_prints() {
+    let src = "fn main() do\n    print(bigint_from_int(1234567890123))\nend";
+    assert_cranelift_executable_output(src, "1234567890123\n", 0);
+}
+
+#[test]
+fn bigint_add_handles_limb_carry() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a + b)\nend";
+    assert_cranelift_executable_output(src, "4294967297\n", 0);
+}
+
+#[test]
+fn bigint_subtract_handles_negative_results() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_subtract(a, b))\nend";
+    assert_cranelift_executable_output(src, "-10\n", 0);
+}
+
+#[test]
+fn bigint_subtract_normalizes_zero() {
+    let src = "fn main() do\n    a = bigint_from_int(5)\n    b = bigint_from_int(5)\n    print(a - b)\nend";
+    assert_cranelift_executable_output(src, "0\n", 0);
+}
+
+#[test]
+fn bigint_compare_works() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_compare(a, b))\n    print(a < b)\n    print(a == b)\n    print(b > a)\nend";
+    assert_cranelift_executable_output(src, "-1\n1\n0\n1\n", 0);
+}
+
+#[test]
+fn bigint_multiply_works() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a * b)\n    print(bigint_multiply(a, b))\nend";
+    assert_cranelift_executable_output(src, "8589934590\n8589934590\n", 0);
+}
+
+#[test]
+fn bigint_divide_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(8589934590)\n    d = bigint_from_int(2)\n    print(a / b)\n    print(bigint_divide(a, b))\n    print(c / d)\nend";
+    assert_cranelift_executable_output(src, "14\n14\n4294967295\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_add_handles_limb_carry() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a + b)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "4294967297\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_subtract_handles_negative_results() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_subtract(a, b))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "-10\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_compare_works() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_compare(a, b))\n    print(a < b)\n    print(a == b)\n    print(b > a)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "-1\n1\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_multiply_works() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a * b)\n    print(bigint_multiply(a, b))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "8589934590\n8589934590\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_divide_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(8589934590)\n    d = bigint_from_int(2)\n    print(a / b)\n    print(bigint_divide(a, b))\n    print(c / d)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "14\n14\n4294967295\n", 0);
 }
 
 #[test]
