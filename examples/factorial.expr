@@ -1,0 +1,18 @@
+# BigInt demo: factorial grows far beyond i64 quickly.
+
+fn fact(n) do
+    fact_acc(n, 1n)
+end
+
+fn fact_acc(n, acc) do
+    if n == 0 do
+        acc
+    else
+        fact_acc(n - 1, acc * n)
+    end
+end
+
+fn main() do
+    print(fact(100))
+    0
+end

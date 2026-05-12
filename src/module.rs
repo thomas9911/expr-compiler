@@ -106,7 +106,8 @@ impl Module {
             }
             match Ast::from_lexer(&mut lexer) {
                 Ok(Ast::FunctionDef(func)) => functions.push(func),
-                Ok(_) | Err(_) => break,
+                Ok(_) => panic!("top-level expressions are not supported in source files"),
+                Err(err) => panic!("parse error: {err}"),
             }
         }
 
@@ -3301,6 +3302,12 @@ fn bigint_divide_works() {
 }
 
 #[test]
+fn bigint_grouped_divide_expression_works() {
+    let src = "fn fact(n) do\n    fact_acc(n, 1n)\nend\n\nfn fact_acc(n, acc) do\n    if n == 0 do\n        acc\n    else\n        fact_acc(n - 1, acc * n)\n    end\nend\n\nfn choose(n, k) do\n    fact(n) / (fact(k) * fact(n - k))\nend\n\nfn main() do\n    choose(40, 20) == 137846528820n\nend";
+    assert_cranelift_jit_result(src, 1);
+}
+
+#[test]
 fn bigint_modulo_works() {
     let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(25)\n    d = bigint_from_int(10)\n    print(a % b)\n    print(bigint_modulo(a, b))\n    print(bigint_modulo(c, d))\nend";
     assert_cranelift_executable_output(src, "2\n2\n5\n", 0);
@@ -3363,6 +3370,13 @@ fn llvm_bigint_multiply_works() {
 fn llvm_bigint_divide_works() {
     let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(8589934590)\n    d = bigint_from_int(2)\n    print(a / b)\n    print(bigint_divide(a, b))\n    print(c / d)\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "14\n14\n4294967295\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_grouped_divide_expression_works() {
+    let src = "fn fact(n) do\n    fact_acc(n, 1n)\nend\n\nfn fact_acc(n, acc) do\n    if n == 0 do\n        acc\n    else\n        fact_acc(n - 1, acc * n)\n    end\nend\n\nfn choose(n, k) do\n    fact(n) / (fact(k) * fact(n - k))\nend\n\nfn main() do\n    choose(40, 20) == 137846528820n\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 1);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]

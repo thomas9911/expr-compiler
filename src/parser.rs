@@ -64,6 +64,16 @@ impl<'a> ParseError<'a> {
     }
 }
 
+impl std::fmt::Display for ParseError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unexpected token {:?} at {}..{}",
+            self.text, self.span.start, self.span.end
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ast {
     Block(BlockAst),
@@ -432,6 +442,14 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
                 unreachable!()
             };
             Ast::Variable(name)
+        }
+        Some(Ok(Token::OpenBracket)) => {
+            lex.next();
+            let expr = parse_expr(lex, 0)?;
+            if lex.next() != Some(Ok(Token::CloseBracket)) {
+                return Err(ParseError::unexpected(lex));
+            }
+            expr
         }
         Some(Ok(Token::OpenSquareBracket)) => {
             lex.next();
@@ -1125,6 +1143,39 @@ fn parse_bigint_literal_expression() {
         output: None,
         block: BlockAst {
             lines: vec![Literal(LiteralAst::BigInt("123".to_string()))],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_parenthesized_expression() {
+    use Ast::*;
+
+    let text = "fn main() do\n    (2 + 3) * 4\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "multiply".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function: "add".to_string(),
+                        args: vec![
+                            Literal(LiteralAst::Integer(2)),
+                            Literal(LiteralAst::Integer(3)),
+                        ],
+                    }),
+                    Literal(LiteralAst::Integer(4)),
+                ],
+            })],
         },
     });
 
