@@ -1,7 +1,7 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
-    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, TAG_FUNCTION, TAG_INT,
-    VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, TAG_BIGINT,
+    TAG_FUNCTION, TAG_INT, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
@@ -1041,6 +1041,7 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                     | "bigint_subtract"
                     | "bigint_multiply"
                     | "bigint_divide"
+                    | "bigint_modulo"
             ) {
                 features.bigint = true;
             }
@@ -1360,6 +1361,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "bigint_subtract"
                 | "bigint_multiply"
                 | "bigint_divide"
+                | "bigint_modulo"
         )
 }
 
@@ -1612,6 +1614,81 @@ fn call_binary(
     lhs: CompiledValue,
     rhs: CompiledValue,
 ) -> CompiledValue {
+    let func_ref = require_func(func_refs, name);
+    let call = builder
+        .ins()
+        .call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
+    let results = builder.inst_results(call);
+    CompiledValue {
+        tag: results[0],
+        payload: results[1],
+    }
+}
+
+fn promote_value_to_bigint(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    value: CompiledValue,
+) -> CompiledValue {
+    let is_bigint = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_BIGINT);
+    let bigint_block = builder.create_block();
+    let int_check_block = builder.create_block();
+    let int_block = builder.create_block();
+    let trap_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    builder.append_block_param(merge_block, types::I64);
+    builder
+        .ins()
+        .brif(is_bigint, bigint_block, &[], int_check_block, &[]);
+
+    builder.switch_to_block(bigint_block);
+    builder.seal_block(bigint_block);
+    builder.ins().jump(
+        merge_block,
+        &[BlockArg::Value(value.tag), BlockArg::Value(value.payload)],
+    );
+
+    builder.switch_to_block(int_check_block);
+    builder.seal_block(int_check_block);
+    let is_int = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_INT);
+    builder.ins().brif(is_int, int_block, &[], trap_block, &[]);
+
+    builder.switch_to_block(int_block);
+    builder.seal_block(int_block);
+    let bigint_from_int = require_func(func_refs, "bigint_from_int");
+    let call = builder
+        .ins()
+        .call(bigint_from_int, &[value.tag, value.payload]);
+    let results = builder.inst_results(call);
+    let result_tag = results[0];
+    let result_payload = results[1];
+    builder.ins().jump(
+        merge_block,
+        &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+    );
+
+    builder.switch_to_block(trap_block);
+    builder.seal_block(trap_block);
+    builder.ins().trap(TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    CompiledValue {
+        tag: builder.block_params(merge_block)[0],
+        payload: builder.block_params(merge_block)[1],
+    }
+}
+
+fn compile_bigint_builtin(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    args: &[CompiledValue],
+) -> CompiledValue {
+    assert_eq!(args.len(), 2, "{name} expects 2 arguments");
+    let lhs = promote_value_to_bigint(builder, func_refs, args[0]);
+    let rhs = promote_value_to_bigint(builder, func_refs, args[1]);
     let func_ref = require_func(func_refs, name);
     let call = builder
         .ins()
@@ -2642,6 +2719,10 @@ fn compile_ast(
                 "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
                 "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
                 "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
+                "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
+                | "bigint_modulo" | "bigint_compare" => {
+                    compile_bigint_builtin(builder, func_refs, function, &compiled)
+                }
                 name => {
                     if vars.contains_key(name) || capture_slots.contains_key(name) {
                         let callee = resolve_named_value(
@@ -3145,6 +3226,24 @@ fn bigint_divide_works() {
     assert_cranelift_executable_output(src, "14\n14\n4294967295\n", 0);
 }
 
+#[test]
+fn bigint_modulo_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(25)\n    d = bigint_from_int(10)\n    print(a % b)\n    print(bigint_modulo(a, b))\n    print(bigint_modulo(c, d))\nend";
+    assert_cranelift_executable_output(src, "2\n2\n5\n", 0);
+}
+
+#[test]
+fn bigint_mixed_arithmetic_and_compare_work() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
+    assert_cranelift_executable_output(src, "15\n15\n7\n15\n30\n30\n14\n2\n1\n1\n1\n", 0);
+}
+
+#[test]
+fn bigint_builtins_accept_mixed_int_and_bigint_operands() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
+    assert_cranelift_executable_output(src, "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n", 0);
+}
+
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_bigint_add_handles_limb_carry() {
@@ -3178,6 +3277,37 @@ fn llvm_bigint_multiply_works() {
 fn llvm_bigint_divide_works() {
     let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(8589934590)\n    d = bigint_from_int(2)\n    print(a / b)\n    print(bigint_divide(a, b))\n    print(c / d)\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "14\n14\n4294967295\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_modulo_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(25)\n    d = bigint_from_int(10)\n    print(a % b)\n    print(bigint_modulo(a, b))\n    print(bigint_modulo(c, d))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "2\n2\n5\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_mixed_arithmetic_and_compare_work() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "15\n15\n7\n15\n30\n30\n14\n2\n1\n1\n1\n",
+        0,
+    );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_builtins_accept_mixed_int_and_bigint_operands() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n",
+        0,
+    );
 }
 
 #[test]

@@ -422,6 +422,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.define_pair_bigint_subtract("__rt_bigint_subtract", "llvm_rt_bigint_subtract");
             self.define_pair_bigint_multiply("__rt_bigint_multiply", "llvm_rt_bigint_multiply");
             self.define_pair_bigint_divide("__rt_bigint_divide", "llvm_rt_bigint_divide");
+            self.define_pair_bigint_modulo("__rt_bigint_modulo", "llvm_rt_bigint_modulo");
         }
         self.define_runtime_operation(
             "__op_add",
@@ -447,7 +448,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
             BinaryArithOp::Divide,
             self.bigint_enabled.then_some("__rt_bigint_divide"),
         );
-        self.define_runtime_operation("__op_modulo", "llvm_rt_modulo", BinaryArithOp::Modulo, None);
+        self.define_runtime_operation(
+            "__op_modulo",
+            "llvm_rt_modulo",
+            BinaryArithOp::Modulo,
+            self.bigint_enabled.then_some("__rt_bigint_modulo"),
+        );
         self.define_runtime_compare(
             "__op_gt",
             "llvm_rt_gt",
@@ -1487,6 +1493,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
                         &[compiled[0], compiled[1]],
                         "ne",
                     ),
+                    "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
+                    | "bigint_modulo" | "bigint_compare" => {
+                        self.compile_bigint_builtin(name, &compiled, function)
+                    }
                     "print" => self.build_internal_call(
                         self.require_func("__rt_print"),
                         &compiled,
@@ -1709,6 +1719,107 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to extract payload")
             .into_int_value();
         CompiledValue { tag, payload }
+    }
+
+    fn build_promote_value_to_bigint(
+        &self,
+        value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let entry_block = self.builder.get_insert_block().unwrap();
+        let bigint_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_bigint"));
+        let int_check_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_int_check"));
+        let int_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_int"));
+        let trap_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_trap"));
+        let merge_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_merge"));
+
+        let is_bigint = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                value.tag,
+                self.i64_type.const_int(TAG_BIGINT as u64, false),
+                &format!("{label}_is_bigint"),
+            )
+            .expect("failed bigint promotion bigint compare");
+        self.builder
+            .build_conditional_branch(is_bigint, bigint_block, int_check_block)
+            .expect("failed bigint promotion first branch");
+
+        self.builder.position_at_end(bigint_block);
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed bigint promotion bigint merge");
+        let bigint_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(int_check_block);
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                value.tag,
+                self.i64_type.const_int(TAG_INT as u64, false),
+                &format!("{label}_is_int"),
+            )
+            .expect("failed bigint promotion int compare");
+        self.builder
+            .build_conditional_branch(is_int, int_block, trap_block)
+            .expect("failed bigint promotion second branch");
+
+        self.builder.position_at_end(int_block);
+        let promoted = self.build_internal_call(
+            self.require_func("bigint_from_int"),
+            &[value],
+            &format!("{label}_promoted"),
+        );
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed bigint promotion int merge");
+        let int_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(merge_block);
+        let tag_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_tag_phi"))
+            .expect("failed bigint promotion tag phi");
+        let payload_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_payload_phi"))
+            .expect("failed bigint promotion payload phi");
+        tag_phi.add_incoming(&[(&value.tag, bigint_end), (&promoted.tag, int_end)]);
+        payload_phi.add_incoming(&[(&value.payload, bigint_end), (&promoted.payload, int_end)]);
+        let promoted_value = CompiledValue {
+            tag: tag_phi.as_basic_value().into_int_value(),
+            payload: payload_phi.as_basic_value().into_int_value(),
+        };
+        debug_assert_eq!(entry_block.get_parent(), merge_block.get_parent());
+        promoted_value
+    }
+
+    fn compile_bigint_builtin(
+        &self,
+        name: &str,
+        args: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        assert_eq!(args.len(), 2, "{name} expects 2 arguments");
+        let lhs = self.build_promote_value_to_bigint(args[0], function, &format!("{name}_lhs"));
+        let rhs = self.build_promote_value_to_bigint(args[1], function, &format!("{name}_rhs"));
+        self.build_internal_call(self.require_func(name), &[lhs, rhs], name)
     }
 
     fn build_user_call(
@@ -4414,8 +4525,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 .build_and(lhs_is_bigint, rhs_is_bigint, "both_bigint")
                 .expect("failed both_bigint");
             let bigint_block = self.context.append_basic_block(function, "bigint");
+            let lhs_promote_check_block = self
+                .context
+                .append_basic_block(function, "lhs_promote_check");
+            let lhs_promote_block = self.context.append_basic_block(function, "lhs_promote");
+            let rhs_maybe_promote_block = self
+                .context
+                .append_basic_block(function, "rhs_maybe_promote");
+            let rhs_promote_block = self.context.append_basic_block(function, "rhs_promote");
             self.builder
-                .build_conditional_branch(both_bigint, bigint_block, trap_block)
+                .build_conditional_branch(both_bigint, bigint_block, lhs_promote_check_block)
                 .expect("failed bigint branch");
 
             self.builder.position_at_end(bigint_block);
@@ -4440,6 +4559,84 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     "bigint_op_result",
                 )))
                 .expect("failed to return bigint op result");
+
+            self.builder.position_at_end(lhs_promote_check_block);
+            let lhs_int_rhs_bigint = self
+                .builder
+                .build_and(lhs_is_int, rhs_is_bigint, "lhs_int_rhs_bigint")
+                .expect("failed lhs_int_rhs_bigint");
+            self.builder
+                .build_conditional_branch(
+                    lhs_int_rhs_bigint,
+                    lhs_promote_block,
+                    rhs_maybe_promote_block,
+                )
+                .expect("failed lhs promote branch");
+
+            self.builder.position_at_end(lhs_promote_block);
+            let lhs_big = self.build_internal_call(
+                self.require_func("__rt_bigint_from_int"),
+                &[CompiledValue {
+                    tag: lhs_tag,
+                    payload: lhs_payload,
+                }],
+                "lhs_promoted_bigint",
+            );
+            let result = self.build_internal_call(
+                self.require_func(bigint_name),
+                &[
+                    lhs_big,
+                    CompiledValue {
+                        tag: rhs_tag,
+                        payload: rhs_payload,
+                    },
+                ],
+                "mixed_bigint_op_lhs",
+            );
+            self.builder
+                .build_return(Some(&self.make_pair_value(
+                    result.tag,
+                    result.payload,
+                    "mixed_bigint_op_lhs_result",
+                )))
+                .expect("failed to return mixed bigint lhs op result");
+
+            self.builder.position_at_end(rhs_maybe_promote_block);
+            let rhs_int_lhs_bigint = self
+                .builder
+                .build_and(lhs_is_bigint, rhs_is_int, "rhs_int_lhs_bigint")
+                .expect("failed rhs_int_lhs_bigint");
+            self.builder
+                .build_conditional_branch(rhs_int_lhs_bigint, rhs_promote_block, trap_block)
+                .expect("failed rhs maybe promote branch");
+
+            self.builder.position_at_end(rhs_promote_block);
+            let rhs_big = self.build_internal_call(
+                self.require_func("__rt_bigint_from_int"),
+                &[CompiledValue {
+                    tag: rhs_tag,
+                    payload: rhs_payload,
+                }],
+                "rhs_promoted_bigint",
+            );
+            let result = self.build_internal_call(
+                self.require_func(bigint_name),
+                &[
+                    CompiledValue {
+                        tag: lhs_tag,
+                        payload: lhs_payload,
+                    },
+                    rhs_big,
+                ],
+                "mixed_bigint_op_rhs",
+            );
+            self.builder
+                .build_return(Some(&self.make_pair_value(
+                    result.tag,
+                    result.payload,
+                    "mixed_bigint_op_rhs_result",
+                )))
+                .expect("failed to return mixed bigint rhs op result");
         } else {
             self.build_trap_and_unreachable();
         }
@@ -4552,8 +4749,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 .build_and(lhs_is_bigint, rhs_is_bigint, "both_bigint")
                 .expect("failed compare both_bigint");
             let bigint_block = self.context.append_basic_block(function, "bigint");
+            let lhs_promote_check_block = self
+                .context
+                .append_basic_block(function, "lhs_promote_check");
+            let lhs_promote_block = self.context.append_basic_block(function, "lhs_promote");
+            let rhs_maybe_promote_block = self
+                .context
+                .append_basic_block(function, "rhs_maybe_promote");
+            let rhs_promote_block = self.context.append_basic_block(function, "rhs_promote");
             self.builder
-                .build_conditional_branch(both_bigint, bigint_block, trap_block)
+                .build_conditional_branch(both_bigint, bigint_block, lhs_promote_check_block)
                 .expect("failed compare bigint branch");
 
             self.builder.position_at_end(bigint_block);
@@ -4582,6 +4787,92 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     "bigint_cmp_result",
                 )))
                 .expect("failed to return bigint compare");
+
+            self.builder.position_at_end(lhs_promote_check_block);
+            let lhs_int_rhs_bigint = self
+                .builder
+                .build_and(lhs_is_int, rhs_is_bigint, "lhs_int_rhs_bigint")
+                .expect("failed compare lhs_int_rhs_bigint");
+            self.builder
+                .build_conditional_branch(
+                    lhs_int_rhs_bigint,
+                    lhs_promote_block,
+                    rhs_maybe_promote_block,
+                )
+                .expect("failed compare lhs promote branch");
+
+            self.builder.position_at_end(lhs_promote_block);
+            let lhs_big = self.build_internal_call(
+                self.require_func("__rt_bigint_from_int"),
+                &[lhs],
+                "lhs_promoted_bigint",
+            );
+            let raw_value = self.build_internal_call(
+                self.require_func(bigint_name),
+                &[lhs_big, rhs],
+                "mixed_bigint_cmp_lhs",
+            );
+            let bigint_cmp = self
+                .builder
+                .build_int_compare(
+                    pred,
+                    raw_value.payload,
+                    self.i64_type.const_zero(),
+                    "mixed_bigint_cmp_lhs_raw",
+                )
+                .expect("failed to build mixed bigint lhs compare");
+            let bigint_raw = self
+                .builder
+                .build_int_z_extend(bigint_cmp, self.i64_type, "mixed_bigint_cmp_lhs_i64")
+                .expect("failed to extend mixed bigint lhs compare");
+            self.builder
+                .build_return(Some(&self.make_pair_value(
+                    self.i64_type.const_int(TAG_INT as u64, false),
+                    bigint_raw,
+                    "mixed_bigint_cmp_lhs_result",
+                )))
+                .expect("failed to return mixed bigint lhs compare");
+
+            self.builder.position_at_end(rhs_maybe_promote_block);
+            let rhs_int_lhs_bigint = self
+                .builder
+                .build_and(lhs_is_bigint, rhs_is_int, "rhs_int_lhs_bigint")
+                .expect("failed compare rhs_int_lhs_bigint");
+            self.builder
+                .build_conditional_branch(rhs_int_lhs_bigint, rhs_promote_block, trap_block)
+                .expect("failed compare rhs maybe promote branch");
+
+            self.builder.position_at_end(rhs_promote_block);
+            let rhs_big = self.build_internal_call(
+                self.require_func("__rt_bigint_from_int"),
+                &[rhs],
+                "rhs_promoted_bigint",
+            );
+            let raw_value = self.build_internal_call(
+                self.require_func(bigint_name),
+                &[lhs, rhs_big],
+                "mixed_bigint_cmp_rhs",
+            );
+            let bigint_cmp = self
+                .builder
+                .build_int_compare(
+                    pred,
+                    raw_value.payload,
+                    self.i64_type.const_zero(),
+                    "mixed_bigint_cmp_rhs_raw",
+                )
+                .expect("failed to build mixed bigint rhs compare");
+            let bigint_raw = self
+                .builder
+                .build_int_z_extend(bigint_cmp, self.i64_type, "mixed_bigint_cmp_rhs_i64")
+                .expect("failed to extend mixed bigint rhs compare");
+            self.builder
+                .build_return(Some(&self.make_pair_value(
+                    self.i64_type.const_int(TAG_INT as u64, false),
+                    bigint_raw,
+                    "mixed_bigint_cmp_rhs_result",
+                )))
+                .expect("failed to return mixed bigint rhs compare");
         } else {
             self.builder
                 .build_unconditional_branch(trap_block)
@@ -5270,6 +5561,184 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "bigint_div_result",
             )))
             .expect("failed bigint_div return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    fn define_pair_bigint_modulo(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type().fn_type(
+                &[
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                ],
+                false,
+            ),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+        self.functions.insert("bigint_modulo".to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let lhs = CompiledValue {
+            tag: function.get_first_param().unwrap().into_int_value(),
+            payload: function.get_nth_param(1).unwrap().into_int_value(),
+        };
+        let rhs = CompiledValue {
+            tag: function.get_nth_param(2).unwrap().into_int_value(),
+            payload: function.get_nth_param(3).unwrap().into_int_value(),
+        };
+
+        let lhs_ok = self.context.append_basic_block(function, "lhs_ok");
+        let lhs_ptr =
+            self.expect_tag_payload(lhs, TAG_BIGINT, "bigint_mod_lhs", lhs_ok, trap_block);
+        self.builder.position_at_end(lhs_ok);
+
+        let rhs_ok = self.context.append_basic_block(function, "rhs_ok");
+        let rhs_ptr =
+            self.expect_tag_payload(rhs, TAG_BIGINT, "bigint_mod_rhs", rhs_ok, trap_block);
+        self.builder.position_at_end(rhs_ok);
+
+        let lhs_sign = self.build_bigint_sign_load(lhs_ptr, "bigint_mod_lhs");
+        let rhs_sign = self.build_bigint_sign_load(rhs_ptr, "bigint_mod_rhs");
+
+        let rhs_is_zero = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                rhs_sign,
+                self.i64_type.const_zero(),
+                "bigint_mod_rhs_zero",
+            )
+            .expect("failed bigint_mod rhs zero compare");
+        let lhs_is_zero = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                lhs_sign,
+                self.i64_type.const_zero(),
+                "bigint_mod_lhs_zero",
+            )
+            .expect("failed bigint_mod lhs zero compare");
+
+        let zero_block = self.context.append_basic_block(function, "zero");
+        let work_block = self.context.append_basic_block(function, "work");
+        let init_block = self.context.append_basic_block(function, "init");
+        self.builder
+            .build_conditional_branch(rhs_is_zero, trap_block, work_block)
+            .expect("failed bigint_mod rhs zero branch");
+
+        self.builder.position_at_end(work_block);
+        let outer_loop = self.context.append_basic_block(function, "outer_loop");
+        let outer_body = self.context.append_basic_block(function, "outer_body");
+        let outer_done = self.context.append_basic_block(function, "outer_done");
+        self.builder
+            .build_conditional_branch(lhs_is_zero, zero_block, init_block)
+            .expect("failed bigint_mod lhs zero branch");
+
+        self.builder.position_at_end(zero_block);
+        let zero_ptr = self.build_bigint_zero("bigint_mod_zero");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_BIGINT as u64, false),
+                zero_ptr,
+                "bigint_mod_zero_result",
+            )))
+            .expect("failed bigint_mod zero return");
+
+        self.builder.position_at_end(init_block);
+        self.builder
+            .build_unconditional_branch(outer_loop)
+            .expect("failed bigint_mod init jump");
+        let init_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(outer_loop);
+        let remainder_phi = self
+            .builder
+            .build_phi(self.i64_type, "bigint_mod_remainder")
+            .expect("failed bigint_mod remainder phi");
+        remainder_phi.add_incoming(&[(&lhs_ptr, init_end)]);
+        let remainder = remainder_phi.as_basic_value().into_int_value();
+        let cmp = self.build_bigint_cmp_abs(remainder, rhs_ptr, "bigint_mod_outer_cmp");
+        let has_more = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SGE,
+                cmp,
+                self.i64_type.const_zero(),
+                "bigint_mod_has_more",
+            )
+            .expect("failed bigint_mod outer cmp check");
+        self.builder
+            .build_conditional_branch(has_more, outer_body, outer_done)
+            .expect("failed bigint_mod outer branch");
+
+        self.builder.position_at_end(outer_body);
+        let inner_loop = self.context.append_basic_block(function, "inner_loop");
+        let inner_body = self.context.append_basic_block(function, "inner_body");
+        let inner_done = self.context.append_basic_block(function, "inner_done");
+        self.builder
+            .build_unconditional_branch(inner_loop)
+            .expect("failed bigint_mod inner jump");
+        let inner_entry_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(inner_loop);
+        let current_phi = self
+            .builder
+            .build_phi(self.i64_type, "bigint_mod_current")
+            .expect("failed bigint_mod current phi");
+        current_phi.add_incoming(&[(&rhs_ptr, inner_entry_end)]);
+        let current = current_phi.as_basic_value().into_int_value();
+        let doubled = self.build_bigint_add_abs(current, current, "bigint_mod_doubled");
+        let doubled_cmp = self.build_bigint_cmp_abs(doubled, remainder, "bigint_mod_doubled_cmp");
+        let can_double = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SLE,
+                doubled_cmp,
+                self.i64_type.const_zero(),
+                "bigint_mod_can_double",
+            )
+            .expect("failed bigint_mod can_double");
+        self.builder
+            .build_conditional_branch(can_double, inner_body, inner_done)
+            .expect("failed bigint_mod inner branch");
+
+        self.builder.position_at_end(inner_body);
+        self.builder
+            .build_unconditional_branch(inner_loop)
+            .expect("failed bigint_mod inner loop");
+        let inner_body_end = self.builder.get_insert_block().unwrap();
+        current_phi.add_incoming(&[(&doubled, inner_body_end)]);
+
+        self.builder.position_at_end(inner_done);
+        let best_current = current_phi.as_basic_value().into_int_value();
+        let next_remainder =
+            self.build_bigint_sub_abs(remainder, best_current, "bigint_mod_next_remainder");
+        self.builder
+            .build_unconditional_branch(outer_loop)
+            .expect("failed bigint_mod outer continue");
+        let inner_done_end = self.builder.get_insert_block().unwrap();
+        remainder_phi.add_incoming(&[(&next_remainder, inner_done_end)]);
+
+        self.builder.position_at_end(outer_done);
+        let raw_remainder = remainder_phi.as_basic_value().into_int_value();
+        self.build_bigint_sign_store(raw_remainder, lhs_sign, "bigint_mod_sign");
+        self.build_bigint_normalize(raw_remainder, "bigint_mod_norm");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_BIGINT as u64, false),
+                raw_remainder,
+                "bigint_mod_result",
+            )))
+            .expect("failed bigint_mod return");
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();

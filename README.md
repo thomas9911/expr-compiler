@@ -43,12 +43,14 @@ Current behavior:
 
 - `bigint_from_int(x)` constructs a bigint from an `Int`
 - `bigint_compare(a, b)` returns `-1`, `0`, or `1`
-- `bigint_add(a, b)`, `bigint_subtract(a, b)`, `bigint_multiply(a, b)`, and
-  `bigint_divide(a, b)` are available as builtins
+- `bigint_add(a, b)`, `bigint_subtract(a, b)`, `bigint_multiply(a, b)`,
+  `bigint_divide(a, b)`, and `bigint_modulo(a, b)` are available as builtins
 - comparison operators also work for `BigInt` values when both operands are bigint:
   - `==`, `!=`, `<`, `<=`, `>`, `>=`
-- `+`, `-`, `*`, and `/` also work for `BigInt` values when both operands are bigint
-- mixed `Int` / `BigInt` arithmetic is rejected for now
+- `+`, `-`, `*`, `/`, and `%` also work for `BigInt` values when both operands are bigint
+- mixed `Int` / `BigInt` arithmetic and comparisons now promote the `Int` operand for operator use
+- plain `Int` / `Int` arithmetic keeps the existing semantics, including overflow traps
+- the explicit `bigint_*` builtins now accept `Int`, `BigInt`, or mixed `Int` / `BigInt` operands by promoting `Int` arguments to `BigInt`
 - bigint arithmetic is implemented in Cranelift IR and LLVM IR, not in Rust runtime helpers
 
 ## Higher-order list functions
@@ -95,7 +97,7 @@ Current constraints:
   `list_filter`
 - direct function-value calls currently use identifier callees such as `f(10)`
 - strings are still not implemented as a language feature
-- mixed `Int` / `BigInt` arithmetic is still rejected
+- mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
 
 ## LLVM backend
 

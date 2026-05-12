@@ -37,8 +37,11 @@ Guidance for coding agents working in this repository.
   - `bigint_subtract(a, b)`
   - `bigint_multiply(a, b)`
   - `bigint_divide(a, b)`
-  - `a + b`, `a - b`, `a * b`, and `a / b` when both sides are `BigInt`
+  - `bigint_modulo(a, b)`
+  - `a + b`, `a - b`, `a * b`, `a / b`, and `a % b` when both sides are `BigInt`
   - `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, and `a >= b` when both sides are `BigInt`
+  - mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
+  - explicit `bigint_*` builtins also promote `Int` arguments to `BigInt`
 - Anonymous functions support captures:
   - `fn item -> item * factor end`
 - Higher-order list builtins are available:
@@ -49,7 +52,6 @@ Guidance for coding agents working in this repository.
 - Function values can be stored in variables and passed around.
 - Generic direct function-value calls are supported:
   - `f(10)`
-- Mixed `Int` / `BigInt` arithmetic is not supported yet.
 
 ## Build and Test
 

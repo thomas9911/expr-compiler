@@ -164,12 +164,25 @@ fn build_builtin_map(
     builtins.insert("__op_eq".to_string(), runtime.op_eq);
     builtins.insert("__op_ne".to_string(), runtime.op_ne);
     if bigint_enabled {
-        builtins.insert("bigint_compare".to_string(), runtime.bigint_compare.unwrap());
-        builtins.insert("bigint_from_int".to_string(), runtime.bigint_from_int.unwrap());
+        builtins.insert(
+            "bigint_compare".to_string(),
+            runtime.bigint_compare.unwrap(),
+        );
+        builtins.insert(
+            "bigint_from_int".to_string(),
+            runtime.bigint_from_int.unwrap(),
+        );
         builtins.insert("bigint_add".to_string(), runtime.bigint_add.unwrap());
-        builtins.insert("bigint_subtract".to_string(), runtime.bigint_subtract.unwrap());
-        builtins.insert("bigint_multiply".to_string(), runtime.bigint_multiply.unwrap());
+        builtins.insert(
+            "bigint_subtract".to_string(),
+            runtime.bigint_subtract.unwrap(),
+        );
+        builtins.insert(
+            "bigint_multiply".to_string(),
+            runtime.bigint_multiply.unwrap(),
+        );
         builtins.insert("bigint_divide".to_string(), runtime.bigint_divide.unwrap());
+        builtins.insert("bigint_modulo".to_string(), runtime.bigint_modulo.unwrap());
     }
     if list_enabled {
         builtins.insert("list_new".to_string(), runtime.list_new.unwrap());
@@ -210,6 +223,7 @@ struct RuntimeBuiltins {
     bigint_subtract: Option<FuncId>,
     bigint_multiply: Option<FuncId>,
     bigint_divide: Option<FuncId>,
+    bigint_modulo: Option<FuncId>,
     list_new: Option<FuncId>,
     list_push: Option<FuncId>,
     list_insert: Option<FuncId>,
@@ -379,7 +393,12 @@ fn declare_runtime_function_ids(
         &[types::I64, types::I64, types::I64, types::I64],
     );
     let bigint_from_int = bigint_enabled.then(|| {
-        declare_local_pair_builtin(module, isa, "__rt_bigint_from_int", &[types::I64, types::I64])
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_from_int",
+            &[types::I64, types::I64],
+        )
     });
     let bigint_compare = bigint_enabled.then(|| {
         declare_local_pair_builtin(
@@ -421,7 +440,16 @@ fn declare_runtime_function_ids(
             &[types::I64, types::I64, types::I64, types::I64],
         )
     });
-    let list_new = list_enabled.then(|| declare_local_pair_builtin(module, isa, "__rt_list_new", &[]));
+    let bigint_modulo = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_modulo",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let list_new =
+        list_enabled.then(|| declare_local_pair_builtin(module, isa, "__rt_list_new", &[]));
     let list_push = list_enabled.then(|| {
         declare_local_pair_builtin(
             module,
@@ -520,6 +548,7 @@ fn declare_runtime_function_ids(
             bigint_subtract,
             bigint_multiply,
             bigint_divide,
+            bigint_modulo,
             list_new,
             list_push,
             list_insert,
@@ -554,6 +583,7 @@ fn define_runtime_operations(
         ids.builtins.op_add,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_add,
         "add",
     );
@@ -564,6 +594,7 @@ fn define_runtime_operations(
         ids.builtins.op_subtract,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_subtract,
         "subtract",
     );
@@ -574,6 +605,7 @@ fn define_runtime_operations(
         ids.builtins.op_multiply,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_multiply,
         "multiply",
     );
@@ -584,6 +616,7 @@ fn define_runtime_operations(
         ids.builtins.op_divide,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_divide,
         "divide",
     );
@@ -594,7 +627,8 @@ fn define_runtime_operations(
         ids.builtins.op_modulo,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
-        None,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_modulo,
         "modulo",
     );
     if bigint_enabled {
@@ -612,7 +646,13 @@ fn define_runtime_operations(
             ids.builtins.bigint_compare.unwrap(),
             ids.builtins.value_int,
         );
-        define_rt_bigint_add(module, isa, flags, ids.builtins.bigint_add.unwrap(), ids.alloc);
+        define_rt_bigint_add(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_add.unwrap(),
+            ids.alloc,
+        );
         define_rt_bigint_subtract(
             module,
             isa,
@@ -634,6 +674,13 @@ fn define_runtime_operations(
             ids.builtins.bigint_divide.unwrap(),
             ids.alloc,
         );
+        define_rt_bigint_modulo(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_modulo.unwrap(),
+            ids.alloc,
+        );
     }
     define_rt_compare_op(
         module,
@@ -642,6 +689,7 @@ fn define_runtime_operations(
         ids.builtins.op_gt,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_compare,
         IntCC::SignedGreaterThan,
     );
@@ -652,6 +700,7 @@ fn define_runtime_operations(
         ids.builtins.op_lt,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_compare,
         IntCC::SignedLessThan,
     );
@@ -662,6 +711,7 @@ fn define_runtime_operations(
         ids.builtins.op_gte,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_compare,
         IntCC::SignedGreaterThanOrEqual,
     );
@@ -672,6 +722,7 @@ fn define_runtime_operations(
         ids.builtins.op_lte,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_compare,
         IntCC::SignedLessThanOrEqual,
     );
@@ -682,6 +733,7 @@ fn define_runtime_operations(
         ids.builtins.op_eq,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_compare,
         IntCC::Equal,
     );
@@ -692,11 +744,18 @@ fn define_runtime_operations(
         ids.builtins.op_ne,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
         ids.builtins.bigint_compare,
         IntCC::NotEqual,
     );
     if list_enabled {
-        define_rt_list_new(module, isa, flags, ids.builtins.list_new.unwrap(), ids.alloc);
+        define_rt_list_new(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_new.unwrap(),
+            ids.alloc,
+        );
         define_rt_list_push(
             module,
             isa,
@@ -2003,6 +2062,7 @@ fn define_rt_binary_op(
     id: FuncId,
     _to_i64_id: FuncId,
     int_id: FuncId,
+    bigint_from_int_id: Option<FuncId>,
     bigint_id: Option<FuncId>,
     op: &str,
 ) {
@@ -2015,6 +2075,8 @@ fn define_rt_binary_op(
         &[types::I64, types::I64, types::I64, types::I64],
         |b, p, func| {
             let make_int = unsafe { (&mut *module_ptr).declare_func_in_func(int_id, func) };
+            let bigint_from_int_ref = bigint_from_int_id
+                .map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
             let bigint_ref =
                 bigint_id.map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
             let lhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_INT);
@@ -2077,18 +2139,70 @@ fn define_rt_binary_op(
 
             b.switch_to_block(non_int_block);
             b.seal_block(non_int_block);
-            if let Some(bigint_ref) = bigint_ref {
+            if let (Some(bigint_ref), Some(bigint_from_int_ref)) = (bigint_ref, bigint_from_int_ref)
+            {
                 let lhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_BIGINT);
                 let rhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_BIGINT);
                 let both_bigint = b.ins().band(lhs_is_bigint, rhs_is_bigint);
                 let bigint_block = b.create_block();
+                let lhs_promote_check_block = b.create_block();
+                let lhs_promote_block = b.create_block();
+                let rhs_promote_check_block = b.create_block();
+                let rhs_promote_block = b.create_block();
                 let trap_block = b.create_block();
                 b.ins()
-                    .brif(both_bigint, bigint_block, &[], trap_block, &[]);
+                    .brif(both_bigint, bigint_block, &[], lhs_promote_check_block, &[]);
 
                 b.switch_to_block(bigint_block);
                 b.seal_block(bigint_block);
                 let out = b.ins().call(bigint_ref, &[p[0], p[1], p[2], p[3]]);
+                let result_tag = b.inst_results(out)[0];
+                let result_payload = b.inst_results(out)[1];
+                b.ins().jump(
+                    merge_block,
+                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                );
+
+                b.switch_to_block(lhs_promote_check_block);
+                b.seal_block(lhs_promote_check_block);
+                let lhs_int_rhs_bigint = b.ins().band(lhs_is_int, rhs_is_bigint);
+                b.ins().brif(
+                    lhs_int_rhs_bigint,
+                    lhs_promote_block,
+                    &[],
+                    rhs_promote_check_block,
+                    &[],
+                );
+
+                b.switch_to_block(lhs_promote_block);
+                b.seal_block(lhs_promote_block);
+                let lhs_big = b.ins().call(bigint_from_int_ref, &[p[0], p[1]]);
+                let lhs_big_tag = b.inst_results(lhs_big)[0];
+                let lhs_big_payload = b.inst_results(lhs_big)[1];
+                let out = b
+                    .ins()
+                    .call(bigint_ref, &[lhs_big_tag, lhs_big_payload, p[2], p[3]]);
+                let result_tag = b.inst_results(out)[0];
+                let result_payload = b.inst_results(out)[1];
+                b.ins().jump(
+                    merge_block,
+                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                );
+
+                b.switch_to_block(rhs_promote_check_block);
+                b.seal_block(rhs_promote_check_block);
+                let rhs_int_lhs_bigint = b.ins().band(lhs_is_bigint, rhs_is_int);
+                b.ins()
+                    .brif(rhs_int_lhs_bigint, rhs_promote_block, &[], trap_block, &[]);
+
+                b.switch_to_block(rhs_promote_block);
+                b.seal_block(rhs_promote_block);
+                let rhs_big = b.ins().call(bigint_from_int_ref, &[p[2], p[3]]);
+                let rhs_big_tag = b.inst_results(rhs_big)[0];
+                let rhs_big_payload = b.inst_results(rhs_big)[1];
+                let out = b
+                    .ins()
+                    .call(bigint_ref, &[p[0], p[1], rhs_big_tag, rhs_big_payload]);
                 let result_tag = b.inst_results(out)[0];
                 let result_payload = b.inst_results(out)[1];
                 b.ins().jump(
@@ -2508,6 +2622,105 @@ fn define_rt_bigint_divide(
     );
 }
 
+fn define_rt_bigint_modulo(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            let lhs_sign = bigint_load_sign(b, lhs_ptr);
+            let rhs_sign = bigint_load_sign(b, rhs_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+
+            let rhs_is_zero = b.ins().icmp(IntCC::Equal, rhs_sign, zero);
+            b.ins()
+                .trapnz(rhs_is_zero, TrapCode::INTEGER_DIVISION_BY_ZERO);
+
+            let lhs_is_zero = b.ins().icmp(IntCC::Equal, lhs_sign, zero);
+            let zero_block = b.create_block();
+            let work_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(done_block, types::I64);
+            b.ins().brif(lhs_is_zero, zero_block, &[], work_block, &[]);
+
+            b.switch_to_block(zero_block);
+            b.seal_block(zero_block);
+            let zero_ptr = bigint_zero(b, alloc_ref);
+            b.ins().jump(done_block, &[BlockArg::Value(zero_ptr)]);
+
+            b.switch_to_block(work_block);
+            b.seal_block(work_block);
+            let outer_loop = b.create_block();
+            let outer_body = b.create_block();
+            let outer_done = b.create_block();
+            b.append_block_param(outer_loop, types::I64);
+            b.ins().jump(outer_loop, &[BlockArg::Value(lhs_ptr)]);
+
+            b.switch_to_block(outer_loop);
+            let remainder = b.block_params(outer_loop)[0];
+            let cmp = bigint_cmp_abs(b, remainder, rhs_ptr);
+            let has_more = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, cmp, 0);
+            b.ins().brif(has_more, outer_body, &[], outer_done, &[]);
+
+            b.switch_to_block(outer_body);
+            b.seal_block(outer_body);
+            let inner_loop = b.create_block();
+            let inner_body = b.create_block();
+            let inner_done = b.create_block();
+            b.append_block_param(inner_loop, types::I64);
+            let current0 = rhs_ptr;
+            b.ins().jump(inner_loop, &[BlockArg::Value(current0)]);
+
+            b.switch_to_block(inner_loop);
+            let current = b.block_params(inner_loop)[0];
+            let doubled = bigint_add_abs(b, alloc_ref, current, current);
+            let doubled_cmp = bigint_cmp_abs(b, doubled, remainder);
+            let can_double = b
+                .ins()
+                .icmp_imm(IntCC::SignedLessThanOrEqual, doubled_cmp, 0);
+            b.ins().brif(can_double, inner_body, &[], inner_done, &[]);
+
+            b.switch_to_block(inner_body);
+            b.seal_block(inner_body);
+            b.ins().jump(inner_loop, &[BlockArg::Value(doubled)]);
+
+            b.switch_to_block(inner_done);
+            b.seal_block(inner_done);
+            let best_current = b.block_params(inner_loop)[0];
+            let next_remainder = bigint_sub_abs(b, alloc_ref, remainder, best_current);
+            b.ins().jump(outer_loop, &[BlockArg::Value(next_remainder)]);
+
+            b.switch_to_block(outer_done);
+            let raw_remainder = b.block_params(outer_loop)[0];
+            bigint_store_sign(b, raw_remainder, lhs_sign);
+            bigint_normalize(b, raw_remainder);
+            b.ins().jump(done_block, &[BlockArg::Value(raw_remainder)]);
+
+            b.seal_block(outer_loop);
+            b.seal_block(outer_done);
+            b.seal_block(inner_loop);
+
+            b.switch_to_block(done_block);
+            b.seal_block(done_block);
+            let result_ptr = b.block_params(done_block)[0];
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
 fn define_rt_compare_op(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -2515,6 +2728,7 @@ fn define_rt_compare_op(
     id: FuncId,
     _to_i64_id: FuncId,
     int_id: FuncId,
+    bigint_from_int_id: Option<FuncId>,
     bigint_compare_id: Option<FuncId>,
     cc: IntCC,
 ) {
@@ -2527,6 +2741,8 @@ fn define_rt_compare_op(
         &[types::I64, types::I64, types::I64, types::I64],
         |b, p, func| {
             let make_int = unsafe { (&mut *module_ptr).declare_func_in_func(int_id, func) };
+            let bigint_from_int_ref = bigint_from_int_id
+                .map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
             let bigint_compare_ref = bigint_compare_id
                 .map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
             let one = b.ins().iconst(types::I64, 1);
@@ -2549,17 +2765,68 @@ fn define_rt_compare_op(
 
             b.switch_to_block(non_int_block);
             b.seal_block(non_int_block);
-            if let Some(bigint_compare_ref) = bigint_compare_ref {
+            if let (Some(bigint_compare_ref), Some(bigint_from_int_ref)) =
+                (bigint_compare_ref, bigint_from_int_ref)
+            {
                 let lhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_BIGINT);
                 let rhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_BIGINT);
                 let both_bigint = b.ins().band(lhs_is_bigint, rhs_is_bigint);
                 let bigint_block = b.create_block();
+                let lhs_promote_check_block = b.create_block();
+                let lhs_promote_block = b.create_block();
+                let rhs_promote_check_block = b.create_block();
+                let rhs_promote_block = b.create_block();
                 b.ins()
-                    .brif(both_bigint, bigint_block, &[], trap_block, &[]);
+                    .brif(both_bigint, bigint_block, &[], lhs_promote_check_block, &[]);
 
                 b.switch_to_block(bigint_block);
                 b.seal_block(bigint_block);
                 let cmp_call = b.ins().call(bigint_compare_ref, &[p[0], p[1], p[2], p[3]]);
+                let cmp_raw = b.inst_results(cmp_call)[1];
+                let cmp = b.ins().icmp_imm(cc, cmp_raw, 0);
+                let bigint_raw = b.ins().select(cmp, one, zero);
+                b.ins().jump(merge, &[BlockArg::Value(bigint_raw)]);
+
+                b.switch_to_block(lhs_promote_check_block);
+                b.seal_block(lhs_promote_check_block);
+                let lhs_int_rhs_bigint = b.ins().band(lhs_is_int, rhs_is_bigint);
+                b.ins().brif(
+                    lhs_int_rhs_bigint,
+                    lhs_promote_block,
+                    &[],
+                    rhs_promote_check_block,
+                    &[],
+                );
+
+                b.switch_to_block(lhs_promote_block);
+                b.seal_block(lhs_promote_block);
+                let lhs_big = b.ins().call(bigint_from_int_ref, &[p[0], p[1]]);
+                let lhs_big_tag = b.inst_results(lhs_big)[0];
+                let lhs_big_payload = b.inst_results(lhs_big)[1];
+                let cmp_call = b.ins().call(
+                    bigint_compare_ref,
+                    &[lhs_big_tag, lhs_big_payload, p[2], p[3]],
+                );
+                let cmp_raw = b.inst_results(cmp_call)[1];
+                let cmp = b.ins().icmp_imm(cc, cmp_raw, 0);
+                let bigint_raw = b.ins().select(cmp, one, zero);
+                b.ins().jump(merge, &[BlockArg::Value(bigint_raw)]);
+
+                b.switch_to_block(rhs_promote_check_block);
+                b.seal_block(rhs_promote_check_block);
+                let rhs_int_lhs_bigint = b.ins().band(lhs_is_bigint, rhs_is_int);
+                b.ins()
+                    .brif(rhs_int_lhs_bigint, rhs_promote_block, &[], trap_block, &[]);
+
+                b.switch_to_block(rhs_promote_block);
+                b.seal_block(rhs_promote_block);
+                let rhs_big = b.ins().call(bigint_from_int_ref, &[p[2], p[3]]);
+                let rhs_big_tag = b.inst_results(rhs_big)[0];
+                let rhs_big_payload = b.inst_results(rhs_big)[1];
+                let cmp_call = b.ins().call(
+                    bigint_compare_ref,
+                    &[p[0], p[1], rhs_big_tag, rhs_big_payload],
+                );
                 let cmp_raw = b.inst_results(cmp_call)[1];
                 let cmp = b.ins().icmp_imm(cc, cmp_raw, 0);
                 let bigint_raw = b.ins().select(cmp, one, zero);

@@ -19,6 +19,16 @@ fn main() do
     print(bigint_subtract(c, d))
     print(e / f)
     print(bigint_divide(e, f))
+    print(e % f)
+    print(bigint_modulo(e, f))
+    print(a + 5)
+    print(5 + a)
+    print(bigint_add(a, 5))
+    print(bigint_add(5, a))
+    print(a > 5)
+    print(5 < a)
+    print(bigint_compare(a, 5))
+    print(bigint_compare(5, a))
 
     0
 end
