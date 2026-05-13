@@ -1385,7 +1385,15 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "bigint_multiply"
                 | "bigint_divide"
                 | "bigint_modulo"
-                | "string_len"
+                | "bytes_len"
+                | "bytes_get"
+                | "bytes_pop"
+                | "bytes_push"
+                | "bytes_insert"
+                | "bytes_remove"
+                | "bytes_set"
+                | "bytes_slice"
+                | "string_copy"
                 | "string_concat"
         )
 }
@@ -1854,7 +1862,7 @@ fn compile_string_literal(
     }
 }
 
-fn compile_string_len(builder: &mut FunctionBuilder, value: CompiledValue) -> CompiledValue {
+fn compile_bytes_len(builder: &mut FunctionBuilder, value: CompiledValue) -> CompiledValue {
     let is_string = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_STRING);
     builder
         .ins()
@@ -1868,6 +1876,619 @@ fn compile_string_len(builder: &mut FunctionBuilder, value: CompiledValue) -> Co
     CompiledValue {
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: len,
+    }
+}
+
+fn compile_bytes_get(
+    builder: &mut FunctionBuilder,
+    string_value: CompiledValue,
+    index_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let non_neg = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, index_value.payload, len);
+    builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let addr = builder.ins().iadd(data_ptr, index_value.payload);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), addr, 0);
+    let byte_i64 = builder.ins().uextend(types::I64, byte);
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: byte_i64,
+    }
+}
+
+fn compile_bytes_slice(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    string_value: CompiledValue,
+    start_value: CompiledValue,
+    end_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let start_is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, start_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(start_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let end_is_int = builder.ins().icmp_imm(IntCC::Equal, end_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(end_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let start_non_neg =
+        builder
+            .ins()
+            .icmp_imm(IntCC::SignedGreaterThanOrEqual, start_value.payload, 0);
+    builder
+        .ins()
+        .trapz(start_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let end_non_neg = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, end_value.payload, 0);
+    builder
+        .ins()
+        .trapz(end_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let start_le_end = builder.ins().icmp(
+        IntCC::UnsignedLessThanOrEqual,
+        start_value.payload,
+        end_value.payload,
+    );
+    builder
+        .ins()
+        .trapz(start_le_end, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let end_in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, end_value.payload, len);
+    builder
+        .ins()
+        .trapz(end_in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+    let slice_len = builder.ins().isub(end_value.payload, start_value.payload);
+    let src_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let slice_src_ptr = builder.ins().iadd(src_ptr, start_value.payload);
+
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let data_call = builder.ins().call(alloc_ref, &[slice_len, align]);
+    let data_ptr = builder.inst_results(data_call)[0];
+    let zero = builder.ins().iconst(types::I64, 0);
+    copy_string_bytes(builder, slice_src_ptr, data_ptr, slice_len, zero);
+
+    let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
+    let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
+    let header_ptr = builder.inst_results(header_call)[0];
+    builder
+        .ins()
+        .store(MemFlags::new(), slice_len, header_ptr, STRING_LEN_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), slice_len, header_ptr, STRING_CAP_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_STRING),
+        payload: header_ptr,
+    }
+}
+
+fn compile_bytes_pop(builder: &mut FunctionBuilder, string_value: CompiledValue) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let non_empty = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
+    builder.ins().trapz(non_empty, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+    let new_len = builder.ins().iadd_imm(len, -1);
+    builder.ins().store(
+        MemFlags::new(),
+        new_len,
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let addr = builder.ins().iadd(data_ptr, new_len);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), addr, 0);
+    let byte_i64 = builder.ins().uextend(types::I64, byte);
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: byte_i64,
+    }
+}
+
+fn compile_bytes_push(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    string_value: CompiledValue,
+    byte_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let cap = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_CAP_OFFSET,
+    );
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let alloc_ref = require_func(func_refs, "__alloc");
+
+    let grow_block = builder.create_block();
+    let write_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    let has_capacity = builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+    builder
+        .ins()
+        .brif(has_capacity, write_block, &[], grow_block, &[]);
+
+    builder.switch_to_block(grow_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let cap_is_zero = builder.ins().icmp(IntCC::Equal, cap, zero);
+    let doubled_cap = builder.ins().iadd(cap, cap);
+    let new_cap = builder.ins().select(cap_is_zero, one, doubled_cap);
+    let align = builder.ins().iconst(types::I64, 8);
+    let new_data_call = builder.ins().call(alloc_ref, &[new_cap, align]);
+    let new_data_ptr = builder.inst_results(new_data_call)[0];
+    copy_string_bytes(builder, data_ptr, new_data_ptr, len, zero);
+    builder.ins().store(
+        MemFlags::new(),
+        new_data_ptr,
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    builder.ins().store(
+        MemFlags::new(),
+        new_cap,
+        string_value.payload,
+        STRING_CAP_OFFSET,
+    );
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(new_data_ptr)]);
+    builder.seal_block(grow_block);
+
+    builder.switch_to_block(write_block);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(data_ptr)]);
+    builder.seal_block(write_block);
+
+    builder.switch_to_block(merge_block);
+    let active_data_ptr = builder.block_params(merge_block)[0];
+    let clamped = builder.ins().band_imm(byte_value.payload, 0xff);
+    let byte_i8 = builder.ins().ireduce(types::I8, clamped);
+    let addr = builder.ins().iadd(active_data_ptr, len);
+    builder.ins().store(MemFlags::new(), byte_i8, addr, 0);
+    let new_len = builder.ins().iadd_imm(len, 1);
+    builder.ins().store(
+        MemFlags::new(),
+        new_len,
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    builder.seal_block(merge_block);
+    string_value
+}
+
+fn compile_bytes_insert(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    string_value: CompiledValue,
+    index_value: CompiledValue,
+    byte_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let idx_is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let byte_is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(byte_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let non_neg = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, index_value.payload, len);
+    builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+    let cap = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_CAP_OFFSET,
+    );
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let alloc_ref = require_func(func_refs, "__alloc");
+
+    let grow_block = builder.create_block();
+    let shift_init_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    let has_capacity = builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+    builder
+        .ins()
+        .brif(has_capacity, shift_init_block, &[], grow_block, &[]);
+
+    builder.switch_to_block(grow_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let cap_is_zero = builder.ins().icmp(IntCC::Equal, cap, zero);
+    let doubled_cap = builder.ins().iadd(cap, cap);
+    let new_cap = builder.ins().select(cap_is_zero, one, doubled_cap);
+    let align = builder.ins().iconst(types::I64, 8);
+    let new_data_call = builder.ins().call(alloc_ref, &[new_cap, align]);
+    let new_data_ptr = builder.inst_results(new_data_call)[0];
+    copy_string_bytes(builder, data_ptr, new_data_ptr, len, zero);
+    builder.ins().store(
+        MemFlags::new(),
+        new_data_ptr,
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    builder.ins().store(
+        MemFlags::new(),
+        new_cap,
+        string_value.payload,
+        STRING_CAP_OFFSET,
+    );
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(new_data_ptr)]);
+    builder.seal_block(grow_block);
+
+    builder.switch_to_block(shift_init_block);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(data_ptr)]);
+    builder.seal_block(shift_init_block);
+
+    builder.switch_to_block(merge_block);
+    let active_data_ptr = builder.block_params(merge_block)[0];
+
+    let shift_loop = builder.create_block();
+    let shift_body = builder.create_block();
+    let insert_block = builder.create_block();
+    builder.append_block_param(shift_loop, types::I64);
+
+    builder.ins().jump(shift_loop, &[BlockArg::Value(len)]);
+    builder.switch_to_block(shift_loop);
+    let idx = builder.block_params(shift_loop)[0];
+    let needs_shift = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, idx, index_value.payload);
+    builder
+        .ins()
+        .brif(needs_shift, shift_body, &[], insert_block, &[]);
+
+    builder.switch_to_block(shift_body);
+    let src_idx = builder.ins().iadd_imm(idx, -1);
+    let src_addr = builder.ins().iadd(active_data_ptr, src_idx);
+    let dst_addr = builder.ins().iadd(active_data_ptr, idx);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), src_addr, 0);
+    builder.ins().store(MemFlags::new(), byte, dst_addr, 0);
+    builder.ins().jump(shift_loop, &[BlockArg::Value(src_idx)]);
+
+    builder.switch_to_block(insert_block);
+    let clamped = builder.ins().band_imm(byte_value.payload, 0xff);
+    let byte_i8 = builder.ins().ireduce(types::I8, clamped);
+    let insert_addr = builder.ins().iadd(active_data_ptr, index_value.payload);
+    builder
+        .ins()
+        .store(MemFlags::new(), byte_i8, insert_addr, 0);
+    let new_len = builder.ins().iadd_imm(len, 1);
+    builder.ins().store(
+        MemFlags::new(),
+        new_len,
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+
+    builder.seal_block(merge_block);
+    builder.seal_block(shift_body);
+    builder.seal_block(shift_loop);
+    builder.seal_block(insert_block);
+    string_value
+}
+
+fn compile_bytes_remove(
+    builder: &mut FunctionBuilder,
+    string_value: CompiledValue,
+    index_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let idx_is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let non_neg = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, index_value.payload, len);
+    builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let removed_addr = builder.ins().iadd(data_ptr, index_value.payload);
+    let removed_byte = builder
+        .ins()
+        .load(types::I8, MemFlags::new(), removed_addr, 0);
+
+    let shift_loop = builder.create_block();
+    let shift_body = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(shift_loop, types::I64);
+
+    let one = builder.ins().iconst(types::I64, 1);
+    let last_index = builder.ins().isub(len, one);
+    builder
+        .ins()
+        .jump(shift_loop, &[BlockArg::Value(index_value.payload)]);
+    builder.switch_to_block(shift_loop);
+    let idx = builder.block_params(shift_loop)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, last_index);
+    builder.ins().brif(more, shift_body, &[], done_block, &[]);
+
+    builder.switch_to_block(shift_body);
+    let src_idx = builder.ins().iadd(idx, one);
+    let src_addr = builder.ins().iadd(data_ptr, src_idx);
+    let dst_addr = builder.ins().iadd(data_ptr, idx);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), src_addr, 0);
+    builder.ins().store(MemFlags::new(), byte, dst_addr, 0);
+    let next_idx = builder.ins().iadd(idx, one);
+    builder.ins().jump(shift_loop, &[BlockArg::Value(next_idx)]);
+
+    builder.switch_to_block(done_block);
+    let new_len = builder.ins().iadd_imm(len, -1);
+    builder.ins().store(
+        MemFlags::new(),
+        new_len,
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    builder.seal_block(shift_body);
+    builder.seal_block(shift_loop);
+    builder.seal_block(done_block);
+
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: builder.ins().uextend(types::I64, removed_byte),
+    }
+}
+
+fn compile_bytes_set(
+    builder: &mut FunctionBuilder,
+    string_value: CompiledValue,
+    index_value: CompiledValue,
+    byte_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let idx_is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let byte_is_int = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
+    builder
+        .ins()
+        .trapz(byte_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let non_neg = builder
+        .ins()
+        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let in_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, index_value.payload, len);
+    builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+    let data_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let addr = builder.ins().iadd(data_ptr, index_value.payload);
+    let clamped = builder.ins().band_imm(byte_value.payload, 0xff);
+    let byte_i8 = builder.ins().ireduce(types::I8, clamped);
+    builder.ins().store(MemFlags::new(), byte_i8, addr, 0);
+    string_value
+}
+
+fn compile_string_copy(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    string_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_LEN_OFFSET,
+    );
+    let src_ptr = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        string_value.payload,
+        STRING_PTR_OFFSET,
+    );
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let data_call = builder.ins().call(alloc_ref, &[len, align]);
+    let data_ptr = builder.inst_results(data_call)[0];
+    let zero = builder.ins().iconst(types::I64, 0);
+    copy_string_bytes(builder, src_ptr, data_ptr, len, zero);
+
+    let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
+    let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
+    let header_ptr = builder.inst_results(header_call)[0];
+    builder
+        .ins()
+        .store(MemFlags::new(), len, header_ptr, STRING_LEN_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), len, header_ptr, STRING_CAP_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_STRING),
+        payload: header_ptr,
     }
 }
 
@@ -2913,8 +3534,8 @@ fn compile_ast(
                     env_ptr,
                 );
             }
-            if function == "string_len" {
-                assert_eq!(args.len(), 1, "string_len expects 1 argument");
+            if function == "bytes_len" {
+                assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
                 let value = compile_ast(
                     builder,
                     &args[0],
@@ -2926,7 +3547,238 @@ fn compile_ast(
                     capture_slots,
                     env_ptr,
                 );
-                return compile_string_len(builder, value);
+                return compile_bytes_len(builder, value);
+            }
+            if function == "bytes_get" {
+                assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let index_value = compile_ast(
+                    builder,
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_bytes_get(builder, string_value, index_value);
+            }
+            if function == "bytes_pop" {
+                assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_bytes_pop(builder, string_value);
+            }
+            if function == "bytes_push" {
+                assert_eq!(args.len(), 2, "bytes_push expects 2 arguments");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let byte_value = compile_ast(
+                    builder,
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_bytes_push(builder, func_refs, string_value, byte_value);
+            }
+            if function == "bytes_insert" {
+                assert_eq!(args.len(), 3, "bytes_insert expects 3 arguments");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let index_value = compile_ast(
+                    builder,
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let byte_value = compile_ast(
+                    builder,
+                    &args[2],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_bytes_insert(
+                    builder,
+                    func_refs,
+                    string_value,
+                    index_value,
+                    byte_value,
+                );
+            }
+            if function == "bytes_remove" {
+                assert_eq!(args.len(), 2, "bytes_remove expects 2 arguments");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let index_value = compile_ast(
+                    builder,
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_bytes_remove(builder, string_value, index_value);
+            }
+            if function == "bytes_set" {
+                assert_eq!(args.len(), 3, "bytes_set expects 3 arguments");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let index_value = compile_ast(
+                    builder,
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let byte_value = compile_ast(
+                    builder,
+                    &args[2],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_bytes_set(builder, string_value, index_value, byte_value);
+            }
+            if function == "bytes_slice" {
+                assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let start_value = compile_ast(
+                    builder,
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let end_value = compile_ast(
+                    builder,
+                    &args[2],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_bytes_slice(
+                    builder,
+                    func_refs,
+                    string_value,
+                    start_value,
+                    end_value,
+                );
+            }
+            if function == "string_copy" {
+                assert_eq!(args.len(), 1, "string_copy expects 1 argument");
+                let string_value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_string_copy(builder, func_refs, string_value);
             }
             if function == "string_concat" {
                 assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
@@ -3542,7 +4394,7 @@ fn bigint_builtins_accept_mixed_int_and_bigint_operands() {
 
 #[test]
 fn strings_print_and_len_work() {
-    let src = "fn main() do\n    print(\"hello\")\n    print(string_len(\"hi\\n\"))\nend";
+    let src = "fn main() do\n    print(\"hello\")\n    print(bytes_len(\"hi\\n\"))\nend";
     assert_cranelift_executable_output(src, "hello\n3\n", 0);
 }
 
@@ -3554,8 +4406,38 @@ fn strings_eq_and_ne_work() {
 
 #[test]
 fn strings_concat_works() {
-    let src = "fn main() do\n    joined = string_concat(\"ab\", \"cd\")\n    print(joined)\n    print(string_len(joined))\nend";
+    let src = "fn main() do\n    joined = string_concat(\"ab\", \"cd\")\n    print(joined)\n    print(bytes_len(joined))\nend";
     assert_cranelift_executable_output(src, "abcd\n4\n", 0);
+}
+
+#[test]
+fn strings_bytes_get_and_slice_work() {
+    let src = "fn main() do\n    s = \"hello\"\n    print(bytes_get(s, 1))\n    mid = bytes_slice(s, 1, 4)\n    print(mid)\n    print(bytes_len(mid))\nend";
+    assert_cranelift_executable_output(src, "101\nell\n3\n", 0);
+}
+
+#[test]
+fn strings_bytes_pop_works() {
+    let src = "fn main() do\n    s = \"hello\"\n    print(bytes_pop(s))\n    print(bytes_pop(s))\n    print(s)\n    print(bytes_len(s))\nend";
+    assert_cranelift_executable_output(src, "111\n108\nhel\n3\n", 0);
+}
+
+#[test]
+fn strings_bytes_push_and_set_work() {
+    let src = "fn main() do\n    s = \"hi\"\n    bytes_push(s, 33)\n    bytes_set(s, 1, 97)\n    print(s)\n    print(bytes_len(s))\nend";
+    assert_cranelift_executable_output(src, "ha!\n3\n", 0);
+}
+
+#[test]
+fn strings_bytes_insert_and_remove_work() {
+    let src = "fn main() do\n    s = \"heo\"\n    bytes_insert(s, 2, 108)\n    bytes_insert(s, 4, 33)\n    print(s)\n    print(bytes_remove(s, 1))\n    print(s)\n    print(bytes_len(s))\nend";
+    assert_cranelift_executable_output(src, "helo!\n101\nhlo!\n4\n", 0);
+}
+
+#[test]
+fn strings_copy_isolated_from_mutation() {
+    let src = "fn main() do\n    s = \"hi\"\n    t = string_copy(s)\n    bytes_push(s, 33)\n    bytes_set(t, 1, 97)\n    print(s)\n    print(t)\nend";
+    assert_cranelift_executable_output(src, "hi!\nha\n", 0);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -3646,7 +4528,7 @@ fn llvm_bigint_builtins_accept_mixed_int_and_bigint_operands() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_strings_print_and_len_work() {
-    let src = "fn main() do\n    print(\"hello\")\n    print(string_len(\"hi\\n\"))\nend";
+    let src = "fn main() do\n    print(\"hello\")\n    print(bytes_len(\"hi\\n\"))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "hello\n3\n", 0);
 }
 
@@ -3660,8 +4542,43 @@ fn llvm_strings_eq_and_ne_work() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_strings_concat_works() {
-    let src = "fn main() do\n    joined = string_concat(\"ab\", \"cd\")\n    print(joined)\n    print(string_len(joined))\nend";
+    let src = "fn main() do\n    joined = string_concat(\"ab\", \"cd\")\n    print(joined)\n    print(bytes_len(joined))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "abcd\n4\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_bytes_get_and_slice_work() {
+    let src = "fn main() do\n    s = \"hello\"\n    print(bytes_get(s, 1))\n    mid = bytes_slice(s, 1, 4)\n    print(mid)\n    print(bytes_len(mid))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "101\nell\n3\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_bytes_pop_works() {
+    let src = "fn main() do\n    s = \"hello\"\n    print(bytes_pop(s))\n    print(bytes_pop(s))\n    print(s)\n    print(bytes_len(s))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "111\n108\nhel\n3\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_bytes_push_and_set_work() {
+    let src = "fn main() do\n    s = \"hi\"\n    bytes_push(s, 33)\n    bytes_set(s, 1, 97)\n    print(s)\n    print(bytes_len(s))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "ha!\n3\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_bytes_insert_and_remove_work() {
+    let src = "fn main() do\n    s = \"heo\"\n    bytes_insert(s, 2, 108)\n    bytes_insert(s, 4, 33)\n    print(s)\n    print(bytes_remove(s, 1))\n    print(s)\n    print(bytes_len(s))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "helo!\n101\nhlo!\n4\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_copy_isolated_from_mutation() {
+    let src = "fn main() do\n    s = \"hi\"\n    t = string_copy(s)\n    bytes_push(s, 33)\n    bytes_set(t, 1, 97)\n    print(s)\n    print(t)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "hi!\nha\n", 0);
 }
 
 #[test]

@@ -57,8 +57,8 @@ Current behavior:
 ## Strings
 
 The language has a `String` runtime type backed by a dedicated heap object with
-`len`, `cap`, and `ptr` fields. Strings are immutable at the language level for
-now, but the runtime layout is already mutation-capable.
+`len`, `cap`, and `ptr` fields. String values are still UTF-8 byte storage, and
+the current API surface is explicitly byte-oriented.
 
 Current string surface:
 
@@ -68,7 +68,12 @@ print("line1\nline2")
 print(string_concat("ab", "cd"))
 print("abc" == "abc")
 print("abc" != "xyz")
-print(string_len("hello"))
+print(bytes_len("hello"))
+print(bytes_get("hello", 1))
+print(bytes_slice("hello", 1, 4))
+bytes_push(s, 33)
+bytes_set(s, 0, 72)
+copy = string_copy(s)
 ```
 
 Current behavior:
@@ -77,7 +82,15 @@ Current behavior:
   - `\"`, `\\`, `\n`, `\r`, `\t`
 - `print` can print string values
 - `string_concat(a, b)` concatenates two strings and returns a fresh string
-- `string_len(s)` returns the byte length as an `Int`
+- `bytes_len(s)` returns the byte length as an `Int`
+- `bytes_get(s, i)` returns the byte at index `i` as an `Int`
+- `bytes_slice(s, start, end)` returns a new string over the byte range `[start, end)`
+- `bytes_pop(s)` removes and returns the last byte as an `Int`
+- `bytes_insert(s, index, byte)` inserts one byte in place, shifting later bytes right
+- `bytes_remove(s, index)` removes and returns one byte as an `Int`, shifting later bytes left
+- `bytes_push(s, byte)` appends one byte, growing capacity if needed
+- `bytes_set(s, index, byte)` overwrites one byte in place
+- `string_copy(s)` returns a fresh exact-fit copy of the visible string contents
 - `==` and `!=` compare string byte contents
 - `String == non-String` is false
 - `String != non-String` is true

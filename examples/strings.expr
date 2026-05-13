@@ -1,4 +1,19 @@
-fn main() do
+fn is_integer(bytes):
+    do_is_integer(bytes, 1)
+
+fn do_is_integer(bytes, now):
+    if bytes_len(bytes) == 0:
+        now
+    elif now == 0:
+        0
+    else:
+        current = bytes_pop(bytes)
+        if current >= 48:
+            do_is_integer(bytes, current <= 57)
+        else:
+            do_is_integer(bytes, 0)
+
+fn main():
     print("hello")
     print("line1\nline2")
     print(string_concat("ab", "cd"))
@@ -6,6 +21,30 @@ fn main() do
     print("abc" != "xyz")
     print("abc" == 1)
     print("abc" != 1)
-    print(string_len("hello"))
-    print(string_len("hi\n"))
-end
+    print(bytes_len("hello"))
+    print(bytes_get("hello", 1))
+    print(bytes_slice("hello", 1, 2))
+    print(bytes_slice("hello", 1, 4))
+
+    s = "hello"
+    print(bytes_pop(s))
+    print(bytes_pop(s))
+    print(s)
+    bytes_insert(s, 1, 97)
+    bytes_insert(s, 4, 33)
+    print(s)
+    print(bytes_remove(s, 2))
+    print(s)
+    bytes_push(s, 33)
+    bytes_set(s, 0, 72)
+    print(s)
+
+    t = string_copy(s)
+    bytes_set(t, 1, 97)
+    print(t)
+    print(s)
+
+    print(bytes_len("hi\n"))
+
+    if is_integer("11234"):
+        print("integer!")

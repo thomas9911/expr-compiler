@@ -1436,23 +1436,94 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 if name == "list_range" {
                     return self.compile_list_range(args, vars, capture_slots, env_ptr, function);
                 }
-                if name == "string_len" {
-                    assert_eq!(args.len(), 1, "string_len expects 1 argument");
+                if name == "bytes_len" {
+                    assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
                     let value = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                    let trap_block = self.context.append_basic_block(function, "string_len_trap");
-                    let ok_block = self.context.append_basic_block(function, "string_len_ok");
+                    let trap_block = self.context.append_basic_block(function, "bytes_len_trap");
+                    let ok_block = self.context.append_basic_block(function, "bytes_len_ok");
                     let raw = self.expect_tag_payload(
                         value,
                         TAG_STRING,
-                        "string_len",
+                        "bytes_len",
                         ok_block,
                         trap_block,
                     );
                     self.builder.position_at_end(trap_block);
                     self.build_trap_and_unreachable();
                     self.builder.position_at_end(ok_block);
-                    let len = self.build_string_len_load(raw, "string_len");
+                    let len = self.build_string_len_load(raw, "bytes_len");
                     return self.int_value(len);
+                }
+                if name == "bytes_get" {
+                    assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let index_value =
+                        self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                    return self.build_bytes_get(string_value, index_value, function);
+                }
+                if name == "bytes_pop" {
+                    assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    return self.build_bytes_pop(string_value, function);
+                }
+                if name == "bytes_push" {
+                    assert_eq!(args.len(), 2, "bytes_push expects 2 arguments");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let byte_value =
+                        self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                    return self.build_bytes_push(string_value, byte_value, function);
+                }
+                if name == "bytes_insert" {
+                    assert_eq!(args.len(), 3, "bytes_insert expects 3 arguments");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let index_value =
+                        self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                    let byte_value =
+                        self.compile_ast(&args[2], vars, capture_slots, env_ptr, function);
+                    return self.build_bytes_insert(
+                        string_value,
+                        index_value,
+                        byte_value,
+                        function,
+                    );
+                }
+                if name == "bytes_remove" {
+                    assert_eq!(args.len(), 2, "bytes_remove expects 2 arguments");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let index_value =
+                        self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                    return self.build_bytes_remove(string_value, index_value, function);
+                }
+                if name == "bytes_set" {
+                    assert_eq!(args.len(), 3, "bytes_set expects 3 arguments");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let index_value =
+                        self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                    let byte_value =
+                        self.compile_ast(&args[2], vars, capture_slots, env_ptr, function);
+                    return self.build_bytes_set(string_value, index_value, byte_value, function);
+                }
+                if name == "bytes_slice" {
+                    assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let start_value =
+                        self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                    let end_value =
+                        self.compile_ast(&args[2], vars, capture_slots, env_ptr, function);
+                    return self.build_bytes_slice(string_value, start_value, end_value, function);
+                }
+                if name == "string_copy" {
+                    assert_eq!(args.len(), 1, "string_copy expects 1 argument");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    return self.build_string_copy(string_value, function);
                 }
                 if name == "string_concat" {
                     assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
@@ -3332,6 +3403,1331 @@ impl<'ctx> LlvmCompiler<'ctx> {
             tag: self.i64_type.const_int(TAG_STRING as u64, false),
             payload: header_raw,
         }
+    }
+
+    fn build_string_header_from_parts(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let header_size = self.i64_type.const_int(STRING_HEADER_SIZE as u64, false);
+        let header_raw =
+            self.build_boxed_call(alloc, &[header_size, align], &format!("{label}_header"));
+        self.build_string_len_store(header_raw, len, label);
+        self.build_string_cap_store(header_raw, len, label);
+        self.build_string_ptr_store(header_raw, data_ptr, label);
+        CompiledValue {
+            tag: self.i64_type.const_int(TAG_STRING as u64, false),
+            payload: header_raw,
+        }
+    }
+
+    fn build_bytes_get(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        index_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "bytes_get_string_trap");
+        let string_ok = self
+            .context
+            .append_basic_block(function, "bytes_get_string_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "bytes_get_string",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let idx_trap = self
+            .context
+            .append_basic_block(function, "bytes_get_idx_trap");
+        let idx = self.expect_tag_int(index_value, "bytes_get_index", idx_trap);
+
+        let trap_block = self
+            .context
+            .append_basic_block(function, "bytes_get_bounds_trap");
+        let ok_block = self.context.append_basic_block(function, "bytes_get_ok");
+        let non_neg = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SGE,
+                idx,
+                self.i64_type.const_zero(),
+                "bytes_get_non_neg",
+            )
+            .expect("failed bytes_get non-neg compare");
+        let len = self.build_string_len_load(string_raw, "bytes_get");
+        let in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len, "bytes_get_in_bounds")
+            .expect("failed bytes_get in-bounds compare");
+        let ok = self
+            .builder
+            .build_and(non_neg, in_bounds, "bytes_get_ok_cond")
+            .expect("failed bytes_get ok cond");
+        self.builder
+            .build_conditional_branch(ok, ok_block, trap_block)
+            .expect("failed bytes_get branch");
+
+        self.builder.position_at_end(idx_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(ok_block);
+        let data_ptr = self.build_string_ptr_load(string_raw, "bytes_get");
+        let base = self
+            .builder
+            .build_ptr_to_int(data_ptr, self.i64_type, "bytes_get_base")
+            .expect("failed bytes_get ptr-to-int");
+        let addr = self
+            .builder
+            .build_int_add(base, idx, "bytes_get_addr")
+            .expect("failed bytes_get addr");
+        let ptr = self
+            .builder
+            .build_int_to_ptr(
+                addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_get_ptr",
+            )
+            .expect("failed bytes_get ptr");
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), ptr, "bytes_get_byte")
+            .expect("failed bytes_get load")
+            .into_int_value();
+        let raw = self
+            .builder
+            .build_int_z_extend(byte, self.i64_type, "bytes_get_i64")
+            .expect("failed bytes_get zext");
+        self.int_value(raw)
+    }
+
+    fn build_bytes_slice(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        start_value: CompiledValue<'ctx>,
+        end_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "bytes_slice_string_trap");
+        let string_ok = self
+            .context
+            .append_basic_block(function, "bytes_slice_string_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "bytes_slice_string",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let start_trap = self
+            .context
+            .append_basic_block(function, "bytes_slice_start_trap");
+        let start = self.expect_tag_int(start_value, "bytes_slice_start", start_trap);
+        let end_trap = self
+            .context
+            .append_basic_block(function, "bytes_slice_end_trap");
+        let end = self.expect_tag_int(end_value, "bytes_slice_end", end_trap);
+
+        let len = self.build_string_len_load(string_raw, "bytes_slice");
+        let bounds_trap = self
+            .context
+            .append_basic_block(function, "bytes_slice_bounds_trap");
+        let bounds_ok = self
+            .context
+            .append_basic_block(function, "bytes_slice_bounds_ok");
+        let start_non_neg = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SGE,
+                start,
+                self.i64_type.const_zero(),
+                "bytes_slice_start_non_neg",
+            )
+            .expect("failed bytes_slice start non-neg");
+        let end_non_neg = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SGE,
+                end,
+                self.i64_type.const_zero(),
+                "bytes_slice_end_non_neg",
+            )
+            .expect("failed bytes_slice end non-neg");
+        let start_le_end = self
+            .builder
+            .build_int_compare(IntPredicate::ULE, start, end, "bytes_slice_start_le_end")
+            .expect("failed bytes_slice start<=end");
+        let end_in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULE, end, len, "bytes_slice_end_in_bounds")
+            .expect("failed bytes_slice end<=len");
+        let non_neg = self
+            .builder
+            .build_and(start_non_neg, end_non_neg, "bytes_slice_non_neg")
+            .expect("failed bytes_slice non_neg");
+        let range_ok = self
+            .builder
+            .build_and(non_neg, start_le_end, "bytes_slice_range_ok")
+            .expect("failed bytes_slice range_ok");
+        let all_ok = self
+            .builder
+            .build_and(range_ok, end_in_bounds, "bytes_slice_all_ok")
+            .expect("failed bytes_slice all_ok");
+        self.builder
+            .build_conditional_branch(all_ok, bounds_ok, bounds_trap)
+            .expect("failed bytes_slice bounds branch");
+
+        self.builder.position_at_end(start_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(end_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(bounds_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(bounds_ok);
+        let slice_len = self
+            .builder
+            .build_int_sub(end, start, "bytes_slice_len")
+            .expect("failed bytes_slice len");
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let data_raw = self.build_boxed_call(alloc, &[slice_len, align], "bytes_slice_data");
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                data_raw,
+                self.context.ptr_type(Default::default()),
+                "bytes_slice_data_ptr",
+            )
+            .expect("failed bytes_slice data ptr");
+        let src_ptr = self.build_string_ptr_load(string_raw, "bytes_slice_src");
+        let src_base = self
+            .builder
+            .build_ptr_to_int(src_ptr, self.i64_type, "bytes_slice_src_base")
+            .expect("failed bytes_slice src base");
+        let slice_src_addr = self
+            .builder
+            .build_int_add(src_base, start, "bytes_slice_src_addr")
+            .expect("failed bytes_slice src addr");
+        let slice_src_ptr = self
+            .builder
+            .build_int_to_ptr(
+                slice_src_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_slice_src_ptr",
+            )
+            .expect("failed bytes_slice src ptr");
+
+        let loop_block = self
+            .context
+            .append_basic_block(function, "bytes_slice_loop");
+        let body_block = self
+            .context
+            .append_basic_block(function, "bytes_slice_body");
+        let done_block = self
+            .context
+            .append_basic_block(function, "bytes_slice_done");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed bytes_slice jump");
+        let entry_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(loop_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "bytes_slice_idx")
+            .expect("failed bytes_slice phi");
+        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_end)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, slice_len, "bytes_slice_more")
+            .expect("failed bytes_slice more");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed bytes_slice loop branch");
+
+        self.builder.position_at_end(body_block);
+        let src_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(slice_src_ptr, self.i64_type, "bytes_slice_copy_src_base")
+                    .expect("failed bytes_slice copy src base"),
+                idx,
+                "bytes_slice_copy_src_addr",
+            )
+            .expect("failed bytes_slice copy src addr");
+        let dst_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, "bytes_slice_copy_dst_base")
+                    .expect("failed bytes_slice copy dst base"),
+                idx,
+                "bytes_slice_copy_dst_addr",
+            )
+            .expect("failed bytes_slice copy dst addr");
+        let src_byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                src_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_slice_copy_src_ptr",
+            )
+            .expect("failed bytes_slice copy src ptr");
+        let dst_byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                dst_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_slice_copy_dst_ptr",
+            )
+            .expect("failed bytes_slice copy dst ptr");
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), src_byte_ptr, "bytes_slice_byte")
+            .expect("failed bytes_slice load");
+        self.builder
+            .build_store(dst_byte_ptr, byte)
+            .expect("failed bytes_slice store");
+        let next_idx = self
+            .builder
+            .build_int_add(
+                idx,
+                self.i64_type.const_int(1, false),
+                "bytes_slice_next_idx",
+            )
+            .expect("failed bytes_slice next idx");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed bytes_slice continue");
+        let body_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next_idx, body_end)]);
+
+        self.builder.position_at_end(done_block);
+        self.build_string_header_from_parts(data_ptr, slice_len, "bytes_slice")
+    }
+
+    fn build_bytes_pop(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "bytes_pop_string_trap");
+        let string_ok = self
+            .context
+            .append_basic_block(function, "bytes_pop_string_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "bytes_pop_string",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let len = self.build_string_len_load(string_raw, "bytes_pop");
+        let trap_block = self
+            .context
+            .append_basic_block(function, "bytes_pop_empty_trap");
+        let ok_block = self.context.append_basic_block(function, "bytes_pop_ok");
+        let non_empty = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                len,
+                self.i64_type.const_zero(),
+                "bytes_pop_non_empty",
+            )
+            .expect("failed bytes_pop non-empty compare");
+        self.builder
+            .build_conditional_branch(non_empty, ok_block, trap_block)
+            .expect("failed bytes_pop branch");
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(ok_block);
+        let new_len = self
+            .builder
+            .build_int_sub(len, self.i64_type.const_int(1, false), "bytes_pop_new_len")
+            .expect("failed bytes_pop new len");
+        self.build_string_len_store(string_raw, new_len, "bytes_pop");
+        let data_ptr = self.build_string_ptr_load(string_raw, "bytes_pop");
+        let base = self
+            .builder
+            .build_ptr_to_int(data_ptr, self.i64_type, "bytes_pop_base")
+            .expect("failed bytes_pop ptr-to-int");
+        let addr = self
+            .builder
+            .build_int_add(base, new_len, "bytes_pop_addr")
+            .expect("failed bytes_pop addr");
+        let ptr = self
+            .builder
+            .build_int_to_ptr(
+                addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_pop_ptr",
+            )
+            .expect("failed bytes_pop ptr");
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), ptr, "bytes_pop_byte")
+            .expect("failed bytes_pop load")
+            .into_int_value();
+        let raw = self
+            .builder
+            .build_int_z_extend(byte, self.i64_type, "bytes_pop_i64")
+            .expect("failed bytes_pop zext");
+        self.int_value(raw)
+    }
+
+    fn build_bytes_push(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        byte_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "bytes_push_string_trap");
+        let string_ok = self
+            .context
+            .append_basic_block(function, "bytes_push_string_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "bytes_push_string",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let byte_trap = self
+            .context
+            .append_basic_block(function, "bytes_push_byte_trap");
+        let byte_raw = self.expect_tag_int(byte_value, "bytes_push_byte", byte_trap);
+
+        let len = self.build_string_len_load(string_raw, "bytes_push");
+        let cap_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                self.build_string_header_ptr(string_raw, "bytes_push_cap"),
+                1,
+                "bytes_push_cap_ptr",
+            )
+            .expect("failed bytes_push cap gep");
+        let cap = self
+            .builder
+            .build_load(self.i64_type, cap_ptr, "bytes_push_cap")
+            .expect("failed bytes_push cap load")
+            .into_int_value();
+        let data_ptr_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                self.build_string_header_ptr(string_raw, "bytes_push_data"),
+                2,
+                "bytes_push_data_ptr_ptr",
+            )
+            .expect("failed bytes_push ptr gep");
+        let data_ptr = self
+            .builder
+            .build_load(
+                self.context.ptr_type(Default::default()),
+                data_ptr_ptr,
+                "bytes_push_data_ptr",
+            )
+            .expect("failed bytes_push data ptr load")
+            .into_pointer_value();
+
+        let grow_block = self.context.append_basic_block(function, "bytes_push_grow");
+        let write_block = self
+            .context
+            .append_basic_block(function, "bytes_push_write");
+        let merge_block = self
+            .context
+            .append_basic_block(function, "bytes_push_merge");
+        self.builder
+            .build_conditional_branch(
+                self.builder
+                    .build_int_compare(IntPredicate::ULT, len, cap, "bytes_push_has_capacity")
+                    .expect("failed bytes_push capacity compare"),
+                write_block,
+                grow_block,
+            )
+            .expect("failed bytes_push branch");
+
+        self.builder.position_at_end(byte_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(grow_block);
+        let cap_is_zero = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                cap,
+                self.i64_type.const_zero(),
+                "bytes_push_cap_zero",
+            )
+            .expect("failed bytes_push cap zero");
+        let doubled_cap = self
+            .builder
+            .build_int_add(cap, cap, "bytes_push_doubled_cap")
+            .expect("failed bytes_push doubled cap");
+        let new_cap = self
+            .builder
+            .build_select(
+                cap_is_zero,
+                self.i64_type.const_int(1, false),
+                doubled_cap,
+                "bytes_push_new_cap",
+            )
+            .expect("failed bytes_push new cap select")
+            .into_int_value();
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let new_data_raw = self.build_boxed_call(alloc, &[new_cap, align], "bytes_push_new_data");
+        let new_data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                new_data_raw,
+                self.context.ptr_type(Default::default()),
+                "bytes_push_new_data_ptr",
+            )
+            .expect("failed bytes_push new data ptr");
+        self.build_copy_bytes_loop(data_ptr, new_data_ptr, len, function, "bytes_push_copy");
+        self.builder
+            .build_store(data_ptr_ptr, new_data_ptr)
+            .expect("failed bytes_push store data ptr");
+        self.builder
+            .build_store(cap_ptr, new_cap)
+            .expect("failed bytes_push store cap");
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed bytes_push grow merge");
+        let grow_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(write_block);
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed bytes_push write merge");
+        let write_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(merge_block);
+        let data_phi = self
+            .builder
+            .build_phi(
+                self.context.ptr_type(Default::default()),
+                "bytes_push_data_phi",
+            )
+            .expect("failed bytes_push data phi");
+        data_phi.add_incoming(&[(&new_data_ptr, grow_end), (&data_ptr, write_end)]);
+        let active_data_ptr = data_phi.as_basic_value().into_pointer_value();
+        let addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(active_data_ptr, self.i64_type, "bytes_push_base")
+                    .expect("failed bytes_push base"),
+                len,
+                "bytes_push_addr",
+            )
+            .expect("failed bytes_push addr");
+        let byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_push_byte_ptr",
+            )
+            .expect("failed bytes_push byte ptr");
+        let byte_i8 = self
+            .builder
+            .build_int_truncate(
+                self.builder
+                    .build_and(
+                        byte_raw,
+                        self.i64_type.const_int(0xff, false),
+                        "bytes_push_mask",
+                    )
+                    .expect("failed bytes_push mask"),
+                self.context.i8_type(),
+                "bytes_push_i8",
+            )
+            .expect("failed bytes_push truncate");
+        self.builder
+            .build_store(byte_ptr, byte_i8)
+            .expect("failed bytes_push store byte");
+        let new_len = self
+            .builder
+            .build_int_add(len, self.i64_type.const_int(1, false), "bytes_push_new_len")
+            .expect("failed bytes_push new len");
+        self.build_string_len_store(string_raw, new_len, "bytes_push");
+        string_value
+    }
+
+    fn build_bytes_set(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        index_value: CompiledValue<'ctx>,
+        byte_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "bytes_set_string_trap");
+        let string_ok = self
+            .context
+            .append_basic_block(function, "bytes_set_string_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "bytes_set_string",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let idx_trap = self
+            .context
+            .append_basic_block(function, "bytes_set_idx_trap");
+        let idx = self.expect_tag_int(index_value, "bytes_set_index", idx_trap);
+        let byte_trap = self
+            .context
+            .append_basic_block(function, "bytes_set_byte_trap");
+        let byte_raw = self.expect_tag_int(byte_value, "bytes_set_byte", byte_trap);
+
+        let trap_block = self
+            .context
+            .append_basic_block(function, "bytes_set_bounds_trap");
+        let ok_block = self.context.append_basic_block(function, "bytes_set_ok");
+        let len = self.build_string_len_load(string_raw, "bytes_set");
+        let in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len, "bytes_set_in_bounds")
+            .expect("failed bytes_set bounds compare");
+        self.builder
+            .build_conditional_branch(in_bounds, ok_block, trap_block)
+            .expect("failed bytes_set branch");
+        self.builder.position_at_end(idx_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(byte_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(ok_block);
+        let data_ptr = self.build_string_ptr_load(string_raw, "bytes_set");
+        let addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, "bytes_set_base")
+                    .expect("failed bytes_set base"),
+                idx,
+                "bytes_set_addr",
+            )
+            .expect("failed bytes_set addr");
+        let byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_set_ptr",
+            )
+            .expect("failed bytes_set ptr");
+        let byte_i8 = self
+            .builder
+            .build_int_truncate(
+                self.builder
+                    .build_and(
+                        byte_raw,
+                        self.i64_type.const_int(0xff, false),
+                        "bytes_set_mask",
+                    )
+                    .expect("failed bytes_set mask"),
+                self.context.i8_type(),
+                "bytes_set_i8",
+            )
+            .expect("failed bytes_set truncate");
+        self.builder
+            .build_store(byte_ptr, byte_i8)
+            .expect("failed bytes_set store");
+        string_value
+    }
+
+    fn build_bytes_insert(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        index_value: CompiledValue<'ctx>,
+        byte_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "bytes_insert_string_trap");
+        let string_ok = self
+            .context
+            .append_basic_block(function, "bytes_insert_string_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "bytes_insert_string",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let idx_trap = self
+            .context
+            .append_basic_block(function, "bytes_insert_idx_trap");
+        let idx = self.expect_tag_int(index_value, "bytes_insert_index", idx_trap);
+        let byte_trap = self
+            .context
+            .append_basic_block(function, "bytes_insert_byte_trap");
+        let byte_raw = self.expect_tag_int(byte_value, "bytes_insert_byte", byte_trap);
+
+        let trap_block = self
+            .context
+            .append_basic_block(function, "bytes_insert_bounds_trap");
+        let ok_block = self.context.append_basic_block(function, "bytes_insert_ok");
+        let len = self.build_string_len_load(string_raw, "bytes_insert");
+        let in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULE, idx, len, "bytes_insert_in_bounds")
+            .expect("failed bytes_insert bounds compare");
+        self.builder
+            .build_conditional_branch(in_bounds, ok_block, trap_block)
+            .expect("failed bytes_insert branch");
+        self.builder.position_at_end(idx_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(byte_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(ok_block);
+        let cap_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                self.build_string_header_ptr(string_raw, "bytes_insert_cap"),
+                1,
+                "bytes_insert_cap_ptr",
+            )
+            .expect("failed bytes_insert cap gep");
+        let cap = self
+            .builder
+            .build_load(self.i64_type, cap_ptr, "bytes_insert_cap")
+            .expect("failed bytes_insert cap load")
+            .into_int_value();
+        let data_ptr_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                self.build_string_header_ptr(string_raw, "bytes_insert_data"),
+                2,
+                "bytes_insert_data_ptr_ptr",
+            )
+            .expect("failed bytes_insert ptr gep");
+        let data_ptr = self
+            .builder
+            .build_load(
+                self.context.ptr_type(Default::default()),
+                data_ptr_ptr,
+                "bytes_insert_data_ptr",
+            )
+            .expect("failed bytes_insert data ptr load")
+            .into_pointer_value();
+
+        let grow_block = self
+            .context
+            .append_basic_block(function, "bytes_insert_grow");
+        let shift_setup_block = self
+            .context
+            .append_basic_block(function, "bytes_insert_shift_setup");
+        let merge_block = self
+            .context
+            .append_basic_block(function, "bytes_insert_merge");
+        self.builder
+            .build_conditional_branch(
+                self.builder
+                    .build_int_compare(IntPredicate::ULT, len, cap, "bytes_insert_has_capacity")
+                    .expect("failed bytes_insert capacity compare"),
+                shift_setup_block,
+                grow_block,
+            )
+            .expect("failed bytes_insert capacity branch");
+
+        self.builder.position_at_end(grow_block);
+        let cap_is_zero = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                cap,
+                self.i64_type.const_zero(),
+                "bytes_insert_cap_zero",
+            )
+            .expect("failed bytes_insert cap zero");
+        let doubled_cap = self
+            .builder
+            .build_int_add(cap, cap, "bytes_insert_doubled_cap")
+            .expect("failed bytes_insert doubled cap");
+        let new_cap = self
+            .builder
+            .build_select(
+                cap_is_zero,
+                self.i64_type.const_int(1, false),
+                doubled_cap,
+                "bytes_insert_new_cap",
+            )
+            .expect("failed bytes_insert new cap select")
+            .into_int_value();
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let new_data_raw = self.build_boxed_call(alloc, &[new_cap, align], "bytes_insert_new_data");
+        let new_data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                new_data_raw,
+                self.context.ptr_type(Default::default()),
+                "bytes_insert_new_data_ptr",
+            )
+            .expect("failed bytes_insert new data ptr");
+        self.build_copy_bytes_loop(data_ptr, new_data_ptr, len, function, "bytes_insert_copy");
+        self.builder
+            .build_store(data_ptr_ptr, new_data_ptr)
+            .expect("failed bytes_insert store data ptr");
+        self.builder
+            .build_store(cap_ptr, new_cap)
+            .expect("failed bytes_insert store cap");
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed bytes_insert grow merge");
+        let grow_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(shift_setup_block);
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed bytes_insert write merge");
+        let shift_setup_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(merge_block);
+        let data_phi = self
+            .builder
+            .build_phi(
+                self.context.ptr_type(Default::default()),
+                "bytes_insert_data_phi",
+            )
+            .expect("failed bytes_insert data phi");
+        data_phi.add_incoming(&[(&new_data_ptr, grow_end), (&data_ptr, shift_setup_end)]);
+        let active_data_ptr = data_phi.as_basic_value().into_pointer_value();
+
+        let shift_loop = self
+            .context
+            .append_basic_block(function, "bytes_insert_shift_loop");
+        let shift_body = self
+            .context
+            .append_basic_block(function, "bytes_insert_shift_body");
+        let insert_block = self
+            .context
+            .append_basic_block(function, "bytes_insert_insert");
+        self.builder
+            .build_unconditional_branch(shift_loop)
+            .expect("failed bytes_insert jump to shift loop");
+        let shift_entry_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(shift_loop);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "bytes_insert_shift_idx")
+            .expect("failed bytes_insert shift phi");
+        idx_phi.add_incoming(&[(&len, shift_entry_end)]);
+        let shift_idx = idx_phi.as_basic_value().into_int_value();
+        let needs_shift = self
+            .builder
+            .build_int_compare(
+                IntPredicate::UGT,
+                shift_idx,
+                idx,
+                "bytes_insert_needs_shift",
+            )
+            .expect("failed bytes_insert shift compare");
+        self.builder
+            .build_conditional_branch(needs_shift, shift_body, insert_block)
+            .expect("failed bytes_insert shift branch");
+
+        self.builder.position_at_end(shift_body);
+        let src_idx = self
+            .builder
+            .build_int_sub(
+                shift_idx,
+                self.i64_type.const_int(1, false),
+                "bytes_insert_src_idx",
+            )
+            .expect("failed bytes_insert src idx");
+        let src_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(active_data_ptr, self.i64_type, "bytes_insert_src_base")
+                    .expect("failed bytes_insert src base"),
+                src_idx,
+                "bytes_insert_src_addr",
+            )
+            .expect("failed bytes_insert src addr");
+        let dst_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(active_data_ptr, self.i64_type, "bytes_insert_dst_base")
+                    .expect("failed bytes_insert dst base"),
+                shift_idx,
+                "bytes_insert_dst_addr",
+            )
+            .expect("failed bytes_insert dst addr");
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(
+                src_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_insert_src_ptr",
+            )
+            .expect("failed bytes_insert src ptr");
+        let dst_ptr = self
+            .builder
+            .build_int_to_ptr(
+                dst_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_insert_dst_ptr",
+            )
+            .expect("failed bytes_insert dst ptr");
+        let moved_byte = self
+            .builder
+            .build_load(self.context.i8_type(), src_ptr, "bytes_insert_moved_byte")
+            .expect("failed bytes_insert moved byte");
+        self.builder
+            .build_store(dst_ptr, moved_byte)
+            .expect("failed bytes_insert moved byte store");
+        self.builder
+            .build_unconditional_branch(shift_loop)
+            .expect("failed bytes_insert shift continue");
+        let shift_body_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&src_idx, shift_body_end)]);
+
+        self.builder.position_at_end(insert_block);
+        let insert_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(active_data_ptr, self.i64_type, "bytes_insert_insert_base")
+                    .expect("failed bytes_insert insert base"),
+                idx,
+                "bytes_insert_insert_addr",
+            )
+            .expect("failed bytes_insert insert addr");
+        let insert_ptr = self
+            .builder
+            .build_int_to_ptr(
+                insert_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_insert_insert_ptr",
+            )
+            .expect("failed bytes_insert insert ptr");
+        let byte_i8 = self
+            .builder
+            .build_int_truncate(
+                self.builder
+                    .build_and(
+                        byte_raw,
+                        self.i64_type.const_int(0xff, false),
+                        "bytes_insert_mask",
+                    )
+                    .expect("failed bytes_insert mask"),
+                self.context.i8_type(),
+                "bytes_insert_i8",
+            )
+            .expect("failed bytes_insert truncate");
+        self.builder
+            .build_store(insert_ptr, byte_i8)
+            .expect("failed bytes_insert store");
+        let new_len = self
+            .builder
+            .build_int_add(
+                len,
+                self.i64_type.const_int(1, false),
+                "bytes_insert_new_len",
+            )
+            .expect("failed bytes_insert new len");
+        self.build_string_len_store(string_raw, new_len, "bytes_insert");
+        string_value
+    }
+
+    fn build_bytes_remove(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        index_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "bytes_remove_string_trap");
+        let string_ok = self
+            .context
+            .append_basic_block(function, "bytes_remove_string_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "bytes_remove_string",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let idx_trap = self
+            .context
+            .append_basic_block(function, "bytes_remove_idx_trap");
+        let idx = self.expect_tag_int(index_value, "bytes_remove_index", idx_trap);
+
+        let trap_block = self
+            .context
+            .append_basic_block(function, "bytes_remove_bounds_trap");
+        let ok_block = self.context.append_basic_block(function, "bytes_remove_ok");
+        let len = self.build_string_len_load(string_raw, "bytes_remove");
+        let in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len, "bytes_remove_in_bounds")
+            .expect("failed bytes_remove bounds compare");
+        self.builder
+            .build_conditional_branch(in_bounds, ok_block, trap_block)
+            .expect("failed bytes_remove branch");
+        self.builder.position_at_end(idx_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(ok_block);
+        let data_ptr = self.build_string_ptr_load(string_raw, "bytes_remove");
+        let removed_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, "bytes_remove_base")
+                    .expect("failed bytes_remove base"),
+                idx,
+                "bytes_remove_addr",
+            )
+            .expect("failed bytes_remove addr");
+        let removed_ptr = self
+            .builder
+            .build_int_to_ptr(
+                removed_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_remove_ptr",
+            )
+            .expect("failed bytes_remove ptr");
+        let removed_byte = self
+            .builder
+            .build_load(self.context.i8_type(), removed_ptr, "bytes_remove_byte")
+            .expect("failed bytes_remove byte load")
+            .into_int_value();
+
+        let last_index = self
+            .builder
+            .build_int_sub(
+                len,
+                self.i64_type.const_int(1, false),
+                "bytes_remove_last_index",
+            )
+            .expect("failed bytes_remove last index");
+
+        let shift_loop = self
+            .context
+            .append_basic_block(function, "bytes_remove_shift_loop");
+        let shift_body = self
+            .context
+            .append_basic_block(function, "bytes_remove_shift_body");
+        let done_block = self
+            .context
+            .append_basic_block(function, "bytes_remove_done");
+        self.builder
+            .build_unconditional_branch(shift_loop)
+            .expect("failed bytes_remove jump to loop");
+        let shift_entry_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(shift_loop);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "bytes_remove_shift_idx")
+            .expect("failed bytes_remove shift phi");
+        idx_phi.add_incoming(&[(&idx, shift_entry_end)]);
+        let shift_idx = idx_phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                shift_idx,
+                last_index,
+                "bytes_remove_more",
+            )
+            .expect("failed bytes_remove compare");
+        self.builder
+            .build_conditional_branch(more, shift_body, done_block)
+            .expect("failed bytes_remove branch");
+
+        self.builder.position_at_end(shift_body);
+        let src_idx = self
+            .builder
+            .build_int_add(
+                shift_idx,
+                self.i64_type.const_int(1, false),
+                "bytes_remove_src_idx",
+            )
+            .expect("failed bytes_remove src idx");
+        let src_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, "bytes_remove_src_base")
+                    .expect("failed bytes_remove src base"),
+                src_idx,
+                "bytes_remove_src_addr",
+            )
+            .expect("failed bytes_remove src addr");
+        let dst_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, "bytes_remove_dst_base")
+                    .expect("failed bytes_remove dst base"),
+                shift_idx,
+                "bytes_remove_dst_addr",
+            )
+            .expect("failed bytes_remove dst addr");
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(
+                src_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_remove_src_ptr",
+            )
+            .expect("failed bytes_remove src ptr");
+        let dst_ptr = self
+            .builder
+            .build_int_to_ptr(
+                dst_addr,
+                self.context.ptr_type(Default::default()),
+                "bytes_remove_dst_ptr",
+            )
+            .expect("failed bytes_remove dst ptr");
+        let moved_byte = self
+            .builder
+            .build_load(self.context.i8_type(), src_ptr, "bytes_remove_moved_byte")
+            .expect("failed bytes_remove moved byte");
+        self.builder
+            .build_store(dst_ptr, moved_byte)
+            .expect("failed bytes_remove moved byte store");
+        let next_idx = self
+            .builder
+            .build_int_add(
+                shift_idx,
+                self.i64_type.const_int(1, false),
+                "bytes_remove_next_idx",
+            )
+            .expect("failed bytes_remove next idx");
+        self.builder
+            .build_unconditional_branch(shift_loop)
+            .expect("failed bytes_remove continue");
+        let shift_body_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next_idx, shift_body_end)]);
+
+        self.builder.position_at_end(done_block);
+        let new_len = self
+            .builder
+            .build_int_sub(
+                len,
+                self.i64_type.const_int(1, false),
+                "bytes_remove_new_len",
+            )
+            .expect("failed bytes_remove new len");
+        self.build_string_len_store(string_raw, new_len, "bytes_remove");
+        let removed_i64 = self
+            .builder
+            .build_int_z_extend(removed_byte, self.i64_type, "bytes_remove_i64")
+            .expect("failed bytes_remove zext");
+        self.int_value(removed_i64)
+    }
+
+    fn build_string_copy(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "string_copy_trap");
+        let string_ok = self.context.append_basic_block(function, "string_copy_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "string_copy",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let len = self.build_string_len_load(string_raw, "string_copy");
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let data_raw = self.build_boxed_call(alloc, &[len, align], "string_copy_data");
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                data_raw,
+                self.context.ptr_type(Default::default()),
+                "string_copy_data_ptr",
+            )
+            .expect("failed string_copy data ptr");
+        let src_ptr = self.build_string_ptr_load(string_raw, "string_copy_src");
+        self.build_copy_bytes_loop(src_ptr, data_ptr, len, function, "string_copy_copy");
+        self.build_string_header_from_parts(data_ptr, len, "string_copy")
+    }
+
+    fn build_copy_bytes_loop(
+        &self,
+        src_ptr: PointerValue<'ctx>,
+        dst_ptr: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) {
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_body"));
+        let done_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_done"));
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed copy loop jump");
+        let entry_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(loop_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_idx"))
+            .expect("failed copy phi");
+        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_end)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len, &format!("{label}_more"))
+            .expect("failed copy compare");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed copy branch");
+
+        self.builder.position_at_end(body_block);
+        let src_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(src_ptr, self.i64_type, &format!("{label}_src_base"))
+                    .expect("failed copy src base"),
+                idx,
+                &format!("{label}_src_addr"),
+            )
+            .expect("failed copy src addr");
+        let dst_addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(dst_ptr, self.i64_type, &format!("{label}_dst_base"))
+                    .expect("failed copy dst base"),
+                idx,
+                &format!("{label}_dst_addr"),
+            )
+            .expect("failed copy dst addr");
+        let src_byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                src_addr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_src_ptr"),
+            )
+            .expect("failed copy src ptr");
+        let dst_byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                dst_addr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_dst_ptr"),
+            )
+            .expect("failed copy dst ptr");
+        let byte = self
+            .builder
+            .build_load(
+                self.context.i8_type(),
+                src_byte_ptr,
+                &format!("{label}_byte"),
+            )
+            .expect("failed copy byte load");
+        self.builder
+            .build_store(dst_byte_ptr, byte)
+            .expect("failed copy byte store");
+        let next_idx = self
+            .builder
+            .build_int_add(
+                idx,
+                self.i64_type.const_int(1, false),
+                &format!("{label}_next"),
+            )
+            .expect("failed copy next idx");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed copy continue");
+        let body_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next_idx, body_end)]);
+
+        self.builder.position_at_end(done_block);
     }
 
     fn build_bigint_add_abs(

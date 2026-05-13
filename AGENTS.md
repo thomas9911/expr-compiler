@@ -47,15 +47,31 @@ Guidance for coding agents working in this repository.
   - `"hello"`
   - `print("hello")`
   - `string_concat("ab", "cd")`
-  - `string_len("hello")`
+  - `bytes_len("hello")`
+  - `bytes_get("hello", 1)`
+  - `bytes_slice("hello", 1, 4)`
+  - `bytes_pop(s)`
+  - `bytes_insert(s, 1, 97)`
+  - `bytes_remove(s, 2)`
+  - `bytes_push(s, 33)`
+  - `bytes_set(s, 0, 72)`
+  - `string_copy(s)`
   - `"a" == "a"`
   - `"a" != "b"`
   - string literals support `\"`, `\\`, `\n`, `\r`, and `\t`
   - `string_concat(a, b)` returns a fresh string
+  - `bytes_len(s)` returns byte length
+  - `bytes_get(s, i)` returns an `Int` byte value
+  - `bytes_slice(s, start, end)` returns a new string over the byte range `[start, end)`
+  - `bytes_pop(s)` mutates the string by shrinking it and returns the removed byte as an `Int`
+  - `bytes_insert(s, index, byte)` mutates the string by inserting one byte in place
+  - `bytes_remove(s, index)` mutates the string by removing one byte and returns that byte as an `Int`
+  - `bytes_push(s, byte)` mutates the string by appending one byte
+  - `bytes_set(s, index, byte)` mutates one byte in place
+  - `string_copy(s)` returns a fresh independent string copy
   - string equality compares byte contents
   - `String == non-String` is false
   - `String != non-String` is true
-  - strings are immutable at the language level for now
 - Anonymous functions support captures:
   - `fn item -> item * factor end`
 - Higher-order list builtins are available:
