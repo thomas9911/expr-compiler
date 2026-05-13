@@ -1,7 +1,7 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
-    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, TAG_FUNCTION, TAG_INT,
-    VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, TAG_BIGINT,
+    TAG_FUNCTION, TAG_INT, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
@@ -43,6 +43,7 @@ pub fn llvm_backend_available() -> bool {
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
     closure_metadata: HashMap<String, ClosureMetadata>,
+    used_features: UsedFeatures,
 }
 
 struct LambdaLifter {
@@ -68,11 +69,19 @@ struct LocalValueVar {
     payload: Variable,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct UsedFeatures {
+    bigint: bool,
+    lists: bool,
+    list_mutation: bool,
+}
+
 impl Module {
     pub fn new() -> Self {
         Module {
             functions: vec![],
             closure_metadata: HashMap::new(),
+            used_features: UsedFeatures::default(),
         }
     }
 
@@ -97,14 +106,17 @@ impl Module {
             }
             match Ast::from_lexer(&mut lexer) {
                 Ok(Ast::FunctionDef(func)) => functions.push(func),
-                Ok(_) | Err(_) => break,
+                Ok(_) => panic!("top-level expressions are not supported in source files"),
+                Err(err) => panic!("parse error: {err}"),
             }
         }
 
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
+        let used_features = collect_used_features(&functions);
         Module {
             functions,
             closure_metadata,
+            used_features,
         }
     }
 
@@ -122,10 +134,27 @@ impl Module {
             _ => {}
         }
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
+        let used_features = collect_used_features(&functions);
         Module {
             functions,
             closure_metadata,
+            used_features,
         }
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_bigint(&self) -> bool {
+        self.used_features.bigint
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_lists(&self) -> bool {
+        self.used_features.lists
+    }
+
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_list_mutation(&self) -> bool {
+        self.used_features.list_mutation
     }
 
     pub fn compile_to_jit(self) -> JitArtifact {
@@ -166,6 +195,9 @@ impl Module {
             &mut cranelift_module,
             &isa,
             &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
             crate::runtime::__expr_print_host as usize as i64,
             crate::runtime::__expr_list_print_host as usize as i64,
             arena_base_addr,
@@ -238,7 +270,14 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "ir", default_libcall_names()).unwrap(),
         );
 
-        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(
+            &mut cranelift_module,
+            &isa,
+            &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
+        );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
@@ -323,7 +362,14 @@ impl Module {
             ObjectBuilder::new(isa.clone(), name, default_libcall_names()).unwrap(),
         );
 
-        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(
+            &mut cranelift_module,
+            &isa,
+            &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
+        );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
@@ -436,7 +482,14 @@ impl Module {
             ObjectBuilder::new(isa.clone(), "exe", default_libcall_names()).unwrap(),
         );
 
-        let builtin_ids = runtime_ir::setup_builtins(&mut cranelift_module, &isa, &flags);
+        let builtin_ids = runtime_ir::setup_builtins(
+            &mut cranelift_module,
+            &isa,
+            &flags,
+            self.used_features.bigint,
+            self.used_features.lists,
+            self.used_features.list_mutation,
+        );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
@@ -964,6 +1017,101 @@ fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
         .collect()
 }
 
+fn collect_used_features(functions: &[FunctionDefAst]) -> UsedFeatures {
+    let mut features = UsedFeatures::default();
+    for function in functions {
+        collect_used_features_from_block(&function.block, &mut features);
+    }
+    features
+}
+
+fn collect_used_features_from_block(block: &BlockAst, features: &mut UsedFeatures) {
+    for line in &block.lines {
+        collect_used_features_from_ast(line, features);
+    }
+}
+
+fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
+    match ast {
+        Ast::Expression(ExpressionAst { function, args }) => {
+            if matches!(
+                function.as_str(),
+                "bigint_from_int"
+                    | "bigint_compare"
+                    | "bigint_add"
+                    | "bigint_subtract"
+                    | "bigint_multiply"
+                    | "bigint_divide"
+                    | "bigint_modulo"
+            ) {
+                features.bigint = true;
+            }
+            if matches!(
+                function.as_str(),
+                "list_new"
+                    | "list_push"
+                    | "list_len"
+                    | "list_get"
+                    | "list_range"
+                    | "list_map"
+                    | "list_filter"
+            ) {
+                features.lists = true;
+            }
+            if matches!(
+                function.as_str(),
+                "list_insert" | "list_set" | "list_swap" | "list_pop" | "list_copy"
+            ) {
+                features.lists = true;
+                features.list_mutation = true;
+            }
+            for arg in args {
+                collect_used_features_from_ast(arg, features);
+            }
+        }
+        Ast::ListLiteral(items) => {
+            features.lists = true;
+            for item in items {
+                collect_used_features_from_ast(item, features);
+            }
+        }
+        Ast::Index { collection, index } => {
+            features.lists = true;
+            collect_used_features_from_ast(collection, features);
+            collect_used_features_from_ast(index, features);
+        }
+        Ast::IndexAssign {
+            collection,
+            index,
+            value,
+        } => {
+            features.lists = true;
+            features.list_mutation = true;
+            collect_used_features_from_ast(collection, features);
+            collect_used_features_from_ast(index, features);
+            collect_used_features_from_ast(value, features);
+        }
+        Ast::Assign { value, .. } => collect_used_features_from_ast(value, features),
+        Ast::If {
+            condition,
+            then,
+            else_,
+        } => {
+            collect_used_features_from_ast(condition, features);
+            collect_used_features_from_block(then, features);
+            if let Some(else_block) = else_ {
+                collect_used_features_from_block(else_block, features);
+            }
+        }
+        Ast::Block(block) => collect_used_features_from_block(block, features),
+        Ast::FunctionDef(func) => collect_used_features_from_block(&func.block, features),
+        Ast::Literal(LiteralAst::BigInt(_)) => {
+            features.bigint = true;
+        }
+        Ast::Literal(_) | Ast::Variable(_) | Ast::Lambda { .. } | Ast::FunctionRef(_) => {}
+    }
+}
+
 fn define_function_body(
     module: &mut impl CraneliftModule,
     isa: OwnedTargetIsa,
@@ -1211,6 +1359,13 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "list_range"
                 | "list_map"
                 | "list_filter"
+                | "bigint_compare"
+                | "bigint_from_int"
+                | "bigint_add"
+                | "bigint_subtract"
+                | "bigint_multiply"
+                | "bigint_divide"
+                | "bigint_modulo"
         )
 }
 
@@ -1474,6 +1629,81 @@ fn call_binary(
     }
 }
 
+fn promote_value_to_bigint(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    value: CompiledValue,
+) -> CompiledValue {
+    let is_bigint = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_BIGINT);
+    let bigint_block = builder.create_block();
+    let int_check_block = builder.create_block();
+    let int_block = builder.create_block();
+    let trap_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    builder.append_block_param(merge_block, types::I64);
+    builder
+        .ins()
+        .brif(is_bigint, bigint_block, &[], int_check_block, &[]);
+
+    builder.switch_to_block(bigint_block);
+    builder.seal_block(bigint_block);
+    builder.ins().jump(
+        merge_block,
+        &[BlockArg::Value(value.tag), BlockArg::Value(value.payload)],
+    );
+
+    builder.switch_to_block(int_check_block);
+    builder.seal_block(int_check_block);
+    let is_int = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_INT);
+    builder.ins().brif(is_int, int_block, &[], trap_block, &[]);
+
+    builder.switch_to_block(int_block);
+    builder.seal_block(int_block);
+    let bigint_from_int = require_func(func_refs, "bigint_from_int");
+    let call = builder
+        .ins()
+        .call(bigint_from_int, &[value.tag, value.payload]);
+    let results = builder.inst_results(call);
+    let result_tag = results[0];
+    let result_payload = results[1];
+    builder.ins().jump(
+        merge_block,
+        &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+    );
+
+    builder.switch_to_block(trap_block);
+    builder.seal_block(trap_block);
+    builder.ins().trap(TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    CompiledValue {
+        tag: builder.block_params(merge_block)[0],
+        payload: builder.block_params(merge_block)[1],
+    }
+}
+
+fn compile_bigint_builtin(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    args: &[CompiledValue],
+) -> CompiledValue {
+    assert_eq!(args.len(), 2, "{name} expects 2 arguments");
+    let lhs = promote_value_to_bigint(builder, func_refs, args[0]);
+    let rhs = promote_value_to_bigint(builder, func_refs, args[1]);
+    let func_ref = require_func(func_refs, name);
+    let call = builder
+        .ins()
+        .call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
+    let results = builder.inst_results(call);
+    CompiledValue {
+        tag: results[0],
+        payload: results[1],
+    }
+}
+
 fn call_ternary(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
@@ -1499,6 +1729,68 @@ fn boxed_int_const(builder: &mut FunctionBuilder, value: i64) -> CompiledValue {
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: builder.ins().iconst(types::I64, value),
     }
+}
+
+fn compile_bigint_literal(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    digits: &str,
+) -> CompiledValue {
+    let bigint_from_int = require_func(func_refs, "bigint_from_int");
+    let bigint_multiply = require_func(func_refs, "bigint_multiply");
+    let bigint_add = require_func(func_refs, "bigint_add");
+
+    let zero = boxed_int_const(builder, 0);
+    let init = builder
+        .ins()
+        .call(bigint_from_int, &[zero.tag, zero.payload]);
+    let init_results = builder.inst_results(init);
+    let mut acc = CompiledValue {
+        tag: init_results[0],
+        payload: init_results[1],
+    };
+    let ten_int = boxed_int_const(builder, 10);
+    let ten_call = builder
+        .ins()
+        .call(bigint_from_int, &[ten_int.tag, ten_int.payload]);
+    let ten_results = builder.inst_results(ten_call);
+    let ten = CompiledValue {
+        tag: ten_results[0],
+        payload: ten_results[1],
+    };
+
+    for ch in digits.chars() {
+        let mul = builder.ins().call(
+            bigint_multiply,
+            &[acc.tag, acc.payload, ten.tag, ten.payload],
+        );
+        let mul_results = builder.inst_results(mul);
+        acc = CompiledValue {
+            tag: mul_results[0],
+            payload: mul_results[1],
+        };
+
+        let digit_int = boxed_int_const(builder, ch.to_digit(10).unwrap() as i64);
+        let digit_call = builder
+            .ins()
+            .call(bigint_from_int, &[digit_int.tag, digit_int.payload]);
+        let digit_results = builder.inst_results(digit_call);
+        let digit = CompiledValue {
+            tag: digit_results[0],
+            payload: digit_results[1],
+        };
+        let add = builder.ins().call(
+            bigint_add,
+            &[acc.tag, acc.payload, digit.tag, digit.payload],
+        );
+        let add_results = builder.inst_results(add);
+        acc = CompiledValue {
+            tag: add_results[0],
+            payload: add_results[1],
+        };
+    }
+
+    acc
 }
 
 fn load_value_from_env(
@@ -2304,6 +2596,9 @@ fn compile_ast(
 ) -> CompiledValue {
     match ast {
         Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, *n),
+        Ast::Literal(LiteralAst::BigInt(digits)) => {
+            compile_bigint_literal(builder, func_refs, digits)
+        }
         Ast::Lambda { .. } => {
             panic!("anonymous functions are not implemented by the compiler yet");
         }
@@ -2493,6 +2788,10 @@ fn compile_ast(
                 "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
                 "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
                 "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
+                "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
+                | "bigint_modulo" | "bigint_compare" => {
+                    compile_bigint_builtin(builder, func_refs, function, &compiled)
+                }
                 name => {
                     if vars.contains_key(name) || capture_slots.contains_key(name) {
                         let callee = resolve_named_value(
@@ -2728,6 +3027,40 @@ fn assert_cranelift_jit_result(src: &str, expected: i64) {
     assert_eq!(func(), expected);
 }
 
+#[cfg(test)]
+fn assert_cranelift_executable_output(src: &str, expected_stdout: &str, expected_exit: i32) {
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Cranelift,
+        expected_stdout,
+        expected_exit,
+    );
+}
+
+#[cfg(test)]
+fn assert_backend_executable_output(
+    src: &str,
+    backend: CodegenBackend,
+    expected_stdout: &str,
+    expected_exit: i32,
+) {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    #[cfg(windows)]
+    let output = windows_temp_exe_path(&format!("__expr_compiler_bigint_test_{unique}"));
+    #[cfg(not(windows))]
+    let output = std::env::temp_dir().join(format!("__expr_compiler_bigint_test_{unique}"));
+
+    Module::from_source(src).compile_to_executable_with_backend(&output, backend);
+    let out = Command::new(&output).output().expect("run failed");
+    std::fs::remove_file(&output).ok();
+
+    assert_eq!(String::from_utf8_lossy(&out.stdout), expected_stdout);
+    assert_eq!(out.status.code(), Some(expected_exit));
+}
+
 #[cfg(all(test, feature = "llvm-backend"))]
 fn assert_jit_backend_result(src: &str, backend: CodegenBackend, expected: i64) {
     crate::runtime::reset_runtime_arena();
@@ -2918,6 +3251,163 @@ fn jit_list_filter_works() {
 fn jit_list_range_works() {
     let src = "fn main() do\n    xs = list_range(2, 6)\n    xs[0] + xs[1] + xs[2] + xs[3] + list_len(xs)\nend";
     assert_cranelift_jit_result(src, 18);
+}
+
+#[test]
+fn bigint_from_int_prints() {
+    let src = "fn main() do\n    print(bigint_from_int(1234567890123))\nend";
+    assert_cranelift_executable_output(src, "1234567890123\n", 0);
+}
+
+#[test]
+fn bigint_literal_prints() {
+    let src = "fn main() do\n    print(123456789012345678901234567890n)\nend";
+    assert_cranelift_executable_output(src, "123456789012345678901234567890\n", 0);
+}
+
+#[test]
+fn bigint_add_handles_limb_carry() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a + b)\nend";
+    assert_cranelift_executable_output(src, "4294967297\n", 0);
+}
+
+#[test]
+fn bigint_subtract_handles_negative_results() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_subtract(a, b))\nend";
+    assert_cranelift_executable_output(src, "-10\n", 0);
+}
+
+#[test]
+fn bigint_subtract_normalizes_zero() {
+    let src = "fn main() do\n    a = bigint_from_int(5)\n    b = bigint_from_int(5)\n    print(a - b)\nend";
+    assert_cranelift_executable_output(src, "0\n", 0);
+}
+
+#[test]
+fn bigint_compare_works() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_compare(a, b))\n    print(a < b)\n    print(a == b)\n    print(b > a)\nend";
+    assert_cranelift_executable_output(src, "-1\n1\n0\n1\n", 0);
+}
+
+#[test]
+fn bigint_multiply_works() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a * b)\n    print(bigint_multiply(a, b))\nend";
+    assert_cranelift_executable_output(src, "8589934590\n8589934590\n", 0);
+}
+
+#[test]
+fn bigint_divide_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(8589934590)\n    d = bigint_from_int(2)\n    print(a / b)\n    print(bigint_divide(a, b))\n    print(c / d)\nend";
+    assert_cranelift_executable_output(src, "14\n14\n4294967295\n", 0);
+}
+
+#[test]
+fn bigint_grouped_divide_expression_works() {
+    let src = "fn fact(n) do\n    fact_acc(n, 1n)\nend\n\nfn fact_acc(n, acc) do\n    if n == 0 do\n        acc\n    else\n        fact_acc(n - 1, acc * n)\n    end\nend\n\nfn choose(n, k) do\n    fact(n) / (fact(k) * fact(n - k))\nend\n\nfn main() do\n    choose(40, 20) == 137846528820n\nend";
+    assert_cranelift_jit_result(src, 1);
+}
+
+#[test]
+fn bigint_modulo_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(25)\n    d = bigint_from_int(10)\n    print(a % b)\n    print(bigint_modulo(a, b))\n    print(bigint_modulo(c, d))\nend";
+    assert_cranelift_executable_output(src, "2\n2\n5\n", 0);
+}
+
+#[test]
+fn bigint_mixed_arithmetic_and_compare_work() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
+    assert_cranelift_executable_output(src, "15\n15\n7\n15\n30\n30\n14\n2\n1\n1\n1\n", 0);
+}
+
+#[test]
+fn bigint_builtins_accept_mixed_int_and_bigint_operands() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
+    assert_cranelift_executable_output(src, "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_add_handles_limb_carry() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a + b)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "4294967297\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_literal_prints() {
+    let src = "fn main() do\n    print(123456789012345678901234567890n)\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "123456789012345678901234567890\n",
+        0,
+    );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_subtract_handles_negative_results() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_subtract(a, b))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "-10\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_compare_works() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    b = bigint_from_int(20)\n    print(bigint_compare(a, b))\n    print(a < b)\n    print(a == b)\n    print(b > a)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "-1\n1\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_multiply_works() {
+    let src = "fn main() do\n    a = bigint_from_int(4294967295)\n    b = bigint_from_int(2)\n    print(a * b)\n    print(bigint_multiply(a, b))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "8589934590\n8589934590\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_divide_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(8589934590)\n    d = bigint_from_int(2)\n    print(a / b)\n    print(bigint_divide(a, b))\n    print(c / d)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "14\n14\n4294967295\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_grouped_divide_expression_works() {
+    let src = "fn fact(n) do\n    fact_acc(n, 1n)\nend\n\nfn fact_acc(n, acc) do\n    if n == 0 do\n        acc\n    else\n        fact_acc(n - 1, acc * n)\n    end\nend\n\nfn choose(n, k) do\n    fact(n) / (fact(k) * fact(n - k))\nend\n\nfn main() do\n    choose(40, 20) == 137846528820n\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 1);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_modulo_works() {
+    let src = "fn main() do\n    a = bigint_from_int(100)\n    b = bigint_from_int(7)\n    c = bigint_from_int(25)\n    d = bigint_from_int(10)\n    print(a % b)\n    print(bigint_modulo(a, b))\n    print(bigint_modulo(c, d))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "2\n2\n5\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_mixed_arithmetic_and_compare_work() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "15\n15\n7\n15\n30\n30\n14\n2\n1\n1\n1\n",
+        0,
+    );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_bigint_builtins_accept_mixed_int_and_bigint_operands() {
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n",
+        0,
+    );
 }
 
 #[test]

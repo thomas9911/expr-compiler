@@ -1,3 +1,4 @@
+use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::Function;
 use cranelift::codegen::ir::condcodes::IntCC;
 use cranelift::codegen::ir::instructions::BlockArg;
@@ -11,8 +12,9 @@ use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::HashMap;
 
 use crate::value::{
-    LIST_CAP_OFFSET, LIST_HEADER_SIZE, LIST_LEN_OFFSET, LIST_PTR_OFFSET, TAG_INT, TAG_LIST,
-    VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    BIGINT_CAP_OFFSET, BIGINT_HEADER_SIZE, BIGINT_LEN_OFFSET, BIGINT_LIMB_SIZE, BIGINT_PTR_OFFSET,
+    BIGINT_SIGN_OFFSET, LIST_CAP_OFFSET, LIST_HEADER_SIZE, LIST_LEN_OFFSET, LIST_PTR_OFFSET,
+    TAG_BIGINT, TAG_INT, TAG_LIST, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 
 const ARENA_BYTES: i64 = 16 * 1024 * 1024;
@@ -22,9 +24,20 @@ pub(super) fn setup_builtins(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> HashMap<String, FuncId> {
     let oom_host_id = declare_host_builtin(module, isa, "__expr_runtime_oom_host", &[]);
-    let runtime = define_runtime_ir(module, isa, flags, oom_host_id);
+    let runtime = define_runtime_ir(
+        module,
+        isa,
+        flags,
+        oom_host_id,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     let print_host_id = declare_host_builtin(module, isa, "__expr_print_host", &[types::I64]);
     let list_print_host_id =
         declare_host_builtin(module, isa, "__expr_list_print_host", &[types::I64]);
@@ -52,13 +65,23 @@ pub(super) fn setup_builtins(
         list_print_host_id,
         runtime.box_value,
     );
-    build_builtin_map(print_id, list_print_id, runtime)
+    build_builtin_map(
+        print_id,
+        list_print_id,
+        runtime,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    )
 }
 
 pub(super) fn setup_builtins_jit(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
     print_host_addr: i64,
     list_print_host_addr: i64,
     arena_base_addr: i64,
@@ -71,6 +94,9 @@ pub(super) fn setup_builtins_jit(
         arena_base_addr,
         arena_offset_addr,
         crate::runtime::__expr_runtime_oom_host as usize as i64,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
     );
     let print_host_id = declare_local_builtin(module, isa, "__rt_print_host_scalar", &[types::I64]);
     let list_print_host_id =
@@ -101,13 +127,23 @@ pub(super) fn setup_builtins_jit(
         list_print_host_id,
         runtime.box_value,
     );
-    build_builtin_map(print_id, list_print_id, runtime)
+    build_builtin_map(
+        print_id,
+        list_print_id,
+        runtime,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    )
 }
 
 fn build_builtin_map(
     print_id: FuncId,
     _list_print_id: FuncId,
     runtime: RuntimeBuiltins,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> HashMap<String, FuncId> {
     let mut builtins = HashMap::new();
     builtins.insert("print".to_string(), print_id);
@@ -127,15 +163,40 @@ fn build_builtin_map(
     builtins.insert("__op_lte".to_string(), runtime.op_lte);
     builtins.insert("__op_eq".to_string(), runtime.op_eq);
     builtins.insert("__op_ne".to_string(), runtime.op_ne);
-    builtins.insert("list_new".to_string(), runtime.list_new);
-    builtins.insert("list_push".to_string(), runtime.list_push);
-    builtins.insert("list_insert".to_string(), runtime.list_insert);
-    builtins.insert("list_len".to_string(), runtime.list_len);
-    builtins.insert("list_get".to_string(), runtime.list_get);
-    builtins.insert("list_set".to_string(), runtime.list_set);
-    builtins.insert("list_swap".to_string(), runtime.list_swap);
-    builtins.insert("list_pop".to_string(), runtime.list_pop);
-    builtins.insert("list_copy".to_string(), runtime.list_copy);
+    if bigint_enabled {
+        builtins.insert(
+            "bigint_compare".to_string(),
+            runtime.bigint_compare.unwrap(),
+        );
+        builtins.insert(
+            "bigint_from_int".to_string(),
+            runtime.bigint_from_int.unwrap(),
+        );
+        builtins.insert("bigint_add".to_string(), runtime.bigint_add.unwrap());
+        builtins.insert(
+            "bigint_subtract".to_string(),
+            runtime.bigint_subtract.unwrap(),
+        );
+        builtins.insert(
+            "bigint_multiply".to_string(),
+            runtime.bigint_multiply.unwrap(),
+        );
+        builtins.insert("bigint_divide".to_string(), runtime.bigint_divide.unwrap());
+        builtins.insert("bigint_modulo".to_string(), runtime.bigint_modulo.unwrap());
+    }
+    if list_enabled {
+        builtins.insert("list_new".to_string(), runtime.list_new.unwrap());
+        builtins.insert("list_push".to_string(), runtime.list_push.unwrap());
+        builtins.insert("list_len".to_string(), runtime.list_len.unwrap());
+        builtins.insert("list_get".to_string(), runtime.list_get.unwrap());
+    }
+    if list_mutation_enabled {
+        builtins.insert("list_insert".to_string(), runtime.list_insert.unwrap());
+        builtins.insert("list_set".to_string(), runtime.list_set.unwrap());
+        builtins.insert("list_swap".to_string(), runtime.list_swap.unwrap());
+        builtins.insert("list_pop".to_string(), runtime.list_pop.unwrap());
+        builtins.insert("list_copy".to_string(), runtime.list_copy.unwrap());
+    }
     builtins
 }
 
@@ -156,15 +217,22 @@ struct RuntimeBuiltins {
     op_lte: FuncId,
     op_eq: FuncId,
     op_ne: FuncId,
-    list_new: FuncId,
-    list_push: FuncId,
-    list_insert: FuncId,
-    list_len: FuncId,
-    list_get: FuncId,
-    list_set: FuncId,
-    list_swap: FuncId,
-    list_pop: FuncId,
-    list_copy: FuncId,
+    bigint_compare: Option<FuncId>,
+    bigint_from_int: Option<FuncId>,
+    bigint_add: Option<FuncId>,
+    bigint_subtract: Option<FuncId>,
+    bigint_multiply: Option<FuncId>,
+    bigint_divide: Option<FuncId>,
+    bigint_modulo: Option<FuncId>,
+    list_new: Option<FuncId>,
+    list_push: Option<FuncId>,
+    list_insert: Option<FuncId>,
+    list_len: Option<FuncId>,
+    list_get: Option<FuncId>,
+    list_set: Option<FuncId>,
+    list_swap: Option<FuncId>,
+    list_pop: Option<FuncId>,
+    list_copy: Option<FuncId>,
 }
 
 struct RuntimeData {
@@ -237,6 +305,9 @@ fn init_runtime_data(module: &mut impl CraneliftModule) -> RuntimeData {
 fn declare_runtime_function_ids(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> RuntimeFunctionIds {
     let alloc = declare_local_builtin(module, isa, "__rt_alloc", &[types::I64, types::I64]);
     let oom = declare_local_builtin(module, isa, "__rt_runtime_oom_host", &[]);
@@ -321,64 +392,134 @@ fn declare_runtime_function_ids(
         "__rt_ne",
         &[types::I64, types::I64, types::I64, types::I64],
     );
-    let list_new = declare_local_pair_builtin(module, isa, "__rt_list_new", &[]);
-    let list_push = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_push",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let list_insert = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_insert",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-    );
-    let list_len =
-        declare_local_pair_builtin(module, isa, "__rt_list_len", &[types::I64, types::I64]);
-    let list_get = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_get",
-        &[types::I64, types::I64, types::I64, types::I64],
-    );
-    let list_set = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_set",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-    );
-    let list_swap = declare_local_pair_builtin(
-        module,
-        isa,
-        "__rt_list_swap",
-        &[
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-            types::I64,
-        ],
-    );
-    let list_pop =
-        declare_local_pair_builtin(module, isa, "__rt_list_pop", &[types::I64, types::I64]);
-    let list_copy =
-        declare_local_pair_builtin(module, isa, "__rt_list_copy", &[types::I64, types::I64]);
+    let bigint_from_int = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_from_int",
+            &[types::I64, types::I64],
+        )
+    });
+    let bigint_compare = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_compare",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_add = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_add",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_subtract = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_subtract",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_multiply = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_multiply",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_divide = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_divide",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_modulo = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_modulo",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let list_new =
+        list_enabled.then(|| declare_local_pair_builtin(module, isa, "__rt_list_new", &[]));
+    let list_push = list_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_push",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let list_insert = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_insert",
+            &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+            ],
+        )
+    });
+    let list_len = list_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_list_len", &[types::I64, types::I64])
+    });
+    let list_get = list_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_get",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let list_set = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_set",
+            &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+            ],
+        )
+    });
+    let list_swap = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_swap",
+            &[
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+                types::I64,
+            ],
+        )
+    });
+    let list_pop = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_list_pop", &[types::I64, types::I64])
+    });
+    let list_copy = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_list_copy", &[types::I64, types::I64])
+    });
 
     RuntimeFunctionIds {
         alloc,
@@ -401,6 +542,13 @@ fn declare_runtime_function_ids(
             op_lte,
             op_eq,
             op_ne,
+            bigint_compare,
+            bigint_from_int,
+            bigint_add,
+            bigint_subtract,
+            bigint_multiply,
+            bigint_divide,
+            bigint_modulo,
             list_new,
             list_push,
             list_insert,
@@ -419,6 +567,9 @@ fn define_runtime_operations(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     ids: &RuntimeFunctionIds,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) {
     define_rt_memcpy(module, isa, flags, ids.memcpy);
     define_rt_box_value(module, isa, flags, ids.builtins.box_value, ids.alloc);
@@ -432,6 +583,8 @@ fn define_runtime_operations(
         ids.builtins.op_add,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_add,
         "add",
     );
     define_rt_binary_op(
@@ -441,6 +594,8 @@ fn define_runtime_operations(
         ids.builtins.op_subtract,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_subtract,
         "subtract",
     );
     define_rt_binary_op(
@@ -450,6 +605,8 @@ fn define_runtime_operations(
         ids.builtins.op_multiply,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_multiply,
         "multiply",
     );
     define_rt_binary_op(
@@ -459,6 +616,8 @@ fn define_runtime_operations(
         ids.builtins.op_divide,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_divide,
         "divide",
     );
     define_rt_binary_op(
@@ -468,8 +627,61 @@ fn define_runtime_operations(
         ids.builtins.op_modulo,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_modulo,
         "modulo",
     );
+    if bigint_enabled {
+        define_rt_bigint_from_int(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_from_int.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_compare(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_compare.unwrap(),
+            ids.builtins.value_int,
+        );
+        define_rt_bigint_add(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_add.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_subtract(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_subtract.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_multiply(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_multiply.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_divide(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_divide.unwrap(),
+            ids.alloc,
+        );
+        define_rt_bigint_modulo(
+            module,
+            isa,
+            flags,
+            ids.builtins.bigint_modulo.unwrap(),
+            ids.alloc,
+        );
+    }
     define_rt_compare_op(
         module,
         isa,
@@ -477,6 +689,8 @@ fn define_runtime_operations(
         ids.builtins.op_gt,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_compare,
         IntCC::SignedGreaterThan,
     );
     define_rt_compare_op(
@@ -486,6 +700,8 @@ fn define_runtime_operations(
         ids.builtins.op_lt,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_compare,
         IntCC::SignedLessThan,
     );
     define_rt_compare_op(
@@ -495,6 +711,8 @@ fn define_runtime_operations(
         ids.builtins.op_gte,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_compare,
         IntCC::SignedGreaterThanOrEqual,
     );
     define_rt_compare_op(
@@ -504,6 +722,8 @@ fn define_runtime_operations(
         ids.builtins.op_lte,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_compare,
         IntCC::SignedLessThanOrEqual,
     );
     define_rt_compare_op(
@@ -513,6 +733,8 @@ fn define_runtime_operations(
         ids.builtins.op_eq,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_compare,
         IntCC::Equal,
     );
     define_rt_compare_op(
@@ -522,73 +744,85 @@ fn define_runtime_operations(
         ids.builtins.op_ne,
         ids.builtins.value_to_i64,
         ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_compare,
         IntCC::NotEqual,
     );
-    define_rt_list_new(module, isa, flags, ids.builtins.list_new, ids.alloc);
-    define_rt_list_push(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_push,
-        ids.alloc,
-        ids.memcpy,
-        ids.builtins.box_value,
-    );
-    define_rt_list_insert(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_insert,
-        ids.builtins.value_to_i64,
-        ids.alloc,
-        ids.memcpy,
-        ids.builtins.box_value,
-    );
-    define_rt_list_len(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_len,
-        ids.builtins.value_int,
-    );
-    define_rt_list_get(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_get,
-        ids.builtins.value_to_i64,
-    );
-    define_rt_list_set(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_set,
-        ids.builtins.value_to_i64,
-        ids.builtins.box_value,
-    );
-    define_rt_list_swap(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_swap,
-        ids.builtins.value_to_i64,
-    );
-    define_rt_list_pop(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_pop,
-        ids.builtins.value_to_i64,
-    );
-    define_rt_list_copy(
-        module,
-        isa,
-        flags,
-        ids.builtins.list_copy,
-        ids.builtins.value_to_i64,
-        ids.alloc,
-        ids.memcpy,
-    );
+    if list_enabled {
+        define_rt_list_new(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_new.unwrap(),
+            ids.alloc,
+        );
+        define_rt_list_push(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_push.unwrap(),
+            ids.alloc,
+            ids.memcpy,
+            ids.builtins.box_value,
+        );
+        define_rt_list_len(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_len.unwrap(),
+            ids.builtins.value_int,
+        );
+        define_rt_list_get(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_get.unwrap(),
+            ids.builtins.value_to_i64,
+        );
+    }
+    if list_mutation_enabled {
+        define_rt_list_insert(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_insert.unwrap(),
+            ids.builtins.value_to_i64,
+            ids.alloc,
+            ids.memcpy,
+            ids.builtins.box_value,
+        );
+        define_rt_list_set(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_set.unwrap(),
+            ids.builtins.value_to_i64,
+            ids.builtins.box_value,
+        );
+        define_rt_list_swap(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_swap.unwrap(),
+            ids.builtins.value_to_i64,
+        );
+        define_rt_list_pop(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_pop.unwrap(),
+            ids.builtins.value_to_i64,
+        );
+        define_rt_list_copy(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_copy.unwrap(),
+            ids.builtins.value_to_i64,
+            ids.alloc,
+            ids.memcpy,
+        );
+    }
 }
 
 fn define_runtime_ir(
@@ -596,12 +830,29 @@ fn define_runtime_ir(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     oom_host_id: FuncId,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> RuntimeBuiltins {
     let data = init_runtime_data(module);
-    let ids = declare_runtime_function_ids(module, isa);
+    let ids = declare_runtime_function_ids(
+        module,
+        isa,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     define_rt_host_oom_import_wrapper(module, isa, flags, ids.oom, oom_host_id);
     define_rt_alloc(module, isa, flags, ids.alloc, ids.oom, &data);
-    define_runtime_operations(module, isa, flags, &ids);
+    define_runtime_operations(
+        module,
+        isa,
+        flags,
+        &ids,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     ids.builtins
 }
 
@@ -657,6 +908,750 @@ fn pair_payload_for_tag(
     payload
 }
 
+fn bigint_load_sign(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder
+        .ins()
+        .load(types::I64, MemFlags::new(), header_ptr, BIGINT_SIGN_OFFSET)
+}
+
+fn bigint_store_sign(builder: &mut FunctionBuilder, header_ptr: Value, sign: Value) {
+    builder
+        .ins()
+        .store(MemFlags::new(), sign, header_ptr, BIGINT_SIGN_OFFSET);
+}
+
+fn bigint_load_len(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder
+        .ins()
+        .load(types::I64, MemFlags::new(), header_ptr, BIGINT_LEN_OFFSET)
+}
+
+fn bigint_store_len(builder: &mut FunctionBuilder, header_ptr: Value, len: Value) {
+    builder
+        .ins()
+        .store(MemFlags::new(), len, header_ptr, BIGINT_LEN_OFFSET);
+}
+
+fn bigint_store_cap(builder: &mut FunctionBuilder, header_ptr: Value, cap: Value) {
+    builder
+        .ins()
+        .store(MemFlags::new(), cap, header_ptr, BIGINT_CAP_OFFSET);
+}
+
+fn bigint_load_ptr(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder
+        .ins()
+        .load(types::I64, MemFlags::new(), header_ptr, BIGINT_PTR_OFFSET)
+}
+
+fn bigint_store_ptr(builder: &mut FunctionBuilder, header_ptr: Value, ptr: Value) {
+    builder
+        .ins()
+        .store(MemFlags::new(), ptr, header_ptr, BIGINT_PTR_OFFSET);
+}
+
+fn bigint_limb_ptr(builder: &mut FunctionBuilder, header_ptr: Value, index: Value) -> Value {
+    let data_ptr = bigint_load_ptr(builder, header_ptr);
+    let byte_off = builder.ins().ishl_imm(index, 2);
+    builder.ins().iadd(data_ptr, byte_off)
+}
+
+fn bigint_load_limb(builder: &mut FunctionBuilder, header_ptr: Value, index: Value) -> Value {
+    let ptr = bigint_limb_ptr(builder, header_ptr, index);
+    let limb = builder.ins().load(types::I32, MemFlags::new(), ptr, 0);
+    builder.ins().uextend(types::I64, limb)
+}
+
+fn bigint_store_limb(builder: &mut FunctionBuilder, header_ptr: Value, index: Value, limb: Value) {
+    let ptr = bigint_limb_ptr(builder, header_ptr, index);
+    let narrowed = builder.ins().ireduce(types::I32, limb);
+    builder.ins().store(MemFlags::new(), narrowed, ptr, 0);
+}
+
+fn bigint_alloc(builder: &mut FunctionBuilder, alloc_ref: FuncRef, cap: Value) -> Value {
+    let limb_size = builder.ins().iconst(types::I64, BIGINT_LIMB_SIZE);
+    let limb_bytes = builder.ins().imul(cap, limb_size);
+    let limb_align = builder.ins().iconst(types::I64, 4);
+    let limb_call = builder.ins().call(alloc_ref, &[limb_bytes, limb_align]);
+    let limb_ptr = builder.inst_results(limb_call)[0];
+
+    let header_size = builder.ins().iconst(types::I64, BIGINT_HEADER_SIZE);
+    let header_align = builder.ins().iconst(types::I64, 8);
+    let header_call = builder.ins().call(alloc_ref, &[header_size, header_align]);
+    let header_ptr = builder.inst_results(header_call)[0];
+
+    let zero = builder.ins().iconst(types::I64, 0);
+    bigint_store_sign(builder, header_ptr, zero);
+    bigint_store_len(builder, header_ptr, zero);
+    bigint_store_cap(builder, header_ptr, cap);
+    bigint_store_ptr(builder, header_ptr, limb_ptr);
+    header_ptr
+}
+
+fn bigint_normalize(builder: &mut FunctionBuilder, header_ptr: Value) {
+    let loop_block = builder.create_block();
+    let trim_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.ins().jump(loop_block, &[]);
+
+    builder.switch_to_block(loop_block);
+    let len = bigint_load_len(builder, header_ptr);
+    let has_len = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
+    builder
+        .ins()
+        .brif(has_len, trim_block, &[], done_block, &[]);
+
+    builder.switch_to_block(trim_block);
+    builder.seal_block(trim_block);
+    let last_index = builder.ins().iadd_imm(len, -1);
+    let last = bigint_load_limb(builder, header_ptr, last_index);
+    let is_zero = builder.ins().icmp_imm(IntCC::Equal, last, 0);
+    let trim_more = builder.create_block();
+    let keep_block = builder.create_block();
+    builder.ins().brif(is_zero, trim_more, &[], keep_block, &[]);
+
+    builder.switch_to_block(trim_more);
+    builder.seal_block(trim_more);
+    bigint_store_len(builder, header_ptr, last_index);
+    builder.ins().jump(loop_block, &[]);
+
+    builder.switch_to_block(keep_block);
+    builder.seal_block(keep_block);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    let final_len = bigint_load_len(builder, header_ptr);
+    let non_zero = builder.ins().icmp_imm(IntCC::NotEqual, final_len, 0);
+    let keep_sign = builder.create_block();
+    let zero_sign = builder.create_block();
+    builder.ins().brif(non_zero, keep_sign, &[], zero_sign, &[]);
+
+    builder.switch_to_block(keep_sign);
+    builder.seal_block(keep_sign);
+    builder.ins().jump(zero_sign, &[]);
+
+    builder.switch_to_block(zero_sign);
+    builder.seal_block(zero_sign);
+    let final_len = bigint_load_len(builder, header_ptr);
+    let still_zero = builder.ins().icmp_imm(IntCC::Equal, final_len, 0);
+    let end_block = builder.create_block();
+    let set_zero_block = builder.create_block();
+    builder
+        .ins()
+        .brif(still_zero, set_zero_block, &[], end_block, &[]);
+
+    builder.switch_to_block(set_zero_block);
+    builder.seal_block(set_zero_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    bigint_store_sign(builder, header_ptr, zero);
+    builder.ins().jump(end_block, &[]);
+
+    builder.switch_to_block(end_block);
+    builder.seal_block(end_block);
+    builder.seal_block(loop_block);
+}
+
+fn bigint_cmp_abs(builder: &mut FunctionBuilder, lhs: Value, rhs: Value) -> Value {
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    let one = builder.ins().iconst(types::I64, 1);
+    let minus_one = builder.ins().iconst(types::I64, -1);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let lhs_len = bigint_load_len(builder, lhs);
+    let rhs_len = bigint_load_len(builder, rhs);
+    let len_eq = builder.ins().icmp(IntCC::Equal, lhs_len, rhs_len);
+    let len_cmp_block = builder.create_block();
+    let same_len_block = builder.create_block();
+    builder
+        .ins()
+        .brif(len_eq, same_len_block, &[], len_cmp_block, &[]);
+
+    builder.switch_to_block(len_cmp_block);
+    builder.seal_block(len_cmp_block);
+    let gt = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, lhs_len, rhs_len);
+    let len_cmp = builder.ins().select(gt, one, minus_one);
+    builder.ins().jump(merge, &[BlockArg::Value(len_cmp)]);
+
+    builder.switch_to_block(same_len_block);
+    builder.seal_block(same_len_block);
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let equal_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.ins().jump(loop_block, &[BlockArg::Value(lhs_len)]);
+
+    builder.switch_to_block(loop_block);
+    let remaining = builder.block_params(loop_block)[0];
+    let has_more = builder.ins().icmp_imm(IntCC::NotEqual, remaining, 0);
+    builder
+        .ins()
+        .brif(has_more, body_block, &[], equal_block, &[]);
+
+    builder.switch_to_block(body_block);
+    builder.seal_block(body_block);
+    let index = builder.ins().iadd_imm(remaining, -1);
+    let lhs_limb = bigint_load_limb(builder, lhs, index);
+    let rhs_limb = bigint_load_limb(builder, rhs, index);
+    let limb_eq = builder.ins().icmp(IntCC::Equal, lhs_limb, rhs_limb);
+    let next_block = builder.create_block();
+    let diff_block = builder.create_block();
+    builder
+        .ins()
+        .brif(limb_eq, next_block, &[], diff_block, &[]);
+
+    builder.switch_to_block(next_block);
+    builder.seal_block(next_block);
+    builder.ins().jump(loop_block, &[BlockArg::Value(index)]);
+
+    builder.switch_to_block(diff_block);
+    builder.seal_block(diff_block);
+    let gt = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, lhs_limb, rhs_limb);
+    let limb_cmp = builder.ins().select(gt, one, minus_one);
+    builder.ins().jump(merge, &[BlockArg::Value(limb_cmp)]);
+
+    builder.switch_to_block(equal_block);
+    builder.seal_block(equal_block);
+    builder.ins().jump(merge, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    builder.seal_block(loop_block);
+    builder.block_params(merge)[0]
+}
+
+fn bigint_add_abs(
+    builder: &mut FunctionBuilder,
+    alloc_ref: FuncRef,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let lhs_len = bigint_load_len(builder, lhs);
+    let rhs_len = bigint_load_len(builder, rhs);
+    let lhs_ge = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_len, rhs_len);
+    let max_len = builder.ins().select(lhs_ge, lhs_len, rhs_len);
+    let cap = builder.ins().iadd_imm(max_len, 1);
+    let header_ptr = bigint_alloc(builder, alloc_ref, cap);
+    bigint_store_len(builder, header_ptr, cap);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.append_block_param(loop_block, types::I64);
+    builder.append_block_param(done_block, types::I64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder
+        .ins()
+        .jump(loop_block, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let carry = builder.block_params(loop_block)[1];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, max_len);
+    builder
+        .ins()
+        .brif(more, body_block, &[], done_block, &[BlockArg::Value(carry)]);
+
+    builder.switch_to_block(body_block);
+    builder.seal_block(body_block);
+    let lhs_in = builder.ins().icmp(IntCC::UnsignedLessThan, idx, lhs_len);
+    let lhs_zero_block = builder.create_block();
+    let lhs_read_block = builder.create_block();
+    let lhs_merge = builder.create_block();
+    builder.append_block_param(lhs_merge, types::I64);
+    builder
+        .ins()
+        .brif(lhs_in, lhs_read_block, &[], lhs_zero_block, &[]);
+
+    builder.switch_to_block(lhs_zero_block);
+    builder.seal_block(lhs_zero_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(lhs_merge, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(lhs_read_block);
+    builder.seal_block(lhs_read_block);
+    let limb = bigint_load_limb(builder, lhs, idx);
+    builder.ins().jump(lhs_merge, &[BlockArg::Value(limb)]);
+
+    builder.switch_to_block(lhs_merge);
+    builder.seal_block(lhs_merge);
+    let lhs_limb = builder.block_params(lhs_merge)[0];
+
+    let rhs_in = builder.ins().icmp(IntCC::UnsignedLessThan, idx, rhs_len);
+    let rhs_zero_block = builder.create_block();
+    let rhs_read_block = builder.create_block();
+    let rhs_merge = builder.create_block();
+    builder.append_block_param(rhs_merge, types::I64);
+    builder
+        .ins()
+        .brif(rhs_in, rhs_read_block, &[], rhs_zero_block, &[]);
+
+    builder.switch_to_block(rhs_zero_block);
+    builder.seal_block(rhs_zero_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(rhs_merge, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(rhs_read_block);
+    builder.seal_block(rhs_read_block);
+    let limb = bigint_load_limb(builder, rhs, idx);
+    builder.ins().jump(rhs_merge, &[BlockArg::Value(limb)]);
+
+    builder.switch_to_block(rhs_merge);
+    builder.seal_block(rhs_merge);
+    let rhs_limb = builder.block_params(rhs_merge)[0];
+
+    let tmp = builder.ins().iadd(lhs_limb, rhs_limb);
+    let sum = builder.ins().iadd(tmp, carry);
+    let mask = builder.ins().iconst(types::I64, 0xffff_ffff);
+    let low = builder.ins().band(sum, mask);
+    bigint_store_limb(builder, header_ptr, idx, low);
+    let next_carry = builder.ins().ushr_imm(sum, 32);
+    let next_idx = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(
+        loop_block,
+        &[BlockArg::Value(next_idx), BlockArg::Value(next_carry)],
+    );
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    let final_carry = builder.block_params(done_block)[0];
+    bigint_store_limb(builder, header_ptr, max_len, final_carry);
+    bigint_normalize(builder, header_ptr);
+    builder.seal_block(loop_block);
+    header_ptr
+}
+
+fn bigint_sub_abs(
+    builder: &mut FunctionBuilder,
+    alloc_ref: FuncRef,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let lhs_len = bigint_load_len(builder, lhs);
+    let rhs_len = bigint_load_len(builder, rhs);
+    let header_ptr = bigint_alloc(builder, alloc_ref, lhs_len);
+    bigint_store_len(builder, header_ptr, lhs_len);
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.append_block_param(loop_block, types::I64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder
+        .ins()
+        .jump(loop_block, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let borrow = builder.block_params(loop_block)[1];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, lhs_len);
+    builder.ins().brif(more, body_block, &[], done_block, &[]);
+
+    builder.switch_to_block(body_block);
+    builder.seal_block(body_block);
+    let lhs_limb = bigint_load_limb(builder, lhs, idx);
+    let rhs_in = builder.ins().icmp(IntCC::UnsignedLessThan, idx, rhs_len);
+    let rhs_zero_block = builder.create_block();
+    let rhs_read_block = builder.create_block();
+    let rhs_merge = builder.create_block();
+    builder.append_block_param(rhs_merge, types::I64);
+    builder
+        .ins()
+        .brif(rhs_in, rhs_read_block, &[], rhs_zero_block, &[]);
+
+    builder.switch_to_block(rhs_zero_block);
+    builder.seal_block(rhs_zero_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(rhs_merge, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(rhs_read_block);
+    builder.seal_block(rhs_read_block);
+    let limb = bigint_load_limb(builder, rhs, idx);
+    builder.ins().jump(rhs_merge, &[BlockArg::Value(limb)]);
+
+    builder.switch_to_block(rhs_merge);
+    builder.seal_block(rhs_merge);
+    let rhs_limb = builder.block_params(rhs_merge)[0];
+    let rhs_plus_borrow = builder.ins().iadd(rhs_limb, borrow);
+    let enough = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_limb, rhs_plus_borrow);
+    let no_borrow_block = builder.create_block();
+    let borrow_block = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    builder.append_block_param(merge, types::I64);
+    builder
+        .ins()
+        .brif(enough, no_borrow_block, &[], borrow_block, &[]);
+
+    builder.switch_to_block(no_borrow_block);
+    builder.seal_block(no_borrow_block);
+    let diff = builder.ins().isub(lhs_limb, rhs_plus_borrow);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder
+        .ins()
+        .jump(merge, &[BlockArg::Value(diff), BlockArg::Value(zero)]);
+
+    builder.switch_to_block(borrow_block);
+    builder.seal_block(borrow_block);
+    let base = builder.ins().iconst(types::I64, 1_i64 << 32);
+    let lhs_with_base = builder.ins().iadd(lhs_limb, base);
+    let diff = builder.ins().isub(lhs_with_base, rhs_plus_borrow);
+    let one = builder.ins().iconst(types::I64, 1);
+    builder
+        .ins()
+        .jump(merge, &[BlockArg::Value(diff), BlockArg::Value(one)]);
+
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    let out_limb = builder.block_params(merge)[0];
+    let next_borrow = builder.block_params(merge)[1];
+    bigint_store_limb(builder, header_ptr, idx, out_limb);
+    let next_idx = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(
+        loop_block,
+        &[BlockArg::Value(next_idx), BlockArg::Value(next_borrow)],
+    );
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    bigint_normalize(builder, header_ptr);
+    builder.seal_block(loop_block);
+    header_ptr
+}
+
+fn emit_bigint_addsub(
+    builder: &mut FunctionBuilder,
+    alloc_ref: FuncRef,
+    lhs_ptr: Value,
+    lhs_sign: Value,
+    rhs_ptr: Value,
+    rhs_sign: Value,
+) -> Value {
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+
+    let lhs_zero = builder.ins().icmp_imm(IntCC::Equal, lhs_sign, 0);
+    let lhs_zero_block = builder.create_block();
+    let rhs_zero_check = builder.create_block();
+    builder
+        .ins()
+        .brif(lhs_zero, lhs_zero_block, &[], rhs_zero_check, &[]);
+
+    builder.switch_to_block(lhs_zero_block);
+    builder.seal_block(lhs_zero_block);
+    builder.ins().jump(merge, &[BlockArg::Value(rhs_ptr)]);
+
+    builder.switch_to_block(rhs_zero_check);
+    builder.seal_block(rhs_zero_check);
+    let rhs_zero = builder.ins().icmp_imm(IntCC::Equal, rhs_sign, 0);
+    let rhs_zero_block = builder.create_block();
+    let same_sign_block = builder.create_block();
+    builder
+        .ins()
+        .brif(rhs_zero, rhs_zero_block, &[], same_sign_block, &[]);
+
+    builder.switch_to_block(rhs_zero_block);
+    builder.seal_block(rhs_zero_block);
+    builder.ins().jump(merge, &[BlockArg::Value(lhs_ptr)]);
+
+    builder.switch_to_block(same_sign_block);
+    builder.seal_block(same_sign_block);
+    let signs_equal = builder.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
+    let add_block = builder.create_block();
+    let diff_sign_block = builder.create_block();
+    builder
+        .ins()
+        .brif(signs_equal, add_block, &[], diff_sign_block, &[]);
+
+    builder.switch_to_block(add_block);
+    builder.seal_block(add_block);
+    let sum_ptr = bigint_add_abs(builder, alloc_ref, lhs_ptr, rhs_ptr);
+    bigint_store_sign(builder, sum_ptr, lhs_sign);
+    bigint_normalize(builder, sum_ptr);
+    builder.ins().jump(merge, &[BlockArg::Value(sum_ptr)]);
+
+    builder.switch_to_block(diff_sign_block);
+    builder.seal_block(diff_sign_block);
+    let cmp = bigint_cmp_abs(builder, lhs_ptr, rhs_ptr);
+    let cmp_zero = builder.ins().icmp_imm(IntCC::Equal, cmp, 0);
+    let equal_block = builder.create_block();
+    let cmp_non_zero_block = builder.create_block();
+    builder
+        .ins()
+        .brif(cmp_zero, equal_block, &[], cmp_non_zero_block, &[]);
+
+    builder.switch_to_block(equal_block);
+    builder.seal_block(equal_block);
+    let zero_cap = builder.ins().iconst(types::I64, 0);
+    let zero_ptr = bigint_alloc(builder, alloc_ref, zero_cap);
+    let zero = builder.ins().iconst(types::I64, 0);
+    bigint_store_sign(builder, zero_ptr, zero);
+    bigint_store_len(builder, zero_ptr, zero);
+    builder.ins().jump(merge, &[BlockArg::Value(zero_ptr)]);
+
+    builder.switch_to_block(cmp_non_zero_block);
+    builder.seal_block(cmp_non_zero_block);
+    let lhs_gt = builder.ins().icmp_imm(IntCC::SignedGreaterThan, cmp, 0);
+    let lhs_gt_block = builder.create_block();
+    let rhs_gt_block = builder.create_block();
+    builder
+        .ins()
+        .brif(lhs_gt, lhs_gt_block, &[], rhs_gt_block, &[]);
+
+    builder.switch_to_block(lhs_gt_block);
+    builder.seal_block(lhs_gt_block);
+    let diff_ptr = bigint_sub_abs(builder, alloc_ref, lhs_ptr, rhs_ptr);
+    bigint_store_sign(builder, diff_ptr, lhs_sign);
+    bigint_normalize(builder, diff_ptr);
+    builder.ins().jump(merge, &[BlockArg::Value(diff_ptr)]);
+
+    builder.switch_to_block(rhs_gt_block);
+    builder.seal_block(rhs_gt_block);
+    let diff_ptr = bigint_sub_abs(builder, alloc_ref, rhs_ptr, lhs_ptr);
+    bigint_store_sign(builder, diff_ptr, rhs_sign);
+    bigint_normalize(builder, diff_ptr);
+    builder.ins().jump(merge, &[BlockArg::Value(diff_ptr)]);
+
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    builder.block_params(merge)[0]
+}
+
+fn bigint_signed_cmp(
+    builder: &mut FunctionBuilder,
+    lhs_ptr: Value,
+    lhs_sign: Value,
+    rhs_ptr: Value,
+    rhs_sign: Value,
+) -> Value {
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+
+    let signs_equal = builder.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
+    let same_sign_block = builder.create_block();
+    let diff_sign_block = builder.create_block();
+    builder
+        .ins()
+        .brif(signs_equal, same_sign_block, &[], diff_sign_block, &[]);
+
+    builder.switch_to_block(diff_sign_block);
+    builder.seal_block(diff_sign_block);
+    let lhs_gt = builder
+        .ins()
+        .icmp(IntCC::SignedGreaterThan, lhs_sign, rhs_sign);
+    let one = builder.ins().iconst(types::I64, 1);
+    let minus_one = builder.ins().iconst(types::I64, -1);
+    let raw = builder.ins().select(lhs_gt, one, minus_one);
+    builder.ins().jump(merge, &[BlockArg::Value(raw)]);
+
+    builder.switch_to_block(same_sign_block);
+    builder.seal_block(same_sign_block);
+    let sign_zero = builder.ins().icmp_imm(IntCC::Equal, lhs_sign, 0);
+    let zero_block = builder.create_block();
+    let cmp_block = builder.create_block();
+    builder
+        .ins()
+        .brif(sign_zero, zero_block, &[], cmp_block, &[]);
+
+    builder.switch_to_block(zero_block);
+    builder.seal_block(zero_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(merge, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(cmp_block);
+    builder.seal_block(cmp_block);
+    let cmp = bigint_cmp_abs(builder, lhs_ptr, rhs_ptr);
+    let sign_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, lhs_sign, 0);
+    let neg_block = builder.create_block();
+    let pos_block = builder.create_block();
+    builder
+        .ins()
+        .brif(sign_negative, neg_block, &[], pos_block, &[]);
+
+    builder.switch_to_block(pos_block);
+    builder.seal_block(pos_block);
+    builder.ins().jump(merge, &[BlockArg::Value(cmp)]);
+
+    builder.switch_to_block(neg_block);
+    builder.seal_block(neg_block);
+    let neg_cmp = builder.ins().ineg(cmp);
+    builder.ins().jump(merge, &[BlockArg::Value(neg_cmp)]);
+
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    builder.block_params(merge)[0]
+}
+
+fn bigint_zero(builder: &mut FunctionBuilder, alloc_ref: FuncRef) -> Value {
+    let zero_cap = builder.ins().iconst(types::I64, 0);
+    let zero_ptr = bigint_alloc(builder, alloc_ref, zero_cap);
+    let zero = builder.ins().iconst(types::I64, 0);
+    bigint_store_sign(builder, zero_ptr, zero);
+    bigint_store_len(builder, zero_ptr, zero);
+    zero_ptr
+}
+
+fn bigint_one(builder: &mut FunctionBuilder, alloc_ref: FuncRef) -> Value {
+    let one = builder.ins().iconst(types::I64, 1);
+    let ptr = bigint_alloc(builder, alloc_ref, one);
+    bigint_store_sign(builder, ptr, one);
+    bigint_store_len(builder, ptr, one);
+    let zero = builder.ins().iconst(types::I64, 0);
+    bigint_store_limb(builder, ptr, zero, one);
+    ptr
+}
+
+fn bigint_mul_abs(
+    builder: &mut FunctionBuilder,
+    alloc_ref: FuncRef,
+    lhs: Value,
+    rhs: Value,
+) -> Value {
+    let lhs_len = bigint_load_len(builder, lhs);
+    let rhs_len = bigint_load_len(builder, rhs);
+    let cap = builder.ins().iadd(lhs_len, rhs_len);
+    let result = bigint_alloc(builder, alloc_ref, cap);
+    bigint_store_len(builder, result, cap);
+
+    let init_loop = builder.create_block();
+    let init_body = builder.create_block();
+    let init_done = builder.create_block();
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.append_block_param(init_loop, types::I64);
+    builder.ins().jump(init_loop, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(init_loop);
+    let init_idx = builder.block_params(init_loop)[0];
+    let init_more = builder.ins().icmp(IntCC::UnsignedLessThan, init_idx, cap);
+    builder
+        .ins()
+        .brif(init_more, init_body, &[], init_done, &[]);
+
+    builder.switch_to_block(init_body);
+    builder.seal_block(init_body);
+    bigint_store_limb(builder, result, init_idx, zero);
+    let init_next = builder.ins().iadd_imm(init_idx, 1);
+    builder.ins().jump(init_loop, &[BlockArg::Value(init_next)]);
+
+    builder.switch_to_block(init_done);
+    builder.seal_block(init_done);
+    builder.seal_block(init_loop);
+
+    let outer_loop = builder.create_block();
+    let outer_body = builder.create_block();
+    let outer_done = builder.create_block();
+    builder.append_block_param(outer_loop, types::I64);
+    builder.ins().jump(outer_loop, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(outer_loop);
+    let i = builder.block_params(outer_loop)[0];
+    let outer_more = builder.ins().icmp(IntCC::UnsignedLessThan, i, lhs_len);
+    builder
+        .ins()
+        .brif(outer_more, outer_body, &[], outer_done, &[]);
+
+    builder.switch_to_block(outer_body);
+    builder.seal_block(outer_body);
+    let lhs_limb = bigint_load_limb(builder, lhs, i);
+    let inner_loop = builder.create_block();
+    let inner_body = builder.create_block();
+    let inner_done = builder.create_block();
+    builder.append_block_param(inner_loop, types::I64);
+    builder.append_block_param(inner_loop, types::I64);
+    builder.append_block_param(inner_done, types::I64);
+    builder
+        .ins()
+        .jump(inner_loop, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+
+    builder.switch_to_block(inner_loop);
+    let j = builder.block_params(inner_loop)[0];
+    let carry = builder.block_params(inner_loop)[1];
+    let inner_more = builder.ins().icmp(IntCC::UnsignedLessThan, j, rhs_len);
+    builder.ins().brif(
+        inner_more,
+        inner_body,
+        &[],
+        inner_done,
+        &[BlockArg::Value(carry)],
+    );
+
+    builder.switch_to_block(inner_body);
+    builder.seal_block(inner_body);
+    let rhs_limb = bigint_load_limb(builder, rhs, j);
+    let idx = builder.ins().iadd(i, j);
+    let existing = bigint_load_limb(builder, result, idx);
+    let prod = builder.ins().imul(lhs_limb, rhs_limb);
+    let tmp = builder.ins().iadd(existing, prod);
+    let total = builder.ins().iadd(tmp, carry);
+    let mask = builder.ins().iconst(types::I64, 0xffff_ffff);
+    let low = builder.ins().band(total, mask);
+    bigint_store_limb(builder, result, idx, low);
+    let next_carry = builder.ins().ushr_imm(total, 32);
+    let next_j = builder.ins().iadd_imm(j, 1);
+    builder.ins().jump(
+        inner_loop,
+        &[BlockArg::Value(next_j), BlockArg::Value(next_carry)],
+    );
+
+    builder.switch_to_block(inner_done);
+    builder.seal_block(inner_done);
+    builder.seal_block(inner_loop);
+    let final_carry = builder.block_params(inner_done)[0];
+    let carry_loop = builder.create_block();
+    let carry_body = builder.create_block();
+    let carry_done = builder.create_block();
+    let carry_idx0 = builder.ins().iadd(i, rhs_len);
+    builder.append_block_param(carry_loop, types::I64);
+    builder.append_block_param(carry_loop, types::I64);
+    builder.ins().jump(
+        carry_loop,
+        &[BlockArg::Value(carry_idx0), BlockArg::Value(final_carry)],
+    );
+
+    builder.switch_to_block(carry_loop);
+    let carry_idx = builder.block_params(carry_loop)[0];
+    let carry_val = builder.block_params(carry_loop)[1];
+    let carry_more = builder.ins().icmp_imm(IntCC::NotEqual, carry_val, 0);
+    builder
+        .ins()
+        .brif(carry_more, carry_body, &[], carry_done, &[]);
+
+    builder.switch_to_block(carry_body);
+    builder.seal_block(carry_body);
+    let existing = bigint_load_limb(builder, result, carry_idx);
+    let total = builder.ins().iadd(existing, carry_val);
+    let mask = builder.ins().iconst(types::I64, 0xffff_ffff);
+    let low = builder.ins().band(total, mask);
+    bigint_store_limb(builder, result, carry_idx, low);
+    let next_carry = builder.ins().ushr_imm(total, 32);
+    let next_idx = builder.ins().iadd_imm(carry_idx, 1);
+    builder.ins().jump(
+        carry_loop,
+        &[BlockArg::Value(next_idx), BlockArg::Value(next_carry)],
+    );
+
+    builder.switch_to_block(carry_done);
+    builder.seal_block(carry_done);
+    builder.seal_block(carry_loop);
+    let next_i = builder.ins().iadd_imm(i, 1);
+    builder.ins().jump(outer_loop, &[BlockArg::Value(next_i)]);
+
+    builder.switch_to_block(outer_done);
+    builder.seal_block(outer_done);
+    builder.seal_block(outer_loop);
+    bigint_normalize(builder, result);
+    result
+}
+
 fn define_runtime_fn(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -696,8 +1691,17 @@ fn define_runtime_ir_jit(
     arena_base_addr: i64,
     arena_offset_addr: i64,
     oom_host_addr: i64,
+    bigint_enabled: bool,
+    list_enabled: bool,
+    list_mutation_enabled: bool,
 ) -> RuntimeBuiltins {
-    let ids = declare_runtime_function_ids(module, isa);
+    let ids = declare_runtime_function_ids(
+        module,
+        isa,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     define_rt_host_oom_shim(module, isa, flags, ids.oom, oom_host_addr);
     define_rt_alloc_from_addrs(
         module,
@@ -708,7 +1712,15 @@ fn define_runtime_ir_jit(
         arena_base_addr,
         arena_offset_addr,
     );
-    define_runtime_operations(module, isa, flags, &ids);
+    define_runtime_operations(
+        module,
+        isa,
+        flags,
+        &ids,
+        bigint_enabled,
+        list_enabled,
+        list_mutation_enabled,
+    );
     ids.builtins
 }
 
@@ -1050,6 +2062,8 @@ fn define_rt_binary_op(
     id: FuncId,
     _to_i64_id: FuncId,
     int_id: FuncId,
+    bigint_from_int_id: Option<FuncId>,
+    bigint_id: Option<FuncId>,
     op: &str,
 ) {
     let module_ptr: *mut _ = module;
@@ -1061,15 +2075,24 @@ fn define_rt_binary_op(
         &[types::I64, types::I64, types::I64, types::I64],
         |b, p, func| {
             let make_int = unsafe { (&mut *module_ptr).declare_func_in_func(int_id, func) };
+            let bigint_from_int_ref = bigint_from_int_id
+                .map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
+            let bigint_ref =
+                bigint_id.map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
             let lhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_INT);
-            b.ins()
-                .trapz(lhs_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
             let rhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_INT);
-            b.ins()
-                .trapz(rhs_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+            let both_int = b.ins().band(lhs_is_int, rhs_is_int);
+            let int_block = b.create_block();
+            let non_int_block = b.create_block();
+            let merge_block = b.create_block();
+            b.append_block_param(merge_block, types::I64);
+            b.append_block_param(merge_block, types::I64);
+            b.ins().brif(both_int, int_block, &[], non_int_block, &[]);
+
+            b.switch_to_block(int_block);
+            b.seal_block(int_block);
             let lhs = p[1];
             let rhs = p[3];
-
             let raw = match op {
                 "add" => {
                     let (sum, ovf) = b.ins().sadd_overflow(lhs, rhs);
@@ -1109,7 +2132,591 @@ fn define_rt_binary_op(
             let out = b.ins().call(make_int, &[raw]);
             let result_tag = b.inst_results(out)[0];
             let result_payload = b.inst_results(out)[1];
+            b.ins().jump(
+                merge_block,
+                &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+            );
+
+            b.switch_to_block(non_int_block);
+            b.seal_block(non_int_block);
+            if let (Some(bigint_ref), Some(bigint_from_int_ref)) = (bigint_ref, bigint_from_int_ref)
+            {
+                let lhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_BIGINT);
+                let rhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_BIGINT);
+                let both_bigint = b.ins().band(lhs_is_bigint, rhs_is_bigint);
+                let bigint_block = b.create_block();
+                let lhs_promote_check_block = b.create_block();
+                let lhs_promote_block = b.create_block();
+                let rhs_promote_check_block = b.create_block();
+                let rhs_promote_block = b.create_block();
+                let trap_block = b.create_block();
+                b.ins()
+                    .brif(both_bigint, bigint_block, &[], lhs_promote_check_block, &[]);
+
+                b.switch_to_block(bigint_block);
+                b.seal_block(bigint_block);
+                let out = b.ins().call(bigint_ref, &[p[0], p[1], p[2], p[3]]);
+                let result_tag = b.inst_results(out)[0];
+                let result_payload = b.inst_results(out)[1];
+                b.ins().jump(
+                    merge_block,
+                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                );
+
+                b.switch_to_block(lhs_promote_check_block);
+                b.seal_block(lhs_promote_check_block);
+                let lhs_int_rhs_bigint = b.ins().band(lhs_is_int, rhs_is_bigint);
+                b.ins().brif(
+                    lhs_int_rhs_bigint,
+                    lhs_promote_block,
+                    &[],
+                    rhs_promote_check_block,
+                    &[],
+                );
+
+                b.switch_to_block(lhs_promote_block);
+                b.seal_block(lhs_promote_block);
+                let lhs_big = b.ins().call(bigint_from_int_ref, &[p[0], p[1]]);
+                let lhs_big_tag = b.inst_results(lhs_big)[0];
+                let lhs_big_payload = b.inst_results(lhs_big)[1];
+                let out = b
+                    .ins()
+                    .call(bigint_ref, &[lhs_big_tag, lhs_big_payload, p[2], p[3]]);
+                let result_tag = b.inst_results(out)[0];
+                let result_payload = b.inst_results(out)[1];
+                b.ins().jump(
+                    merge_block,
+                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                );
+
+                b.switch_to_block(rhs_promote_check_block);
+                b.seal_block(rhs_promote_check_block);
+                let rhs_int_lhs_bigint = b.ins().band(lhs_is_bigint, rhs_is_int);
+                b.ins()
+                    .brif(rhs_int_lhs_bigint, rhs_promote_block, &[], trap_block, &[]);
+
+                b.switch_to_block(rhs_promote_block);
+                b.seal_block(rhs_promote_block);
+                let rhs_big = b.ins().call(bigint_from_int_ref, &[p[2], p[3]]);
+                let rhs_big_tag = b.inst_results(rhs_big)[0];
+                let rhs_big_payload = b.inst_results(rhs_big)[1];
+                let out = b
+                    .ins()
+                    .call(bigint_ref, &[p[0], p[1], rhs_big_tag, rhs_big_payload]);
+                let result_tag = b.inst_results(out)[0];
+                let result_payload = b.inst_results(out)[1];
+                b.ins().jump(
+                    merge_block,
+                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                );
+
+                b.switch_to_block(trap_block);
+                b.seal_block(trap_block);
+                b.ins().trap(TrapCode::BAD_CONVERSION_TO_INTEGER);
+            } else {
+                b.ins().trap(TrapCode::BAD_CONVERSION_TO_INTEGER);
+            }
+
+            b.switch_to_block(merge_block);
+            b.seal_block(merge_block);
+            let result_tag = b.block_params(merge_block)[0];
+            let result_payload = b.block_params(merge_block)[1];
             b.ins().return_(&[result_tag, result_payload]);
+        },
+    );
+}
+
+fn define_rt_bigint_from_int(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let raw = pair_payload_for_tag(b, p[0], p[1], TAG_INT);
+            let zero = b.ins().iconst(types::I64, 0);
+            let is_zero = b.ins().icmp(IntCC::Equal, raw, zero);
+            let zero_block = b.create_block();
+            let non_zero_block = b.create_block();
+            let merge_block = b.create_block();
+            b.append_block_param(merge_block, types::I64);
+            b.ins().brif(is_zero, zero_block, &[], non_zero_block, &[]);
+
+            b.switch_to_block(zero_block);
+            b.seal_block(zero_block);
+            let zero_ptr = bigint_alloc(b, alloc_ref, zero);
+            b.ins().jump(merge_block, &[BlockArg::Value(zero_ptr)]);
+
+            b.switch_to_block(non_zero_block);
+            b.seal_block(non_zero_block);
+            let is_negative = b.ins().icmp_imm(IntCC::SignedLessThan, raw, 0);
+            let neg_block = b.create_block();
+            let pos_block = b.create_block();
+            let sign_merge = b.create_block();
+            b.append_block_param(sign_merge, types::I64);
+            b.append_block_param(sign_merge, types::I64);
+            b.ins().brif(is_negative, neg_block, &[], pos_block, &[]);
+
+            b.switch_to_block(neg_block);
+            b.seal_block(neg_block);
+            let sign = b.ins().iconst(types::I64, -1);
+            let abs = b.ins().isub(zero, raw);
+            b.ins()
+                .jump(sign_merge, &[BlockArg::Value(sign), BlockArg::Value(abs)]);
+
+            b.switch_to_block(pos_block);
+            b.seal_block(pos_block);
+            let sign = b.ins().iconst(types::I64, 1);
+            b.ins()
+                .jump(sign_merge, &[BlockArg::Value(sign), BlockArg::Value(raw)]);
+
+            b.switch_to_block(sign_merge);
+            b.seal_block(sign_merge);
+            let sign = b.block_params(sign_merge)[0];
+            let abs = b.block_params(sign_merge)[1];
+            let high = b.ins().ushr_imm(abs, 32);
+            let has_high = b.ins().icmp_imm(IntCC::NotEqual, high, 0);
+            let high_block = b.create_block();
+            let low_block = b.create_block();
+            let cap_merge = b.create_block();
+            b.append_block_param(cap_merge, types::I64);
+            b.ins().brif(has_high, high_block, &[], low_block, &[]);
+
+            b.switch_to_block(high_block);
+            b.seal_block(high_block);
+            let two = b.ins().iconst(types::I64, 2);
+            b.ins().jump(cap_merge, &[BlockArg::Value(two)]);
+
+            b.switch_to_block(low_block);
+            b.seal_block(low_block);
+            let one = b.ins().iconst(types::I64, 1);
+            b.ins().jump(cap_merge, &[BlockArg::Value(one)]);
+
+            b.switch_to_block(cap_merge);
+            b.seal_block(cap_merge);
+            let cap = b.block_params(cap_merge)[0];
+            let header_ptr = bigint_alloc(b, alloc_ref, cap);
+            bigint_store_sign(b, header_ptr, sign);
+            bigint_store_len(b, header_ptr, cap);
+            let mask = b.ins().iconst(types::I64, 0xffff_ffff);
+            let low = b.ins().band(abs, mask);
+            let zero_index = b.ins().iconst(types::I64, 0);
+            bigint_store_limb(b, header_ptr, zero_index, low);
+            let one_index = b.ins().iconst(types::I64, 1);
+            let has_second = b.ins().icmp_imm(IntCC::Equal, cap, 2);
+            let second_block = b.create_block();
+            let done_block = b.create_block();
+            b.ins().brif(has_second, second_block, &[], done_block, &[]);
+
+            b.switch_to_block(second_block);
+            b.seal_block(second_block);
+            bigint_store_limb(b, header_ptr, one_index, high);
+            b.ins().jump(done_block, &[]);
+
+            b.switch_to_block(done_block);
+            b.seal_block(done_block);
+            bigint_normalize(b, header_ptr);
+            b.ins().jump(merge_block, &[BlockArg::Value(header_ptr)]);
+
+            b.switch_to_block(merge_block);
+            b.seal_block(merge_block);
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            let ptr = b.block_params(merge_block)[0];
+            b.ins().return_(&[tag, ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_add(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            let lhs_sign = bigint_load_sign(b, lhs_ptr);
+            let rhs_sign = bigint_load_sign(b, rhs_ptr);
+            let result_ptr = emit_bigint_addsub(b, alloc_ref, lhs_ptr, lhs_sign, rhs_ptr, rhs_sign);
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_subtract(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            let lhs_sign = bigint_load_sign(b, lhs_ptr);
+            let rhs_sign = bigint_load_sign(b, rhs_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+            let rhs_is_zero = b.ins().icmp(IntCC::Equal, rhs_sign, zero);
+            let neg_block = b.create_block();
+            let zero_block = b.create_block();
+            let merge = b.create_block();
+            b.append_block_param(merge, types::I64);
+            b.ins().brif(rhs_is_zero, zero_block, &[], neg_block, &[]);
+
+            b.switch_to_block(zero_block);
+            b.seal_block(zero_block);
+            b.ins().jump(merge, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(neg_block);
+            b.seal_block(neg_block);
+            let neg_rhs_sign = b.ins().isub(zero, rhs_sign);
+            b.ins().jump(merge, &[BlockArg::Value(neg_rhs_sign)]);
+
+            b.switch_to_block(merge);
+            b.seal_block(merge);
+            let effective_rhs_sign = b.block_params(merge)[0];
+            let result_ptr =
+                emit_bigint_addsub(b, alloc_ref, lhs_ptr, lhs_sign, rhs_ptr, effective_rhs_sign);
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_compare(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    int_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let make_int = unsafe { (&mut *module_ptr).declare_func_in_func(int_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            let lhs_sign = bigint_load_sign(b, lhs_ptr);
+            let rhs_sign = bigint_load_sign(b, rhs_ptr);
+            let raw = bigint_signed_cmp(b, lhs_ptr, lhs_sign, rhs_ptr, rhs_sign);
+            let out = b.ins().call(make_int, &[raw]);
+            let result_tag = b.inst_results(out)[0];
+            let result_payload = b.inst_results(out)[1];
+            b.ins().return_(&[result_tag, result_payload]);
+        },
+    );
+}
+
+fn define_rt_bigint_multiply(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            let lhs_sign = bigint_load_sign(b, lhs_ptr);
+            let rhs_sign = bigint_load_sign(b, rhs_ptr);
+
+            let merge = b.create_block();
+            b.append_block_param(merge, types::I64);
+
+            let lhs_zero = b.ins().icmp_imm(IntCC::Equal, lhs_sign, 0);
+            let rhs_zero = b.ins().icmp_imm(IntCC::Equal, rhs_sign, 0);
+            let either_zero = b.ins().bor(lhs_zero, rhs_zero);
+            let zero_block = b.create_block();
+            let mul_block = b.create_block();
+            b.ins().brif(either_zero, zero_block, &[], mul_block, &[]);
+
+            b.switch_to_block(zero_block);
+            b.seal_block(zero_block);
+            let zero_ptr = bigint_zero(b, alloc_ref);
+            b.ins().jump(merge, &[BlockArg::Value(zero_ptr)]);
+
+            b.switch_to_block(mul_block);
+            b.seal_block(mul_block);
+            let result_ptr = bigint_mul_abs(b, alloc_ref, lhs_ptr, rhs_ptr);
+            let signs_equal = b.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
+            let pos_one = b.ins().iconst(types::I64, 1);
+            let neg_one = b.ins().iconst(types::I64, -1);
+            let out_sign = b.ins().select(signs_equal, pos_one, neg_one);
+            bigint_store_sign(b, result_ptr, out_sign);
+            bigint_normalize(b, result_ptr);
+            b.ins().jump(merge, &[BlockArg::Value(result_ptr)]);
+
+            b.switch_to_block(merge);
+            b.seal_block(merge);
+            let result_ptr = b.block_params(merge)[0];
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_divide(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            let lhs_sign = bigint_load_sign(b, lhs_ptr);
+            let rhs_sign = bigint_load_sign(b, rhs_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+            let one = b.ins().iconst(types::I64, 1);
+            let neg_one = b.ins().iconst(types::I64, -1);
+
+            let rhs_is_zero = b.ins().icmp(IntCC::Equal, rhs_sign, zero);
+            b.ins()
+                .trapnz(rhs_is_zero, TrapCode::INTEGER_DIVISION_BY_ZERO);
+
+            let lhs_is_zero = b.ins().icmp(IntCC::Equal, lhs_sign, zero);
+            let zero_block = b.create_block();
+            let work_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(done_block, types::I64);
+            b.ins().brif(lhs_is_zero, zero_block, &[], work_block, &[]);
+
+            b.switch_to_block(zero_block);
+            b.seal_block(zero_block);
+            let zero_ptr = bigint_zero(b, alloc_ref);
+            b.ins().jump(done_block, &[BlockArg::Value(zero_ptr)]);
+
+            b.switch_to_block(work_block);
+            b.seal_block(work_block);
+            let outer_loop = b.create_block();
+            let outer_body = b.create_block();
+            let outer_done = b.create_block();
+            b.append_block_param(outer_loop, types::I64);
+            b.append_block_param(outer_loop, types::I64);
+            let quotient0 = bigint_zero(b, alloc_ref);
+            b.ins().jump(
+                outer_loop,
+                &[BlockArg::Value(quotient0), BlockArg::Value(lhs_ptr)],
+            );
+
+            b.switch_to_block(outer_loop);
+            let quotient = b.block_params(outer_loop)[0];
+            let remainder = b.block_params(outer_loop)[1];
+            let cmp = bigint_cmp_abs(b, remainder, rhs_ptr);
+            let has_more = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, cmp, 0);
+            b.ins().brif(has_more, outer_body, &[], outer_done, &[]);
+
+            b.switch_to_block(outer_body);
+            b.seal_block(outer_body);
+            let inner_loop = b.create_block();
+            let inner_body = b.create_block();
+            let inner_done = b.create_block();
+            b.append_block_param(inner_loop, types::I64);
+            b.append_block_param(inner_loop, types::I64);
+            let multiple0 = bigint_one(b, alloc_ref);
+            b.ins().jump(
+                inner_loop,
+                &[BlockArg::Value(rhs_ptr), BlockArg::Value(multiple0)],
+            );
+
+            b.switch_to_block(inner_loop);
+            let current = b.block_params(inner_loop)[0];
+            let multiple = b.block_params(inner_loop)[1];
+            let doubled = bigint_add_abs(b, alloc_ref, current, current);
+            let doubled_cmp = bigint_cmp_abs(b, doubled, remainder);
+            let can_double = b
+                .ins()
+                .icmp_imm(IntCC::SignedLessThanOrEqual, doubled_cmp, 0);
+            b.ins().brif(can_double, inner_body, &[], inner_done, &[]);
+
+            b.switch_to_block(inner_body);
+            b.seal_block(inner_body);
+            let doubled_multiple = bigint_add_abs(b, alloc_ref, multiple, multiple);
+            b.ins().jump(
+                inner_loop,
+                &[BlockArg::Value(doubled), BlockArg::Value(doubled_multiple)],
+            );
+
+            b.switch_to_block(inner_done);
+            b.seal_block(inner_done);
+            let best_current = b.block_params(inner_loop)[0];
+            let best_multiple = b.block_params(inner_loop)[1];
+            let next_remainder = bigint_sub_abs(b, alloc_ref, remainder, best_current);
+            let next_quotient = bigint_add_abs(b, alloc_ref, quotient, best_multiple);
+            b.ins().jump(
+                outer_loop,
+                &[
+                    BlockArg::Value(next_quotient),
+                    BlockArg::Value(next_remainder),
+                ],
+            );
+
+            b.switch_to_block(outer_done);
+            let raw_quotient = b.block_params(outer_loop)[0];
+            let signs_equal = b.ins().icmp(IntCC::Equal, lhs_sign, rhs_sign);
+            let out_sign = b.ins().select(signs_equal, one, neg_one);
+            bigint_store_sign(b, raw_quotient, out_sign);
+            bigint_normalize(b, raw_quotient);
+            b.ins().jump(done_block, &[BlockArg::Value(raw_quotient)]);
+
+            b.seal_block(outer_loop);
+            b.seal_block(outer_done);
+            b.seal_block(inner_loop);
+
+            b.switch_to_block(done_block);
+            b.seal_block(done_block);
+            let result_ptr = b.block_params(done_block)[0];
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_modulo(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            let lhs_sign = bigint_load_sign(b, lhs_ptr);
+            let rhs_sign = bigint_load_sign(b, rhs_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+
+            let rhs_is_zero = b.ins().icmp(IntCC::Equal, rhs_sign, zero);
+            b.ins()
+                .trapnz(rhs_is_zero, TrapCode::INTEGER_DIVISION_BY_ZERO);
+
+            let lhs_is_zero = b.ins().icmp(IntCC::Equal, lhs_sign, zero);
+            let zero_block = b.create_block();
+            let work_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(done_block, types::I64);
+            b.ins().brif(lhs_is_zero, zero_block, &[], work_block, &[]);
+
+            b.switch_to_block(zero_block);
+            b.seal_block(zero_block);
+            let zero_ptr = bigint_zero(b, alloc_ref);
+            b.ins().jump(done_block, &[BlockArg::Value(zero_ptr)]);
+
+            b.switch_to_block(work_block);
+            b.seal_block(work_block);
+            let outer_loop = b.create_block();
+            let outer_body = b.create_block();
+            let outer_done = b.create_block();
+            b.append_block_param(outer_loop, types::I64);
+            b.ins().jump(outer_loop, &[BlockArg::Value(lhs_ptr)]);
+
+            b.switch_to_block(outer_loop);
+            let remainder = b.block_params(outer_loop)[0];
+            let cmp = bigint_cmp_abs(b, remainder, rhs_ptr);
+            let has_more = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, cmp, 0);
+            b.ins().brif(has_more, outer_body, &[], outer_done, &[]);
+
+            b.switch_to_block(outer_body);
+            b.seal_block(outer_body);
+            let inner_loop = b.create_block();
+            let inner_body = b.create_block();
+            let inner_done = b.create_block();
+            b.append_block_param(inner_loop, types::I64);
+            let current0 = rhs_ptr;
+            b.ins().jump(inner_loop, &[BlockArg::Value(current0)]);
+
+            b.switch_to_block(inner_loop);
+            let current = b.block_params(inner_loop)[0];
+            let doubled = bigint_add_abs(b, alloc_ref, current, current);
+            let doubled_cmp = bigint_cmp_abs(b, doubled, remainder);
+            let can_double = b
+                .ins()
+                .icmp_imm(IntCC::SignedLessThanOrEqual, doubled_cmp, 0);
+            b.ins().brif(can_double, inner_body, &[], inner_done, &[]);
+
+            b.switch_to_block(inner_body);
+            b.seal_block(inner_body);
+            b.ins().jump(inner_loop, &[BlockArg::Value(doubled)]);
+
+            b.switch_to_block(inner_done);
+            b.seal_block(inner_done);
+            let best_current = b.block_params(inner_loop)[0];
+            let next_remainder = bigint_sub_abs(b, alloc_ref, remainder, best_current);
+            b.ins().jump(outer_loop, &[BlockArg::Value(next_remainder)]);
+
+            b.switch_to_block(outer_done);
+            let raw_remainder = b.block_params(outer_loop)[0];
+            bigint_store_sign(b, raw_remainder, lhs_sign);
+            bigint_normalize(b, raw_remainder);
+            b.ins().jump(done_block, &[BlockArg::Value(raw_remainder)]);
+
+            b.seal_block(outer_loop);
+            b.seal_block(outer_done);
+            b.seal_block(inner_loop);
+
+            b.switch_to_block(done_block);
+            b.seal_block(done_block);
+            let result_ptr = b.block_params(done_block)[0];
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
         },
     );
 }
@@ -1121,6 +2728,8 @@ fn define_rt_compare_op(
     id: FuncId,
     _to_i64_id: FuncId,
     int_id: FuncId,
+    bigint_from_int_id: Option<FuncId>,
+    bigint_compare_id: Option<FuncId>,
     cc: IntCC,
 ) {
     let module_ptr: *mut _ = module;
@@ -1132,22 +2741,113 @@ fn define_rt_compare_op(
         &[types::I64, types::I64, types::I64, types::I64],
         |b, p, func| {
             let make_int = unsafe { (&mut *module_ptr).declare_func_in_func(int_id, func) };
-            let lhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_INT);
-            b.ins()
-                .trapz(lhs_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
-            let rhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_INT);
-            b.ins()
-                .trapz(rhs_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
-            let lhs = p[1];
-            let rhs = p[3];
-            let cmp = b.ins().icmp(cc, lhs, rhs);
+            let bigint_from_int_ref = bigint_from_int_id
+                .map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
+            let bigint_compare_ref = bigint_compare_id
+                .map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
             let one = b.ins().iconst(types::I64, 1);
             let zero = b.ins().iconst(types::I64, 0);
-            let raw = b.ins().select(cmp, one, zero);
+            let lhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_INT);
+            let rhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_INT);
+            let both_int = b.ins().band(lhs_is_int, rhs_is_int);
+            let int_block = b.create_block();
+            let non_int_block = b.create_block();
+            let merge = b.create_block();
+            let trap_block = b.create_block();
+            b.append_block_param(merge, types::I64);
+            b.ins().brif(both_int, int_block, &[], non_int_block, &[]);
+
+            b.switch_to_block(int_block);
+            b.seal_block(int_block);
+            let int_cmp = b.ins().icmp(cc, p[1], p[3]);
+            let int_raw = b.ins().select(int_cmp, one, zero);
+            b.ins().jump(merge, &[BlockArg::Value(int_raw)]);
+
+            b.switch_to_block(non_int_block);
+            b.seal_block(non_int_block);
+            if let (Some(bigint_compare_ref), Some(bigint_from_int_ref)) =
+                (bigint_compare_ref, bigint_from_int_ref)
+            {
+                let lhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_BIGINT);
+                let rhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_BIGINT);
+                let both_bigint = b.ins().band(lhs_is_bigint, rhs_is_bigint);
+                let bigint_block = b.create_block();
+                let lhs_promote_check_block = b.create_block();
+                let lhs_promote_block = b.create_block();
+                let rhs_promote_check_block = b.create_block();
+                let rhs_promote_block = b.create_block();
+                b.ins()
+                    .brif(both_bigint, bigint_block, &[], lhs_promote_check_block, &[]);
+
+                b.switch_to_block(bigint_block);
+                b.seal_block(bigint_block);
+                let cmp_call = b.ins().call(bigint_compare_ref, &[p[0], p[1], p[2], p[3]]);
+                let cmp_raw = b.inst_results(cmp_call)[1];
+                let cmp = b.ins().icmp_imm(cc, cmp_raw, 0);
+                let bigint_raw = b.ins().select(cmp, one, zero);
+                b.ins().jump(merge, &[BlockArg::Value(bigint_raw)]);
+
+                b.switch_to_block(lhs_promote_check_block);
+                b.seal_block(lhs_promote_check_block);
+                let lhs_int_rhs_bigint = b.ins().band(lhs_is_int, rhs_is_bigint);
+                b.ins().brif(
+                    lhs_int_rhs_bigint,
+                    lhs_promote_block,
+                    &[],
+                    rhs_promote_check_block,
+                    &[],
+                );
+
+                b.switch_to_block(lhs_promote_block);
+                b.seal_block(lhs_promote_block);
+                let lhs_big = b.ins().call(bigint_from_int_ref, &[p[0], p[1]]);
+                let lhs_big_tag = b.inst_results(lhs_big)[0];
+                let lhs_big_payload = b.inst_results(lhs_big)[1];
+                let cmp_call = b.ins().call(
+                    bigint_compare_ref,
+                    &[lhs_big_tag, lhs_big_payload, p[2], p[3]],
+                );
+                let cmp_raw = b.inst_results(cmp_call)[1];
+                let cmp = b.ins().icmp_imm(cc, cmp_raw, 0);
+                let bigint_raw = b.ins().select(cmp, one, zero);
+                b.ins().jump(merge, &[BlockArg::Value(bigint_raw)]);
+
+                b.switch_to_block(rhs_promote_check_block);
+                b.seal_block(rhs_promote_check_block);
+                let rhs_int_lhs_bigint = b.ins().band(lhs_is_bigint, rhs_is_int);
+                b.ins()
+                    .brif(rhs_int_lhs_bigint, rhs_promote_block, &[], trap_block, &[]);
+
+                b.switch_to_block(rhs_promote_block);
+                b.seal_block(rhs_promote_block);
+                let rhs_big = b.ins().call(bigint_from_int_ref, &[p[2], p[3]]);
+                let rhs_big_tag = b.inst_results(rhs_big)[0];
+                let rhs_big_payload = b.inst_results(rhs_big)[1];
+                let cmp_call = b.ins().call(
+                    bigint_compare_ref,
+                    &[p[0], p[1], rhs_big_tag, rhs_big_payload],
+                );
+                let cmp_raw = b.inst_results(cmp_call)[1];
+                let cmp = b.ins().icmp_imm(cc, cmp_raw, 0);
+                let bigint_raw = b.ins().select(cmp, one, zero);
+                b.ins().jump(merge, &[BlockArg::Value(bigint_raw)]);
+            } else {
+                b.ins().jump(trap_block, &[]);
+            }
+
+            b.switch_to_block(merge);
+            b.seal_block(merge);
+            let raw = b.block_params(merge)[0];
             let out = b.ins().call(make_int, &[raw]);
             let result_tag = b.inst_results(out)[0];
             let result_payload = b.inst_results(out)[1];
             b.ins().return_(&[result_tag, result_payload]);
+
+            b.switch_to_block(trap_block);
+            b.seal_block(trap_block);
+            b.ins().trapnz(one, TrapCode::BAD_CONVERSION_TO_INTEGER);
+            let zero_pair = b.ins().iconst(types::I64, 0);
+            b.ins().return_(&[zero_pair, zero_pair]);
         },
     );
 }

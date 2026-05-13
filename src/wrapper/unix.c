@@ -2,11 +2,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define VALUE_TAG_INT 1
 #define VALUE_TAG_LIST 2
 #define VALUE_TAG_STRING 3
 #define VALUE_TAG_FUNCTION 4
+#define VALUE_TAG_BIGINT 5
 
 typedef struct Value {
     uint8_t tag;
@@ -19,6 +21,13 @@ typedef struct ListHeader {
     size_t len;
     size_t cap;
 } ListHeader;
+
+typedef struct BigIntHeader {
+    int64_t sign;
+    size_t len;
+    size_t cap;
+    uint32_t *ptr;
+} BigIntHeader;
 
 static const Value PRINT_ZERO = {VALUE_TAG_INT, {0, 0, 0, 0, 0, 0, 0}, 0};
 
@@ -35,6 +44,42 @@ static const Value *value_ptr(int64_t handle) {
 }
 
 static void print_value_ref(const Value *value) {
+    if (value->tag == VALUE_TAG_BIGINT) {
+        const BigIntHeader *header = (const BigIntHeader *)(uintptr_t)value->payload;
+        if (header->sign == 0 || header->len == 0) {
+            printf("0");
+            return;
+        }
+        uint32_t *work = malloc(header->len * sizeof(uint32_t));
+        if (work == NULL) {
+            runtime_trap("out of arena memory");
+        }
+        memcpy(work, header->ptr, header->len * sizeof(uint32_t));
+        uint32_t chunks[128];
+        size_t chunk_len = 0;
+        size_t len = header->len;
+        while (len > 0) {
+            uint64_t rem = 0;
+            for (size_t i = len; i-- > 0;) {
+                uint64_t cur = (rem << 32) | work[i];
+                work[i] = (uint32_t)(cur / 1000000000ULL);
+                rem = cur % 1000000000ULL;
+            }
+            chunks[chunk_len++] = (uint32_t)rem;
+            while (len > 0 && work[len - 1] == 0) {
+                len--;
+            }
+        }
+        free(work);
+        if (header->sign < 0) {
+            putchar('-');
+        }
+        printf("%" PRIu32, chunks[chunk_len - 1]);
+        for (size_t i = chunk_len - 1; i-- > 0;) {
+            printf("%09" PRIu32, chunks[i]);
+        }
+        return;
+    }
     if (value->tag == VALUE_TAG_INT) {
         printf("%" PRId64, value->payload);
         return;

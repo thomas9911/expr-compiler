@@ -1,0 +1,35 @@
+# Demonstrates the current BigInt feature set.
+
+fn main() do
+    a = 2147483647n
+    b = 2147483647n
+    ten = 10
+    c = bigint_from_int(ten)
+    d = bigint_from_int(25)
+    e = bigint_from_int(100)
+    f = bigint_from_int(7)
+
+    print(a)
+    print(bigint_compare(a, b))
+    print(a < b)
+    print(a + b)
+    print(bigint_add(a, b))
+    print(a * bigint_from_int(2))
+    print(bigint_multiply(a, bigint_from_int(2)))
+    print(d - c)
+    print(bigint_subtract(c, d))
+    print(e / f)
+    print(bigint_divide(e, f))
+    print(e % f)
+    print(bigint_modulo(e, f))
+    print(a + 5)
+    print(5 + a)
+    print(bigint_add(a, 5))
+    print(bigint_add(5, a))
+    print(a > 5)
+    print(5 < a)
+    print(bigint_compare(a, 5))
+    print(bigint_compare(5, a))
+
+    0
+end

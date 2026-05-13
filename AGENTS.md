@@ -30,6 +30,19 @@ Guidance for coding agents working in this repository.
 
 ## Current Language Features
 
+- BigInt values are supported:
+  - `123n`
+  - `bigint_from_int(x)`
+  - `bigint_compare(a, b)`
+  - `bigint_add(a, b)`
+  - `bigint_subtract(a, b)`
+  - `bigint_multiply(a, b)`
+  - `bigint_divide(a, b)`
+  - `bigint_modulo(a, b)`
+  - `a + b`, `a - b`, `a * b`, `a / b`, and `a % b` when both sides are `BigInt`
+  - `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, and `a >= b` when both sides are `BigInt`
+  - mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
+  - explicit `bigint_*` builtins also promote `Int` arguments to `BigInt`
 - Anonymous functions support captures:
   - `fn item -> item * factor end`
 - Higher-order list builtins are available:
@@ -99,6 +112,10 @@ From `Justfile`:
 - Cranelift and LLVM both lower function values as closure objects:
   - `TAG_FUNCTION`
   - payload = pointer to `{ function_ordinal, env_ptr }`
+- BigInt values use `TAG_BIGINT` and a dedicated heap object:
+  - `{ sign, len, cap, ptr }`
+  - limbs are `u32`
+- BigInt arithmetic and comparisons are implemented in backend IR, not in Rust runtime arithmetic helpers.
 - Print/list_print are still host-runtime boundaries.
 - LLVM core Wasm keeps print/list_print as custom imports for the Node runner.
 - LLVM component output is behind the Cargo feature `wasi`.

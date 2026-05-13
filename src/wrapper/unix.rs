@@ -23,6 +23,7 @@ enum ValueTag {
     List = 2,
     String = 3,
     Function = 4,
+    BigInt = 5,
 }
 
 #[repr(C)]
@@ -38,6 +39,14 @@ struct ListHeader {
     ptr: *mut Value,
     len: usize,
     cap: usize,
+}
+
+#[repr(C)]
+struct BigIntHeader {
+    sign: i64,
+    len: usize,
+    cap: usize,
+    ptr: *mut u32,
 }
 
 static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
@@ -164,6 +173,75 @@ fn write_i64(n: i64) {
 }
 
 fn print_value_inner(handle: i64) {
+    unsafe fn print_bigint(header: &BigIntHeader) {
+        if header.sign == 0 || header.len == 0 {
+            write_stdout(b"0");
+            return;
+        }
+
+        let limb_bytes = header.len * core::mem::size_of::<u32>();
+        let tmp_ptr = arena_alloc(limb_bytes, core::mem::align_of::<u32>()) as *mut u32;
+        core::ptr::copy_nonoverlapping(header.ptr, tmp_ptr, header.len);
+
+        let mut len = header.len;
+        let mut chunks = [0u32; 128];
+        let mut chunk_len = 0usize;
+        const BASE10: u64 = 1_000_000_000;
+
+        while len > 0 {
+            let mut rem = 0u64;
+            let mut i = len;
+            while i > 0 {
+                i -= 1;
+                let cur = (rem << 32) | (*tmp_ptr.add(i) as u64);
+                *tmp_ptr.add(i) = (cur / BASE10) as u32;
+                rem = cur % BASE10;
+            }
+            chunks[chunk_len] = rem as u32;
+            chunk_len += 1;
+            while len > 0 && *tmp_ptr.add(len - 1) == 0 {
+                len -= 1;
+            }
+        }
+
+        if header.sign < 0 {
+            write_stdout(b"-");
+        }
+        write_u32(chunks[chunk_len - 1], false);
+        let mut i = chunk_len - 1;
+        while i > 0 {
+            i -= 1;
+            write_u32(chunks[i], true);
+        }
+    }
+
+    fn write_u32(n: u32, zero_pad_9: bool) {
+        let mut value = n;
+        let mut rev_digits = [0u8; 10];
+        let mut rev_len = 0usize;
+        loop {
+            rev_digits[rev_len] = b'0' + (value % 10) as u8;
+            rev_len += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+
+        let min_width = if zero_pad_9 { 9 } else { rev_len };
+        let mut out = [b'0'; 10];
+        let mut idx = 0usize;
+        let pad = min_width.saturating_sub(rev_len);
+        idx += pad;
+        let mut i = rev_len;
+        while i > 0 {
+            i -= 1;
+            out[idx] = rev_digits[i];
+            idx += 1;
+        }
+        write_stdout(&out[..idx]);
+    }
+
     unsafe fn print_inline_value(value: &Value) {
         match value.tag {
             ValueTag::Int => write_i64(value.payload),
@@ -182,6 +260,10 @@ fn print_value_inner(handle: i64) {
             }
             ValueTag::String => runtime_abort(),
             ValueTag::Function => runtime_abort(),
+            ValueTag::BigInt => {
+                let header = &*(value.payload as usize as *const BigIntHeader);
+                print_bigint(header);
+            }
         }
     }
 
@@ -256,6 +338,7 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         2 => unsafe { alloc_value(ValueTag::List, payload) },
         3 => unsafe { alloc_value(ValueTag::String, payload) },
         4 => unsafe { alloc_value(ValueTag::Function, payload) },
+        5 => unsafe { alloc_value(ValueTag::BigInt, payload) },
         _ => runtime_abort(),
     }
 }

@@ -36,6 +36,11 @@ fn parse_integer(lex: &mut Lexer<'_>) -> Result<i64, LexingError> {
     }
 }
 
+fn parse_bigint_literal(lex: &mut Lexer<'_>) -> String {
+    let slice = lex.slice();
+    slice[..slice.len() - 1].to_string()
+}
+
 impl LexingError {
     fn from_lexer(lex: &mut Lexer<'_>) -> Self {
         LexingError {
@@ -53,6 +58,8 @@ pub enum Token {
     Indent,
     #[regex(r"[\r\n]+")]
     Newline,
+    #[regex(r"[0-9]+n", parse_bigint_literal)]
+    BigIntLiteral(String),
     #[regex(r"[0-9]+", parse_integer)]
     Integer(i64),
     #[token("+")]
@@ -114,6 +121,7 @@ impl Token {
         match self {
             Token::Indent => TokenKind::Space,
             Token::Newline => TokenKind::Newline,
+            Token::BigIntLiteral(_) => TokenKind::Integer,
             Token::Integer(_) => TokenKind::Integer,
             Token::Add => TokenKind::InfixOperator,
             Token::Arrow => TokenKind::Arrow,
@@ -250,6 +258,17 @@ fn tokenize_lambda_arrow() {
             Integer(2),
             EndBlock,
         ]
+    );
+}
+
+#[test]
+fn tokenize_bigint_literal() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("123n + 4").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![BigIntLiteral("123".to_string()), Add, Integer(4)]
     );
 }
 

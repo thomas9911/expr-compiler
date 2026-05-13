@@ -64,6 +64,30 @@ function renderValue(tag, payload, memory) {
     return `[${items.join(", ")}]`;
   }
 
+  if (tag === 5) {
+    const mem = new DataView(memory.buffer);
+    const headerPtr = Number(payload);
+    const sign = mem.getBigInt64(headerPtr + 0, true);
+    const len = Number(mem.getBigUint64(headerPtr + 8, true));
+    const limbsPtr = Number(mem.getBigUint64(headerPtr + 24, true));
+
+    if (sign === 0n || len === 0) {
+      return "0";
+    }
+
+    let value = 0n;
+    for (let i = len - 1; i >= 0; i--) {
+      const limb = BigInt(mem.getUint32(limbsPtr + i * 4, true));
+      value = (value << 32n) + limb;
+    }
+
+    if (sign < 0n) {
+      value = -value;
+    }
+
+    return value.toString();
+  }
+
   if (tag === 3) {
     return "<string>";
   }
