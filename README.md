@@ -65,6 +65,7 @@ Current string surface:
 ```text
 print("hello")
 print("line1\nline2")
+print(string_concat("ab", "cd"))
 print("abc" == "abc")
 print("abc" != "xyz")
 print(string_len("hello"))
@@ -75,6 +76,7 @@ Current behavior:
 - string literals are supported with basic escapes:
   - `\"`, `\\`, `\n`, `\r`, `\t`
 - `print` can print string values
+- `string_concat(a, b)` concatenates two strings and returns a fresh string
 - `string_len(s)` returns the byte length as an `Int`
 - `==` and `!=` compare string byte contents
 - `String == non-String` is false

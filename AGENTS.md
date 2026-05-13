@@ -46,10 +46,12 @@ Guidance for coding agents working in this repository.
 - String values are supported:
   - `"hello"`
   - `print("hello")`
+  - `string_concat("ab", "cd")`
   - `string_len("hello")`
   - `"a" == "a"`
   - `"a" != "b"`
   - string literals support `\"`, `\\`, `\n`, `\r`, and `\t`
+  - `string_concat(a, b)` returns a fresh string
   - string equality compares byte contents
   - `String == non-String` is false
   - `String != non-String` is true

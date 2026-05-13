@@ -1454,6 +1454,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     let len = self.build_string_len_load(raw, "string_len");
                     return self.int_value(len);
                 }
+                if name == "string_concat" {
+                    assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
+                    let lhs = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let rhs = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                    return self.build_string_concat(lhs, rhs, function);
+                }
                 let compiled = args
                     .iter()
                     .map(|arg| self.compile_ast(arg, vars, capture_slots, env_ptr, function))
@@ -3145,6 +3151,187 @@ impl<'ctx> LlvmCompiler<'ctx> {
             (&self.i64_type.const_zero(), equal_end),
         ]);
         phi.as_basic_value().into_int_value()
+    }
+
+    fn build_string_concat(
+        &self,
+        lhs: CompiledValue<'ctx>,
+        rhs: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let lhs_trap = self
+            .context
+            .append_basic_block(function, "string_concat_lhs_trap");
+        let lhs_ok = self
+            .context
+            .append_basic_block(function, "string_concat_lhs_ok");
+        let lhs_raw =
+            self.expect_tag_payload(lhs, TAG_STRING, "string_concat_lhs", lhs_ok, lhs_trap);
+        self.builder.position_at_end(lhs_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(lhs_ok);
+        let rhs_trap = self
+            .context
+            .append_basic_block(function, "string_concat_rhs_trap");
+        let rhs_ok = self
+            .context
+            .append_basic_block(function, "string_concat_rhs_ok");
+        let rhs_raw =
+            self.expect_tag_payload(rhs, TAG_STRING, "string_concat_rhs", rhs_ok, rhs_trap);
+        self.builder.position_at_end(rhs_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(rhs_ok);
+        let lhs_len = self.build_string_len_load(lhs_raw, "string_concat_lhs");
+        let rhs_len = self.build_string_len_load(rhs_raw, "string_concat_rhs");
+        let total_len = self
+            .builder
+            .build_int_add(lhs_len, rhs_len, "string_concat_total_len")
+            .expect("failed to add string lengths");
+
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let data_raw = self.build_boxed_call(alloc, &[total_len, align], "string_concat_data");
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                data_raw,
+                self.context.ptr_type(Default::default()),
+                "string_concat_data_ptr",
+            )
+            .expect("failed to convert string concat data ptr");
+        let lhs_data = self.build_string_ptr_load(lhs_raw, "string_concat_lhs");
+        let rhs_data = self.build_string_ptr_load(rhs_raw, "string_concat_rhs");
+
+        let copy_into = |this: &Self,
+                         src_ptr: PointerValue<'ctx>,
+                         start_index: IntValue<'ctx>,
+                         copy_len: IntValue<'ctx>,
+                         label: &str| {
+            let function = this
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_parent()
+                .unwrap();
+            let loop_block = this
+                .context
+                .append_basic_block(function, &format!("{label}_loop"));
+            let body_block = this
+                .context
+                .append_basic_block(function, &format!("{label}_body"));
+            let done_block = this
+                .context
+                .append_basic_block(function, &format!("{label}_done"));
+            this.builder
+                .build_unconditional_branch(loop_block)
+                .expect("failed to branch to string concat loop");
+            let entry_end = this.builder.get_insert_block().unwrap();
+
+            this.builder.position_at_end(loop_block);
+            let idx_phi = this
+                .builder
+                .build_phi(this.i64_type, &format!("{label}_idx"))
+                .expect("failed to build string concat idx phi");
+            idx_phi.add_incoming(&[(&this.i64_type.const_zero(), entry_end)]);
+            let idx = idx_phi.as_basic_value().into_int_value();
+            let more = this
+                .builder
+                .build_int_compare(IntPredicate::ULT, idx, copy_len, &format!("{label}_more"))
+                .expect("failed to compare string concat idx");
+            this.builder
+                .build_conditional_branch(more, body_block, done_block)
+                .expect("failed to branch in string concat loop");
+
+            this.builder.position_at_end(body_block);
+            let src_addr = this
+                .builder
+                .build_int_add(
+                    this.builder
+                        .build_ptr_to_int(src_ptr, this.i64_type, &format!("{label}_src_base"))
+                        .expect("failed src ptr-to-int"),
+                    idx,
+                    &format!("{label}_src_addr"),
+                )
+                .expect("failed string concat src addr");
+            let dst_index = this
+                .builder
+                .build_int_add(start_index, idx, &format!("{label}_dst_index"))
+                .expect("failed string concat dst index");
+            let dst_addr = this
+                .builder
+                .build_int_add(
+                    this.builder
+                        .build_ptr_to_int(data_ptr, this.i64_type, &format!("{label}_dst_base"))
+                        .expect("failed dst ptr-to-int"),
+                    dst_index,
+                    &format!("{label}_dst_addr"),
+                )
+                .expect("failed string concat dst addr");
+            let src_byte_ptr = this
+                .builder
+                .build_int_to_ptr(
+                    src_addr,
+                    this.context.ptr_type(Default::default()),
+                    &format!("{label}_src_ptr"),
+                )
+                .expect("failed string concat src ptr");
+            let dst_byte_ptr = this
+                .builder
+                .build_int_to_ptr(
+                    dst_addr,
+                    this.context.ptr_type(Default::default()),
+                    &format!("{label}_dst_ptr"),
+                )
+                .expect("failed string concat dst ptr");
+            let byte = this
+                .builder
+                .build_load(
+                    this.context.i8_type(),
+                    src_byte_ptr,
+                    &format!("{label}_byte"),
+                )
+                .expect("failed to load string concat byte");
+            this.builder
+                .build_store(dst_byte_ptr, byte)
+                .expect("failed to store string concat byte");
+            let next_idx = this
+                .builder
+                .build_int_add(
+                    idx,
+                    this.i64_type.const_int(1, false),
+                    &format!("{label}_next_idx"),
+                )
+                .expect("failed string concat next idx");
+            this.builder
+                .build_unconditional_branch(loop_block)
+                .expect("failed string concat loop continue");
+            let body_end = this.builder.get_insert_block().unwrap();
+            idx_phi.add_incoming(&[(&next_idx, body_end)]);
+
+            this.builder.position_at_end(done_block);
+        };
+
+        copy_into(
+            self,
+            lhs_data,
+            self.i64_type.const_zero(),
+            lhs_len,
+            "string_concat_lhs_copy",
+        );
+        copy_into(self, rhs_data, lhs_len, rhs_len, "string_concat_rhs_copy");
+
+        let header_size = self.i64_type.const_int(STRING_HEADER_SIZE as u64, false);
+        let header_raw =
+            self.build_boxed_call(alloc, &[header_size, align], "string_concat_header");
+        self.build_string_len_store(header_raw, total_len, "string_concat");
+        self.build_string_cap_store(header_raw, total_len, "string_concat");
+        self.build_string_ptr_store(header_raw, data_ptr, "string_concat");
+        CompiledValue {
+            tag: self.i64_type.const_int(TAG_STRING as u64, false),
+            payload: header_raw,
+        }
     }
 
     fn build_bigint_add_abs(

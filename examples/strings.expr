@@ -1,6 +1,7 @@
 fn main() do
     print("hello")
     print("line1\nline2")
+    print(string_concat("ab", "cd"))
     print("abc" == "abc")
     print("abc" != "xyz")
     print("abc" == 1)

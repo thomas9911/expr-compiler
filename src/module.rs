@@ -1386,6 +1386,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "bigint_divide"
                 | "bigint_modulo"
                 | "string_len"
+                | "string_concat"
         )
 }
 
@@ -1868,6 +1869,97 @@ fn compile_string_len(builder: &mut FunctionBuilder, value: CompiledValue) -> Co
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: len,
     }
+}
+
+fn compile_string_concat(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    lhs: CompiledValue,
+    rhs: CompiledValue,
+) -> CompiledValue {
+    let lhs_is_string = builder.ins().icmp_imm(IntCC::Equal, lhs.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(lhs_is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let rhs_is_string = builder.ins().icmp_imm(IntCC::Equal, rhs.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(rhs_is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+
+    let lhs_len = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), lhs.payload, STRING_LEN_OFFSET);
+    let rhs_len = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), rhs.payload, STRING_LEN_OFFSET);
+    let total_len = builder.ins().iadd(lhs_len, rhs_len);
+    let lhs_ptr = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), lhs.payload, STRING_PTR_OFFSET);
+    let rhs_ptr = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), rhs.payload, STRING_PTR_OFFSET);
+
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let data_call = builder.ins().call(alloc_ref, &[total_len, align]);
+    let data_ptr = builder.inst_results(data_call)[0];
+    let zero = builder.ins().iconst(types::I64, 0);
+    copy_string_bytes(builder, lhs_ptr, data_ptr, lhs_len, zero);
+    copy_string_bytes(builder, rhs_ptr, data_ptr, rhs_len, lhs_len);
+
+    let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
+    let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
+    let header_ptr = builder.inst_results(header_call)[0];
+    builder
+        .ins()
+        .store(MemFlags::new(), total_len, header_ptr, STRING_LEN_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), total_len, header_ptr, STRING_CAP_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_STRING),
+        payload: header_ptr,
+    }
+}
+
+fn copy_string_bytes(
+    builder: &mut FunctionBuilder,
+    src_ptr: Value,
+    dst_ptr: Value,
+    len: Value,
+    dst_offset_base: Value,
+) {
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+    builder.ins().brif(more, body_block, &[], done_block, &[]);
+
+    builder.switch_to_block(body_block);
+    let src_addr = builder.ins().iadd(src_ptr, idx);
+    let dst_offset = builder.ins().iadd(dst_offset_base, idx);
+    let dst_addr = builder.ins().iadd(dst_ptr, dst_offset);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), src_addr, 0);
+    builder.ins().store(MemFlags::new(), byte, dst_addr, 0);
+    let next_idx = builder.ins().iadd(idx, one);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next_idx)]);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(body_block);
+    builder.seal_block(loop_block);
+    builder.seal_block(done_block);
 }
 
 fn load_value_from_env(
@@ -2836,6 +2928,32 @@ fn compile_ast(
                 );
                 return compile_string_len(builder, value);
             }
+            if function == "string_concat" {
+                assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
+                let lhs = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                let rhs = compile_ast(
+                    builder,
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_string_concat(builder, func_refs, lhs, rhs);
+            }
             let compiled: Vec<_> = args
                 .iter()
                 .map(|arg| {
@@ -3434,6 +3552,12 @@ fn strings_eq_and_ne_work() {
     assert_cranelift_executable_output(src, "1\n1\n0\n1\n", 0);
 }
 
+#[test]
+fn strings_concat_works() {
+    let src = "fn main() do\n    joined = string_concat(\"ab\", \"cd\")\n    print(joined)\n    print(string_len(joined))\nend";
+    assert_cranelift_executable_output(src, "abcd\n4\n", 0);
+}
+
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_bigint_add_handles_limb_carry() {
@@ -3531,6 +3655,13 @@ fn llvm_strings_print_and_len_work() {
 fn llvm_strings_eq_and_ne_work() {
     let src = "fn main() do\n    print(\"abc\" == \"abc\")\n    print(\"abc\" != \"xyz\")\n    print(\"abc\" == 1)\n    print(\"abc\" != 1)\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n1\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_concat_works() {
+    let src = "fn main() do\n    joined = string_concat(\"ab\", \"cd\")\n    print(joined)\n    print(string_len(joined))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "abcd\n4\n", 0);
 }
 
 #[test]
