@@ -106,7 +106,11 @@ impl Module {
             }
             match Ast::from_lexer(&mut lexer) {
                 Ok(Ast::FunctionDef(func)) => functions.push(func),
-                Ok(_) => panic!("top-level expressions are not supported in source files"),
+                Ok(_) => {
+                    panic!(
+                        "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
+                    )
+                }
                 Err(err) => panic!("parse error: {err}"),
             }
         }
@@ -609,9 +613,9 @@ impl Module {
             .expect("cc not found — install gcc or clang");
 
         #[cfg(windows)]
-        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
         #[cfg(not(windows))]
-        std::fs::remove_file(output.with_extension("wrapper.c")).ok();
+        std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.c")).ok();
         std::fs::remove_file(&tmp).ok();
         assert!(status.success(), "linker failed with: {status}");
     }
@@ -672,9 +676,9 @@ impl Module {
             .expect("rustc not found");
 
         #[cfg(windows)]
-        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
         #[cfg(not(windows))]
-        std::fs::remove_file(output.with_extension("wrapper.rs")).ok();
+        std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
         assert!(status.success(), "linker failed with: {status}");
     }
@@ -888,26 +892,37 @@ impl CraneliftJitModule {
 
 #[cfg(windows)]
 fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
-    let wrapper = output.with_extension("wrapper.rs");
+    let wrapper = generated_wrapper_path(output, "windows_wrapper.rs");
     let source = include_str!("./wrapper/windows.rs");
+    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
     std::fs::write(&wrapper, source).unwrap();
     wrapper
 }
 
 #[cfg(not(windows))]
 fn write_unix_wrapper(output: &Path) -> std::path::PathBuf {
-    let wrapper = output.with_extension("wrapper.c");
+    let wrapper = generated_wrapper_path(output, "unix_wrapper.c");
     let source = include_str!("./wrapper/unix.c");
+    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
     std::fs::write(&wrapper, source).unwrap();
     wrapper
 }
 
 #[cfg(all(not(windows), feature = "llvm-backend"))]
 fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
-    let wrapper = output.with_extension("wrapper.rs");
+    let wrapper = generated_wrapper_path(output, "unix_wrapper.rs");
     let source = include_str!("./wrapper/unix.rs");
+    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
     std::fs::write(&wrapper, source).unwrap();
     wrapper
+}
+
+fn generated_wrapper_path(output: &Path, suffix: &str) -> std::path::PathBuf {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    parent
+        .join(".expr-compiler")
+        .join(format!("{stem}.{suffix}"))
 }
 
 fn is_wasm_output(output: &Path) -> bool {

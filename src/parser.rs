@@ -113,6 +113,20 @@ fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
     }
 }
 
+fn peek_line_indent<'a>(lex: &mut ParseLexer<'a>) -> usize {
+    let mut count = 0;
+    while matches!(lex.peek_n(count), Some(Ok(Token::Indent))) {
+        count += 1;
+    }
+    count
+}
+
+fn consume_indents<'a>(lex: &mut ParseLexer<'a>, count: usize) {
+    for _ in 0..count {
+        assert!(lex.next() == Some(Ok(Token::Indent)));
+    }
+}
+
 fn parse_block_body_until_end<'a>(lex: &mut ParseLexer<'a>) -> Result<BlockAst, ParseError<'a>> {
     let mut block = BlockAst::default();
     loop {
@@ -125,14 +139,109 @@ fn parse_block_body_until_end<'a>(lex: &mut ParseLexer<'a>) -> Result<BlockAst, 
                 break;
             }
             Some(Ok(Token::DefineFunction)) | None => break,
+            Some(Ok(Token::Else)) | Some(Ok(Token::Elif)) => break,
             _ => block.lines.push(Ast::from_lexer(lex)?),
         }
     }
     Ok(block)
 }
 
+fn parse_block_after_colon<'a>(lex: &mut ParseLexer<'a>) -> Result<BlockAst, ParseError<'a>> {
+    let mut block = BlockAst::default();
+    assert!(lex.next() == Some(Ok(Token::ColonBlock)));
+
+    trim_newlines(lex);
+    let block_indent = peek_line_indent(lex);
+    if block_indent == 0 {
+        return Err(ParseError::unexpected(lex));
+    }
+
+    loop {
+        trim_newlines(lex);
+        match lex.peek() {
+            Some(Ok(Token::DefineFunction)) | Some(Ok(Token::EndBlock)) | None => break,
+            _ => {
+                let line_indent = peek_line_indent(lex);
+                if line_indent < block_indent {
+                    break;
+                }
+                if line_indent > block_indent {
+                    return Err(ParseError::unexpected(lex));
+                }
+                consume_indents(lex, line_indent);
+                if lex.peek().is_none() {
+                    break;
+                }
+                if matches!(lex.peek(), Some(Ok(Token::Newline))) {
+                    lex.next();
+                    continue;
+                }
+                if matches!(lex.peek(), Some(Ok(Token::Else)) | Some(Ok(Token::Elif))) {
+                    break;
+                }
+                block
+                    .lines
+                    .push(Ast::from_lexer_with_indent(lex, block_indent)?);
+            }
+        }
+    }
+
+    Ok(block)
+}
+
+fn parse_if_after_keyword<'a>(
+    lex: &mut ParseLexer<'a>,
+    current_indent: usize,
+) -> Result<Ast, ParseError<'a>> {
+    let condition = parse_expr(lex, 0)?;
+    let then = match lex.peek() {
+        Some(Ok(Token::DoBlock)) => BlockAst::from_lexer(lex)?,
+        Some(Ok(Token::ColonBlock)) => parse_block_after_colon(lex)?,
+        _ => return Err(ParseError::unexpected(lex)),
+    };
+    trim_newlines(lex);
+    let branch_indent = peek_line_indent(lex);
+    let else_ = if branch_indent == current_indent {
+        match lex.peek_n(branch_indent) {
+            Some(Ok(Token::Else)) => {
+                consume_indents(lex, branch_indent);
+                lex.next();
+                trim_newlines(lex);
+                match lex.peek() {
+                    Some(Ok(Token::DoBlock)) => Some(BlockAst::from_lexer(lex)?),
+                    Some(Ok(Token::ColonBlock)) => Some(parse_block_after_colon(lex)?),
+                    _ => Some(parse_block_body_until_end(lex)?),
+                }
+            }
+            Some(Ok(Token::Elif)) => {
+                consume_indents(lex, branch_indent);
+                lex.next();
+                Some(BlockAst {
+                    lines: vec![parse_if_after_keyword(lex, current_indent)?],
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Ast::If {
+        condition: Box::new(condition),
+        then,
+        else_,
+    })
+}
+
 impl Ast {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
+        Self::from_lexer_with_indent(lex, 0)
+    }
+
+    fn from_lexer_with_indent<'a>(
+        lex: &mut ParseLexer<'a>,
+        current_indent: usize,
+    ) -> Result<Self, ParseError<'a>> {
         trim_newlines(lex);
 
         if matches!(lex.peek(), Some(Ok(Token::Symbol(_)))) {
@@ -169,25 +278,7 @@ impl Ast {
             }
             Some(&Ok(Token::If)) => {
                 lex.next();
-                let condition = parse_expr(lex, 0)?;
-                let then = BlockAst::from_lexer(lex)?;
-                trim_newlines(lex);
-                let else_ = if lex.peek() == Some(&Ok(Token::Else)) {
-                    lex.next();
-                    trim_newlines(lex);
-                    if matches!(lex.peek(), Some(Ok(Token::StartBlock))) {
-                        Some(BlockAst::from_lexer(lex)?)
-                    } else {
-                        Some(parse_block_body_until_end(lex)?)
-                    }
-                } else {
-                    None
-                };
-                Ok(Ast::If {
-                    condition: Box::new(condition),
-                    then,
-                    else_,
-                })
+                parse_if_after_keyword(lex, current_indent)
             }
             _ => parse_expr(lex, 0),
         }
@@ -202,27 +293,20 @@ pub struct BlockAst {
 impl BlockAst {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
         let mut block = BlockAst::default();
-        assert!(lex.next() == Some(Ok(Token::StartBlock)));
+        assert!(lex.next() == Some(Ok(Token::DoBlock)));
 
-        trim_newlines(lex);
         loop {
             match lex.peek() {
-                Some(Ok(Token::Indent)) => {
+                Some(Ok(Token::Indent)) | Some(Ok(Token::Newline)) => {
                     lex.next();
                 }
                 Some(Ok(Token::EndBlock)) => {
                     lex.next();
                     break;
                 }
-                Some(Ok(Token::Newline)) => {
-                    lex.next();
-                }
-                Some(Ok(Token::DefineFunction)) | Some(Ok(Token::Else)) | None => {
-                    break;
-                }
-                _ => {
-                    block.lines.push(Ast::from_lexer(lex)?);
-                }
+                Some(Ok(Token::DefineFunction)) | None => break,
+                Some(Ok(Token::Else)) | Some(Ok(Token::Elif)) => break,
+                _ => block.lines.push(Ast::from_lexer(lex)?),
             }
         }
 
@@ -276,8 +360,12 @@ impl FunctionDefAst {
                     lex.next();
                     bracket_counter = 0;
                 }
-                Some(Ok(Token::StartBlock)) => {
+                Some(Ok(Token::DoBlock)) => {
                     function_def.block = BlockAst::from_lexer(lex)?;
+                    break;
+                }
+                Some(Ok(Token::ColonBlock)) => {
+                    function_def.block = parse_block_after_colon(lex)?;
                     break;
                 }
                 None | Some(Ok(Token::DefineFunction)) => {
@@ -1176,6 +1264,215 @@ fn parse_parenthesized_expression() {
                     Literal(LiteralAst::Integer(4)),
                 ],
             })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_python_style_nested_if_with_inner_else() {
+    use Ast::*;
+
+    let text = "fn main():\n    if 1 < 2:\n        if 1 != 1:\n            15\n        else:\n            34\n    else:\n        67\n";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![If {
+                condition: Box::new(Expression(ExpressionAst {
+                    function: "lt".to_string(),
+                    args: vec![
+                        Literal(LiteralAst::Integer(1)),
+                        Literal(LiteralAst::Integer(2)),
+                    ],
+                })),
+                then: BlockAst {
+                    lines: vec![If {
+                        condition: Box::new(Expression(ExpressionAst {
+                            function: "ne".to_string(),
+                            args: vec![
+                                Literal(LiteralAst::Integer(1)),
+                                Literal(LiteralAst::Integer(1)),
+                            ],
+                        })),
+                        then: BlockAst {
+                            lines: vec![Literal(LiteralAst::Integer(15))],
+                        },
+                        else_: Some(BlockAst {
+                            lines: vec![Literal(LiteralAst::Integer(34))],
+                        }),
+                    }],
+                },
+                else_: Some(BlockAst {
+                    lines: vec![Literal(LiteralAst::Integer(67))],
+                }),
+            }],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_python_style_nested_if_without_inner_else() {
+    use Ast::*;
+
+    let text =
+        "fn main():\n    if 1 < 2:\n        if 1 == 2:\n            15\n    else:\n        67\n";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![If {
+                condition: Box::new(Expression(ExpressionAst {
+                    function: "lt".to_string(),
+                    args: vec![
+                        Literal(LiteralAst::Integer(1)),
+                        Literal(LiteralAst::Integer(2)),
+                    ],
+                })),
+                then: BlockAst {
+                    lines: vec![If {
+                        condition: Box::new(Expression(ExpressionAst {
+                            function: "eq".to_string(),
+                            args: vec![
+                                Literal(LiteralAst::Integer(1)),
+                                Literal(LiteralAst::Integer(2)),
+                            ],
+                        })),
+                        then: BlockAst {
+                            lines: vec![Literal(LiteralAst::Integer(15))],
+                        },
+                        else_: None,
+                    }],
+                },
+                else_: Some(BlockAst {
+                    lines: vec![Literal(LiteralAst::Integer(67))],
+                }),
+            }],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_python_style_elif() {
+    use Ast::*;
+
+    let text = "fn main():\n    if 1 == 2:\n        10\n    elif 1 == 1:\n        20\n    else:\n        30\n";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![If {
+                condition: Box::new(Expression(ExpressionAst {
+                    function: "eq".to_string(),
+                    args: vec![
+                        Literal(LiteralAst::Integer(1)),
+                        Literal(LiteralAst::Integer(2)),
+                    ],
+                })),
+                then: BlockAst {
+                    lines: vec![Literal(LiteralAst::Integer(10))],
+                },
+                else_: Some(BlockAst {
+                    lines: vec![If {
+                        condition: Box::new(Expression(ExpressionAst {
+                            function: "eq".to_string(),
+                            args: vec![
+                                Literal(LiteralAst::Integer(1)),
+                                Literal(LiteralAst::Integer(1)),
+                            ],
+                        })),
+                        then: BlockAst {
+                            lines: vec![Literal(LiteralAst::Integer(20))],
+                        },
+                        else_: Some(BlockAst {
+                            lines: vec![Literal(LiteralAst::Integer(30))],
+                        }),
+                    }],
+                }),
+            }],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_python_style_nested_elif() {
+    use Ast::*;
+
+    let text = "fn main():\n    if 1 == 2:\n        10\n    elif 2 == 3:\n        20\n    elif 3 == 3:\n        30\n    else:\n        40\n";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![If {
+                condition: Box::new(Expression(ExpressionAst {
+                    function: "eq".to_string(),
+                    args: vec![
+                        Literal(LiteralAst::Integer(1)),
+                        Literal(LiteralAst::Integer(2)),
+                    ],
+                })),
+                then: BlockAst {
+                    lines: vec![Literal(LiteralAst::Integer(10))],
+                },
+                else_: Some(BlockAst {
+                    lines: vec![If {
+                        condition: Box::new(Expression(ExpressionAst {
+                            function: "eq".to_string(),
+                            args: vec![
+                                Literal(LiteralAst::Integer(2)),
+                                Literal(LiteralAst::Integer(3)),
+                            ],
+                        })),
+                        then: BlockAst {
+                            lines: vec![Literal(LiteralAst::Integer(20))],
+                        },
+                        else_: Some(BlockAst {
+                            lines: vec![If {
+                                condition: Box::new(Expression(ExpressionAst {
+                                    function: "eq".to_string(),
+                                    args: vec![
+                                        Literal(LiteralAst::Integer(3)),
+                                        Literal(LiteralAst::Integer(3)),
+                                    ],
+                                })),
+                                then: BlockAst {
+                                    lines: vec![Literal(LiteralAst::Integer(30))],
+                                },
+                                else_: Some(BlockAst {
+                                    lines: vec![Literal(LiteralAst::Integer(40))],
+                                }),
+                            }],
+                        }),
+                    }],
+                }),
+            }],
         },
     });
 

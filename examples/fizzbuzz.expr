@@ -1,0 +1,26 @@
+# Python-style FizzBuzz using recursion for iteration.
+# Output convention:
+# - print 69 for fizz
+# - print 420 for buzz
+# - print 69420 for fizzbuzz
+# - otherwise print the number itself
+
+fn fizzbuzz_one(x):
+    if x % 15 == 0:
+        print(69420)
+    elif x % 3 == 0:
+        print(69)
+    elif x % 5 == 0:
+        print(420)
+    else:
+        print(x)
+
+fn fizzbuzz_range(i, limit):
+    if i > limit:
+        0
+    else:
+        fizzbuzz_one(i)
+        fizzbuzz_range(i + 1, limit)
+
+fn main():
+    fizzbuzz_range(1, 15)

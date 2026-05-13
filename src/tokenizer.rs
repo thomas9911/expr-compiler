@@ -102,12 +102,16 @@ pub enum Token {
     DefineFunction,
     #[token("if")]
     If,
+    #[token("elif")]
+    Elif,
     #[token("else")]
     Else,
     #[regex(r"#[^\r\n]*", logos::skip, allow_greedy = true)]
     Comment,
-    #[regex("do|:", priority = 5)]
-    StartBlock,
+    #[token("do")]
+    DoBlock,
+    #[token(":")]
+    ColonBlock,
     #[token("end")]
     EndBlock,
     #[regex(r"[a-zA-Z_]+", |lexer| lexer.slice().to_string())]
@@ -143,9 +147,10 @@ impl Token {
             Token::Assign => TokenKind::Assign,
             Token::DefineFunction => TokenKind::DefineFunction,
             Token::If => TokenKind::If,
+            Token::Elif => TokenKind::Else,
             Token::Else => TokenKind::Else,
             Token::Comment => unreachable!(),
-            Token::StartBlock => TokenKind::StartBlock,
+            Token::DoBlock | Token::ColonBlock => TokenKind::StartBlock,
             Token::EndBlock => TokenKind::EndBlock,
             Token::Symbol(_) => TokenKind::Symbol,
             Token::Ignored => unreachable!(),
@@ -194,7 +199,7 @@ end
         Symbol("main".to_string()),
         OpenBracket,
         CloseBracket,
-        StartBlock,
+        DoBlock,
         Newline,
         Indent,
         Integer(1),
@@ -225,7 +230,7 @@ fn main():
         Symbol("main".to_string()),
         OpenBracket,
         CloseBracket,
-        StartBlock,
+        ColonBlock,
         Newline,
         Indent,
         Integer(1),
@@ -289,7 +294,7 @@ fn tokenize_function_with_params() {
             Comma,
             Symbol("y".to_string()),
             CloseBracket,
-            StartBlock,
+            DoBlock,
             Newline,
             Indent,
             Symbol("x".to_string()),
@@ -319,7 +324,7 @@ fn add(x, y):
             Comma,
             Symbol("y".to_string()),
             CloseBracket,
-            StartBlock,
+            ColonBlock,
             Newline,
             Indent,
             Symbol("x".to_string()),
@@ -442,7 +447,7 @@ fn tokenize_if_else_keywords() {
             Symbol("x".to_string()),
             GreaterThan,
             Integer(0),
-            StartBlock,
+            DoBlock,
             Newline,
             Indent,
             Symbol("x".to_string()),
@@ -499,7 +504,7 @@ fn tokenize_skips_line_comments() {
             Symbol("main".to_string()),
             OpenBracket,
             CloseBracket,
-            StartBlock,
+            ColonBlock,
             Newline,
             Indent,
             Newline,
@@ -529,7 +534,7 @@ fn tokenize_skips_line_comments_crlf() {
             Symbol("main".to_string()),
             OpenBracket,
             CloseBracket,
-            StartBlock,
+            ColonBlock,
             Newline,
             Indent,
             Symbol("x".to_string()),
