@@ -14,7 +14,8 @@ use std::collections::HashMap;
 use crate::value::{
     BIGINT_CAP_OFFSET, BIGINT_HEADER_SIZE, BIGINT_LEN_OFFSET, BIGINT_LIMB_SIZE, BIGINT_PTR_OFFSET,
     BIGINT_SIGN_OFFSET, LIST_CAP_OFFSET, LIST_HEADER_SIZE, LIST_LEN_OFFSET, LIST_PTR_OFFSET,
-    TAG_BIGINT, TAG_INT, TAG_LIST, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_INT, TAG_LIST, TAG_STRING,
+    VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 
 const ARENA_BYTES: i64 = 16 * 1024 * 1024;
@@ -906,6 +907,80 @@ fn pair_payload_for_tag(
     let ok = builder.ins().icmp_imm(IntCC::Equal, tag, expected_tag);
     builder.ins().trapz(ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
     payload
+}
+
+fn string_load_len(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder
+        .ins()
+        .load(types::I64, MemFlags::new(), header_ptr, STRING_LEN_OFFSET)
+}
+
+fn string_load_ptr(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder
+        .ins()
+        .load(types::I64, MemFlags::new(), header_ptr, STRING_PTR_OFFSET)
+}
+
+fn string_eq_bytes(builder: &mut FunctionBuilder, lhs_ptr: Value, rhs_ptr: Value) -> Value {
+    let lhs_len = string_load_len(builder, lhs_ptr);
+    let rhs_len = string_load_len(builder, rhs_ptr);
+    let len_equal = builder.ins().icmp(IntCC::Equal, lhs_len, rhs_len);
+    let len_equal_block = builder.create_block();
+    let false_block = builder.create_block();
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.append_block_param(done_block, types::I64);
+    builder
+        .ins()
+        .brif(len_equal, len_equal_block, &[], false_block, &[]);
+
+    builder.switch_to_block(false_block);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(done_block, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(len_equal_block);
+    builder.seal_block(len_equal_block);
+    let lhs_data = string_load_ptr(builder, lhs_ptr);
+    let rhs_data = string_load_ptr(builder, rhs_ptr);
+    let start = builder.ins().iconst(types::I64, 0);
+    builder.ins().jump(loop_block, &[BlockArg::Value(start)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, lhs_len);
+    let one = builder.ins().iconst(types::I64, 1);
+    builder
+        .ins()
+        .brif(more, body_block, &[], done_block, &[BlockArg::Value(one)]);
+
+    builder.switch_to_block(body_block);
+    let lhs_byte_ptr = builder.ins().iadd(lhs_data, idx);
+    let rhs_byte_ptr = builder.ins().iadd(rhs_data, idx);
+    let lhs_byte = builder
+        .ins()
+        .load(types::I8, MemFlags::new(), lhs_byte_ptr, 0);
+    let rhs_byte = builder
+        .ins()
+        .load(types::I8, MemFlags::new(), rhs_byte_ptr, 0);
+    let bytes_equal = builder.ins().icmp(IntCC::Equal, lhs_byte, rhs_byte);
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(bytes_equal, continue_block, &[], false_block, &[]);
+
+    builder.switch_to_block(continue_block);
+    builder.seal_block(continue_block);
+    let next = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(false_block);
+    builder.seal_block(done_block);
+    builder.seal_block(loop_block);
+    builder.seal_block(body_block);
+    builder.block_params(done_block)[0]
 }
 
 fn bigint_load_sign(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
@@ -2747,6 +2822,8 @@ fn define_rt_compare_op(
                 .map(|id| unsafe { (&mut *module_ptr).declare_func_in_func(id, func) });
             let one = b.ins().iconst(types::I64, 1);
             let zero = b.ins().iconst(types::I64, 0);
+            let is_equality = matches!(cc, IntCC::Equal | IntCC::NotEqual);
+            let neq_result = matches!(cc, IntCC::NotEqual);
             let lhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_INT);
             let rhs_is_int = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_INT);
             let both_int = b.ins().band(lhs_is_int, rhs_is_int);
@@ -2765,6 +2842,42 @@ fn define_rt_compare_op(
 
             b.switch_to_block(non_int_block);
             b.seal_block(non_int_block);
+            if is_equality {
+                let lhs_is_string = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_STRING);
+                let rhs_is_string = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_STRING);
+                let both_string = b.ins().band(lhs_is_string, rhs_is_string);
+                let any_string = b.ins().bor(lhs_is_string, rhs_is_string);
+                let string_block = b.create_block();
+                let string_mixed_block = b.create_block();
+                let after_string_block = b.create_block();
+                b.ins()
+                    .brif(both_string, string_block, &[], string_mixed_block, &[]);
+
+                b.switch_to_block(string_block);
+                b.seal_block(string_block);
+                let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_STRING);
+                let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
+                let string_eq = string_eq_bytes(b, lhs_ptr, rhs_ptr);
+                let string_raw = if neq_result {
+                    b.ins().bxor(string_eq, one)
+                } else {
+                    string_eq
+                };
+                b.ins().jump(merge, &[BlockArg::Value(string_raw)]);
+
+                b.switch_to_block(string_mixed_block);
+                b.seal_block(string_mixed_block);
+                b.ins().brif(
+                    any_string,
+                    merge,
+                    &[BlockArg::Value(if neq_result { one } else { zero })],
+                    after_string_block,
+                    &[],
+                );
+
+                b.switch_to_block(after_string_block);
+                b.seal_block(after_string_block);
+            }
             if let (Some(bigint_compare_ref), Some(bigint_from_int_ref)) =
                 (bigint_compare_ref, bigint_from_int_ref)
             {

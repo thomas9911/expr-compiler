@@ -22,6 +22,12 @@ typedef struct ListHeader {
     size_t cap;
 } ListHeader;
 
+typedef struct StringHeader {
+    size_t len;
+    size_t cap;
+    uint8_t *ptr;
+} StringHeader;
+
 typedef struct BigIntHeader {
     int64_t sign;
     size_t len;
@@ -97,7 +103,9 @@ static void print_value_ref(const Value *value) {
         return;
     }
     if (value->tag == VALUE_TAG_STRING) {
-        runtime_trap("string values are not supported yet");
+        const StringHeader *header = (const StringHeader *)(uintptr_t)value->payload;
+        fwrite(header->ptr, 1, header->len, stdout);
+        return;
     }
     if (value->tag == VALUE_TAG_FUNCTION) {
         runtime_trap("function values are not supported yet");

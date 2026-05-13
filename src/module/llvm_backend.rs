@@ -3,8 +3,8 @@ use super::{
 };
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
-    BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT,
-    TAG_LIST, VALUE_SIZE,
+    BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, STRING_HEADER_SIZE, TAG_BIGINT,
+    TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_STRING, VALUE_SIZE,
 };
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -1373,6 +1373,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::Literal(LiteralAst::Integer(n)) => {
                 self.int_value(self.i64_type.const_int(*n as u64, true))
             }
+            Ast::Literal(LiteralAst::String(value)) => {
+                self.build_string_literal(value.as_bytes(), "string_literal")
+            }
             Ast::Literal(LiteralAst::BigInt(digits)) => {
                 self.build_bigint_literal(digits, "bigint_literal")
             }
@@ -1432,6 +1435,24 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 }
                 if name == "list_range" {
                     return self.compile_list_range(args, vars, capture_slots, env_ptr, function);
+                }
+                if name == "string_len" {
+                    assert_eq!(args.len(), 1, "string_len expects 1 argument");
+                    let value = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    let trap_block = self.context.append_basic_block(function, "string_len_trap");
+                    let ok_block = self.context.append_basic_block(function, "string_len_ok");
+                    let raw = self.expect_tag_payload(
+                        value,
+                        TAG_STRING,
+                        "string_len",
+                        ok_block,
+                        trap_block,
+                    );
+                    self.builder.position_at_end(trap_block);
+                    self.build_trap_and_unreachable();
+                    self.builder.position_at_end(ok_block);
+                    let len = self.build_string_len_load(raw, "string_len");
+                    return self.int_value(len);
                 }
                 let compiled = args
                     .iter()
@@ -1759,6 +1780,216 @@ impl<'ctx> LlvmCompiler<'ctx> {
         }
 
         acc
+    }
+
+    fn build_string_literal(&self, bytes: &[u8], label: &str) -> CompiledValue<'ctx> {
+        let alloc = self.require_func("__alloc");
+        let len = self.i64_type.const_int(bytes.len() as u64, false);
+        let align = self.i64_type.const_int(8, false);
+        let data_raw = self.build_boxed_call(alloc, &[len, align], &format!("{label}_data"));
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                data_raw,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_data_ptr"),
+            )
+            .expect("failed to convert string data ptr");
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            let byte_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        data_ptr,
+                        &[self.context.i32_type().const_int(index as u64, false)],
+                        &format!("{label}_byte_ptr_{index}"),
+                    )
+                    .expect("failed to gep string byte ptr")
+            };
+            self.builder
+                .build_store(
+                    byte_ptr,
+                    self.context.i8_type().const_int(byte as u64, false),
+                )
+                .expect("failed to store string byte");
+        }
+
+        let header_size = self.i64_type.const_int(STRING_HEADER_SIZE as u64, false);
+        let header_raw =
+            self.build_boxed_call(alloc, &[header_size, align], &format!("{label}_header"));
+        self.build_string_len_store(header_raw, len, label);
+        self.build_string_cap_store(header_raw, len, label);
+        self.build_string_ptr_store(header_raw, data_ptr, label);
+        CompiledValue {
+            tag: self.i64_type.const_int(TAG_STRING as u64, false),
+            payload: header_raw,
+        }
+    }
+
+    fn build_string_eq_bytes(
+        &self,
+        lhs_payload: IntValue<'ctx>,
+        rhs_payload: IntValue<'ctx>,
+        label: &str,
+    ) -> IntValue<'ctx> {
+        let function = self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let lhs_len = self.build_string_len_load(lhs_payload, &format!("{label}_lhs"));
+        let rhs_len = self.build_string_len_load(rhs_payload, &format!("{label}_rhs"));
+        let len_equal = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                lhs_len,
+                rhs_len,
+                &format!("{label}_len_eq"),
+            )
+            .expect("failed to compare string lens");
+        let len_equal_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_len_ok"));
+        let false_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_false"));
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_body"));
+        let continue_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_continue"));
+        let done_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_done"));
+        self.builder
+            .build_conditional_branch(len_equal, len_equal_block, false_block)
+            .expect("failed string len branch");
+
+        self.builder.position_at_end(false_block);
+        self.builder
+            .build_unconditional_branch(done_block)
+            .expect("failed string false branch");
+        let false_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(len_equal_block);
+        let lhs_data = self.build_string_ptr_load(lhs_payload, &format!("{label}_lhs"));
+        let rhs_data = self.build_string_ptr_load(rhs_payload, &format!("{label}_rhs"));
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed string loop jump");
+        let len_ok_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(loop_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_idx"))
+            .expect("failed string idx phi");
+        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), len_ok_end)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, lhs_len, &format!("{label}_more"))
+            .expect("failed string loop compare");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed string loop branch");
+        let loop_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(body_block);
+        let lhs_addr = self
+            .builder
+            .build_ptr_to_int(lhs_data, self.i64_type, &format!("{label}_lhs_base"))
+            .expect("failed lhs ptr to int");
+        let rhs_addr = self
+            .builder
+            .build_ptr_to_int(rhs_data, self.i64_type, &format!("{label}_rhs_base"))
+            .expect("failed rhs ptr to int");
+        let lhs_elem_addr = self
+            .builder
+            .build_int_add(lhs_addr, idx, &format!("{label}_lhs_addr"))
+            .expect("failed lhs elem addr");
+        let rhs_elem_addr = self
+            .builder
+            .build_int_add(rhs_addr, idx, &format!("{label}_rhs_addr"))
+            .expect("failed rhs elem addr");
+        let lhs_elem_ptr = self
+            .builder
+            .build_int_to_ptr(
+                lhs_elem_addr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_lhs_ptr"),
+            )
+            .expect("failed lhs elem ptr");
+        let rhs_elem_ptr = self
+            .builder
+            .build_int_to_ptr(
+                rhs_elem_addr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_rhs_ptr"),
+            )
+            .expect("failed rhs elem ptr");
+        let lhs_byte = self
+            .builder
+            .build_load(
+                self.context.i8_type(),
+                lhs_elem_ptr,
+                &format!("{label}_lhs_byte"),
+            )
+            .expect("failed lhs byte load")
+            .into_int_value();
+        let rhs_byte = self
+            .builder
+            .build_load(
+                self.context.i8_type(),
+                rhs_elem_ptr,
+                &format!("{label}_rhs_byte"),
+            )
+            .expect("failed rhs byte load")
+            .into_int_value();
+        let bytes_equal = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                lhs_byte,
+                rhs_byte,
+                &format!("{label}_byte_eq"),
+            )
+            .expect("failed byte compare");
+        self.builder
+            .build_conditional_branch(bytes_equal, continue_block, false_block)
+            .expect("failed byte branch");
+
+        self.builder.position_at_end(continue_block);
+        let next = self
+            .builder
+            .build_int_add(
+                idx,
+                self.i64_type.const_int(1, false),
+                &format!("{label}_next"),
+            )
+            .expect("failed string next");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed continue to loop");
+        let continue_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next, continue_end)]);
+
+        self.builder.position_at_end(done_block);
+        let result_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_result"))
+            .expect("failed string result phi");
+        result_phi.add_incoming(&[
+            (&self.i64_type.const_zero(), false_end),
+            (&self.i64_type.const_int(1, false), loop_end),
+        ]);
+        result_phi.as_basic_value().into_int_value()
     }
 
     fn build_promote_value_to_bigint(
@@ -2272,6 +2503,107 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_header_ptr"),
             )
             .expect("failed to convert list payload to pointer")
+    }
+
+    fn build_string_header_ptr(&self, payload: IntValue<'ctx>, label: &str) -> PointerValue<'ctx> {
+        self.builder
+            .build_int_to_ptr(
+                payload,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_string_header_ptr"),
+            )
+            .expect("failed to convert string payload to pointer")
+    }
+
+    fn build_string_len_load(&self, payload: IntValue<'ctx>, label: &str) -> IntValue<'ctx> {
+        let ptr = self.build_string_header_ptr(payload, label);
+        let len_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                ptr,
+                0,
+                &format!("{label}_len_ptr"),
+            )
+            .expect("failed to build string len gep");
+        self.builder
+            .build_load(self.i64_type, len_ptr, &format!("{label}_len"))
+            .expect("failed to load string len")
+            .into_int_value()
+    }
+
+    fn build_string_cap_store(&self, payload: IntValue<'ctx>, cap: IntValue<'ctx>, label: &str) {
+        let ptr = self.build_string_header_ptr(payload, label);
+        let cap_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                ptr,
+                1,
+                &format!("{label}_cap_ptr"),
+            )
+            .expect("failed to build string cap gep");
+        self.builder
+            .build_store(cap_ptr, cap)
+            .expect("failed to store string cap");
+    }
+
+    fn build_string_len_store(&self, payload: IntValue<'ctx>, len: IntValue<'ctx>, label: &str) {
+        let ptr = self.build_string_header_ptr(payload, label);
+        let len_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                ptr,
+                0,
+                &format!("{label}_len_ptr"),
+            )
+            .expect("failed to build string len gep");
+        self.builder
+            .build_store(len_ptr, len)
+            .expect("failed to store string len");
+    }
+
+    fn build_string_ptr_load(&self, payload: IntValue<'ctx>, label: &str) -> PointerValue<'ctx> {
+        let ptr = self.build_string_header_ptr(payload, label);
+        let data_ptr_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                ptr,
+                2,
+                &format!("{label}_ptr_ptr"),
+            )
+            .expect("failed to build string ptr gep");
+        self.builder
+            .build_load(
+                self.context.ptr_type(Default::default()),
+                data_ptr_ptr,
+                &format!("{label}_ptr"),
+            )
+            .expect("failed to load string ptr")
+            .into_pointer_value()
+    }
+
+    fn build_string_ptr_store(
+        &self,
+        payload: IntValue<'ctx>,
+        ptr_value: PointerValue<'ctx>,
+        label: &str,
+    ) {
+        let ptr = self.build_string_header_ptr(payload, label);
+        let data_ptr_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_header_type(),
+                ptr,
+                2,
+                &format!("{label}_ptr_ptr"),
+            )
+            .expect("failed to build string ptr gep");
+        self.builder
+            .build_store(data_ptr_ptr, ptr_value)
+            .expect("failed to store string ptr");
     }
 
     fn build_bigint_header_ptr(&self, payload: IntValue<'ctx>, label: &str) -> PointerValue<'ctx> {
@@ -4221,6 +4553,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
         )
     }
 
+    fn string_header_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context.struct_type(
+            &[
+                self.i64_type.into(),
+                self.i64_type.into(),
+                self.context.ptr_type(Default::default()).into(),
+            ],
+            false,
+        )
+    }
+
     fn bigint_header_type(&self) -> inkwell::types::StructType<'ctx> {
         self.context.struct_type(
             &[
@@ -4765,6 +5108,79 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to return compare");
 
         self.builder.position_at_end(non_int_block);
+        if matches!(pred, IntPredicate::EQ | IntPredicate::NE) {
+            let lhs_is_string = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    lhs.tag,
+                    self.i64_type.const_int(TAG_STRING as u64, false),
+                    "lhs_is_string",
+                )
+                .expect("failed compare lhs_is_string");
+            let rhs_is_string = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    rhs.tag,
+                    self.i64_type.const_int(TAG_STRING as u64, false),
+                    "rhs_is_string",
+                )
+                .expect("failed compare rhs_is_string");
+            let both_string = self
+                .builder
+                .build_and(lhs_is_string, rhs_is_string, "both_string")
+                .expect("failed compare both_string");
+            let any_string = self
+                .builder
+                .build_or(lhs_is_string, rhs_is_string, "any_string")
+                .expect("failed compare any_string");
+            let string_block = self.context.append_basic_block(function, "string");
+            let string_mixed_block = self.context.append_basic_block(function, "string_mixed");
+            let after_string_block = self.context.append_basic_block(function, "after_string");
+            self.builder
+                .build_conditional_branch(both_string, string_block, string_mixed_block)
+                .expect("failed compare string branch");
+
+            self.builder.position_at_end(string_block);
+            let string_eq = self.build_string_eq_bytes(lhs.payload, rhs.payload, "string_eq");
+            let string_raw = if matches!(pred, IntPredicate::NE) {
+                self.builder
+                    .build_xor(string_eq, self.i64_type.const_int(1, false), "string_ne")
+                    .expect("failed string ne xor")
+            } else {
+                string_eq
+            };
+            self.builder
+                .build_return(Some(&self.make_pair_value(
+                    self.i64_type.const_int(TAG_INT as u64, false),
+                    string_raw,
+                    "string_cmp_result",
+                )))
+                .expect("failed to return string compare");
+
+            self.builder.position_at_end(string_mixed_block);
+            let mixed_raw = if matches!(pred, IntPredicate::NE) {
+                self.i64_type.const_int(1, false)
+            } else {
+                self.i64_type.const_zero()
+            };
+            let mixed_done = self
+                .context
+                .append_basic_block(function, "string_mixed_done");
+            self.builder
+                .build_conditional_branch(any_string, mixed_done, after_string_block)
+                .expect("failed compare string mixed short-circuit");
+            self.builder.position_at_end(mixed_done);
+            self.builder
+                .build_return(Some(&self.make_pair_value(
+                    self.i64_type.const_int(TAG_INT as u64, false),
+                    mixed_raw,
+                    "string_mixed_cmp_result",
+                )))
+                .expect("failed to return string mixed compare");
+            self.builder.position_at_end(after_string_block);
+        }
         if let Some(bigint_name) = bigint_name {
             let lhs_is_bigint = self
                 .builder
@@ -5904,11 +6320,20 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.functions
             .insert("__wasi_write_list".to_string(), write_list);
 
+        let write_string = self.module.add_function(
+            "llvm_wasi_write_string",
+            void_type.fn_type(&[self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions
+            .insert("__wasi_write_string".to_string(), write_string);
+
         self.define_wasi_write_bytes_body(write_bytes);
         self.define_wasi_write_i64_body(write_i64);
         self.define_wasi_write_value_body(write_value);
         self.define_wasi_write_bigint_body(write_bigint);
         self.define_wasi_write_list_body(write_list);
+        self.define_wasi_write_string_body(write_string);
         self.define_wasi_preview1_pair_print_wrapper("__rt_print", "llvm_rt_print");
         self.define_wasi_preview1_pair_print_wrapper("__rt_list_print", "llvm_rt_list_print");
     }
@@ -6478,7 +6903,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_compare(IntPredicate::EQ, tag, bigint_tag, "wasi_value_is_bigint")
             .expect("failed to compare value tag bigint");
-        let string_tag = self.i64_type.const_int(3, false);
+        let string_tag = self.i64_type.const_int(TAG_STRING as u64, false);
         let is_string = self
             .builder
             .build_int_compare(IntPredicate::EQ, tag, string_tag, "wasi_value_is_string")
@@ -6527,7 +6952,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to return from value bigint writer");
 
         self.builder.position_at_end(string_block);
-        self.build_wasi_write_const("__wasi_string_placeholder", b"<string>", "wasi_string");
+        let write_string = self.require_func("__wasi_write_string");
+        self.builder
+            .build_call(write_string, &[payload.into()], "wasi_write_string")
+            .expect("failed to call write_string");
         self.builder
             .build_return(None)
             .expect("failed to return from value string writer");
@@ -6620,6 +7048,31 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder
             .build_return(None)
             .expect("failed to return from list writer");
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_write_string_body(&self, function: FunctionValue<'ctx>) {
+        let entry = self.context.append_basic_block(function, "entry");
+        self.builder.position_at_end(entry);
+
+        let payload = function.get_first_param().unwrap().into_int_value();
+        let len = self.build_string_len_load(payload, "wasi_string");
+        let len32 = self
+            .builder
+            .build_int_truncate(len, self.context.i32_type(), "wasi_string_len32")
+            .expect("failed to truncate string len");
+        let data_ptr = self.build_string_ptr_load(payload, "wasi_string");
+        let write_bytes = self.require_func("__wasi_write_bytes");
+        self.builder
+            .build_call(
+                write_bytes,
+                &[data_ptr.into(), len32.into()],
+                "wasi_write_string_bytes",
+            )
+            .expect("failed to write string bytes");
+        self.builder
+            .build_return(None)
+            .expect("failed to return from string writer");
     }
 
     #[cfg(feature = "wasi")]

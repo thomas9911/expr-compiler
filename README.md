@@ -15,7 +15,7 @@ Current tag usage:
 - `Int`
 - `List`
 - `BigInt`
-- `String` is reserved in the value model, but not implemented as a language feature yet
+- `String`
 - `Function`
 
 ## BigInt
@@ -53,6 +53,33 @@ Current behavior:
 - plain `Int` / `Int` arithmetic keeps the existing semantics, including overflow traps
 - the explicit `bigint_*` builtins now accept `Int`, `BigInt`, or mixed `Int` / `BigInt` operands by promoting `Int` arguments to `BigInt`
 - bigint arithmetic is implemented in Cranelift IR and LLVM IR, not in Rust runtime helpers
+
+## Strings
+
+The language has a `String` runtime type backed by a dedicated heap object with
+`len`, `cap`, and `ptr` fields. Strings are immutable at the language level for
+now, but the runtime layout is already mutation-capable.
+
+Current string surface:
+
+```text
+print("hello")
+print("line1\nline2")
+print("abc" == "abc")
+print("abc" != "xyz")
+print(string_len("hello"))
+```
+
+Current behavior:
+
+- string literals are supported with basic escapes:
+  - `\"`, `\\`, `\n`, `\r`, `\t`
+- `print` can print string values
+- `string_len(s)` returns the byte length as an `Int`
+- `==` and `!=` compare string byte contents
+- `String == non-String` is false
+- `String != non-String` is true
+- string mutation, concatenation, indexing, slicing, and conversions are not implemented yet
 
 ## Higher-order list functions
 
@@ -97,7 +124,6 @@ Current constraints:
 - function values can be stored in variables and passed to `list_map` /
   `list_filter`
 - direct function-value calls currently use identifier callees such as `f(10)`
-- strings are still not implemented as a language feature
 - mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
 
 ## LLVM backend

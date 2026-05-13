@@ -13,6 +13,10 @@ pub const LIST_HEADER_SIZE: i64 = 24;
 pub const LIST_PTR_OFFSET: i32 = 0;
 pub const LIST_LEN_OFFSET: i32 = 8;
 pub const LIST_CAP_OFFSET: i32 = 16;
+pub const STRING_HEADER_SIZE: i64 = 24;
+pub const STRING_LEN_OFFSET: i32 = 0;
+pub const STRING_CAP_OFFSET: i32 = 8;
+pub const STRING_PTR_OFFSET: i32 = 16;
 pub const BIGINT_HEADER_SIZE: i64 = 32;
 pub const BIGINT_SIGN_OFFSET: i32 = 0;
 pub const BIGINT_LEN_OFFSET: i32 = 8;
@@ -57,6 +61,14 @@ pub struct ListHeader<T> {
     pub ptr: *mut T,
     pub len: usize,
     pub cap: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct StringHeader {
+    pub len: usize,
+    pub cap: usize,
+    pub ptr: *mut u8,
 }
 
 #[repr(C)]

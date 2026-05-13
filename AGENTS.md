@@ -43,6 +43,17 @@ Guidance for coding agents working in this repository.
   - `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, and `a >= b` when both sides are `BigInt`
   - mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
   - explicit `bigint_*` builtins also promote `Int` arguments to `BigInt`
+- String values are supported:
+  - `"hello"`
+  - `print("hello")`
+  - `string_len("hello")`
+  - `"a" == "a"`
+  - `"a" != "b"`
+  - string literals support `\"`, `\\`, `\n`, `\r`, and `\t`
+  - string equality compares byte contents
+  - `String == non-String` is false
+  - `String != non-String` is true
+  - strings are immutable at the language level for now
 - Anonymous functions support captures:
   - `fn item -> item * factor end`
 - Higher-order list builtins are available:
@@ -115,6 +126,8 @@ From `Justfile`:
 - BigInt values use `TAG_BIGINT` and a dedicated heap object:
   - `{ sign, len, cap, ptr }`
   - limbs are `u32`
+- String values use `TAG_STRING` and a dedicated heap object:
+  - `{ len, cap, ptr }`
 - BigInt arithmetic and comparisons are implemented in backend IR, not in Rust runtime arithmetic helpers.
 - Print/list_print are still host-runtime boundaries.
 - LLVM core Wasm keeps print/list_print as custom imports for the Node runner.

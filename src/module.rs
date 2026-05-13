@@ -1,7 +1,8 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
-    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, TAG_BIGINT,
-    TAG_FUNCTION, TAG_INT, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, STRING_CAP_OFFSET,
+    STRING_HEADER_SIZE, STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION, TAG_INT,
+    TAG_STRING, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
@@ -919,7 +920,10 @@ fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
 
 fn generated_wrapper_path(output: &Path, suffix: &str) -> std::path::PathBuf {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
     parent
         .join(".expr-compiler")
         .join(format!("{stem}.{suffix}"))
@@ -1381,6 +1385,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "bigint_multiply"
                 | "bigint_divide"
                 | "bigint_modulo"
+                | "string_len"
         )
 }
 
@@ -1806,6 +1811,63 @@ fn compile_bigint_literal(
     }
 
     acc
+}
+
+fn compile_string_literal(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    value: &str,
+) -> CompiledValue {
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let bytes = value.as_bytes();
+    let len = i64::try_from(bytes.len()).expect("string literal too large");
+    let len_value = builder.ins().iconst(types::I64, len);
+    let align = builder.ins().iconst(types::I64, 8);
+    let data_call = builder.ins().call(alloc_ref, &[len_value, align]);
+    let data_ptr = builder.inst_results(data_call)[0];
+
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let offset = i32::try_from(index).expect("string literal offset overflow");
+        let byte_value = builder.ins().iconst(types::I8, i64::from(byte));
+        builder
+            .ins()
+            .store(MemFlags::new(), byte_value, data_ptr, offset);
+    }
+
+    let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
+    let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
+    let header_ptr = builder.inst_results(header_call)[0];
+    builder
+        .ins()
+        .store(MemFlags::new(), len_value, header_ptr, STRING_LEN_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), len_value, header_ptr, STRING_CAP_OFFSET);
+    builder
+        .ins()
+        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_STRING),
+        payload: header_ptr,
+    }
+}
+
+fn compile_string_len(builder: &mut FunctionBuilder, value: CompiledValue) -> CompiledValue {
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_STRING);
+    builder
+        .ins()
+        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let len = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        value.payload,
+        STRING_LEN_OFFSET,
+    );
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: len,
+    }
 }
 
 fn load_value_from_env(
@@ -2611,6 +2673,9 @@ fn compile_ast(
 ) -> CompiledValue {
     match ast {
         Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, *n),
+        Ast::Literal(LiteralAst::String(value)) => {
+            compile_string_literal(builder, func_refs, value)
+        }
         Ast::Literal(LiteralAst::BigInt(digits)) => {
             compile_bigint_literal(builder, func_refs, digits)
         }
@@ -2755,6 +2820,21 @@ fn compile_ast(
                     capture_slots,
                     env_ptr,
                 );
+            }
+            if function == "string_len" {
+                assert_eq!(args.len(), 1, "string_len expects 1 argument");
+                let value = compile_ast(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return compile_string_len(builder, value);
             }
             let compiled: Vec<_> = args
                 .iter()
@@ -3059,10 +3139,12 @@ fn assert_backend_executable_output(
     expected_stdout: &str,
     expected_exit: i32,
 ) {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system time before unix epoch")
-        .as_nanos();
+        .as_nanos()
+        + u128::from(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     #[cfg(windows)]
     let output = windows_temp_exe_path(&format!("__expr_compiler_bigint_test_{unique}"));
     #[cfg(not(windows))]
@@ -3340,6 +3422,18 @@ fn bigint_builtins_accept_mixed_int_and_bigint_operands() {
     assert_cranelift_executable_output(src, "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n", 0);
 }
 
+#[test]
+fn strings_print_and_len_work() {
+    let src = "fn main() do\n    print(\"hello\")\n    print(string_len(\"hi\\n\"))\nend";
+    assert_cranelift_executable_output(src, "hello\n3\n", 0);
+}
+
+#[test]
+fn strings_eq_and_ne_work() {
+    let src = "fn main() do\n    print(\"abc\" == \"abc\")\n    print(\"abc\" != \"xyz\")\n    print(\"abc\" == 1)\n    print(\"abc\" != 1)\nend";
+    assert_cranelift_executable_output(src, "1\n1\n0\n1\n", 0);
+}
+
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_bigint_add_handles_limb_carry() {
@@ -3423,6 +3517,20 @@ fn llvm_bigint_builtins_accept_mixed_int_and_bigint_operands() {
         "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n",
         0,
     );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_print_and_len_work() {
+    let src = "fn main() do\n    print(\"hello\")\n    print(string_len(\"hi\\n\"))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "hello\n3\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_strings_eq_and_ne_work() {
+    let src = "fn main() do\n    print(\"abc\" == \"abc\")\n    print(\"abc\" != \"xyz\")\n    print(\"abc\" == 1)\n    print(\"abc\" != 1)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n1\n0\n1\n", 0);
 }
 
 #[test]

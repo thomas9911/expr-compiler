@@ -49,6 +49,13 @@ struct ListHeader {
 }
 
 #[repr(C)]
+struct StringHeader {
+    len: usize,
+    cap: usize,
+    ptr: *mut u8,
+}
+
+#[repr(C)]
 struct BigIntHeader {
     sign: i64,
     len: usize,
@@ -255,7 +262,11 @@ fn print_value_inner(handle: i64) {
                 }
                 write_stdout(b"]");
             }
-            ValueTag::String => runtime_abort(),
+            ValueTag::String => {
+                let header = &*(value.payload as usize as *const StringHeader);
+                let bytes = core::slice::from_raw_parts(header.ptr, header.len);
+                write_stdout(bytes);
+            }
             ValueTag::Function => runtime_abort(),
             ValueTag::BigInt => {
                 let header = &*(value.payload as usize as *const BigIntHeader);

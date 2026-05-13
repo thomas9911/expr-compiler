@@ -13,6 +13,7 @@ pub struct LexingError {
 #[derive(Default, Debug, Clone, PartialEq)]
 pub enum LexingErrorKind {
     InvalidInteger(String),
+    InvalidString(String),
     UnknownCharacter(char),
     #[default]
     Other,
@@ -41,6 +42,37 @@ fn parse_bigint_literal(lex: &mut Lexer<'_>) -> String {
     slice[..slice.len() - 1].to_string()
 }
 
+fn parse_string_literal(lex: &mut Lexer<'_>) -> Result<String, LexingError> {
+    let slice = lex.slice();
+    let inner = &slice[1..slice.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let escaped = chars.next().ok_or_else(|| LexingError {
+            error: LexingErrorKind::InvalidString("unterminated escape".to_string()),
+            span: lex.span(),
+        })?;
+        match escaped {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            other => {
+                return Err(LexingError {
+                    error: LexingErrorKind::InvalidString(format!("unsupported escape: \\{other}")),
+                    span: lex.span(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl LexingError {
     fn from_lexer(lex: &mut Lexer<'_>) -> Self {
         LexingError {
@@ -60,6 +92,8 @@ pub enum Token {
     Newline,
     #[regex(r"[0-9]+n", parse_bigint_literal)]
     BigIntLiteral(String),
+    #[regex(r#""([^"\\]|\\["\\nrt])*""#, parse_string_literal)]
+    StringLiteral(String),
     #[regex(r"[0-9]+", parse_integer)]
     Integer(i64),
     #[token("+")]
@@ -126,6 +160,7 @@ impl Token {
             Token::Indent => TokenKind::Space,
             Token::Newline => TokenKind::Newline,
             Token::BigIntLiteral(_) => TokenKind::Integer,
+            Token::StringLiteral(_) => TokenKind::Integer,
             Token::Integer(_) => TokenKind::Integer,
             Token::Add => TokenKind::InfixOperator,
             Token::Arrow => TokenKind::Arrow,
@@ -274,6 +309,17 @@ fn tokenize_bigint_literal() {
     assert_eq!(
         result.unwrap(),
         vec![BigIntLiteral("123".to_string()), Add, Integer(4)]
+    );
+}
+
+#[test]
+fn tokenize_string_literal() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("\"hello\\nworld\"").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![StringLiteral("hello\nworld".to_string())]
     );
 }
 

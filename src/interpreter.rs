@@ -286,6 +286,9 @@ impl Interpreter {
         if matches!(literal, LiteralAst::BigInt(_)) {
             panic!("bigint literals are not supported by the interpreter");
         }
+        if matches!(literal, LiteralAst::String(_)) {
+            panic!("string literals are not supported by the interpreter");
+        }
         self.output = Ast::Literal(literal);
     }
 

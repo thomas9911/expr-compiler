@@ -1,0 +1,10 @@
+fn main() do
+    print("hello")
+    print("line1\nline2")
+    print("abc" == "abc")
+    print("abc" != "xyz")
+    print("abc" == 1)
+    print("abc" != 1)
+    print(string_len("hello"))
+    print(string_len("hi\n"))
+end

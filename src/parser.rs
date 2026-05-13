@@ -636,6 +636,7 @@ fn parse_expr_with_lhs<'a>(
 pub enum LiteralAst {
     Integer(i64),
     BigInt(String),
+    String(String),
 }
 
 impl LiteralAst {
@@ -643,6 +644,7 @@ impl LiteralAst {
         match lex.next() {
             Some(Ok(Token::Integer(int))) => Ok(LiteralAst::Integer(int)),
             Some(Ok(Token::BigIntLiteral(value))) => Ok(LiteralAst::BigInt(value)),
+            Some(Ok(Token::StringLiteral(value))) => Ok(LiteralAst::String(value)),
             _ => Err(ParseError::unexpected(lex)),
         }
     }
@@ -1231,6 +1233,29 @@ fn parse_bigint_literal_expression() {
         output: None,
         block: BlockAst {
             lines: vec![Literal(LiteralAst::BigInt("123".to_string()))],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_string_literal_expression() {
+    use Ast::*;
+
+    let text = r#"fn main() do
+    "hello\tworld"
+end"#;
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Literal(LiteralAst::String("hello\tworld".to_string()))],
         },
     });
 

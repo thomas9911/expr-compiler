@@ -1,17 +1,12 @@
 # Python-style FizzBuzz using recursion for iteration.
-# Output convention:
-# - print 69 for fizz
-# - print 420 for buzz
-# - print 69420 for fizzbuzz
-# - otherwise print the number itself
 
 fn fizzbuzz_one(x):
     if x % 15 == 0:
-        print(69420)
+        print("fizzbuzz")
     elif x % 3 == 0:
-        print(69)
+        print("fizz")
     elif x % 5 == 0:
-        print(420)
+        print("buzz")
     else:
         print(x)
 
