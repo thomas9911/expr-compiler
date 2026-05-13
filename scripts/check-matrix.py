@@ -114,13 +114,19 @@ def llvm_env(llvm_root_arg: str | None) -> dict[str, str]:
     env["LLVM_SYS_201_PREFIX"] = str(llvm_root)
     env["LLVM_CONFIG_PATH"] = str(llvm_config)
     env["PATH"] = str(llvm_bin) + os.pathsep + env.get("PATH", "")
-    env["CARGO_TARGET_DIR"] = str(REPO_ROOT / "target_llvm_backend")
+    env["CARGO_TARGET_DIR"] = os.environ.get(
+        "MATRIX_LLVM_TARGET_DIR",
+        str(REPO_ROOT / "target_llvm_backend"),
+    )
     return env
 
 
 def cranelift_env() -> dict[str, str]:
     env = os.environ.copy()
-    env["CARGO_TARGET_DIR"] = str(REPO_ROOT / "target_matrix_cranelift")
+    env["CARGO_TARGET_DIR"] = os.environ.get(
+        "MATRIX_CRANELIFT_TARGET_DIR",
+        str(REPO_ROOT / "target_matrix_cranelift"),
+    )
     return env
 
 
@@ -140,31 +146,55 @@ def run_command(
     )
 
 
-def cargo_run_args(release: bool, extra: list[str]) -> list[str]:
-    args = ["cargo", "run"]
+def compiler_binary_path(target_dir: Path, release: bool) -> Path:
+    profile = "release" if release else "debug"
+    binary = "expr-compiler.exe" if os.name == "nt" else "expr-compiler"
+    return target_dir / profile / binary
+
+
+def cargo_build_args(release: bool, features: str | None = None) -> list[str]:
+    args = ["cargo", "build"]
     if release:
         args.append("--release")
-    args.extend(["-q", "--"])
-    args.extend(extra)
+    if features:
+        args.extend(["--features", features])
     return args
 
 
-def cargo_run_args_llvm(release: bool, extra: list[str]) -> list[str]:
-    args = ["cargo", "run"]
-    if release:
-        args.append("--release")
-    args.extend(["-q", "--features", "llvm-backend", "--"])
-    args.extend(extra)
-    return args
+def ensure_compiler_built(
+    *,
+    release: bool,
+    env: dict[str, str],
+    features: str | None = None,
+) -> Path:
+    target_dir = Path(env["CARGO_TARGET_DIR"])
+    binary = compiler_binary_path(target_dir, release)
+    build_proc = run_command(
+        "cargo-build",
+        cargo_build_args(release, features),
+        env=env,
+    )
+    if build_proc.returncode != 0:
+        stderr = build_proc.stderr.rstrip()
+        stdout = build_proc.stdout.rstrip()
+        detail = stderr or stdout or "cargo build failed"
+        raise SystemExit(detail)
+    if not binary.exists():
+        raise SystemExit(f"compiler binary not found after build: {binary}")
+    return binary
 
 
-def cargo_run_args_llvm_wasi(release: bool, extra: list[str]) -> list[str]:
-    args = ["cargo", "run"]
-    if release:
-        args.append("--release")
-    args.extend(["-q", "--features", "llvm-backend,wasi", "--"])
-    args.extend(extra)
-    return args
+def run_compiler(
+    compiler: Path,
+    extra: list[str],
+    *,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return run_command(
+        compiler.name,
+        [str(compiler), *extra],
+        env=env,
+    )
 
 
 def binary_path_for(staging_dir: Path, example: Path) -> Path:
@@ -247,22 +277,27 @@ def check_binary_size(size: int) -> tuple[bool, str]:
     return (True, "")
 
 
-def run_cranelift_jit(example: Path, release: bool) -> subprocess.CompletedProcess[str]:
-    return run_command(
-        "cranelift-jit",
-        cargo_run_args(release, [str(example), "--run-jit"]),
-        env=cranelift_env(),
+def run_cranelift_jit(
+    compiler: Path, example: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return run_compiler(
+        compiler,
+        [str(example), "--run-jit"],
+        env=env,
     )
 
 
 def run_cranelift_native(
-    example: Path, release: bool, staging_dir: Path
+    compiler: Path,
+    example: Path,
+    staging_dir: Path,
+    env: dict[str, str],
 ) -> tuple[subprocess.CompletedProcess[str], int]:
     output = binary_path_for(staging_dir, example)
-    compile_proc = run_command(
-        "cranelift-native-compile",
-        cargo_run_args(release, [str(example), "-o", str(output)]),
-        env=cranelift_env(),
+    compile_proc = run_compiler(
+        compiler,
+        [str(example), "-o", str(output)],
+        env=env,
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
@@ -271,45 +306,46 @@ def run_cranelift_native(
 
 
 def run_cranelift_run_ir(
-    example: Path, release: bool
+    compiler: Path, example: Path, env: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
-    return run_command(
-        "cranelift-run-ir",
-        cargo_run_args(release, [str(example), "--run-ir"]),
-        env=cranelift_env(),
+    return run_compiler(
+        compiler,
+        [str(example), "--run-ir"],
+        env=env,
     )
 
 
 def run_cranelift_emit_ir(
-    example: Path, release: bool
+    compiler: Path, example: Path, env: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
-    return run_command(
-        "cranelift-emit-ir",
-        cargo_run_args(release, [str(example), "--emit-ir"]),
-        env=cranelift_env(),
+    return run_compiler(
+        compiler,
+        [str(example), "--emit-ir"],
+        env=env,
     )
 
 
 def run_llvm_jit(
-    example: Path, release: bool, llvm_root: str | None
+    compiler: Path, example: Path, env: dict[str, str]
 ) -> subprocess.CompletedProcess[str]:
-    return run_command(
-        "llvm-jit",
-        cargo_run_args_llvm(release, [str(example), "--run-jit", "--backend", "llvm"]),
-        env=llvm_env(llvm_root),
+    return run_compiler(
+        compiler,
+        [str(example), "--run-jit", "--backend", "llvm"],
+        env=env,
     )
 
 
 def run_llvm_native(
-    example: Path, release: bool, llvm_root: str | None, staging_dir: Path
+    compiler: Path,
+    example: Path,
+    staging_dir: Path,
+    env: dict[str, str],
 ) -> tuple[subprocess.CompletedProcess[str], int]:
     output = binary_path_for(staging_dir, example)
-    compile_proc = run_command(
-        "llvm-native-compile",
-        cargo_run_args_llvm(
-            release, [str(example), "--backend", "llvm", "-o", str(output)]
-        ),
-        env=llvm_env(llvm_root),
+    compile_proc = run_compiler(
+        compiler,
+        [str(example), "--backend", "llvm", "-o", str(output)],
+        env=env,
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
@@ -318,15 +354,16 @@ def run_llvm_native(
 
 
 def run_llvm_wasm(
-    example: Path, release: bool, llvm_root: str | None, staging_dir: Path
+    compiler: Path,
+    example: Path,
+    staging_dir: Path,
+    env: dict[str, str],
 ) -> tuple[subprocess.CompletedProcess[str], int]:
     output = staging_dir / f"{example.stem}.wasm"
-    compile_proc = run_command(
-        "llvm-wasm-compile",
-        cargo_run_args_llvm(
-            release, [str(example), "--backend", "llvm", "-o", str(output)]
-        ),
-        env=llvm_env(llvm_root),
+    compile_proc = run_compiler(
+        compiler,
+        [str(example), "--backend", "llvm", "-o", str(output)],
+        env=env,
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
@@ -339,15 +376,16 @@ def run_llvm_wasm(
 
 
 def run_llvm_component(
-    example: Path, release: bool, llvm_root: str | None, staging_dir: Path
+    compiler: Path,
+    example: Path,
+    staging_dir: Path,
+    env: dict[str, str],
 ) -> tuple[subprocess.CompletedProcess[str], int]:
     output = staging_dir / f"{example.stem}.component.wasm"
-    compile_proc = run_command(
-        "llvm-component-compile",
-        cargo_run_args_llvm_wasi(
-            release, [str(example), "--backend", "llvm", "-o", str(output)]
-        ),
-        env=llvm_env(llvm_root),
+    compile_proc = run_compiler(
+        compiler,
+        [str(example), "--backend", "llvm", "-o", str(output)],
+        env=env,
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
@@ -388,12 +426,42 @@ def main() -> int:
     args = parse_args()
     examples = resolve_examples(args.examples)
     failures: list[RunResult] = []
+    cranelift_build_env = cranelift_env()
+    llvm_build_env = llvm_env(args.llvm_root) if any(
+        mode.startswith("llvm-") for mode in args.modes
+    ) else None
+    llvm_wasi_build_env = llvm_env(args.llvm_root) if "llvm-component" in args.modes else None
+
+    cranelift_compiler = ensure_compiler_built(
+        release=args.release,
+        env=cranelift_build_env,
+    )
+    llvm_compiler = (
+        ensure_compiler_built(
+            release=args.release,
+            env=llvm_build_env,
+            features="llvm-backend",
+        )
+        if llvm_build_env is not None
+        else None
+    )
+    llvm_wasi_compiler = (
+        ensure_compiler_built(
+            release=args.release,
+            env=llvm_wasi_build_env,
+            features="llvm-backend,wasi",
+        )
+        if llvm_wasi_build_env is not None
+        else None
+    )
 
     temp_dir = Path(tempfile.mkdtemp(prefix="expr-matrix-"))
     try:
         for example in examples:
             example_results: list[RunResult] = []
-            baseline = run_cranelift_jit(example, args.release)
+            baseline = run_cranelift_jit(
+                cranelift_compiler, example, cranelift_build_env
+            )
             baseline_stdout = normalize_output(baseline.stdout)
             baseline_name = f"{example.stem}:cranelift-jit"
             baseline_result = RunResult(
@@ -412,7 +480,9 @@ def main() -> int:
 
                 name = f"{example.stem}:{mode}"
                 if mode == "cranelift-native":
-                    proc, size = run_cranelift_native(example, args.release, temp_dir)
+                    proc, size = run_cranelift_native(
+                        cranelift_compiler, example, temp_dir, cranelift_build_env
+                    )
                     ok, detail = compare_to_baseline(
                         proc,
                         baseline_stdout=baseline_stdout,
@@ -431,7 +501,9 @@ def main() -> int:
                         detail=detail,
                     )
                 elif mode == "cranelift-emit-ir":
-                    proc = run_cranelift_emit_ir(example, args.release)
+                    proc = run_cranelift_emit_ir(
+                        cranelift_compiler, example, cranelift_build_env
+                    )
                     ir_ok = proc.returncode == 0 and "function" in proc.stdout
                     detail = "" if ir_ok else "emit-ir output missing function"
                     result = RunResult(
@@ -444,7 +516,8 @@ def main() -> int:
                         detail=detail,
                     )
                 elif mode == "llvm-jit":
-                    proc = run_llvm_jit(example, args.release, args.llvm_root)
+                    assert llvm_compiler is not None and llvm_build_env is not None
+                    proc = run_llvm_jit(llvm_compiler, example, llvm_build_env)
                     ok, detail = compare_to_baseline(
                         proc,
                         baseline_stdout=baseline_stdout,
@@ -460,8 +533,9 @@ def main() -> int:
                         detail=detail,
                     )
                 elif mode == "llvm-native":
+                    assert llvm_compiler is not None and llvm_build_env is not None
                     proc, size = run_llvm_native(
-                        example, args.release, args.llvm_root, temp_dir
+                        llvm_compiler, example, temp_dir, llvm_build_env
                     )
                     ok, detail = compare_to_baseline(
                         proc,
@@ -481,8 +555,9 @@ def main() -> int:
                         detail=detail,
                     )
                 elif mode == "llvm-wasm":
+                    assert llvm_compiler is not None and llvm_build_env is not None
                     proc, size = run_llvm_wasm(
-                        example, args.release, args.llvm_root, temp_dir
+                        llvm_compiler, example, temp_dir, llvm_build_env
                     )
                     ok, detail = compare_to_baseline(
                         proc,
@@ -500,8 +575,11 @@ def main() -> int:
                         detail=detail,
                     )
                 elif mode == "llvm-component":
+                    assert (
+                        llvm_wasi_compiler is not None and llvm_wasi_build_env is not None
+                    )
                     proc, size = run_llvm_component(
-                        example, args.release, args.llvm_root, temp_dir
+                        llvm_wasi_compiler, example, temp_dir, llvm_wasi_build_env
                     )
                     ok, detail = compare_to_baseline(
                         proc,
