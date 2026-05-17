@@ -59,6 +59,11 @@ Guidance for coding agents working in this repository.
   - `string_iter_done(it)`
   - `string_iter_next(it)`
   - `string_copy(s)`
+  - `string_is_empty(s)`
+  - `string_is_not_empty(s)`
+  - `string_len(s)`
+  - `string_first(s)`
+  - `string_last(s)`
   - `"a" == "a"`
   - `"a" != "b"`
   - string literals support `\"`, `\\`, `\n`, `\r`, and `\t`
@@ -75,6 +80,8 @@ Guidance for coding agents working in this repository.
   - `string_iter_done(it)` reports whether the iterator is exhausted
   - `string_iter_next(it)` returns the next Unicode scalar value as an `Int`
   - `string_copy(s)` returns a fresh independent string copy
+  - some higher-level helpers can be autoloaded from compiler-managed `.expr` stdlib source instead of being backend builtins
+  - current autoloaded helpers include `string_is_empty(s)`, `string_is_not_empty(s)`, `string_len(s)`, `string_first(s)`, and `string_last(s)`
   - UTF-8 iterator operations validate encoding and trap on invalid byte sequences
   - string equality compares byte contents
   - `String == non-String` is false

@@ -1,0 +1,3 @@
+fn string_first(s) do
+    string_iter_next(string_chars(s))
+end

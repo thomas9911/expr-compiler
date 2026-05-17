@@ -80,6 +80,13 @@ Current behavior:
 
 - string literals are supported with basic escapes:
   - `\"`, `\\`, `\n`, `\r`, `\t`
+- some higher-level helpers can be implemented in the language and autoloaded by the compiler on use
+  - current examples:
+    - `string_is_empty(s)`
+    - `string_is_not_empty(s)`
+    - `string_len(s)`
+    - `string_first(s)`
+    - `string_last(s)`
 - `print` can print string values
 - `string_concat(a, b)` concatenates two strings and returns a fresh string
 - `bytes_len(s)` returns the byte length as an `Int`

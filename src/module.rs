@@ -13,7 +13,7 @@ use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{FuncId, Linkage, Module as CraneliftModule, default_libcall_names};
 use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 #[cfg(feature = "llvm-backend")]
@@ -71,6 +71,12 @@ struct LocalValueVar {
     payload: Variable,
 }
 
+#[derive(Clone, Copy)]
+struct StdlibFunction {
+    source: &'static str,
+    stdlib_deps: &'static [&'static str],
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct UsedFeatures {
     bigint: bool,
@@ -92,38 +98,7 @@ impl Module {
     }
 
     pub fn from_source(source: &str) -> Self {
-        use crate::parser::ParseLexer;
-        use crate::tokenizer::{Logos, Token};
-
-        let mut functions = vec![];
-        let lex = Token::lexer(source);
-        let mut lexer = ParseLexer::new(lex);
-
-        loop {
-            while lexer.peek() == Some(&Ok(Token::Newline)) {
-                lexer.next();
-            }
-            if lexer.peek().is_none() {
-                break;
-            }
-            match Ast::from_lexer(&mut lexer) {
-                Ok(Ast::FunctionDef(func)) => functions.push(func),
-                Ok(_) => {
-                    panic!(
-                        "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
-                    )
-                }
-                Err(err) => panic!("parse error: {err}"),
-            }
-        }
-
-        let (functions, closure_metadata) = lift_anonymous_functions(functions);
-        let used_features = collect_used_features(&functions);
-        Module {
-            functions,
-            closure_metadata,
-            used_features,
-        }
+        Self::from_functions(parse_source_functions(source))
     }
 
     pub fn from_ast(ast: Ast) -> Self {
@@ -139,6 +114,11 @@ impl Module {
             }
             _ => {}
         }
+        Self::from_functions(functions)
+    }
+
+    fn from_functions(functions: Vec<FunctionDefAst>) -> Self {
+        let functions = autoload_stdlib_functions(functions);
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
         let used_features = collect_used_features(&functions);
         Module {
@@ -1035,6 +1015,196 @@ fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
         .iter()
         .map(|func| (func.name.clone(), func.inputs.len()))
         .collect()
+}
+
+fn parse_source_functions(source: &str) -> Vec<FunctionDefAst> {
+    use crate::parser::ParseLexer;
+    use crate::tokenizer::{Logos, Token};
+
+    let mut functions = vec![];
+    let lex = Token::lexer(source);
+    let mut lexer = ParseLexer::new(lex);
+
+    loop {
+        while lexer.peek() == Some(&Ok(Token::Newline)) {
+            lexer.next();
+        }
+        if lexer.peek().is_none() {
+            break;
+        }
+        match Ast::from_lexer(&mut lexer) {
+            Ok(Ast::FunctionDef(func)) => functions.push(func),
+            Ok(_) => {
+                panic!(
+                    "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
+                )
+            }
+            Err(err) => panic!("parse error: {err}"),
+        }
+    }
+
+    functions
+}
+
+fn stdlib_function(name: &str) -> Option<StdlibFunction> {
+    match name {
+        "string_is_empty" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_is_empty.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_is_not_empty" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_is_not_empty.expr"),
+            stdlib_deps: &["string_is_empty"],
+        }),
+        "string_len" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_len.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_first" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_first.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_last" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_last.expr"),
+            stdlib_deps: &[],
+        }),
+        _ => None,
+    }
+}
+
+fn autoload_stdlib_functions(mut functions: Vec<FunctionDefAst>) -> Vec<FunctionDefAst> {
+    let mut defined = functions
+        .iter()
+        .map(|func| func.name.clone())
+        .collect::<HashSet<_>>();
+
+    loop {
+            let mut needed = collect_stdlib_references(&functions);
+            let mut queued = needed.iter().cloned().collect::<Vec<_>>();
+            while let Some(name) = queued.pop() {
+                if let Some(stdlib) = stdlib_function(&name) {
+                for dep in stdlib.stdlib_deps {
+                        if !needed.contains(*dep) {
+                            needed.insert((*dep).to_string());
+                            queued.push((*dep).to_string());
+                        }
+                    }
+            }
+        }
+
+        let mut added = vec![];
+        for name in needed {
+            if defined.contains(&name) {
+                continue;
+            }
+            let Some(stdlib) = stdlib_function(&name) else {
+                continue;
+            };
+            for func in parse_source_functions(stdlib.source) {
+                if defined.insert(func.name.clone()) {
+                    added.push(func);
+                }
+            }
+        }
+
+        if added.is_empty() {
+            break;
+        }
+        functions.extend(added);
+    }
+
+    functions
+}
+
+fn collect_stdlib_references(functions: &[FunctionDefAst]) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    for function in functions {
+        let mut scope = function.inputs.iter().cloned().collect::<HashSet<_>>();
+        collect_stdlib_references_from_block(&function.block, &mut scope, &mut refs);
+    }
+    refs
+}
+
+fn collect_stdlib_references_from_block(
+    block: &BlockAst,
+    scope: &mut HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    for line in &block.lines {
+        collect_stdlib_references_from_ast(line, scope, refs);
+        if let Ast::Assign { name, .. } = line {
+            scope.insert(name.clone());
+        }
+    }
+}
+
+fn collect_stdlib_references_from_ast(
+    ast: &Ast,
+    scope: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    match ast {
+        Ast::Expression(ExpressionAst { function, args }) => {
+            if !function.is_empty() && !scope.contains(function) && stdlib_function(function).is_some()
+            {
+                refs.insert(function.clone());
+            }
+            for arg in args {
+                collect_stdlib_references_from_ast(arg, scope, refs);
+            }
+        }
+        Ast::Variable(name) | Ast::FunctionRef(name) => {
+            if !scope.contains(name) && stdlib_function(name).is_some() {
+                refs.insert(name.clone());
+            }
+        }
+        Ast::Assign { value, .. } => collect_stdlib_references_from_ast(value, scope, refs),
+        Ast::If {
+            condition,
+            then,
+            else_,
+        } => {
+            collect_stdlib_references_from_ast(condition, scope, refs);
+            let mut then_scope = scope.clone();
+            collect_stdlib_references_from_block(then, &mut then_scope, refs);
+            if let Some(else_block) = else_ {
+                let mut else_scope = scope.clone();
+                collect_stdlib_references_from_block(else_block, &mut else_scope, refs);
+            }
+        }
+        Ast::Block(block) => {
+            let mut nested_scope = scope.clone();
+            collect_stdlib_references_from_block(block, &mut nested_scope, refs);
+        }
+        Ast::Lambda { inputs, body } => {
+            let mut nested_scope = scope.clone();
+            nested_scope.extend(inputs.iter().cloned());
+            collect_stdlib_references_from_ast(body, &nested_scope, refs);
+        }
+        Ast::ListLiteral(items) => {
+            for item in items {
+                collect_stdlib_references_from_ast(item, scope, refs);
+            }
+        }
+        Ast::Index { collection, index } => {
+            collect_stdlib_references_from_ast(collection, scope, refs);
+            collect_stdlib_references_from_ast(index, scope, refs);
+        }
+        Ast::IndexAssign {
+            collection,
+            index,
+            value,
+        } => {
+            collect_stdlib_references_from_ast(collection, scope, refs);
+            collect_stdlib_references_from_ast(index, scope, refs);
+            collect_stdlib_references_from_ast(value, scope, refs);
+        }
+        Ast::FunctionDef(func) => {
+            let mut nested_scope = func.inputs.iter().cloned().collect::<HashSet<_>>();
+            collect_stdlib_references_from_block(&func.block, &mut nested_scope, refs);
+        }
+        Ast::Literal(_) => {}
+    }
 }
 
 fn collect_used_features(functions: &[FunctionDefAst]) -> UsedFeatures {
@@ -4809,6 +4979,18 @@ fn strings_utf8_iteration_works() {
     assert_cranelift_executable_output(src, "104\n233\n128578\n1\n", 0);
 }
 
+#[test]
+fn autoloaded_stdlib_string_helpers_work() {
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\nend";
+    assert_cranelift_executable_output(src, "1\n0\n0\n1\n3\n104\n128578\n", 0);
+}
+
+#[test]
+fn autoloaded_stdlib_functions_can_be_used_as_values() {
+    let src = "fn main() do\n    pred = string_is_empty\n    print(pred(\"\"))\n    print(pred(\"x\"))\nend";
+    assert_cranelift_executable_output(src, "1\n0\n", 0);
+}
+
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_bigint_add_handles_limb_carry() {
@@ -4955,6 +5137,25 @@ fn llvm_strings_copy_isolated_from_mutation() {
 fn llvm_strings_utf8_iteration_works() {
     let src = "fn walk(it) do\n    if string_iter_done(it) do\n        0\n    else\n        print(string_iter_next(it))\n        walk(it)\n    end\nend\n\nfn main() do\n    walk(string_chars(\"hé🙂\"))\n    print(string_iter_done(string_chars(\"\")))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "104\n233\n128578\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_autoloaded_stdlib_string_helpers_work() {
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "1\n0\n0\n1\n3\n104\n128578\n",
+        0,
+    );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
+    let src = "fn main() do\n    pred = string_is_empty\n    print(pred(\"\"))\n    print(pred(\"x\"))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n0\n", 0);
 }
 
 #[test]
