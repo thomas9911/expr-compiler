@@ -91,6 +91,8 @@ Current behavior:
     - `string_ends_with(s, suffix)`
     - `string_contains(s, needle)`
     - `string_is_ascii(s)`
+    - `string_all(s, predicate)`
+    - `string_is_integer(s)`
     - `string_repeat(s, n)`
     - `string_reverse(s)`
 - `print` can print string values

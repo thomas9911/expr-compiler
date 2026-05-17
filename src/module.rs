@@ -1084,12 +1084,32 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
             source: include_str!("./stdlib/string_is_ascii.expr"),
             stdlib_deps: &[],
         }),
+        "string_all" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_all.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_any" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_any.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_is_integer" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_is_integer.expr"),
+            stdlib_deps: &["string_all"],
+        }),
         "string_repeat" => Some(StdlibFunction {
             source: include_str!("./stdlib/string_repeat.expr"),
             stdlib_deps: &[],
         }),
         "string_reverse" => Some(StdlibFunction {
             source: include_str!("./stdlib/string_reverse.expr"),
+            stdlib_deps: &[],
+        }),
+        "list_all" => Some(StdlibFunction {
+            source: include_str!("./stdlib/list_all.expr"),
+            stdlib_deps: &[],
+        }),
+        "list_any" => Some(StdlibFunction {
+            source: include_str!("./stdlib/list_any.expr"),
             stdlib_deps: &[],
         }),
         _ => None,
@@ -5006,10 +5026,10 @@ fn strings_utf8_iteration_works() {
 
 #[test]
 fn autoloaded_stdlib_string_helpers_work() {
-    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend";
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_all(\"1234\", __all_digits))\n    print(string_all(\"12a4\", __all_digits))\n    print(string_all(\"\", __all_digits))\n    print(string_any(\"12a4\", __all_digits))\n    print(string_any(\"abcd\", __all_digits))\n    print(string_any(\"\", __all_digits))\n    print(string_is_integer(\"11234\"))\n    print(string_is_integer(\"11T234\"))\n    print(list_all([1, 2, 3], __positive_item))\n    print(list_all([1, 0, 3], __positive_item))\n    print(list_all([], __positive_item))\n    print(list_any([1, 0, 3], __zero_item))\n    print(list_any([1, 2, 3], __zero_item))\n    print(list_any([], __zero_item))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend\n\nfn __all_digits(ch) do\n    if ch >= 48 do\n        ch <= 57\n    else\n        0\n    end\nend\n\nfn __positive_item(item) do\n    if item > 0 do\n        1\n    else\n        0\n    end\nend\n\nfn __zero_item(item) do\n    if item == 0 do\n        1\n    else\n        0\n    end\nend";
     assert_cranelift_executable_output(
         src,
-        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\nababab\n1\n",
+        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n0\n0\n1\n0\n1\n0\n0\n1\n0\n0\nababab\n1\n",
         0,
     );
 }
@@ -5171,11 +5191,11 @@ fn llvm_strings_utf8_iteration_works() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_autoloaded_stdlib_string_helpers_work() {
-    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend";
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_all(\"1234\", __all_digits))\n    print(string_all(\"12a4\", __all_digits))\n    print(string_all(\"\", __all_digits))\n    print(string_any(\"12a4\", __all_digits))\n    print(string_any(\"abcd\", __all_digits))\n    print(string_any(\"\", __all_digits))\n    print(string_is_integer(\"11234\"))\n    print(string_is_integer(\"11T234\"))\n    print(list_all([1, 2, 3], __positive_item))\n    print(list_all([1, 0, 3], __positive_item))\n    print(list_all([], __positive_item))\n    print(list_any([1, 0, 3], __zero_item))\n    print(list_any([1, 2, 3], __zero_item))\n    print(list_any([], __zero_item))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend\n\nfn __all_digits(ch) do\n    if ch >= 48 do\n        ch <= 57\n    else\n        0\n    end\nend\n\nfn __positive_item(item) do\n    if item > 0 do\n        1\n    else\n        0\n    end\nend\n\nfn __zero_item(item) do\n    if item == 0 do\n        1\n    else\n        0\n    end\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\nababab\n1\n",
+        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n0\n0\n1\n0\n1\n0\n0\n1\n0\n0\nababab\n1\n",
         0,
     );
 }

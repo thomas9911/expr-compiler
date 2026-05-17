@@ -8,6 +8,13 @@ fn consume(xs, count, total):
         x = list_pop(xs)
         consume(xs, count + 1, total + x)
 
+fn positive(x):
+    x > 0
+
 fn main():
     xs = list_map(list_range(1, 5), fn x -> x * x end)
     consume(xs, 0, 0)
+
+    print(list_all([1, 2, 3], positive))
+    print(list_all([1, 0, 3], positive))
+    print(list_any([1, 0, 3], fn x -> x == 0 end))

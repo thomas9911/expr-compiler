@@ -1,0 +1,19 @@
+fn list_all(xs, predicate) do
+    if list_len(xs) == 0 do
+        0
+    else
+        __list_all_loop(xs, 0, list_len(xs), 1, predicate)
+    end
+end
+
+fn __list_all_loop(xs, index, len, now, predicate) do
+    if index == len do
+        now
+    else
+        if now == 0 do
+            0
+        else
+            __list_all_loop(xs, index + 1, len, predicate(xs[index]), predicate)
+        end
+    end
+end
