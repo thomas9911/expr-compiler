@@ -90,10 +90,14 @@ Current behavior:
 - `bytes_remove(s, index)` removes and returns one byte as an `Int`, shifting later bytes left
 - `bytes_push(s, byte)` appends one byte, growing capacity if needed
 - `bytes_set(s, index, byte)` overwrites one byte in place
+- `string_chars(s)` returns a UTF-8 code point iterator
+- `string_iter_done(it)` returns truthy when the iterator is exhausted
+- `string_iter_next(it)` returns the next Unicode scalar value as an `Int`
 - `string_copy(s)` returns a fresh exact-fit copy of the visible string contents
 - `==` and `!=` compare string byte contents
 - `String == non-String` is false
 - `String != non-String` is true
+- `string_*` iteration validates UTF-8 and traps on invalid byte sequences
 - string mutation, concatenation, indexing, slicing, and conversions are not implemented yet
 
 ## Higher-order list functions

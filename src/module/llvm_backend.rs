@@ -3,8 +3,9 @@ use super::{
 };
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
-    BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, STRING_HEADER_SIZE, TAG_BIGINT,
-    TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_STRING, VALUE_SIZE,
+    BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, STRING_HEADER_SIZE,
+    STRING_ITER_HEADER_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_STRING,
+    TAG_STRING_ITER, VALUE_SIZE,
 };
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -1519,6 +1520,24 @@ impl<'ctx> LlvmCompiler<'ctx> {
                         self.compile_ast(&args[2], vars, capture_slots, env_ptr, function);
                     return self.build_bytes_slice(string_value, start_value, end_value, function);
                 }
+                if name == "string_chars" {
+                    assert_eq!(args.len(), 1, "string_chars expects 1 argument");
+                    let string_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    return self.build_string_chars(string_value, function);
+                }
+                if name == "string_iter_done" {
+                    assert_eq!(args.len(), 1, "string_iter_done expects 1 argument");
+                    let iter_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    return self.build_string_iter_done(iter_value, function);
+                }
+                if name == "string_iter_next" {
+                    assert_eq!(args.len(), 1, "string_iter_next expects 1 argument");
+                    let iter_value =
+                        self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                    return self.build_string_iter_next(iter_value, function);
+                }
                 if name == "string_copy" {
                     assert_eq!(args.len(), 1, "string_copy expects 1 argument");
                     let string_value =
@@ -2683,6 +2702,104 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to store string ptr");
     }
 
+    fn build_string_iter_header_ptr(
+        &self,
+        payload: IntValue<'ctx>,
+        label: &str,
+    ) -> PointerValue<'ctx> {
+        self.builder
+            .build_int_to_ptr(
+                payload,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_string_iter_header_ptr"),
+            )
+            .expect("failed to convert string iter payload to pointer")
+    }
+
+    fn build_string_iter_string_load(
+        &self,
+        payload: IntValue<'ctx>,
+        label: &str,
+    ) -> IntValue<'ctx> {
+        let ptr = self.build_string_iter_header_ptr(payload, label);
+        let string_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_iter_header_type(),
+                ptr,
+                0,
+                &format!("{label}_string_ptr_ptr"),
+            )
+            .expect("failed to build string iter string ptr");
+        self.builder
+            .build_load(self.i64_type, string_ptr, &format!("{label}_string_ptr"))
+            .expect("failed to load string iter string ptr")
+            .into_int_value()
+    }
+
+    fn build_string_iter_string_store(
+        &self,
+        payload: IntValue<'ctx>,
+        string_payload: IntValue<'ctx>,
+        label: &str,
+    ) {
+        let ptr = self.build_string_iter_header_ptr(payload, label);
+        let string_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_iter_header_type(),
+                ptr,
+                0,
+                &format!("{label}_string_ptr_ptr"),
+            )
+            .expect("failed to build string iter string store ptr");
+        self.builder
+            .build_store(string_ptr, string_payload)
+            .expect("failed to store string iter string ptr");
+    }
+
+    fn build_string_iter_index_load(
+        &self,
+        payload: IntValue<'ctx>,
+        label: &str,
+    ) -> IntValue<'ctx> {
+        let ptr = self.build_string_iter_header_ptr(payload, label);
+        let index_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_iter_header_type(),
+                ptr,
+                1,
+                &format!("{label}_index_ptr"),
+            )
+            .expect("failed to build string iter index ptr");
+        self.builder
+            .build_load(self.i64_type, index_ptr, &format!("{label}_index"))
+            .expect("failed to load string iter index")
+            .into_int_value()
+    }
+
+    fn build_string_iter_index_store(
+        &self,
+        payload: IntValue<'ctx>,
+        index: IntValue<'ctx>,
+        label: &str,
+    ) {
+        let ptr = self.build_string_iter_header_ptr(payload, label);
+        let index_ptr = self
+            .builder
+            .build_struct_gep(
+                self.string_iter_header_type(),
+                ptr,
+                1,
+                &format!("{label}_index_ptr"),
+            )
+            .expect("failed to build string iter index store ptr");
+        self.builder
+            .build_store(index_ptr, index)
+            .expect("failed to store string iter index");
+    }
+
     fn build_bigint_header_ptr(&self, payload: IntValue<'ctx>, label: &str) -> PointerValue<'ctx> {
         self.builder
             .build_int_to_ptr(
@@ -3423,6 +3540,765 @@ impl<'ctx> LlvmCompiler<'ctx> {
             tag: self.i64_type.const_int(TAG_STRING as u64, false),
             payload: header_raw,
         }
+    }
+
+    fn build_string_chars(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let string_trap = self
+            .context
+            .append_basic_block(function, "string_chars_trap");
+        let string_ok = self.context.append_basic_block(function, "string_chars_ok");
+        let string_raw = self.expect_tag_payload(
+            string_value,
+            TAG_STRING,
+            "string_chars",
+            string_ok,
+            string_trap,
+        );
+        self.builder.position_at_end(string_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(string_ok);
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let header_size = self
+            .i64_type
+            .const_int(STRING_ITER_HEADER_SIZE as u64, false);
+        let header_raw =
+            self.build_boxed_call(alloc, &[header_size, align], "string_chars_iter_header");
+        self.build_string_iter_string_store(header_raw, string_raw, "string_chars");
+        self.build_string_iter_index_store(
+            header_raw,
+            self.i64_type.const_zero(),
+            "string_chars",
+        );
+        CompiledValue {
+            tag: self.i64_type.const_int(TAG_STRING_ITER as u64, false),
+            payload: header_raw,
+        }
+    }
+
+    fn build_string_iter_done(
+        &self,
+        iter_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let iter_trap = self
+            .context
+            .append_basic_block(function, "string_iter_done_trap");
+        let iter_ok = self
+            .context
+            .append_basic_block(function, "string_iter_done_ok");
+        let iter_raw = self.expect_tag_payload(
+            iter_value,
+            TAG_STRING_ITER,
+            "string_iter_done",
+            iter_ok,
+            iter_trap,
+        );
+        self.builder.position_at_end(iter_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(iter_ok);
+        let string_raw = self.build_string_iter_string_load(iter_raw, "string_iter_done");
+        let index = self.build_string_iter_index_load(iter_raw, "string_iter_done");
+        let len = self.build_string_len_load(string_raw, "string_iter_done");
+        let done = self
+            .builder
+            .build_int_compare(
+                IntPredicate::UGE,
+                index,
+                len,
+                "string_iter_done_cmp",
+            )
+            .expect("failed string_iter_done compare");
+        self.int_value(
+            self.builder
+                .build_int_z_extend(done, self.i64_type, "string_iter_done_i64")
+                .expect("failed string_iter_done zext"),
+        )
+    }
+
+    fn build_string_iter_next(
+        &self,
+        iter_value: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let iter_trap = self
+            .context
+            .append_basic_block(function, "string_iter_next_trap");
+        let iter_ok = self
+            .context
+            .append_basic_block(function, "string_iter_next_ok");
+        let iter_raw = self.expect_tag_payload(
+            iter_value,
+            TAG_STRING_ITER,
+            "string_iter_next",
+            iter_ok,
+            iter_trap,
+        );
+        self.builder.position_at_end(iter_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(iter_ok);
+        let string_raw = self.build_string_iter_string_load(iter_raw, "string_iter_next");
+        let index = self.build_string_iter_index_load(iter_raw, "string_iter_next");
+        let len = self.build_string_len_load(string_raw, "string_iter_next");
+        let not_done = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                index,
+                len,
+                "string_iter_next_not_done",
+            )
+            .expect("failed string_iter_next done compare");
+        let done_trap = self
+            .context
+            .append_basic_block(function, "string_iter_next_done_trap");
+        let decode_block = self
+            .context
+            .append_basic_block(function, "string_iter_next_decode");
+        self.builder
+            .build_conditional_branch(not_done, decode_block, done_trap)
+            .expect("failed string_iter_next branch");
+        self.builder.position_at_end(done_trap);
+        self.build_trap_and_unreachable();
+
+        self.builder.position_at_end(decode_block);
+        let data_ptr = self.build_string_ptr_load(string_raw, "string_iter_next");
+        let (codepoint, next_index) =
+            self.build_utf8_decode_forward(data_ptr, len, index, function, "string_iter_next");
+        self.build_string_iter_index_store(iter_raw, next_index, "string_iter_next");
+        self.int_value(codepoint)
+    }
+
+    fn build_utf8_decode_forward(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        len: IntValue<'ctx>,
+        index: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) -> (IntValue<'ctx>, IntValue<'ctx>) {
+        let lead = self.build_byte_load_at(data_ptr, index, &format!("{label}_lead"));
+        let ascii_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_ascii"));
+        let non_ascii_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_non_ascii"));
+        let two_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_two"));
+        let three_or_more_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_three_or_more"));
+        let three_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_three"));
+        let four_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_four"));
+        let done_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_done"));
+
+        let is_ascii = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                lead,
+                self.i64_type.const_int(0x80, false),
+                &format!("{label}_is_ascii"),
+            )
+            .expect("failed utf8 ascii compare");
+        self.builder
+            .build_conditional_branch(is_ascii, ascii_block, non_ascii_block)
+            .expect("failed utf8 ascii branch");
+        let _entry_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(ascii_block);
+        let ascii_cp = lead;
+        let ascii_next = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(1, false),
+                &format!("{label}_ascii_next"),
+            )
+            .expect("failed utf8 ascii next");
+        self.builder
+            .build_unconditional_branch(done_block)
+            .expect("failed utf8 ascii merge");
+        let ascii_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(non_ascii_block);
+        let is_two = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                lead,
+                self.i64_type.const_int(0xe0, false),
+                &format!("{label}_is_two"),
+            )
+            .expect("failed utf8 two compare");
+        self.builder
+            .build_conditional_branch(is_two, two_block, three_or_more_block)
+            .expect("failed utf8 two branch");
+
+        self.builder.position_at_end(two_block);
+        let valid_lead = self
+            .builder
+            .build_int_compare(
+                IntPredicate::UGE,
+                lead,
+                self.i64_type.const_int(0xc2, false),
+                &format!("{label}_two_valid_lead"),
+            )
+            .expect("failed utf8 two valid lead");
+        self.build_conditional_trap(valid_lead, function, &format!("{label}_two_lead"));
+        let two_idx1 = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(1, false),
+                &format!("{label}_two_idx1"),
+            )
+            .expect("failed utf8 two idx1");
+        let has_second = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                two_idx1,
+                len,
+                &format!("{label}_two_has_second"),
+            )
+            .expect("failed utf8 two len compare");
+        self.build_conditional_trap(has_second, function, &format!("{label}_two_len"));
+        let two_b1 = self.build_byte_load_at(data_ptr, two_idx1, &format!("{label}_two_b1"));
+        self.build_trap_if_not_continuation_byte(two_b1, function, &format!("{label}_two_b1"));
+        let two_cp = self
+            .builder
+            .build_or(
+                self.builder
+                    .build_left_shift(
+                        self.builder
+                            .build_and(
+                                lead,
+                                self.i64_type.const_int(0x1f, false),
+                                &format!("{label}_two_lead_mask"),
+                            )
+                            .expect("failed utf8 two lead mask"),
+                        self.i64_type.const_int(6, false),
+                        &format!("{label}_two_lead_shift"),
+                    )
+                    .expect("failed utf8 two lead shift"),
+                self.builder
+                    .build_and(
+                        two_b1,
+                        self.i64_type.const_int(0x3f, false),
+                        &format!("{label}_two_b1_mask"),
+                    )
+                    .expect("failed utf8 two b1 mask"),
+                &format!("{label}_two_cp"),
+            )
+            .expect("failed utf8 two cp");
+        let two_next = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(2, false),
+                &format!("{label}_two_next"),
+            )
+            .expect("failed utf8 two next");
+        self.builder
+            .build_unconditional_branch(done_block)
+            .expect("failed utf8 two merge");
+        let two_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(three_or_more_block);
+        let is_three = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                lead,
+                self.i64_type.const_int(0xf0, false),
+                &format!("{label}_is_three"),
+            )
+            .expect("failed utf8 three compare");
+        self.builder
+            .build_conditional_branch(is_three, three_block, four_block)
+            .expect("failed utf8 three branch");
+
+        self.builder.position_at_end(three_block);
+        let three_idx1 = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(1, false),
+                &format!("{label}_three_idx1"),
+            )
+            .expect("failed utf8 three idx1");
+        let three_idx2 = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(2, false),
+                &format!("{label}_three_idx2"),
+            )
+            .expect("failed utf8 three idx2");
+        let has_third = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                three_idx2,
+                len,
+                &format!("{label}_three_has_third"),
+            )
+            .expect("failed utf8 three len compare");
+        self.build_conditional_trap(has_third, function, &format!("{label}_three_len"));
+        let three_b1 =
+            self.build_byte_load_at(data_ptr, three_idx1, &format!("{label}_three_b1"));
+        let three_b2 =
+            self.build_byte_load_at(data_ptr, three_idx2, &format!("{label}_three_b2"));
+        self.build_trap_if_not_continuation_byte(
+            three_b1,
+            function,
+            &format!("{label}_three_b1"),
+        );
+        self.build_trap_if_not_continuation_byte(
+            three_b2,
+            function,
+            &format!("{label}_three_b2"),
+        );
+        self.build_trap_if_invalid_three_byte_lead(
+            lead,
+            three_b1,
+            function,
+            &format!("{label}_three"),
+        );
+        let three_cp = self
+            .builder
+            .build_or(
+                self.builder
+                    .build_or(
+                        self.builder
+                            .build_left_shift(
+                                self.builder
+                                    .build_and(
+                                        lead,
+                                        self.i64_type.const_int(0x0f, false),
+                                        &format!("{label}_three_lead_mask"),
+                                    )
+                                    .expect("failed utf8 three lead mask"),
+                                self.i64_type.const_int(12, false),
+                                &format!("{label}_three_lead_shift"),
+                            )
+                            .expect("failed utf8 three lead shift"),
+                        self.builder
+                            .build_left_shift(
+                                self.builder
+                                    .build_and(
+                                        three_b1,
+                                        self.i64_type.const_int(0x3f, false),
+                                        &format!("{label}_three_b1_mask"),
+                                    )
+                                    .expect("failed utf8 three b1 mask"),
+                                self.i64_type.const_int(6, false),
+                                &format!("{label}_three_b1_shift"),
+                            )
+                            .expect("failed utf8 three b1 shift"),
+                        &format!("{label}_three_hi"),
+                    )
+                    .expect("failed utf8 three hi"),
+                self.builder
+                    .build_and(
+                        three_b2,
+                        self.i64_type.const_int(0x3f, false),
+                        &format!("{label}_three_b2_mask"),
+                    )
+                    .expect("failed utf8 three b2 mask"),
+                &format!("{label}_three_cp"),
+            )
+            .expect("failed utf8 three cp");
+        let three_next = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(3, false),
+                &format!("{label}_three_next"),
+            )
+            .expect("failed utf8 three next");
+        self.builder
+            .build_unconditional_branch(done_block)
+            .expect("failed utf8 three merge");
+        let three_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(four_block);
+        let valid_four_lead = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                lead,
+                self.i64_type.const_int(0xf5, false),
+                &format!("{label}_four_valid_lead"),
+            )
+            .expect("failed utf8 four valid lead");
+        self.build_conditional_trap(valid_four_lead, function, &format!("{label}_four_lead"));
+        let four_idx1 = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(1, false),
+                &format!("{label}_four_idx1"),
+            )
+            .expect("failed utf8 four idx1");
+        let four_idx2 = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(2, false),
+                &format!("{label}_four_idx2"),
+            )
+            .expect("failed utf8 four idx2");
+        let four_idx3 = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(3, false),
+                &format!("{label}_four_idx3"),
+            )
+            .expect("failed utf8 four idx3");
+        let has_fourth = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                four_idx3,
+                len,
+                &format!("{label}_four_has_fourth"),
+            )
+            .expect("failed utf8 four len compare");
+        self.build_conditional_trap(has_fourth, function, &format!("{label}_four_len"));
+        let four_b1 = self.build_byte_load_at(data_ptr, four_idx1, &format!("{label}_four_b1"));
+        let four_b2 = self.build_byte_load_at(data_ptr, four_idx2, &format!("{label}_four_b2"));
+        let four_b3 = self.build_byte_load_at(data_ptr, four_idx3, &format!("{label}_four_b3"));
+        self.build_trap_if_not_continuation_byte(
+            four_b1,
+            function,
+            &format!("{label}_four_b1"),
+        );
+        self.build_trap_if_not_continuation_byte(
+            four_b2,
+            function,
+            &format!("{label}_four_b2"),
+        );
+        self.build_trap_if_not_continuation_byte(
+            four_b3,
+            function,
+            &format!("{label}_four_b3"),
+        );
+        self.build_trap_if_invalid_four_byte_lead(
+            lead,
+            four_b1,
+            function,
+            &format!("{label}_four"),
+        );
+        let four_cp = self
+            .builder
+            .build_or(
+                self.builder
+                    .build_or(
+                        self.builder
+                            .build_or(
+                                self.builder
+                                    .build_left_shift(
+                                        self.builder
+                                            .build_and(
+                                                lead,
+                                                self.i64_type.const_int(0x07, false),
+                                                &format!("{label}_four_lead_mask"),
+                                            )
+                                            .expect("failed utf8 four lead mask"),
+                                        self.i64_type.const_int(18, false),
+                                        &format!("{label}_four_lead_shift"),
+                                    )
+                                    .expect("failed utf8 four lead shift"),
+                                self.builder
+                                    .build_left_shift(
+                                        self.builder
+                                            .build_and(
+                                                four_b1,
+                                                self.i64_type.const_int(0x3f, false),
+                                                &format!("{label}_four_b1_mask"),
+                                            )
+                                            .expect("failed utf8 four b1 mask"),
+                                        self.i64_type.const_int(12, false),
+                                        &format!("{label}_four_b1_shift"),
+                                    )
+                                    .expect("failed utf8 four b1 shift"),
+                                &format!("{label}_four_hi_a"),
+                            )
+                            .expect("failed utf8 four hi a"),
+                        self.builder
+                            .build_left_shift(
+                                self.builder
+                                    .build_and(
+                                        four_b2,
+                                        self.i64_type.const_int(0x3f, false),
+                                        &format!("{label}_four_b2_mask"),
+                                    )
+                                    .expect("failed utf8 four b2 mask"),
+                                self.i64_type.const_int(6, false),
+                                &format!("{label}_four_b2_shift"),
+                            )
+                            .expect("failed utf8 four b2 shift"),
+                        &format!("{label}_four_hi_b"),
+                    )
+                    .expect("failed utf8 four hi b"),
+                self.builder
+                    .build_and(
+                        four_b3,
+                        self.i64_type.const_int(0x3f, false),
+                        &format!("{label}_four_b3_mask"),
+                    )
+                    .expect("failed utf8 four b3 mask"),
+                &format!("{label}_four_cp"),
+            )
+            .expect("failed utf8 four cp");
+        let four_next = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(4, false),
+                &format!("{label}_four_next"),
+            )
+            .expect("failed utf8 four next");
+        self.builder
+            .build_unconditional_branch(done_block)
+            .expect("failed utf8 four merge");
+        let four_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(done_block);
+        let cp_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_cp_phi"))
+            .expect("failed utf8 cp phi");
+        let next_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_next_phi"))
+            .expect("failed utf8 next phi");
+        cp_phi.add_incoming(&[
+            (&ascii_cp, ascii_end),
+            (&two_cp, two_end),
+            (&three_cp, three_end),
+            (&four_cp, four_end),
+        ]);
+        next_phi.add_incoming(&[
+            (&ascii_next, ascii_end),
+            (&two_next, two_end),
+            (&three_next, three_end),
+            (&four_next, four_end),
+        ]);
+        (
+            cp_phi.as_basic_value().into_int_value(),
+            next_phi.as_basic_value().into_int_value(),
+        )
+    }
+
+    fn build_byte_load_at(
+        &self,
+        data_ptr: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        label: &str,
+    ) -> IntValue<'ctx> {
+        let addr = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_ptr_to_int(data_ptr, self.i64_type, &format!("{label}_base"))
+                    .expect("failed byte base"),
+                index,
+                &format!("{label}_addr"),
+            )
+            .expect("failed byte addr");
+        let ptr = self
+            .builder
+            .build_int_to_ptr(
+                addr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_ptr"),
+            )
+            .expect("failed byte ptr");
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), ptr, label)
+            .expect("failed byte load")
+            .into_int_value();
+        self.builder
+            .build_int_z_extend(byte, self.i64_type, &format!("{label}_i64"))
+            .expect("failed byte zext")
+    }
+
+    fn build_trap_if_not_continuation_byte(
+        &self,
+        byte: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) {
+        let masked = self
+            .builder
+            .build_and(
+                byte,
+                self.i64_type.const_int(0xc0, false),
+                &format!("{label}_masked"),
+            )
+            .expect("failed continuation mask");
+        let ok = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                masked,
+                self.i64_type.const_int(0x80, false),
+                &format!("{label}_ok"),
+            )
+            .expect("failed continuation compare");
+        self.build_conditional_trap(ok, function, label);
+    }
+
+    fn build_trap_if_invalid_three_byte_lead(
+        &self,
+        lead: IntValue<'ctx>,
+        b1: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) {
+        let not_e0 = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                lead,
+                self.i64_type.const_int(0xe0, false),
+                &format!("{label}_not_e0"),
+            )
+            .expect("failed not_e0");
+        let b1_ge_a0 = self
+            .builder
+            .build_int_compare(
+                IntPredicate::UGE,
+                b1,
+                self.i64_type.const_int(0xa0, false),
+                &format!("{label}_b1_ge_a0"),
+            )
+            .expect("failed b1_ge_a0");
+        let e0_ok = self
+            .builder
+            .build_or(not_e0, b1_ge_a0, &format!("{label}_e0_ok"))
+            .expect("failed e0_ok");
+        self.build_conditional_trap(e0_ok, function, &format!("{label}_e0"));
+
+        let not_ed = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                lead,
+                self.i64_type.const_int(0xed, false),
+                &format!("{label}_not_ed"),
+            )
+            .expect("failed not_ed");
+        let b1_lt_a0 = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                b1,
+                self.i64_type.const_int(0xa0, false),
+                &format!("{label}_b1_lt_a0"),
+            )
+            .expect("failed b1_lt_a0");
+        let ed_ok = self
+            .builder
+            .build_or(not_ed, b1_lt_a0, &format!("{label}_ed_ok"))
+            .expect("failed ed_ok");
+        self.build_conditional_trap(ed_ok, function, &format!("{label}_ed"));
+    }
+
+    fn build_trap_if_invalid_four_byte_lead(
+        &self,
+        lead: IntValue<'ctx>,
+        b1: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) {
+        let not_f0 = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                lead,
+                self.i64_type.const_int(0xf0, false),
+                &format!("{label}_not_f0"),
+            )
+            .expect("failed not_f0");
+        let b1_ge_90 = self
+            .builder
+            .build_int_compare(
+                IntPredicate::UGE,
+                b1,
+                self.i64_type.const_int(0x90, false),
+                &format!("{label}_b1_ge_90"),
+            )
+            .expect("failed b1_ge_90");
+        let f0_ok = self
+            .builder
+            .build_or(not_f0, b1_ge_90, &format!("{label}_f0_ok"))
+            .expect("failed f0_ok");
+        self.build_conditional_trap(f0_ok, function, &format!("{label}_f0"));
+
+        let not_f4 = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                lead,
+                self.i64_type.const_int(0xf4, false),
+                &format!("{label}_not_f4"),
+            )
+            .expect("failed not_f4");
+        let b1_lt_90 = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                b1,
+                self.i64_type.const_int(0x90, false),
+                &format!("{label}_b1_lt_90"),
+            )
+            .expect("failed b1_lt_90");
+        let f4_ok = self
+            .builder
+            .build_or(not_f4, b1_lt_90, &format!("{label}_f4_ok"))
+            .expect("failed f4_ok");
+        self.build_conditional_trap(f4_ok, function, &format!("{label}_f4"));
+    }
+
+    fn build_conditional_trap(
+        &self,
+        ok: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) {
+        let ok_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_ok"));
+        let trap_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_trap"));
+        self.builder
+            .build_conditional_branch(ok, ok_block, trap_block)
+            .expect("failed conditional trap branch");
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(ok_block);
     }
 
     fn build_bytes_get(
@@ -6145,6 +7021,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             ],
             false,
         )
+    }
+
+    fn string_iter_header_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context
+            .struct_type(&[self.i64_type.into(), self.i64_type.into()], false)
     }
 
     fn bigint_header_type(&self) -> inkwell::types::StructType<'ctx> {

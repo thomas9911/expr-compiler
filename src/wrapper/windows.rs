@@ -31,6 +31,7 @@ enum ValueTag {
     String = 3,
     Function = 4,
     BigInt = 5,
+    StringIter = 6,
 }
 
 #[repr(C)]
@@ -272,6 +273,7 @@ fn print_value_inner(handle: i64) {
                 let header = &*(value.payload as usize as *const BigIntHeader);
                 print_bigint(header);
             }
+            ValueTag::StringIter => runtime_abort(),
         }
     }
 
@@ -349,6 +351,7 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         3 => unsafe { alloc_value(ValueTag::String, payload) },
         4 => unsafe { alloc_value(ValueTag::Function, payload) },
         5 => unsafe { alloc_value(ValueTag::BigInt, payload) },
+        6 => unsafe { alloc_value(ValueTag::StringIter, payload) },
         _ => runtime_abort(),
     }
 }

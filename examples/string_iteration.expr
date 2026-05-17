@@ -1,0 +1,9 @@
+fn walk(it):
+    if string_iter_done(it):
+        0
+    else:
+        print(string_iter_next(it))
+        walk(it)
+
+fn main():
+    walk(string_chars("hé🙂"))

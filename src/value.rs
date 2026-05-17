@@ -3,6 +3,7 @@ pub const TAG_LIST: i64 = 2;
 pub const TAG_STRING: i64 = 3;
 pub const TAG_FUNCTION: i64 = 4;
 pub const TAG_BIGINT: i64 = 5;
+pub const TAG_STRING_ITER: i64 = 6;
 
 pub const VALUE_SIZE: i64 = 16;
 pub const VALUE_PAYLOAD_OFFSET: i32 = 8;
@@ -17,6 +18,9 @@ pub const STRING_HEADER_SIZE: i64 = 24;
 pub const STRING_LEN_OFFSET: i32 = 0;
 pub const STRING_CAP_OFFSET: i32 = 8;
 pub const STRING_PTR_OFFSET: i32 = 16;
+pub const STRING_ITER_HEADER_SIZE: i64 = 16;
+pub const STRING_ITER_STRING_OFFSET: i32 = 0;
+pub const STRING_ITER_INDEX_OFFSET: i32 = 8;
 pub const BIGINT_HEADER_SIZE: i64 = 32;
 pub const BIGINT_SIGN_OFFSET: i32 = 0;
 pub const BIGINT_LEN_OFFSET: i32 = 8;
@@ -32,6 +36,7 @@ pub enum ValueTag {
     String = TAG_STRING as u8,
     Function = TAG_FUNCTION as u8,
     BigInt = TAG_BIGINT as u8,
+    StringIter = TAG_STRING_ITER as u8,
 }
 
 impl ValueTag {
@@ -42,6 +47,7 @@ impl ValueTag {
             TAG_STRING => Some(Self::String),
             TAG_FUNCTION => Some(Self::Function),
             TAG_BIGINT => Some(Self::BigInt),
+            TAG_STRING_ITER => Some(Self::StringIter),
             _ => None,
         }
     }
@@ -69,6 +75,13 @@ pub struct StringHeader {
     pub len: usize,
     pub cap: usize,
     pub ptr: *mut u8,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct StringIterHeader {
+    pub string_ptr: i64,
+    pub byte_index: i64,
 }
 
 #[repr(C)]

@@ -55,6 +55,9 @@ Guidance for coding agents working in this repository.
   - `bytes_remove(s, 2)`
   - `bytes_push(s, 33)`
   - `bytes_set(s, 0, 72)`
+  - `string_chars(s)`
+  - `string_iter_done(it)`
+  - `string_iter_next(it)`
   - `string_copy(s)`
   - `"a" == "a"`
   - `"a" != "b"`
@@ -68,7 +71,11 @@ Guidance for coding agents working in this repository.
   - `bytes_remove(s, index)` mutates the string by removing one byte and returns that byte as an `Int`
   - `bytes_push(s, byte)` mutates the string by appending one byte
   - `bytes_set(s, index, byte)` mutates one byte in place
+  - `string_chars(s)` creates a left-to-right UTF-8 code point iterator
+  - `string_iter_done(it)` reports whether the iterator is exhausted
+  - `string_iter_next(it)` returns the next Unicode scalar value as an `Int`
   - `string_copy(s)` returns a fresh independent string copy
+  - UTF-8 iterator operations validate encoding and trap on invalid byte sequences
   - string equality compares byte contents
   - `String == non-String` is false
   - `String != non-String` is true
