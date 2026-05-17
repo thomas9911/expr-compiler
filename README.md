@@ -15,7 +15,7 @@ Current tag usage:
 - `Int`
 - `List`
 - `BigInt`
-- `String` is reserved in the value model, but not implemented as a language feature yet
+- `String`
 - `Function`
 
 ## BigInt
@@ -53,6 +53,67 @@ Current behavior:
 - plain `Int` / `Int` arithmetic keeps the existing semantics, including overflow traps
 - the explicit `bigint_*` builtins now accept `Int`, `BigInt`, or mixed `Int` / `BigInt` operands by promoting `Int` arguments to `BigInt`
 - bigint arithmetic is implemented in Cranelift IR and LLVM IR, not in Rust runtime helpers
+
+## Strings
+
+The language has a `String` runtime type backed by a dedicated heap object with
+`len`, `cap`, and `ptr` fields. String values are still UTF-8 byte storage, and
+the current API surface is explicitly byte-oriented.
+
+Current string surface:
+
+```text
+print("hello")
+print("line1\nline2")
+print(string_concat("ab", "cd"))
+print("abc" == "abc")
+print("abc" != "xyz")
+print(bytes_len("hello"))
+print(bytes_get("hello", 1))
+print(bytes_slice("hello", 1, 4))
+bytes_push(s, 33)
+bytes_set(s, 0, 72)
+copy = string_copy(s)
+```
+
+Current behavior:
+
+- string literals are supported with basic escapes:
+  - `\"`, `\\`, `\n`, `\r`, `\t`
+- some higher-level helpers can be implemented in the language and autoloaded by the compiler on use
+  - current examples:
+    - `string_is_empty(s)`
+    - `string_is_not_empty(s)`
+    - `string_len(s)`
+    - `string_first(s)`
+    - `string_last(s)`
+    - `string_starts_with(s, prefix)`
+    - `string_ends_with(s, suffix)`
+    - `string_contains(s, needle)`
+    - `string_is_ascii(s)`
+    - `string_all(s, predicate)`
+    - `string_is_integer(s)`
+    - `string_repeat(s, n)`
+    - `string_reverse(s)`
+- `print` can print string values
+- `string_concat(a, b)` concatenates two strings and returns a fresh string
+- `bytes_len(s)` returns the byte length as an `Int`
+- `bytes_get(s, i)` returns the byte at index `i` as an `Int`
+- `bytes_slice(s, start, end)` returns a new string over the byte range `[start, end)`
+- `bytes_pop(s)` removes and returns the last byte as an `Int`
+- `bytes_insert(s, index, byte)` inserts one byte in place, shifting later bytes right
+- `bytes_remove(s, index)` removes and returns one byte as an `Int`, shifting later bytes left
+- `bytes_push(s, byte)` appends one byte, growing capacity if needed
+- `bytes_set(s, index, byte)` overwrites one byte in place
+- `string_chars(s)` returns a UTF-8 code point iterator
+- `string_iter_done(it)` returns truthy when the iterator is exhausted
+- `string_iter_next(it)` returns the next Unicode scalar value as an `Int`
+- `string_copy(s)` returns a fresh exact-fit copy of the visible string contents
+- `==` and `!=` compare string byte contents
+- `String == non-String` is false
+- `String != non-String` is true
+- `string_*` iteration validates UTF-8 and traps on invalid byte sequences
+- string mutation, concatenation, indexing, slicing, and conversions are not implemented yet
 
 ## Higher-order list functions
 
@@ -97,7 +158,6 @@ Current constraints:
 - function values can be stored in variables and passed to `list_map` /
   `list_filter`
 - direct function-value calls currently use identifier callees such as `f(10)`
-- strings are still not implemented as a language feature
 - mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
 
 ## LLVM backend

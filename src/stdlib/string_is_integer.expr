@@ -1,0 +1,11 @@
+fn string_is_integer(string) do
+    string_all(string, __string_is_integer_predicate)
+end
+
+fn __string_is_integer_predicate(ch) do
+    if ch >= 48 do
+        ch <= 57
+    else
+        0
+    end
+end

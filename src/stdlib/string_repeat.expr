@@ -1,0 +1,11 @@
+fn string_repeat(s, n) do
+    __string_repeat_acc(s, n, "")
+end
+
+fn __string_repeat_acc(s, n, acc) do
+    if n <= 0 do
+        acc
+    else
+        __string_repeat_acc(s, n - 1, string_concat(acc, s))
+    end
+end

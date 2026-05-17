@@ -1,8 +1,8 @@
 use std::sync::{Mutex, OnceLock};
 
 use crate::value::{
-    BigIntHeader, ListHeader, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_STRING, Value,
-    ValueTag,
+    BigIntHeader, ListHeader, StringHeader, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST,
+    TAG_STRING, TAG_STRING_ITER, Value, ValueTag,
 };
 
 const DEFAULT_ARENA_BYTES: usize = 16 * 1024 * 1024;
@@ -141,6 +141,11 @@ fn print_bigint_ref(header: &BigIntHeader) {
     }
 }
 
+fn print_string_ref(header: &StringHeader) {
+    let bytes = unsafe { std::slice::from_raw_parts(header.ptr, header.len) };
+    print!("{}", String::from_utf8_lossy(bytes));
+}
+
 fn print_value_ref(value: &Value) {
     match value.tag {
         ValueTag::Int => print!("{}", value.payload),
@@ -156,12 +161,16 @@ fn print_value_ref(value: &Value) {
             }
             print!("]");
         }
-        ValueTag::String => runtime_trap("string values are not supported yet"),
+        ValueTag::String => {
+            let header = unsafe { &*(value.payload as usize as *const StringHeader) };
+            print_string_ref(header);
+        }
         ValueTag::Function => runtime_trap("function values are not supported here yet"),
         ValueTag::BigInt => {
             let header = unsafe { &*(value.payload as usize as *const BigIntHeader) };
             print_bigint_ref(header);
         }
+        ValueTag::StringIter => runtime_trap("string iterators are not printable"),
     }
 }
 
@@ -300,6 +309,7 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         TAG_STRING => with_arena(|arena| alloc_value(arena, ValueTag::String, payload)),
         TAG_FUNCTION => with_arena(|arena| alloc_value(arena, ValueTag::Function, payload)),
         TAG_BIGINT => with_arena(|arena| alloc_value(arena, ValueTag::BigInt, payload)),
+        TAG_STRING_ITER => with_arena(|arena| alloc_value(arena, ValueTag::StringIter, payload)),
         _ => runtime_trap("unknown value tag"),
     }
 }

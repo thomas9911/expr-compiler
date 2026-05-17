@@ -43,6 +43,57 @@ Guidance for coding agents working in this repository.
   - `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, and `a >= b` when both sides are `BigInt`
   - mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
   - explicit `bigint_*` builtins also promote `Int` arguments to `BigInt`
+- String values are supported:
+  - `"hello"`
+  - `print("hello")`
+  - `string_concat("ab", "cd")`
+  - `bytes_len("hello")`
+  - `bytes_get("hello", 1)`
+  - `bytes_slice("hello", 1, 4)`
+  - `bytes_pop(s)`
+  - `bytes_insert(s, 1, 97)`
+  - `bytes_remove(s, 2)`
+  - `bytes_push(s, 33)`
+  - `bytes_set(s, 0, 72)`
+  - `string_chars(s)`
+  - `string_iter_done(it)`
+  - `string_iter_next(it)`
+  - `string_copy(s)`
+  - `string_is_empty(s)`
+  - `string_is_not_empty(s)`
+  - `string_len(s)`
+  - `string_first(s)`
+  - `string_last(s)`
+  - `string_starts_with(s, prefix)`
+  - `string_ends_with(s, suffix)`
+  - `string_contains(s, needle)`
+  - `string_is_ascii(s)`
+  - `string_all(s, predicate)`
+  - `string_is_integer(s)`
+  - `string_repeat(s, n)`
+  - `string_reverse(s)`
+  - `"a" == "a"`
+  - `"a" != "b"`
+  - string literals support `\"`, `\\`, `\n`, `\r`, and `\t`
+  - `string_concat(a, b)` returns a fresh string
+  - `bytes_len(s)` returns byte length
+  - `bytes_get(s, i)` returns an `Int` byte value
+  - `bytes_slice(s, start, end)` returns a new string over the byte range `[start, end)`
+  - `bytes_pop(s)` mutates the string by shrinking it and returns the removed byte as an `Int`
+  - `bytes_insert(s, index, byte)` mutates the string by inserting one byte in place
+  - `bytes_remove(s, index)` mutates the string by removing one byte and returns that byte as an `Int`
+  - `bytes_push(s, byte)` mutates the string by appending one byte
+  - `bytes_set(s, index, byte)` mutates one byte in place
+  - `string_chars(s)` creates a left-to-right UTF-8 code point iterator
+  - `string_iter_done(it)` reports whether the iterator is exhausted
+  - `string_iter_next(it)` returns the next Unicode scalar value as an `Int`
+  - `string_copy(s)` returns a fresh independent string copy
+  - some higher-level helpers can be autoloaded from compiler-managed `.expr` stdlib source instead of being backend builtins
+  - current autoloaded helpers include `string_is_empty(s)`, `string_is_not_empty(s)`, `string_len(s)`, `string_first(s)`, `string_last(s)`, `string_starts_with(s, prefix)`, `string_ends_with(s, suffix)`, `string_contains(s, needle)`, `string_is_ascii(s)`, `string_all(s, predicate)`, `string_is_integer(s)`, `string_repeat(s, n)`, and `string_reverse(s)`
+  - UTF-8 iterator operations validate encoding and trap on invalid byte sequences
+  - string equality compares byte contents
+  - `String == non-String` is false
+  - `String != non-String` is true
 - Anonymous functions support captures:
   - `fn item -> item * factor end`
 - Higher-order list builtins are available:
@@ -115,6 +166,8 @@ From `Justfile`:
 - BigInt values use `TAG_BIGINT` and a dedicated heap object:
   - `{ sign, len, cap, ptr }`
   - limbs are `u32`
+- String values use `TAG_STRING` and a dedicated heap object:
+  - `{ len, cap, ptr }`
 - BigInt arithmetic and comparisons are implemented in backend IR, not in Rust runtime arithmetic helpers.
 - Print/list_print are still host-runtime boundaries.
 - LLVM core Wasm keeps print/list_print as custom imports for the Node runner.

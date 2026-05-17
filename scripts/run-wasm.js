@@ -89,7 +89,12 @@ function renderValue(tag, payload, memory) {
   }
 
   if (tag === 3) {
-    return "<string>";
+    const mem = new DataView(memory.buffer);
+    const headerPtr = Number(payload);
+    const len = Number(mem.getBigUint64(headerPtr + 0, true));
+    const bytesPtr = Number(mem.getBigUint64(headerPtr + 16, true));
+    const bytes = new Uint8Array(memory.buffer, bytesPtr, len);
+    return new TextDecoder().decode(bytes);
   }
 
   throw new Error(`unsupported tag: ${tag}`);
