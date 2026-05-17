@@ -5,15 +5,9 @@ end
 fn __string_contains_at(s, needle, index, s_len, needle_len) do
     if needle_len == 0 do
         1
+    else if index + needle_len > s_len do
+        0
     else
-        if index + needle_len > s_len do
-            0
-        else
-            if bytes_slice(s, index, index + needle_len) == needle do
-                1
-            else
-                __string_contains_at(s, needle, index + 1, s_len, needle_len)
-            end
-        end
+        bytes_slice(s, index, index + needle_len) == needle or __string_contains_at(s, needle, index + 1, s_len, needle_len)
     end
 end

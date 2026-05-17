@@ -403,20 +403,24 @@ impl ExpressionAst {
 
 fn infix_precedence(token: &Token) -> Option<u8> {
     match token {
+        Token::Or => Some(0),
+        Token::And => Some(1),
         Token::GreaterThan
         | Token::LessThan
         | Token::GreaterThanOrEqual
         | Token::LessThanOrEqual
         | Token::EqualEqual
-        | Token::NotEqual => Some(1),
-        Token::Add | Token::Subtract => Some(2),
-        Token::Multiply | Token::Divide | Token::Modulo => Some(3),
+        | Token::NotEqual => Some(2),
+        Token::Add | Token::Subtract => Some(3),
+        Token::Multiply | Token::Divide | Token::Modulo => Some(4),
         _ => None,
     }
 }
 
 fn infix_name(token: &Token) -> &'static str {
     match token {
+        Token::And => "and",
+        Token::Or => "or",
         Token::Add => "add",
         Token::Subtract => "subtract",
         Token::Multiply => "multiply",
@@ -1525,4 +1529,49 @@ fn parse_identifier_with_digits() {
             },
         })
     );
+}
+
+#[test]
+fn parse_logical_operator_precedence() {
+    use Ast::*;
+
+    let text = "fn main() do\n    1 == 1 and 2 == 2 or 0\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "or".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function: "and".to_string(),
+                        args: vec![
+                            Expression(ExpressionAst {
+                                function: "eq".to_string(),
+                                args: vec![
+                                    Literal(LiteralAst::Integer(1)),
+                                    Literal(LiteralAst::Integer(1)),
+                                ],
+                            }),
+                            Expression(ExpressionAst {
+                                function: "eq".to_string(),
+                                args: vec![
+                                    Literal(LiteralAst::Integer(2)),
+                                    Literal(LiteralAst::Integer(2)),
+                                ],
+                            }),
+                        ],
+                    }),
+                    Literal(LiteralAst::Integer(0)),
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
 }

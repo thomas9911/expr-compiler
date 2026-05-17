@@ -3,9 +3,5 @@ fn string_ends_with(s, suffix) do
 end
 
 fn __string_ends_with_len(s, suffix, s_len, suffix_len) do
-    if suffix_len > s_len do
-        0
-    else
-        bytes_slice(s, s_len - suffix_len, s_len) == suffix
-    end
+    suffix_len <= s_len and bytes_slice(s, s_len - suffix_len, s_len) == suffix
 end

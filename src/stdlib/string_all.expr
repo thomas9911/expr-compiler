@@ -7,13 +7,9 @@ fn string_all(string, predicate) do
 end
 
 fn __string_all_loop(it, now, predicate) do
-    if string_iter_done(it) do
+    if string_iter_done(it) or now == 0 do
         now
     else
-        if now == 0 do
-            0
-        else
-            __string_all_loop(it, predicate(string_iter_next(it)), predicate)
-        end
+        __string_all_loop(it, predicate(string_iter_next(it)), predicate)
     end
 end

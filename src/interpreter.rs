@@ -96,6 +96,40 @@ impl Interpreter {
         }
 
         match expression.function.as_ref() {
+            "and" => {
+                if expression.args.len() != 2 {
+                    eprintln!("and expects 2 arguments");
+                    self.execute_literal(LiteralAst::Integer(0));
+                    return;
+                }
+                let mut args = expression.args.into_iter();
+                let lhs = args.next().unwrap();
+                let rhs = args.next().unwrap();
+                self.execute(lhs);
+                if self.output_is_truthy() {
+                    self.execute(rhs);
+                    self.execute_literal(LiteralAst::Integer(i64::from(self.output_is_truthy())));
+                } else {
+                    self.execute_literal(LiteralAst::Integer(0));
+                }
+            }
+            "or" => {
+                if expression.args.len() != 2 {
+                    eprintln!("or expects 2 arguments");
+                    self.execute_literal(LiteralAst::Integer(0));
+                    return;
+                }
+                let mut args = expression.args.into_iter();
+                let lhs = args.next().unwrap();
+                let rhs = args.next().unwrap();
+                self.execute(lhs);
+                if self.output_is_truthy() {
+                    self.execute_literal(LiteralAst::Integer(1));
+                } else {
+                    self.execute(rhs);
+                    self.execute_literal(LiteralAst::Integer(i64::from(self.output_is_truthy())));
+                }
+            }
             "add" => {
                 let mut sum = 0i64;
                 for arg in expression.args {
@@ -350,6 +384,40 @@ mod tests {
             *interpreter.get_output(),
             Ast::Literal(LiteralAst::Integer(99))
         );
+    }
+
+    #[test]
+    fn executes_logical_and_or_with_short_circuit() {
+        let mut interpreter = Interpreter::default();
+        interpreter.execute(Ast::Expression(ExpressionAst {
+            function: "and".to_string(),
+            args: vec![
+                Ast::Literal(LiteralAst::Integer(0)),
+                Ast::Expression(ExpressionAst {
+                    function: "divide".to_string(),
+                    args: vec![
+                        Ast::Literal(LiteralAst::Integer(1)),
+                        Ast::Literal(LiteralAst::Integer(0)),
+                    ],
+                }),
+            ],
+        }));
+        assert_eq!(*interpreter.get_output(), Ast::Literal(LiteralAst::Integer(0)));
+
+        interpreter.execute(Ast::Expression(ExpressionAst {
+            function: "or".to_string(),
+            args: vec![
+                Ast::Literal(LiteralAst::Integer(1)),
+                Ast::Expression(ExpressionAst {
+                    function: "divide".to_string(),
+                    args: vec![
+                        Ast::Literal(LiteralAst::Integer(1)),
+                        Ast::Literal(LiteralAst::Integer(0)),
+                    ],
+                }),
+            ],
+        }));
+        assert_eq!(*interpreter.get_output(), Ast::Literal(LiteralAst::Integer(1)));
     }
 
     #[test]

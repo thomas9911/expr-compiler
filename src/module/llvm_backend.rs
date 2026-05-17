@@ -1428,6 +1428,18 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 function: name,
                 args,
             }) => {
+                if name == "and" || name == "or" {
+                    assert_eq!(args.len(), 2, "{name} expects 2 arguments");
+                    return self.compile_logical_op(
+                        name,
+                        &args[0],
+                        &args[1],
+                        vars,
+                        capture_slots,
+                        env_ptr,
+                        function,
+                    );
+                }
                 if name == "list_map" {
                     return self.compile_list_map(args, vars, capture_slots, env_ptr, function);
                 }
@@ -2239,6 +2251,82 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .try_as_basic_value()
             .unwrap_basic()
             .into_int_value()
+    }
+
+    fn compile_logical_op(
+        &self,
+        name: &str,
+        lhs_ast: &Ast,
+        rhs_ast: &Ast,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let lhs = self.compile_ast(lhs_ast, vars, capture_slots, env_ptr, function);
+        let lhs_truth =
+            self.build_internal_scalar_call(self.require_func("__value_is_truthy"), &[lhs], "logic_lhs");
+        let lhs_non_zero = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                lhs_truth,
+                self.i64_type.const_zero(),
+                "logic_lhs_non_zero",
+            )
+            .expect("failed to compare logical lhs truth");
+
+        let rhs_block = self.context.append_basic_block(function, "logic_rhs");
+        let short_block = self.context.append_basic_block(function, "logic_short");
+        let merge_block = self.context.append_basic_block(function, "logic_merge");
+
+        if name == "and" {
+            self.builder
+                .build_conditional_branch(lhs_non_zero, rhs_block, short_block)
+                .expect("failed to branch logical and");
+        } else {
+            self.builder
+                .build_conditional_branch(lhs_non_zero, short_block, rhs_block)
+                .expect("failed to branch logical or");
+        }
+
+        self.builder.position_at_end(short_block);
+        let short_payload = self
+            .i64_type
+            .const_int(if name == "and" { 0 } else { 1 }, false);
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed to branch logical short merge");
+        let short_from = self
+            .builder
+            .get_insert_block()
+            .expect("missing logical short block");
+
+        self.builder.position_at_end(rhs_block);
+        let rhs = self.compile_ast(rhs_ast, vars, capture_slots, env_ptr, function);
+        let rhs_truth =
+            self.build_internal_scalar_call(self.require_func("__value_is_truthy"), &[rhs], "logic_rhs");
+        self.builder
+            .build_unconditional_branch(merge_block)
+            .expect("failed to branch logical rhs merge");
+        let rhs_from = self
+            .builder
+            .get_insert_block()
+            .expect("missing logical rhs block");
+
+        self.builder.position_at_end(merge_block);
+        let payload_phi = self
+            .builder
+            .build_phi(self.i64_type, "logic_payload")
+            .expect("failed to build logical payload phi");
+        payload_phi.add_incoming(&[
+            (&short_payload as &dyn inkwell::values::BasicValue<'ctx>, short_from),
+            (&rhs_truth as &dyn inkwell::values::BasicValue<'ctx>, rhs_from),
+        ]);
+        CompiledValue {
+            tag: self.i64_type.const_int(TAG_INT as u64, false),
+            payload: payload_phi.as_basic_value().into_int_value(),
+        }
     }
 
     fn require_func(&self, name: &str) -> FunctionValue<'ctx> {

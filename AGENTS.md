@@ -96,6 +96,11 @@ Guidance for coding agents working in this repository.
   - `String != non-String` is true
 - Anonymous functions support captures:
   - `fn item -> item * factor end`
+- logical infix operators are supported:
+  - `a and b`
+  - `a or b`
+  - both short-circuit
+  - both return normalized integer booleans `0` or `1`
 - Higher-order list builtins are available:
   - `list_map(xs, callback)`
   - `list_filter(xs, callback)`

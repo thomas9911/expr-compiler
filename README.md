@@ -113,7 +113,14 @@ Current behavior:
 - `String == non-String` is false
 - `String != non-String` is true
 - `string_*` iteration validates UTF-8 and traps on invalid byte sequences
-- string mutation, concatenation, indexing, slicing, and conversions are not implemented yet
+- UTF-8-aware indexing/slicing and string conversion helpers are not implemented yet
+
+Logical infix operators are also supported:
+
+- `a and b`
+- `a or b`
+- both short-circuit
+- both return normalized integer booleans `0` or `1`
 
 ## Higher-order list functions
 

@@ -136,6 +136,10 @@ pub enum Token {
     DefineFunction,
     #[token("if")]
     If,
+    #[token("and")]
+    And,
+    #[token("or")]
+    Or,
     #[token("elif")]
     Elif,
     #[token("else")]
@@ -182,6 +186,7 @@ impl Token {
             Token::Assign => TokenKind::Assign,
             Token::DefineFunction => TokenKind::DefineFunction,
             Token::If => TokenKind::If,
+            Token::And | Token::Or => TokenKind::InfixOperator,
             Token::Elif => TokenKind::Else,
             Token::Else => TokenKind::Else,
             Token::Comment => unreachable!(),
@@ -504,6 +509,23 @@ fn tokenize_if_else_keywords() {
             Integer(0),
             Newline,
             EndBlock,
+        ]
+    );
+}
+
+#[test]
+fn tokenize_logical_keywords() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("a and b or c").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("a".to_string()),
+            And,
+            Symbol("b".to_string()),
+            Or,
+            Symbol("c".to_string()),
         ]
     );
 }

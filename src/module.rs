@@ -1860,6 +1860,79 @@ fn call_unary_scalar(
     builder.inst_results(call)[0]
 }
 
+fn compile_logical_op(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    lhs_ast: &Ast,
+    rhs_ast: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let lhs = compile_ast(
+        builder,
+        lhs_ast,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let lhs_truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", lhs);
+    let lhs_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, lhs_truth, 0);
+
+    let rhs_block = builder.create_block();
+    let short_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+
+    if function == "and" {
+        builder
+            .ins()
+            .brif(lhs_non_zero, rhs_block, &[], short_block, &[]);
+    } else {
+        builder
+            .ins()
+            .brif(lhs_non_zero, short_block, &[], rhs_block, &[]);
+    }
+
+    builder.switch_to_block(short_block);
+    builder.seal_block(short_block);
+    let short_payload = builder
+        .ins()
+        .iconst(types::I64, if function == "and" { 0 } else { 1 });
+    builder.ins().jump(merge_block, &[BlockArg::Value(short_payload)]);
+
+    builder.switch_to_block(rhs_block);
+    builder.seal_block(rhs_block);
+    let rhs = compile_ast(
+        builder,
+        rhs_ast,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let rhs_truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", rhs);
+    builder.ins().jump(merge_block, &[BlockArg::Value(rhs_truth)]);
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload: builder.block_params(merge_block)[0],
+    }
+}
+
 fn call_binary(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
@@ -4028,6 +4101,22 @@ fn compile_ast(
             )
         }
         Ast::Expression(ExpressionAst { function, args }) => {
+            if function == "and" || function == "or" {
+                assert_eq!(args.len(), 2, "{function} expects 2 arguments");
+                return compile_logical_op(
+                    builder,
+                    function,
+                    &args[0],
+                    &args[1],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+            }
             if function == "list_map" {
                 return compile_list_map(
                     builder,
@@ -5040,6 +5129,12 @@ fn autoloaded_stdlib_functions_can_be_used_as_values() {
     assert_cranelift_executable_output(src, "1\n0\n", 0);
 }
 
+#[test]
+fn jit_logical_and_or_short_circuit() {
+    let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\nend";
+    assert_cranelift_executable_output(src, "0\n1\n1\n1\n", 0);
+}
+
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_bigint_add_handles_limb_carry() {
@@ -5205,6 +5300,13 @@ fn llvm_autoloaded_stdlib_string_helpers_work() {
 fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
     let src = "fn main() do\n    pred = string_is_empty\n    print(pred(\"\"))\n    print(pred(\"x\"))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n0\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_logical_and_or_short_circuit() {
+    let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n1\n1\n1\n", 0);
 }
 
 #[test]

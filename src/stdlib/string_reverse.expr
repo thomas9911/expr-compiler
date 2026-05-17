@@ -23,6 +23,4 @@ fn __string_utf_width(codepoint) do
     else
         4
     end
-    end
-    end
 end
