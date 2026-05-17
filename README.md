@@ -87,6 +87,12 @@ Current behavior:
     - `string_len(s)`
     - `string_first(s)`
     - `string_last(s)`
+    - `string_starts_with(s, prefix)`
+    - `string_ends_with(s, suffix)`
+    - `string_contains(s, needle)`
+    - `string_is_ascii(s)`
+    - `string_repeat(s, n)`
+    - `string_reverse(s)`
 - `print` can print string values
 - `string_concat(a, b)` concatenates two strings and returns a fresh string
 - `bytes_len(s)` returns the byte length as an `Int`

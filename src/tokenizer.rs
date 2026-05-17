@@ -148,7 +148,7 @@ pub enum Token {
     ColonBlock,
     #[token("end")]
     EndBlock,
-    #[regex(r"[a-zA-Z_]+", |lexer| lexer.slice().to_string())]
+    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lexer| lexer.slice().to_string())]
     Symbol(String),
     #[regex(" ", logos::skip, priority = 3)]
     Ignored,
@@ -515,6 +515,21 @@ fn tokenize_if_not_symbol() {
     // 'if' and 'else' must not lex as Symbol
     let result: Result<Vec<_>, _> = Token::lexer("if else").collect();
     assert_eq!(result.unwrap(), vec![If, Else]);
+}
+
+#[test]
+fn tokenize_identifier_with_digits() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("utf8_width x1 _tmp2").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("utf8_width".to_string()),
+            Symbol("x1".to_string()),
+            Symbol("_tmp2".to_string()),
+        ]
+    );
 }
 
 #[test]

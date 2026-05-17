@@ -1503,3 +1503,26 @@ fn parse_python_style_nested_elif() {
 
     assert_eq!(ast, expected);
 }
+
+#[test]
+fn parse_identifier_with_digits() {
+    use crate::parser::Ast::*;
+    use crate::parser::LiteralAst;
+
+    let mut lexer = ParseLexer::new(Token::lexer("fn utf8_width(x1) do\n    x1 + 1\nend"));
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+    assert_eq!(
+        ast,
+        FunctionDef(FunctionDefAst {
+            name: "utf8_width".to_string(),
+            inputs: vec!["x1".to_string()],
+            output: None,
+            block: BlockAst {
+                lines: vec![Expression(ExpressionAst {
+                    function: "add".to_string(),
+                    args: vec![Variable("x1".to_string()), Literal(LiteralAst::Integer(1))],
+                })],
+            },
+        })
+    );
+}

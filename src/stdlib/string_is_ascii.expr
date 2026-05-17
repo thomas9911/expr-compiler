@@ -1,0 +1,15 @@
+fn string_is_ascii(s) do
+    __string_is_ascii_at(s, 0, bytes_len(s))
+end
+
+fn __string_is_ascii_at(s, index, len) do
+    if index == len do
+        1
+    else
+        if bytes_get(s, index) < 128 do
+            __string_is_ascii_at(s, index + 1, len)
+        else
+            0
+        end
+    end
+end

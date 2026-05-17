@@ -1,0 +1,28 @@
+fn string_reverse(s) do
+    __string_reverse_walk(s, string_chars(s), 0, "")
+end
+
+fn __string_reverse_walk(s, it, byte_index, acc) do
+    if string_iter_done(it) do
+        acc
+    else
+        codepoint = string_iter_next(it)
+        width = __string_utf_width(codepoint)
+        piece = bytes_slice(s, byte_index, byte_index + width)
+        __string_reverse_walk(s, it, byte_index + width, string_concat(piece, acc))
+    end
+end
+
+fn __string_utf_width(codepoint) do
+    if codepoint < 128 do
+        1
+    else if codepoint < 2048 do
+        2
+    else if codepoint < 65536 do
+        3
+    else
+        4
+    end
+    end
+    end
+end

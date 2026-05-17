@@ -2758,11 +2758,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to store string iter string ptr");
     }
 
-    fn build_string_iter_index_load(
-        &self,
-        payload: IntValue<'ctx>,
-        label: &str,
-    ) -> IntValue<'ctx> {
+    fn build_string_iter_index_load(&self, payload: IntValue<'ctx>, label: &str) -> IntValue<'ctx> {
         let ptr = self.build_string_iter_header_ptr(payload, label);
         let index_ptr = self
             .builder
@@ -3570,11 +3566,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let header_raw =
             self.build_boxed_call(alloc, &[header_size, align], "string_chars_iter_header");
         self.build_string_iter_string_store(header_raw, string_raw, "string_chars");
-        self.build_string_iter_index_store(
-            header_raw,
-            self.i64_type.const_zero(),
-            "string_chars",
-        );
+        self.build_string_iter_index_store(header_raw, self.i64_type.const_zero(), "string_chars");
         CompiledValue {
             tag: self.i64_type.const_int(TAG_STRING_ITER as u64, false),
             payload: header_raw,
@@ -3608,12 +3600,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let len = self.build_string_len_load(string_raw, "string_iter_done");
         let done = self
             .builder
-            .build_int_compare(
-                IntPredicate::UGE,
-                index,
-                len,
-                "string_iter_done_cmp",
-            )
+            .build_int_compare(IntPredicate::UGE, index, len, "string_iter_done_cmp")
             .expect("failed string_iter_done compare");
         self.int_value(
             self.builder
@@ -3649,12 +3636,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let len = self.build_string_len_load(string_raw, "string_iter_next");
         let not_done = self
             .builder
-            .build_int_compare(
-                IntPredicate::ULT,
-                index,
-                len,
-                "string_iter_next_not_done",
-            )
+            .build_int_compare(IntPredicate::ULT, index, len, "string_iter_next_not_done")
             .expect("failed string_iter_next done compare");
         let done_trap = self
             .context
@@ -3861,20 +3843,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )
             .expect("failed utf8 three len compare");
         self.build_conditional_trap(has_third, function, &format!("{label}_three_len"));
-        let three_b1 =
-            self.build_byte_load_at(data_ptr, three_idx1, &format!("{label}_three_b1"));
-        let three_b2 =
-            self.build_byte_load_at(data_ptr, three_idx2, &format!("{label}_three_b2"));
-        self.build_trap_if_not_continuation_byte(
-            three_b1,
-            function,
-            &format!("{label}_three_b1"),
-        );
-        self.build_trap_if_not_continuation_byte(
-            three_b2,
-            function,
-            &format!("{label}_three_b2"),
-        );
+        let three_b1 = self.build_byte_load_at(data_ptr, three_idx1, &format!("{label}_three_b1"));
+        let three_b2 = self.build_byte_load_at(data_ptr, three_idx2, &format!("{label}_three_b2"));
+        self.build_trap_if_not_continuation_byte(three_b1, function, &format!("{label}_three_b1"));
+        self.build_trap_if_not_continuation_byte(three_b2, function, &format!("{label}_three_b2"));
         self.build_trap_if_invalid_three_byte_lead(
             lead,
             three_b1,
@@ -3986,21 +3958,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let four_b1 = self.build_byte_load_at(data_ptr, four_idx1, &format!("{label}_four_b1"));
         let four_b2 = self.build_byte_load_at(data_ptr, four_idx2, &format!("{label}_four_b2"));
         let four_b3 = self.build_byte_load_at(data_ptr, four_idx3, &format!("{label}_four_b3"));
-        self.build_trap_if_not_continuation_byte(
-            four_b1,
-            function,
-            &format!("{label}_four_b1"),
-        );
-        self.build_trap_if_not_continuation_byte(
-            four_b2,
-            function,
-            &format!("{label}_four_b2"),
-        );
-        self.build_trap_if_not_continuation_byte(
-            four_b3,
-            function,
-            &format!("{label}_four_b3"),
-        );
+        self.build_trap_if_not_continuation_byte(four_b1, function, &format!("{label}_four_b1"));
+        self.build_trap_if_not_continuation_byte(four_b2, function, &format!("{label}_four_b2"));
+        self.build_trap_if_not_continuation_byte(four_b3, function, &format!("{label}_four_b3"));
         self.build_trap_if_invalid_four_byte_lead(
             lead,
             four_b1,

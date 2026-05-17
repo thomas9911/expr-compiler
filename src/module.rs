@@ -1068,6 +1068,30 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
             source: include_str!("./stdlib/string_last.expr"),
             stdlib_deps: &[],
         }),
+        "string_starts_with" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_starts_with.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_ends_with" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_ends_with.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_contains" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_contains.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_is_ascii" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_is_ascii.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_repeat" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_repeat.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_reverse" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_reverse.expr"),
+            stdlib_deps: &[],
+        }),
         _ => None,
     }
 }
@@ -1079,16 +1103,16 @@ fn autoload_stdlib_functions(mut functions: Vec<FunctionDefAst>) -> Vec<Function
         .collect::<HashSet<_>>();
 
     loop {
-            let mut needed = collect_stdlib_references(&functions);
-            let mut queued = needed.iter().cloned().collect::<Vec<_>>();
-            while let Some(name) = queued.pop() {
-                if let Some(stdlib) = stdlib_function(&name) {
+        let mut needed = collect_stdlib_references(&functions);
+        let mut queued = needed.iter().cloned().collect::<Vec<_>>();
+        while let Some(name) = queued.pop() {
+            if let Some(stdlib) = stdlib_function(&name) {
                 for dep in stdlib.stdlib_deps {
-                        if !needed.contains(*dep) {
-                            needed.insert((*dep).to_string());
-                            queued.push((*dep).to_string());
-                        }
+                    if !needed.contains(*dep) {
+                        needed.insert((*dep).to_string());
+                        queued.push((*dep).to_string());
                     }
+                }
             }
         }
 
@@ -1145,7 +1169,9 @@ fn collect_stdlib_references_from_ast(
 ) {
     match ast {
         Ast::Expression(ExpressionAst { function, args }) => {
-            if !function.is_empty() && !scope.contains(function) && stdlib_function(function).is_some()
+            if !function.is_empty()
+                && !scope.contains(function)
+                && stdlib_function(function).is_some()
             {
                 refs.insert(function.clone());
             }
@@ -1569,7 +1595,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "string_iter_next"
                 | "string_copy"
                 | "string_concat"
-          )
+        )
 }
 
 fn lift_anonymous_functions(
@@ -2777,12 +2803,9 @@ fn compile_string_iter_done(
         iter_value.payload,
         STRING_ITER_INDEX_OFFSET,
     );
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_ptr,
-        STRING_LEN_OFFSET,
-    );
+    let len = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), string_ptr, STRING_LEN_OFFSET);
     let done = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
@@ -2814,24 +2837,14 @@ fn compile_string_iter_next(
         iter_value.payload,
         STRING_ITER_INDEX_OFFSET,
     );
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_ptr,
-        STRING_LEN_OFFSET,
-    );
-    let not_done = builder
+    let len = builder
         .ins()
-        .icmp(IntCC::UnsignedLessThan, index, len);
-    builder
+        .load(types::I64, MemFlags::new(), string_ptr, STRING_LEN_OFFSET);
+    let not_done = builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
+    builder.ins().trapz(not_done, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let data_ptr = builder
         .ins()
-        .trapz(not_done, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_ptr,
-        STRING_PTR_OFFSET,
-    );
+        .load(types::I64, MemFlags::new(), string_ptr, STRING_PTR_OFFSET);
 
     let (codepoint, next_index) = decode_utf8_forward(builder, data_ptr, len, index);
     builder.ins().store(
@@ -2870,9 +2883,10 @@ fn decode_utf8_forward(
 
     builder.switch_to_block(ascii_block);
     let ascii_next = builder.ins().iadd_imm(index, 1);
-    builder
-        .ins()
-        .jump(done_block, &[BlockArg::Value(lead), BlockArg::Value(ascii_next)]);
+    builder.ins().jump(
+        done_block,
+        &[BlockArg::Value(lead), BlockArg::Value(ascii_next)],
+    );
 
     builder.switch_to_block(non_ascii_block);
     let lead_lt_e0 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, lead, 0xe0);
@@ -2899,9 +2913,10 @@ fn decode_utf8_forward(
     let b1_mask = builder.ins().band_imm(b1, 0x3f);
     let cp = builder.ins().bor(lead_shift, b1_mask);
     let next_index = builder.ins().iadd_imm(index, 2);
-    builder
-        .ins()
-        .jump(done_block, &[BlockArg::Value(cp), BlockArg::Value(next_index)]);
+    builder.ins().jump(
+        done_block,
+        &[BlockArg::Value(cp), BlockArg::Value(next_index)],
+    );
 
     builder.switch_to_block(three_or_more_block);
     let lead_lt_f0 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, lead, 0xf0);
@@ -2933,9 +2948,10 @@ fn decode_utf8_forward(
     let hi = builder.ins().bor(lead_shift, b1_shift);
     let cp = builder.ins().bor(hi, b2_mask);
     let next_index = builder.ins().iadd_imm(index, 3);
-    builder
-        .ins()
-        .jump(done_block, &[BlockArg::Value(cp), BlockArg::Value(next_index)]);
+    builder.ins().jump(
+        done_block,
+        &[BlockArg::Value(cp), BlockArg::Value(next_index)],
+    );
 
     builder.switch_to_block(four_block);
     let lead_lt_f5 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, lead, 0xf5);
@@ -2967,9 +2983,10 @@ fn decode_utf8_forward(
     let hi_b = builder.ins().bor(hi_a, b2_shift);
     let cp = builder.ins().bor(hi_b, b3_mask);
     let next_index = builder.ins().iadd_imm(index, 4);
-    builder
-        .ins()
-        .jump(done_block, &[BlockArg::Value(cp), BlockArg::Value(next_index)]);
+    builder.ins().jump(
+        done_block,
+        &[BlockArg::Value(cp), BlockArg::Value(next_index)],
+    );
     builder.switch_to_block(done_block);
     builder.seal_block(ascii_block);
     builder.seal_block(non_ascii_block);
@@ -3009,13 +3026,17 @@ fn if_continuation_requires_extra_validation(
         .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b1, 0xa0);
     let b1_ge_a0_i64 = builder.ins().select(b1_ge_a0, one, zero);
     let e0_ok = builder.ins().select(lead_is_e0, b1_ge_a0_i64, one);
-    builder.ins().trapz(e0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder
+        .ins()
+        .trapz(e0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
     let lead_is_ed = builder.ins().icmp_imm(IntCC::Equal, lead, 0xed);
     let b1_lt_a0 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, b1, 0xa0);
     let b1_lt_a0_i64 = builder.ins().select(b1_lt_a0, one, zero);
     let ed_ok = builder.ins().select(lead_is_ed, b1_lt_a0_i64, one);
-    builder.ins().trapz(ed_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder
+        .ins()
+        .trapz(ed_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 }
 
 fn trap_if_special_four_byte_invalid(builder: &mut FunctionBuilder, lead: Value, b1: Value) {
@@ -3027,13 +3048,17 @@ fn trap_if_special_four_byte_invalid(builder: &mut FunctionBuilder, lead: Value,
         .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b1, 0x90);
     let b1_ge_90_i64 = builder.ins().select(b1_ge_90, one, zero);
     let f0_ok = builder.ins().select(lead_is_f0, b1_ge_90_i64, one);
-    builder.ins().trapz(f0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder
+        .ins()
+        .trapz(f0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
     let lead_is_f4 = builder.ins().icmp_imm(IntCC::Equal, lead, 0xf4);
     let b1_lt_90 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, b1, 0x90);
     let b1_lt_90_i64 = builder.ins().select(b1_lt_90, one, zero);
     let f4_ok = builder.ins().select(lead_is_f4, b1_lt_90_i64, one);
-    builder.ins().trapz(f4_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder
+        .ins()
+        .trapz(f4_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 }
 
 fn copy_string_bytes(
@@ -4981,8 +5006,12 @@ fn strings_utf8_iteration_works() {
 
 #[test]
 fn autoloaded_stdlib_string_helpers_work() {
-    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\nend";
-    assert_cranelift_executable_output(src, "1\n0\n0\n1\n3\n104\n128578\n", 0);
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend";
+    assert_cranelift_executable_output(
+        src,
+        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\nababab\n1\n",
+        0,
+    );
 }
 
 #[test]
@@ -5142,11 +5171,11 @@ fn llvm_strings_utf8_iteration_works() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_autoloaded_stdlib_string_helpers_work() {
-    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\nend";
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "1\n0\n0\n1\n3\n104\n128578\n",
+        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\nababab\n1\n",
         0,
     );
 }
