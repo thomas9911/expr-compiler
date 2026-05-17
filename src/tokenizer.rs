@@ -140,6 +140,8 @@ pub enum Token {
     And,
     #[token("or")]
     Or,
+    #[token("not")]
+    Not,
     #[token("elif")]
     Elif,
     #[token("else")]
@@ -187,6 +189,7 @@ impl Token {
             Token::DefineFunction => TokenKind::DefineFunction,
             Token::If => TokenKind::If,
             Token::And | Token::Or => TokenKind::InfixOperator,
+            Token::Not => TokenKind::PrefixOperator,
             Token::Elif => TokenKind::Else,
             Token::Else => TokenKind::Else,
             Token::Comment => unreachable!(),
@@ -204,6 +207,7 @@ pub enum TokenKind {
     Newline,
     Integer,
     InfixOperator,
+    PrefixOperator,
     Arrow,
     OpenBracket,
     CloseBracket,
@@ -528,6 +532,14 @@ fn tokenize_logical_keywords() {
             Symbol("c".to_string()),
         ]
     );
+}
+
+#[test]
+fn tokenize_not_keyword() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("not notx").collect();
+    assert_eq!(result.unwrap(), vec![Not, Symbol("notx".to_string())]);
 }
 
 #[test]

@@ -119,8 +119,9 @@ Logical infix operators are also supported:
 
 - `a and b`
 - `a or b`
+- `not a`
 - both short-circuit
-- both return normalized integer booleans `0` or `1`
+- all return normalized integer booleans `0` or `1`
 
 ## Higher-order list functions
 

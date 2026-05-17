@@ -1428,6 +1428,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 function: name,
                 args,
             }) => {
+                if name == "not" {
+                    assert_eq!(args.len(), 1, "{name} expects 1 argument");
+                    return self.compile_logical_not(
+                        &args[0],
+                        vars,
+                        capture_slots,
+                        env_ptr,
+                        function,
+                    );
+                }
                 if name == "and" || name == "or" {
                     assert_eq!(args.len(), 2, "{name} expects 2 arguments");
                     return self.compile_logical_op(
@@ -2264,8 +2274,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
         let lhs = self.compile_ast(lhs_ast, vars, capture_slots, env_ptr, function);
-        let lhs_truth =
-            self.build_internal_scalar_call(self.require_func("__value_is_truthy"), &[lhs], "logic_lhs");
+        let lhs_truth = self.build_internal_scalar_call(
+            self.require_func("__value_is_truthy"),
+            &[lhs],
+            "logic_lhs",
+        );
         let lhs_non_zero = self
             .builder
             .build_int_compare(
@@ -2304,8 +2317,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(rhs_block);
         let rhs = self.compile_ast(rhs_ast, vars, capture_slots, env_ptr, function);
-        let rhs_truth =
-            self.build_internal_scalar_call(self.require_func("__value_is_truthy"), &[rhs], "logic_rhs");
+        let rhs_truth = self.build_internal_scalar_call(
+            self.require_func("__value_is_truthy"),
+            &[rhs],
+            "logic_rhs",
+        );
         self.builder
             .build_unconditional_branch(merge_block)
             .expect("failed to branch logical rhs merge");
@@ -2320,12 +2336,51 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_phi(self.i64_type, "logic_payload")
             .expect("failed to build logical payload phi");
         payload_phi.add_incoming(&[
-            (&short_payload as &dyn inkwell::values::BasicValue<'ctx>, short_from),
-            (&rhs_truth as &dyn inkwell::values::BasicValue<'ctx>, rhs_from),
+            (
+                &short_payload as &dyn inkwell::values::BasicValue<'ctx>,
+                short_from,
+            ),
+            (
+                &rhs_truth as &dyn inkwell::values::BasicValue<'ctx>,
+                rhs_from,
+            ),
         ]);
         CompiledValue {
             tag: self.i64_type.const_int(TAG_INT as u64, false),
             payload: payload_phi.as_basic_value().into_int_value(),
+        }
+    }
+
+    fn compile_logical_not(
+        &self,
+        arg_ast: &Ast,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let arg = self.compile_ast(arg_ast, vars, capture_slots, env_ptr, function);
+        let truth = self.build_internal_scalar_call(
+            self.require_func("__value_is_truthy"),
+            &[arg],
+            "not_truth",
+        );
+        let is_zero = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                truth,
+                self.i64_type.const_zero(),
+                "not_is_zero",
+            )
+            .expect("failed to compare logical not truth");
+        let payload = self
+            .builder
+            .build_int_z_extend(is_zero, self.i64_type, "not_payload")
+            .expect("failed to extend logical not");
+        CompiledValue {
+            tag: self.i64_type.const_int(TAG_INT as u64, false),
+            payload,
         }
     }
 

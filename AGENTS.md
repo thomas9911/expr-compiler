@@ -99,8 +99,9 @@ Guidance for coding agents working in this repository.
 - logical infix operators are supported:
   - `a and b`
   - `a or b`
+  - `not a`
   - both short-circuit
-  - both return normalized integer booleans `0` or `1`
+  - all return normalized integer booleans `0` or `1`
 - Higher-order list builtins are available:
   - `list_map(xs, callback)`
   - `list_filter(xs, callback)`

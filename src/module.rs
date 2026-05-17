@@ -1907,7 +1907,9 @@ fn compile_logical_op(
     let short_payload = builder
         .ins()
         .iconst(types::I64, if function == "and" { 0 } else { 1 });
-    builder.ins().jump(merge_block, &[BlockArg::Value(short_payload)]);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(short_payload)]);
 
     builder.switch_to_block(rhs_block);
     builder.seal_block(rhs_block);
@@ -1923,13 +1925,48 @@ fn compile_logical_op(
         env_ptr,
     );
     let rhs_truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", rhs);
-    builder.ins().jump(merge_block, &[BlockArg::Value(rhs_truth)]);
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(rhs_truth)]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
     CompiledValue {
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: builder.block_params(merge_block)[0],
+    }
+}
+
+fn compile_logical_not(
+    builder: &mut FunctionBuilder,
+    arg_ast: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let arg = compile_ast(
+        builder,
+        arg_ast,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", arg);
+    let is_zero = builder.ins().icmp_imm(IntCC::Equal, truth, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let payload = builder.ins().select(is_zero, one, zero);
+    CompiledValue {
+        tag: builder.ins().iconst(types::I64, TAG_INT),
+        payload,
     }
 }
 
@@ -4101,6 +4138,20 @@ fn compile_ast(
             )
         }
         Ast::Expression(ExpressionAst { function, args }) => {
+            if function == "not" {
+                assert_eq!(args.len(), 1, "not expects 1 argument");
+                return compile_logical_not(
+                    builder,
+                    &args[0],
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+            }
             if function == "and" || function == "or" {
                 assert_eq!(args.len(), 2, "{function} expects 2 arguments");
                 return compile_logical_op(
@@ -5131,8 +5182,8 @@ fn autoloaded_stdlib_functions_can_be_used_as_values() {
 
 #[test]
 fn jit_logical_and_or_short_circuit() {
-    let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\nend";
-    assert_cranelift_executable_output(src, "0\n1\n1\n1\n", 0);
+    let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\n    print(not 0)\n    print(not 7)\n    print(not 1 == 0)\nend";
+    assert_cranelift_executable_output(src, "0\n1\n1\n1\n1\n0\n1\n", 0);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -5305,8 +5356,8 @@ fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_jit_logical_and_or_short_circuit() {
-    let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\nend";
-    assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n1\n1\n1\n", 0);
+    let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\n    print(not 0)\n    print(not 7)\n    print(not 1 == 0)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n1\n1\n1\n1\n0\n1\n", 0);
 }
 
 #[test]

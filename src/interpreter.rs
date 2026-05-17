@@ -96,6 +96,15 @@ impl Interpreter {
         }
 
         match expression.function.as_ref() {
+            "not" => {
+                if expression.args.len() != 1 {
+                    eprintln!("not expects 1 argument");
+                    self.execute_literal(LiteralAst::Integer(0));
+                    return;
+                }
+                self.execute(expression.args.into_iter().next().unwrap());
+                self.execute_literal(LiteralAst::Integer(i64::from(!self.output_is_truthy())));
+            }
             "and" => {
                 if expression.args.len() != 2 {
                     eprintln!("and expects 2 arguments");
@@ -402,7 +411,10 @@ mod tests {
                 }),
             ],
         }));
-        assert_eq!(*interpreter.get_output(), Ast::Literal(LiteralAst::Integer(0)));
+        assert_eq!(
+            *interpreter.get_output(),
+            Ast::Literal(LiteralAst::Integer(0))
+        );
 
         interpreter.execute(Ast::Expression(ExpressionAst {
             function: "or".to_string(),
@@ -417,7 +429,32 @@ mod tests {
                 }),
             ],
         }));
-        assert_eq!(*interpreter.get_output(), Ast::Literal(LiteralAst::Integer(1)));
+        assert_eq!(
+            *interpreter.get_output(),
+            Ast::Literal(LiteralAst::Integer(1))
+        );
+    }
+
+    #[test]
+    fn executes_not_with_truthiness() {
+        let mut interpreter = Interpreter::default();
+        interpreter.execute(Ast::Expression(ExpressionAst {
+            function: "not".to_string(),
+            args: vec![Ast::Literal(LiteralAst::Integer(0))],
+        }));
+        assert_eq!(
+            *interpreter.get_output(),
+            Ast::Literal(LiteralAst::Integer(1))
+        );
+
+        interpreter.execute(Ast::Expression(ExpressionAst {
+            function: "not".to_string(),
+            args: vec![Ast::Literal(LiteralAst::Integer(7))],
+        }));
+        assert_eq!(
+            *interpreter.get_output(),
+            Ast::Literal(LiteralAst::Integer(0))
+        );
     }
 
     #[test]

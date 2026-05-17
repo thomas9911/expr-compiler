@@ -527,6 +527,15 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         return parse_lambda(lex);
     }
 
+    if lex.peek() == Some(&Ok(Token::Not)) {
+        lex.next();
+        let rhs = parse_expr(lex, 2)?;
+        return Ok(Ast::Expression(ExpressionAst {
+            function: "not".to_string(),
+            args: vec![rhs],
+        }));
+    }
+
     let lhs = match lex.peek() {
         Some(Ok(x)) if x.kind() == TokenKind::Integer => Ast::Literal(LiteralAst::from_lexer(lex)?),
         Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
@@ -1568,6 +1577,41 @@ fn parse_logical_operator_precedence() {
                         ],
                     }),
                     Literal(LiteralAst::Integer(0)),
+                ],
+            })],
+        },
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_not_operator_precedence() {
+    use Ast::*;
+
+    let text = "fn main() do\n    not 1 == 0 and 2\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function: "and".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function: "not".to_string(),
+                        args: vec![Expression(ExpressionAst {
+                            function: "eq".to_string(),
+                            args: vec![
+                                Literal(LiteralAst::Integer(1)),
+                                Literal(LiteralAst::Integer(0)),
+                            ],
+                        })],
+                    }),
+                    Literal(LiteralAst::Integer(2)),
                 ],
             })],
         },

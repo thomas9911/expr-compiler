@@ -31,7 +31,7 @@ fn main():
 
     print(bytes_len("hi\n"))
 
-    if string_is_integer("11234") == 1:
+    if string_is_integer("11234"):
         print("integer!")
-    if string_is_integer("11T234") == 0:
+    if not string_is_integer("11T234"):
         print("not integer :(")
