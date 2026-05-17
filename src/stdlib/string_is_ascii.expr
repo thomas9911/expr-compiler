@@ -4,7 +4,7 @@ end
 
 fn __string_is_ascii_at(s, index, len) do
     if index == len do
-        1
+        true
     else
         bytes_get(s, index) < 128 and __string_is_ascii_at(s, index + 1, len)
     end

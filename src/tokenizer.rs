@@ -146,6 +146,10 @@ pub enum Token {
     Elif,
     #[token("else")]
     Else,
+    #[token("true")]
+    True,
+    #[token("false")]
+    False,
     #[regex(r"#[^\r\n]*", logos::skip, allow_greedy = true)]
     Comment,
     #[token("do")]
@@ -192,6 +196,7 @@ impl Token {
             Token::Not => TokenKind::PrefixOperator,
             Token::Elif => TokenKind::Else,
             Token::Else => TokenKind::Else,
+            Token::True | Token::False => TokenKind::Integer,
             Token::Comment => unreachable!(),
             Token::DoBlock | Token::ColonBlock => TokenKind::StartBlock,
             Token::EndBlock => TokenKind::EndBlock,
@@ -546,9 +551,9 @@ fn tokenize_not_keyword() {
 fn tokenize_if_not_symbol() {
     use Token::*;
 
-    // 'if' and 'else' must not lex as Symbol
-    let result: Result<Vec<_>, _> = Token::lexer("if else").collect();
-    assert_eq!(result.unwrap(), vec![If, Else]);
+    // language keywords must not lex as Symbol
+    let result: Result<Vec<_>, _> = Token::lexer("if else true false").collect();
+    assert_eq!(result.unwrap(), vec![If, Else, True, False]);
 }
 
 #[test]

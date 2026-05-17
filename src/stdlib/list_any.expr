@@ -1,13 +1,13 @@
 fn list_any(xs, predicate) do
     if list_len(xs) == 0 do
-        0
+        false
     else
-        __list_any_loop(xs, 0, list_len(xs), 0, predicate)
+        __list_any_loop(xs, 0, list_len(xs), false, predicate)
     end
 end
 
 fn __list_any_loop(xs, index, len, now, predicate) do
-    if index == len or now != 0 do
+    if index == len or now do
         now
     else
         __list_any_loop(xs, index + 1, len, predicate(xs[index]), predicate)

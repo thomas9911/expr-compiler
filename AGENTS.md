@@ -100,8 +100,11 @@ Guidance for coding agents working in this repository.
   - `a and b`
   - `a or b`
   - `not a`
+  - `true`
+  - `false`
   - both short-circuit
   - all return normalized integer booleans `0` or `1`
+  - `true` and `false` are aliases for integer literals `1` and `0`
 - Higher-order list builtins are available:
   - `list_map(xs, callback)`
   - `list_filter(xs, callback)`
