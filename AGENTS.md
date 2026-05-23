@@ -113,6 +113,12 @@ Guidance for coding agents working in this repository.
 - Function values can be stored in variables and passed around.
 - Generic direct function-value calls are supported:
   - `f(10)`
+- JIT, native executable, LLVM core Wasm, and LLVM `wasi:cli/command` component `main` may optionally take one argument:
+  - `fn main(args) do ... end`
+  - `args` is a list of strings containing the CLI arguments passed to the program
+  - these runnable paths pass only actual CLI arguments, not the executable name
+  - for CLI JIT runs, program arguments are passed after `--`
+  - `main` currently supports at most one argument in these modes
 
 ## Build and Test
 

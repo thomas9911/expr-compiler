@@ -553,13 +553,55 @@ pub extern "C" fn __expr_list_print_host(handle: i64) -> i64 {
     new_int(0)
 }
 
+unsafe fn c_strlen(mut ptr: *const u8) -> usize {
+    let mut len = 0usize;
+    while !ptr.is_null() && *ptr != 0 {
+        len += 1;
+        ptr = ptr.add(1);
+    }
+    len
+}
+
+unsafe fn new_string_handle_from_bytes(bytes: *const u8, len: usize) -> i64 {
+    let data_ptr = arena_alloc(len.max(1), core::mem::align_of::<u8>());
+    if len != 0 {
+        ptr::copy_nonoverlapping(bytes, data_ptr, len);
+    }
+    let header_ptr = arena_alloc(
+        core::mem::size_of::<StringHeader>(),
+        core::mem::align_of::<StringHeader>(),
+    ) as *mut StringHeader;
+    (*header_ptr).len = len;
+    (*header_ptr).cap = len;
+    (*header_ptr).ptr = data_ptr;
+    alloc_value(ValueTag::String, header_ptr as usize as i64)
+}
+
+unsafe fn build_argv_list(argc: i32, argv: *const *const u8) -> i64 {
+    let list = __expr_list_new_host();
+    if argc <= 1 || argv.is_null() {
+        return list;
+    }
+
+    let argc = usize::try_from(argc).unwrap_or_else(|_| runtime_abort());
+    for index in 1..argc {
+        let arg_ptr = *argv.add(index);
+        let len = c_strlen(arg_ptr);
+        let string = new_string_handle_from_bytes(arg_ptr, len);
+        __expr_list_push_host(list, string);
+    }
+    list
+}
+
 unsafe extern "C" {
-    fn __expr_main_i64() -> i64;
+    fn __expr_main_i64(arg_tag: i64, arg_payload: i64) -> i64;
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn main() -> i32 {
-    let int_code = unsafe { __expr_main_i64() };
+pub extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
+    let args = unsafe { build_argv_list(argc, argv) };
+    let args_value = unsafe { &*value_ptr(args) };
+    let int_code = unsafe { __expr_main_i64(args_value.tag as i64, args_value.payload) };
     if int_code < i32::MIN as i64 || int_code > i32::MAX as i64 {
         1
     } else {

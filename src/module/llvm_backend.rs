@@ -102,7 +102,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
     let int_result_function_names = expr_module
         .functions
         .iter()
-        .filter(|func| func.inputs.is_empty())
+        .filter(|func| func.inputs.len() <= 1)
         .map(|func| func.name.clone())
         .collect::<HashSet<_>>();
 
@@ -174,12 +174,16 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
 
 pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u8> {
     Target::initialize_webassembly(&InitializationConfig::default());
+    let needs_argv_list = expr_module
+        .functions
+        .iter()
+        .any(|func| func.name == "main" && func.inputs.len() == 1);
 
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Wasm);
         compiler.bigint_enabled = expr_module.uses_bigint();
-        compiler.list_enabled = expr_module.uses_lists();
+        compiler.list_enabled = expr_module.uses_lists() || needs_argv_list;
         compiler.list_mutation_enabled = expr_module.uses_list_mutation();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
@@ -206,12 +210,16 @@ pub(super) fn compile_to_wasm_preview1_command_assembly(
     name: &str,
 ) -> Vec<u8> {
     Target::initialize_webassembly(&InitializationConfig::default());
+    let needs_argv_list = expr_module
+        .functions
+        .iter()
+        .any(|func| func.name == "main" && func.inputs.len() == 1);
 
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Wasm);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);
         compiler.bigint_enabled = expr_module.uses_bigint();
-        compiler.list_enabled = expr_module.uses_lists();
+        compiler.list_enabled = expr_module.uses_lists() || needs_argv_list;
         compiler.list_mutation_enabled = expr_module.uses_list_mutation();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
@@ -334,6 +342,28 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 ),
                 None,
             ),
+            "args_sizes_get" => self.module.add_function(
+                name,
+                i32_type.fn_type(
+                    &[
+                        self.context.ptr_type(Default::default()).into(),
+                        self.context.ptr_type(Default::default()).into(),
+                    ],
+                    false,
+                ),
+                None,
+            ),
+            "args_get" => self.module.add_function(
+                name,
+                i32_type.fn_type(
+                    &[
+                        self.context.ptr_type(Default::default()).into(),
+                        self.context.ptr_type(Default::default()).into(),
+                    ],
+                    false,
+                ),
+                None,
+            ),
             "proc_exit" => self.module.add_function(
                 name,
                 self.context.void_type().fn_type(&[i32_type.into()], false),
@@ -402,12 +432,34 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     self.functions.insert(name.to_string(), function);
                 }
 
+                let args_runtime = [
+                    (
+                        "__expr_wasm_args_len_host",
+                        self.i64_type.fn_type(&[], false),
+                    ),
+                    (
+                        "__expr_wasm_arg_len_host",
+                        self.i64_type.fn_type(&[i64_type.into()], false),
+                    ),
+                    (
+                        "__expr_wasm_arg_copy_host",
+                        self.i64_type
+                            .fn_type(&[i64_type.into(), i64_type.into()], false),
+                    ),
+                ];
+                for (name, ty) in args_runtime {
+                    let function = self.module.add_function(name, ty, None);
+                    self.functions.insert(name.to_string(), function);
+                }
+
                 self.define_wasm_allocator("__alloc", "llvm_wasm_alloc");
                 self.define_wasm_multi3();
             }
             #[cfg(feature = "wasi")]
             LlvmRuntimeMode::WasiPreview1Command => {
                 self.declare_wasi_preview1_import("__wasi_fd_write", "fd_write");
+                self.declare_wasi_preview1_import("__wasi_args_sizes_get", "args_sizes_get");
+                self.declare_wasi_preview1_import("__wasi_args_get", "args_get");
                 self.declare_wasi_preview1_import("__wasi_proc_exit", "proc_exit");
                 self.define_wasm_allocator("__alloc", "llvm_wasm_alloc");
                 self.define_wasm_multi3();
@@ -555,10 +607,92 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
     fn define_int_result_wrappers(&self, functions: &[FunctionDefAst], mode: LlvmOutputMode) {
         for func in functions {
+            if matches!(mode, LlvmOutputMode::Jit) && func.inputs.len() <= 1 {
+                self.define_jit_int_result_wrapper(func);
+                continue;
+            }
+            if func.name == "main"
+                && matches!(mode, LlvmOutputMode::Executable)
+                && func.inputs.len() <= 1
+            {
+                self.define_executable_main_int_result_wrapper(func);
+                continue;
+            }
+            if func.name == "main" && matches!(mode, LlvmOutputMode::Wasm) && func.inputs.len() <= 1
+            {
+                self.define_wasm_main_int_result_wrapper(func);
+                continue;
+            }
+            #[cfg(feature = "wasi")]
+            if func.name == "main"
+                && matches!(mode, LlvmOutputMode::WasiPreview1Command)
+                && func.inputs.len() <= 1
+            {
+                self.define_wasi_preview1_main_int_result_wrapper(func);
+                continue;
+            }
             if func.inputs.is_empty() {
                 self.define_int_result_wrapper(func, mode);
             }
         }
+    }
+
+    fn define_jit_int_result_wrapper(&self, func_def: &FunctionDefAst) {
+        assert!(
+            func_def.inputs.len() <= 1,
+            "jit int-result wrapper supports at most one argument"
+        );
+
+        let symbol = int_result_symbol_name(&func_def.name, LlvmOutputMode::Jit);
+        let function_type = if func_def.inputs.len() == 1 {
+            self.i64_type
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false)
+        } else {
+            self.i64_type.fn_type(&[], false)
+        };
+        let function = self
+            .module
+            .add_function(&symbol, function_type, Some(Linkage::External));
+        let internal = self.require_func(&func_def.name);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let call_args = if func_def.inputs.len() == 1 {
+            vec![CompiledValue {
+                tag: function.get_nth_param(0).unwrap().into_int_value(),
+                payload: function.get_nth_param(1).unwrap().into_int_value(),
+            }]
+        } else {
+            vec![]
+        };
+        let value = self.build_user_call(
+            internal,
+            self.i64_type.const_zero(),
+            &call_args,
+            "jit_int_result_value",
+        );
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                value.tag,
+                self.i64_type.const_int(TAG_INT as u64, false),
+                "jit_int_result_is_int",
+            )
+            .expect("failed to compare jit int-result tag");
+        self.builder
+            .build_conditional_branch(is_int, ok_block, trap_block)
+            .expect("failed to branch on jit int-result tag");
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_return(Some(&value.payload))
+            .expect("failed to build jit int-result wrapper return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
     }
 
     #[cfg(feature = "wasi")]
@@ -643,6 +777,555 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();
+    }
+
+    fn define_executable_main_int_result_wrapper(&self, func_def: &FunctionDefAst) {
+        assert!(
+            func_def.inputs.len() <= 1,
+            "native executable main function supports at most one argument"
+        );
+
+        let symbol = int_result_symbol_name(&func_def.name, LlvmOutputMode::Executable);
+        let linkage = Some(Linkage::External);
+        let function = self.module.add_function(
+            &symbol,
+            self.i64_type
+                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            linkage,
+        );
+        let internal = self.require_func(&func_def.name);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let arg_tag = function.get_nth_param(0).unwrap().into_int_value();
+        let arg_payload = function.get_nth_param(1).unwrap().into_int_value();
+        let args = if func_def.inputs.len() == 1 {
+            vec![CompiledValue {
+                tag: arg_tag,
+                payload: arg_payload,
+            }]
+        } else {
+            vec![]
+        };
+        let value = self.build_user_call(
+            internal,
+            self.i64_type.const_zero(),
+            &args,
+            "executable_main_value",
+        );
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                value.tag,
+                self.i64_type.const_int(TAG_INT as u64, false),
+                "executable_main_is_int",
+            )
+            .expect("failed to compare executable main result tag");
+        self.builder
+            .build_conditional_branch(is_int, ok_block, trap_block)
+            .expect("failed to branch on executable main result tag");
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_return(Some(&value.payload))
+            .expect("failed to build executable main int-result return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    fn define_wasm_main_int_result_wrapper(&self, func_def: &FunctionDefAst) {
+        assert!(
+            func_def.inputs.len() <= 1,
+            "wasm main function supports at most one argument"
+        );
+
+        let symbol = int_result_symbol_name(&func_def.name, LlvmOutputMode::Wasm);
+        let function = self.module.add_function(
+            &symbol,
+            self.i64_type.fn_type(&[], false),
+            Some(Linkage::External),
+        );
+        let internal = self.require_func(&func_def.name);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let args_value = if func_def.inputs.len() == 1 {
+            Some(self.build_wasm_args_list(function))
+        } else {
+            None
+        };
+        let call_args = args_value
+            .as_ref()
+            .map_or_else(Vec::new, |value| vec![*value]);
+        let value = self.build_user_call(
+            internal,
+            self.i64_type.const_zero(),
+            &call_args,
+            "wasm_main_value",
+        );
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                value.tag,
+                self.i64_type.const_int(TAG_INT as u64, false),
+                "wasm_main_is_int",
+            )
+            .expect("failed to compare wasm main result tag");
+        self.builder
+            .build_conditional_branch(is_int, ok_block, trap_block)
+            .expect("failed to branch on wasm main result tag");
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_return(Some(&value.payload))
+            .expect("failed to build wasm main int-result return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    #[cfg(feature = "wasi")]
+    fn define_wasi_preview1_main_int_result_wrapper(&self, func_def: &FunctionDefAst) {
+        assert!(
+            func_def.inputs.len() <= 1,
+            "wasi command main function supports at most one argument"
+        );
+
+        let symbol = int_result_symbol_name(&func_def.name, LlvmOutputMode::WasiPreview1Command);
+        let function = self.module.add_function(
+            &symbol,
+            self.i64_type.fn_type(&[], false),
+            Some(Linkage::External),
+        );
+        let internal = self.require_func(&func_def.name);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+
+        let args_value = if func_def.inputs.len() == 1 {
+            Some(self.build_wasi_preview1_args_list(function))
+        } else {
+            None
+        };
+        let call_args = args_value
+            .as_ref()
+            .map_or_else(Vec::new, |value| vec![*value]);
+        let value = self.build_user_call(
+            internal,
+            self.i64_type.const_zero(),
+            &call_args,
+            "wasi_main_value",
+        );
+        let is_int = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                value.tag,
+                self.i64_type.const_int(TAG_INT as u64, false),
+                "wasi_main_is_int",
+            )
+            .expect("failed to compare wasi main result tag");
+        self.builder
+            .build_conditional_branch(is_int, ok_block, trap_block)
+            .expect("failed to branch on wasi main result tag");
+
+        self.builder.position_at_end(ok_block);
+        self.builder
+            .build_return(Some(&value.payload))
+            .expect("failed to build wasi main int-result return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    #[cfg(feature = "wasi")]
+    fn build_wasi_errno_check(
+        &self,
+        errno: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        label: &str,
+    ) {
+        let ok_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_ok"));
+        let trap_block = self
+            .context
+            .append_basic_block(function, &format!("{label}_trap"));
+        let is_ok = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                errno,
+                self.context.i32_type().const_zero(),
+                &format!("{label}_is_ok"),
+            )
+            .expect("failed to compare wasi errno");
+        self.builder
+            .build_conditional_branch(is_ok, ok_block, trap_block)
+            .expect("failed to branch on wasi errno");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(ok_block);
+    }
+
+    fn build_wasm_args_list(&self, function: FunctionValue<'ctx>) -> CompiledValue<'ctx> {
+        let args_len = self.require_func("__expr_wasm_args_len_host");
+        let arg_len = self.require_func("__expr_wasm_arg_len_host");
+        let arg_copy = self.require_func("__expr_wasm_arg_copy_host");
+        let list_new = self.require_func("__rt_list_new");
+        let list_push = self.require_func("__rt_list_push");
+        let alloc = self.require_func("__alloc");
+
+        let argc = self
+            .builder
+            .build_call(args_len, &[], "wasm_args_len")
+            .expect("failed to call wasm args len")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let list = self.build_internal_call(list_new, &[], "wasm_args_list");
+
+        let index_ptr = self
+            .builder
+            .build_alloca(self.i64_type, "wasm_args_index")
+            .expect("failed to allocate wasm args index");
+        self.builder
+            .build_store(index_ptr, self.i64_type.const_zero())
+            .expect("failed to initialize wasm args index");
+
+        let loop_check = self
+            .context
+            .append_basic_block(function, "wasm_args_loop_check");
+        let loop_body = self
+            .context
+            .append_basic_block(function, "wasm_args_loop_body");
+        let loop_done = self
+            .context
+            .append_basic_block(function, "wasm_args_loop_done");
+        self.builder
+            .build_unconditional_branch(loop_check)
+            .expect("failed to branch to wasm args loop");
+
+        self.builder.position_at_end(loop_check);
+        let index = self
+            .builder
+            .build_load(self.i64_type, index_ptr, "wasm_args_index_load")
+            .expect("failed to load wasm args index")
+            .into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, index, argc, "wasm_args_more")
+            .expect("failed to compare wasm args index");
+        self.builder
+            .build_conditional_branch(more, loop_body, loop_done)
+            .expect("failed to branch wasm args loop");
+
+        self.builder.position_at_end(loop_body);
+        let len = self
+            .builder
+            .build_call(arg_len, &[index.into()], "wasm_arg_len")
+            .expect("failed to call wasm arg len")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let data_raw = self.build_boxed_call(
+            alloc,
+            &[len, self.i64_type.const_int(1, false)],
+            "wasm_arg_data_alloc",
+        );
+        let _ = self
+            .builder
+            .build_call(arg_copy, &[index.into(), data_raw.into()], "wasm_arg_copy")
+            .expect("failed to call wasm arg copy");
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                data_raw,
+                self.context.ptr_type(Default::default()),
+                "wasm_arg_data_ptr",
+            )
+            .expect("failed to convert wasm arg data ptr");
+        let string = self.build_string_header_from_parts(data_ptr, len, "wasm_arg_string");
+        let list_value = CompiledValue {
+            tag: list.tag,
+            payload: list.payload,
+        };
+        let _ = self.build_internal_call(list_push, &[list_value, string], "wasm_args_push");
+
+        let next_index = self
+            .builder
+            .build_int_add(
+                index,
+                self.i64_type.const_int(1, false),
+                "wasm_args_index_next",
+            )
+            .expect("failed to increment wasm args index");
+        self.builder
+            .build_store(index_ptr, next_index)
+            .expect("failed to store wasm args index");
+        self.builder
+            .build_unconditional_branch(loop_check)
+            .expect("failed to branch back to wasm args loop");
+
+        self.builder.position_at_end(loop_done);
+        list
+    }
+
+    #[cfg(feature = "wasi")]
+    fn build_wasi_preview1_args_list(&self, function: FunctionValue<'ctx>) -> CompiledValue<'ctx> {
+        let i32_type = self.context.i32_type();
+        let ptr_type = self.context.ptr_type(Default::default());
+        let alloc = self.require_func("__alloc");
+        let args_sizes_get = self.require_func("__wasi_args_sizes_get");
+        let args_get = self.require_func("__wasi_args_get");
+        let list_new = self.require_func("__rt_list_new");
+        let list_push = self.require_func("__rt_list_push");
+
+        let argc_ptr = self
+            .builder
+            .build_alloca(i32_type, "wasi_argc_ptr")
+            .expect("failed to allocate wasi argc ptr");
+        let buf_size_ptr = self
+            .builder
+            .build_alloca(i32_type, "wasi_buf_size_ptr")
+            .expect("failed to allocate wasi buf size ptr");
+        let errno = self
+            .builder
+            .build_call(
+                args_sizes_get,
+                &[argc_ptr.into(), buf_size_ptr.into()],
+                "wasi_args_sizes_get",
+            )
+            .expect("failed to call wasi args_sizes_get")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        self.build_wasi_errno_check(errno, function, "wasi_args_sizes_get");
+
+        let argc32 = self
+            .builder
+            .build_load(i32_type, argc_ptr, "wasi_argc")
+            .expect("failed to load wasi argc")
+            .into_int_value();
+        let buf_size32 = self
+            .builder
+            .build_load(i32_type, buf_size_ptr, "wasi_buf_size")
+            .expect("failed to load wasi buf size")
+            .into_int_value();
+        let argc64 = self
+            .builder
+            .build_int_z_extend(argc32, self.i64_type, "wasi_argc64")
+            .expect("failed to zext wasi argc");
+        let buf_size64 = self
+            .builder
+            .build_int_z_extend(buf_size32, self.i64_type, "wasi_buf_size64")
+            .expect("failed to zext wasi buf size");
+        let argv_ptr_bytes = self
+            .builder
+            .build_int_mul(
+                argc64,
+                self.i64_type.const_int(4, false),
+                "wasi_argv_ptr_bytes",
+            )
+            .expect("failed to compute wasi argv ptr bytes");
+        let argv_raw = self.build_boxed_call(
+            alloc,
+            &[argv_ptr_bytes, self.i64_type.const_int(4, false)],
+            "wasi_argv_alloc",
+        );
+        let argv_buf_raw = self.build_boxed_call(
+            alloc,
+            &[buf_size64, self.i64_type.const_int(1, false)],
+            "wasi_argv_buf_alloc",
+        );
+        let argv_ptr = self
+            .builder
+            .build_int_to_ptr(argv_raw, ptr_type, "wasi_argv_ptr")
+            .expect("failed to convert wasi argv ptr");
+        let argv_buf_ptr = self
+            .builder
+            .build_int_to_ptr(argv_buf_raw, ptr_type, "wasi_argv_buf_ptr")
+            .expect("failed to convert wasi argv buf ptr");
+        let errno = self
+            .builder
+            .build_call(
+                args_get,
+                &[argv_ptr.into(), argv_buf_ptr.into()],
+                "wasi_args_get",
+            )
+            .expect("failed to call wasi args_get")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        self.build_wasi_errno_check(errno, function, "wasi_args_get");
+
+        let list = self.build_internal_call(list_new, &[], "wasi_args_list");
+        let index_ptr = self
+            .builder
+            .build_alloca(i32_type, "wasi_args_index")
+            .expect("failed to allocate wasi args index");
+        self.builder
+            .build_store(index_ptr, i32_type.const_int(1, false))
+            .expect("failed to initialize wasi args index");
+
+        let loop_check = self
+            .context
+            .append_basic_block(function, "wasi_args_loop_check");
+        let loop_body = self
+            .context
+            .append_basic_block(function, "wasi_args_loop_body");
+        let loop_done = self
+            .context
+            .append_basic_block(function, "wasi_args_loop_done");
+        self.builder
+            .build_unconditional_branch(loop_check)
+            .expect("failed to branch to wasi args loop");
+
+        self.builder.position_at_end(loop_check);
+        let index32 = self
+            .builder
+            .build_load(i32_type, index_ptr, "wasi_args_index_load")
+            .expect("failed to load wasi args index")
+            .into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, index32, argc32, "wasi_args_more")
+            .expect("failed to compare wasi args index");
+        self.builder
+            .build_conditional_branch(more, loop_body, loop_done)
+            .expect("failed to branch wasi args loop");
+
+        self.builder.position_at_end(loop_body);
+        let argv_entry_ptr = unsafe {
+            self.builder
+                .build_gep(ptr_type, argv_ptr, &[index32], "wasi_argv_entry_ptr")
+                .expect("failed to build wasi argv entry gep")
+        };
+        let arg_ptr = self
+            .builder
+            .build_load(ptr_type, argv_entry_ptr, "wasi_arg_ptr")
+            .expect("failed to load wasi arg ptr")
+            .into_pointer_value();
+
+        let len_ptr = self
+            .builder
+            .build_alloca(i32_type, "wasi_arg_len_ptr")
+            .expect("failed to allocate wasi arg len ptr");
+        self.builder
+            .build_store(len_ptr, i32_type.const_zero())
+            .expect("failed to init wasi arg len");
+        let len_check = self
+            .context
+            .append_basic_block(function, "wasi_arg_len_check");
+        let len_body = self
+            .context
+            .append_basic_block(function, "wasi_arg_len_body");
+        let len_done = self
+            .context
+            .append_basic_block(function, "wasi_arg_len_done");
+        self.builder
+            .build_unconditional_branch(len_check)
+            .expect("failed to branch to wasi arg len loop");
+
+        self.builder.position_at_end(len_check);
+        let len32 = self
+            .builder
+            .build_load(i32_type, len_ptr, "wasi_arg_len")
+            .expect("failed to load wasi arg len")
+            .into_int_value();
+        let byte_ptr = unsafe {
+            self.builder
+                .build_gep(
+                    self.context.i8_type(),
+                    arg_ptr,
+                    &[len32],
+                    "wasi_arg_byte_ptr",
+                )
+                .expect("failed to build wasi arg byte ptr")
+        };
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), byte_ptr, "wasi_arg_byte")
+            .expect("failed to load wasi arg byte")
+            .into_int_value();
+        let is_zero = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                byte,
+                self.context.i8_type().const_zero(),
+                "wasi_arg_byte_is_zero",
+            )
+            .expect("failed to compare wasi arg byte");
+        self.builder
+            .build_conditional_branch(is_zero, len_done, len_body)
+            .expect("failed to branch wasi arg len loop");
+
+        self.builder.position_at_end(len_body);
+        let next_len = self
+            .builder
+            .build_int_add(len32, i32_type.const_int(1, false), "wasi_arg_len_next")
+            .expect("failed to increment wasi arg len");
+        self.builder
+            .build_store(len_ptr, next_len)
+            .expect("failed to store wasi arg len next");
+        self.builder
+            .build_unconditional_branch(len_check)
+            .expect("failed to branch back to wasi arg len check");
+
+        self.builder.position_at_end(len_done);
+        let len32 = self
+            .builder
+            .build_load(i32_type, len_ptr, "wasi_arg_len_final")
+            .expect("failed to reload wasi arg len")
+            .into_int_value();
+        let len64 = self
+            .builder
+            .build_int_z_extend(len32, self.i64_type, "wasi_arg_len64")
+            .expect("failed to zext wasi arg len");
+        let data_raw = self.build_boxed_call(
+            alloc,
+            &[len64, self.i64_type.const_int(1, false)],
+            "wasi_arg_data_alloc",
+        );
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(data_raw, ptr_type, "wasi_arg_data_ptr")
+            .expect("failed to convert wasi arg data ptr");
+        self.build_copy_bytes_loop(arg_ptr, data_ptr, len64, function, "wasi_arg_copy");
+        let string = self.build_string_header_from_parts(data_ptr, len64, "wasi_arg_string");
+        let list_value = CompiledValue {
+            tag: list.tag,
+            payload: list.payload,
+        };
+        let _ = self.build_internal_call(list_push, &[list_value, string], "wasi_args_push");
+
+        let next_index = self
+            .builder
+            .build_int_add(
+                index32,
+                i32_type.const_int(1, false),
+                "wasi_args_index_next",
+            )
+            .expect("failed to increment wasi args index");
+        self.builder
+            .build_store(index_ptr, next_index)
+            .expect("failed to store wasi args index");
+        self.builder
+            .build_unconditional_branch(loop_check)
+            .expect("failed to branch back to wasi args loop");
+
+        self.builder.position_at_end(loop_done);
+        list
     }
 
     fn define_user_function(&self, func_def: &FunctionDefAst) {

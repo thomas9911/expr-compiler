@@ -3,7 +3,7 @@ const path = require("path");
 
 function usage() {
   console.error(
-    "usage: node scripts/run-wasm.js <file.wasm> [--export <name>]",
+    "usage: node scripts/run-wasm.js <file.wasm> [--export <name>] [-- <arg>...]",
   );
   process.exit(1);
 }
@@ -15,9 +15,14 @@ function parseArgs(argv) {
 
   let wasmPath = null;
   let exportName = "__expr_main_i64";
+  let programArgs = [];
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === "--") {
+      programArgs = argv.slice(i + 1);
+      break;
+    }
     if (arg === "--export") {
       i += 1;
       if (i >= argv.length) {
@@ -39,7 +44,7 @@ function parseArgs(argv) {
     usage();
   }
 
-  return { wasmPath, exportName };
+  return { wasmPath, exportName, programArgs };
 }
 
 function renderValue(tag, payload, memory) {
@@ -105,10 +110,11 @@ function printValue(tag, payload, memory) {
 }
 
 async function main() {
-  const { wasmPath, exportName } = parseArgs(process.argv.slice(2));
+  const { wasmPath, exportName, programArgs } = parseArgs(process.argv.slice(2));
   const bytes = fs.readFileSync(wasmPath);
 
   let memoryRef = null;
+  const encodedArgs = programArgs.map((arg) => new TextEncoder().encode(arg));
 
   const imports = {
     env: {
@@ -117,6 +123,27 @@ async function main() {
       },
       __expr_wasm_list_print_host(tag, payload) {
         printValue(Number(tag), BigInt(payload), memoryRef);
+      },
+      __expr_wasm_args_len_host() {
+        return BigInt(encodedArgs.length);
+      },
+      __expr_wasm_arg_len_host(index) {
+        const idx = Number(index);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= encodedArgs.length) {
+          throw new Error(`invalid wasm argv index: ${index}`);
+        }
+        return BigInt(encodedArgs[idx].length);
+      },
+      __expr_wasm_arg_copy_host(index, dest) {
+        const idx = Number(index);
+        const ptr = Number(dest);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= encodedArgs.length) {
+          throw new Error(`invalid wasm argv index: ${index}`);
+        }
+        const bytes = encodedArgs[idx];
+        const view = new Uint8Array(memoryRef.buffer, ptr, bytes.length);
+        view.set(bytes);
+        return 0n;
       },
     },
   };

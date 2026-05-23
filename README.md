@@ -126,6 +126,27 @@ Logical infix operators are also supported:
 - all return normalized integer booleans `0` or `1`
 - `true` and `false` are parser aliases for integer literals `1` and `0`
 
+## Executable arguments
+
+JIT, native executable, core Wasm, and `wasi:cli/command` component `main` may optionally take one argument:
+
+```text
+fn main(args) do
+    print(list_len(args))
+    print(list_get(args, 0))
+    0
+end
+```
+
+Current behavior:
+
+- this applies to JIT execution, native executable output, LLVM core Wasm output, and LLVM `wasi:cli/command` component output
+- `args` is a list of strings
+- only actual CLI arguments are passed; the executable name is omitted
+- `main` currently supports at most one argument in these runnable output modes
+- for JIT execution through the CLI, pass program arguments after `--`, for example:
+  - `cargo run --release -q -- examples/args.expr --run-jit -- hello world`
+
 ## Higher-order list functions
 
 The language supports anonymous functions, captured closures, and higher-order

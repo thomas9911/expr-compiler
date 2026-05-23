@@ -1,0 +1,22 @@
+fn handle_subcommand(command, args) do
+    if command == "hello" do
+        print("hello")
+    else if command == "bye" do
+        print("bye")
+    else if command == "print" do
+        print(args)
+    else
+        print(string_concat("invalid subcommand: ", command))
+        1
+    end
+end
+
+fn main(args) do
+    if list_len(args) == 0 do
+        print("not enough arguments")
+        1
+    else
+        subcommand = list_get(args, 0)
+        handle_subcommand(subcommand, args)
+    end
+end

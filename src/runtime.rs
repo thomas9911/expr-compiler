@@ -180,6 +180,31 @@ fn print_value_inner(handle: i64) {
     print_value_ref(value);
 }
 
+fn new_string_handle_from_bytes(bytes: &[u8]) -> i64 {
+    with_arena(|arena| {
+        let data_ptr = arena.alloc(bytes.len().max(1), std::mem::align_of::<u8>());
+        if !bytes.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, bytes.len());
+            }
+        }
+
+        let header_ptr = arena.alloc(
+            std::mem::size_of::<StringHeader>(),
+            std::mem::align_of::<StringHeader>(),
+        ) as *mut StringHeader;
+        unsafe {
+            *header_ptr = StringHeader {
+                len: bytes.len(),
+                cap: bytes.len(),
+                ptr: data_ptr,
+            };
+        }
+
+        alloc_value(arena, ValueTag::String, header_ptr as usize as i64)
+    })
+}
+
 fn box_inline_value(value: Value) -> i64 {
     with_arena(|arena| alloc_value(arena, value.tag, value.payload))
 }
@@ -204,6 +229,16 @@ pub fn jit_arena_addresses() -> (i64, i64) {
         let offset = (&mut arena.offset as *mut usize) as usize as i64;
         (base, offset)
     })
+}
+
+pub fn build_argv_list_value(args: &[String]) -> (i64, i64) {
+    let list = __expr_list_new_host();
+    for arg in args {
+        let string = new_string_handle_from_bytes(arg.as_bytes());
+        __expr_list_push_host(list, string);
+    }
+    let value = value_ref(list);
+    (value.tag as i64, value.payload)
 }
 
 #[unsafe(no_mangle)]

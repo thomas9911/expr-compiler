@@ -16,6 +16,9 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 MAX_NATIVE_BINARY_SIZE = 50 * 1024
+EXAMPLE_RUN_ARGS: dict[str, list[str]] = {
+    "args": ["hello", "world"],
+}
 
 
 @dataclass
@@ -197,6 +200,10 @@ def run_compiler(
     )
 
 
+def example_run_args(example: Path) -> list[str]:
+    return EXAMPLE_RUN_ARGS.get(example.stem, [])
+
+
 def binary_path_for(staging_dir: Path, example: Path) -> Path:
     stem = example.stem
     if os.name == "nt":
@@ -204,8 +211,10 @@ def binary_path_for(staging_dir: Path, example: Path) -> Path:
     return staging_dir / stem
 
 
-def run_binary(name: str, path: Path) -> subprocess.CompletedProcess[str]:
-    argv = [str(path)]
+def run_binary(
+    name: str, path: Path, args: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    argv = [str(path), *(args or [])]
     return subprocess.run(argv, text=True, capture_output=True)
 
 
@@ -282,7 +291,7 @@ def run_cranelift_jit(
 ) -> subprocess.CompletedProcess[str]:
     return run_compiler(
         compiler,
-        [str(example), "--run-jit"],
+        [str(example), "--run-jit", "--", *example_run_args(example)],
         env=env,
     )
 
@@ -301,7 +310,7 @@ def run_cranelift_native(
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
-    run_proc = run_binary("cranelift-native-run", output)
+    run_proc = run_binary("cranelift-native-run", output, example_run_args(example))
     return run_proc, output.stat().st_size
 
 
@@ -330,7 +339,14 @@ def run_llvm_jit(
 ) -> subprocess.CompletedProcess[str]:
     return run_compiler(
         compiler,
-        [str(example), "--run-jit", "--backend", "llvm"],
+        [
+            str(example),
+            "--run-jit",
+            "--backend",
+            "llvm",
+            "--",
+            *example_run_args(example),
+        ],
         env=env,
     )
 
@@ -349,7 +365,7 @@ def run_llvm_native(
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
-    run_proc = run_binary("llvm-native-run", output)
+    run_proc = run_binary("llvm-native-run", output, example_run_args(example))
     return run_proc, output.stat().st_size
 
 
@@ -369,7 +385,13 @@ def run_llvm_wasm(
         return compile_proc, 0
     run_proc = run_command(
         "llvm-wasm-run",
-        [js_runtime(), str(REPO_ROOT / "scripts" / "run-wasm.js"), str(output)],
+        [
+            js_runtime(),
+            str(REPO_ROOT / "scripts" / "run-wasm.js"),
+            str(output),
+            "--",
+            *example_run_args(example),
+        ],
         env=os.environ.copy(),
     )
     return run_proc, output.stat().st_size
@@ -391,7 +413,7 @@ def run_llvm_component(
         return compile_proc, 0
     run_proc = run_command(
         "llvm-component-run",
-        [wasmtime_runtime(), "run", str(output)],
+        [wasmtime_runtime(), "run", str(output), *example_run_args(example)],
         env=os.environ.copy(),
     )
     return run_proc, output.stat().st_size

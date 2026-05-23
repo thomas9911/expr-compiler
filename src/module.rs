@@ -85,6 +85,15 @@ struct UsedFeatures {
 }
 
 impl Module {
+    fn assert_native_main_arity(&self) {
+        if let Some(main) = self.functions.iter().find(|func| func.name == "main") {
+            assert!(
+                main.inputs.len() <= 1,
+                "native executable main function supports at most one argument"
+            );
+        }
+    }
+
     pub fn new() -> Self {
         Module {
             functions: vec![],
@@ -217,19 +226,21 @@ impl Module {
                 &function_arities,
                 &closure_metadata,
             );
-            if func_def.inputs.is_empty() {
-                let scalar_id = declare_zero_arg_int_result_sig(
+            if func_def.inputs.len() <= 1 {
+                let scalar_id = declare_jit_int_result_sig(
                     &mut cranelift_module,
                     &isa,
                     &int_result_symbol_name(&func_def.name),
                     Linkage::Local,
+                    func_def.inputs.len(),
                 );
-                define_zero_arg_int_result_wrapper(
+                define_jit_int_result_wrapper(
                     &mut cranelift_module,
                     isa.clone(),
                     &flags,
                     scalar_id,
                     internal_func_ids[&func_def.name],
+                    func_def.inputs.len(),
                 );
                 int_result_func_ids.insert(func_def.name.clone(), scalar_id);
             }
@@ -392,6 +403,7 @@ impl Module {
     }
 
     pub fn compile_to_executable_with_backend(self, output: &Path, backend: CodegenBackend) {
+        self.assert_native_main_arity();
         if is_component_wasm_output(output) {
             match backend {
                 CodegenBackend::Llvm => {
@@ -492,20 +504,11 @@ impl Module {
                     Linkage::Local,
                 );
                 internal_func_ids.insert("main".to_string(), internal_id);
-                if func_def.inputs.is_empty() {
-                    #[cfg(windows)]
-                    let int_symbol = "expr_main_entry_int";
-                    #[cfg(not(windows))]
-                    let int_symbol = &int_result_symbol_name(&func_def.name);
-                    let int_id = declare_zero_arg_int_result_sig(
+                if func_def.inputs.len() <= 1 {
+                    let int_id = declare_executable_main_int_result_sig(
                         &mut cranelift_module,
                         &isa,
-                        int_symbol,
-                        if cfg!(windows) {
-                            Linkage::Export
-                        } else {
-                            Linkage::Local
-                        },
+                        Linkage::Export,
                     );
                     expr_main_int_id = Some(int_id);
                 }
@@ -533,20 +536,16 @@ impl Module {
                 &function_arities,
                 &closure_metadata,
             );
-            if func_def.name == "main" && func_def.inputs.is_empty() {
-                define_zero_arg_int_result_wrapper(
+            if func_def.name == "main" && func_def.inputs.len() <= 1 {
+                define_executable_main_int_result_wrapper(
                     &mut cranelift_module,
                     isa.clone(),
                     &flags,
                     expr_main_int_id.expect("main int wrapper id should exist"),
                     internal_func_ids[&func_def.name],
+                    func_def.inputs.len(),
                 );
             }
-        }
-
-        #[cfg(not(windows))]
-        if let Some(id) = expr_main_int_id {
-            generate_c_main(&mut cranelift_module, isa.clone(), &flags, id);
         }
         let bytes = cranelift_module.finish().emit().unwrap();
 
@@ -667,13 +666,13 @@ impl Module {
 
     #[cfg(feature = "llvm-backend")]
     fn compile_to_llvm_wasm(self, output: &Path) {
-        let has_zero_arg_main = self
+        let has_supported_main = self
             .functions
             .iter()
-            .any(|func| func.name == "main" && func.inputs.is_empty());
+            .any(|func| func.name == "main" && func.inputs.len() <= 1);
         assert!(
-            has_zero_arg_main,
-            "llvm wasm output requires a zero-argument main function"
+            has_supported_main,
+            "llvm wasm output requires a main function with at most one argument"
         );
 
         let asm = llvm_backend::compile_to_wasm_assembly(self, "llvm_wasm");
@@ -722,13 +721,13 @@ impl Module {
 
     #[cfg(all(feature = "llvm-backend", feature = "wasi"))]
     fn compile_to_llvm_component(self, output: &Path) {
-        let has_zero_arg_main = self
+        let has_supported_main = self
             .functions
             .iter()
-            .any(|func| func.name == "main" && func.inputs.is_empty());
+            .any(|func| func.name == "main" && func.inputs.len() <= 1);
         assert!(
-            has_zero_arg_main,
-            "llvm component output requires a zero-argument main function"
+            has_supported_main,
+            "llvm component output requires a main function with at most one argument"
         );
 
         let asm = llvm_backend::compile_to_wasm_preview1_command_assembly(self, "llvm_component");
@@ -986,15 +985,45 @@ fn int_result_symbol_name(name: &str) -> String {
     format!("__expr_i64_{name}")
 }
 
-fn declare_zero_arg_int_result_sig(
+fn executable_main_symbol_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "expr_main_entry_int"
+    }
+    #[cfg(not(windows))]
+    {
+        "__expr_main_i64"
+    }
+}
+
+fn declare_jit_int_result_sig(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     name: &str,
     linkage: Linkage,
+    input_count: usize,
 ) -> FuncId {
     let mut sig = Signature::new(isa.default_call_conv());
+    if input_count == 1 {
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+    }
     sig.returns.push(AbiParam::new(types::I64));
     module.declare_function(name, linkage, &sig).unwrap()
+}
+
+fn declare_executable_main_int_result_sig(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    linkage: Linkage,
+) -> FuncId {
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.params.push(AbiParam::new(types::I64));
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
+    module
+        .declare_function(executable_main_symbol_name(), linkage, &sig)
+        .unwrap()
 }
 
 fn function_ordinals(functions: &[FunctionDefAst]) -> HashMap<String, i64> {
@@ -1455,14 +1484,23 @@ fn define_function_body(
     ir
 }
 
-fn define_zero_arg_int_result_wrapper(
+fn define_jit_int_result_wrapper(
     module: &mut impl CraneliftModule,
     isa: OwnedTargetIsa,
     flags: &settings::Flags,
     wrapper_id: FuncId,
     internal_id: FuncId,
+    input_count: usize,
 ) {
+    assert!(
+        input_count <= 1,
+        "jit int-result wrapper supports at most one argument"
+    );
     let mut sig = Signature::new(isa.default_call_conv());
+    if input_count == 1 {
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+    }
     sig.returns.push(AbiParam::new(types::I64));
 
     let mut ctx = module.make_context();
@@ -1475,11 +1513,20 @@ fn define_zero_arg_int_result_wrapper(
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
         let block0 = builder.create_block();
+        builder.append_block_params_for_function_params(block0);
         builder.switch_to_block(block0);
         builder.seal_block(block0);
 
         let zero_env = builder.ins().iconst(types::I64, 0);
-        let internal_call = builder.ins().call(internal_ref, &[zero_env]);
+        let internal_call = if input_count == 1 {
+            let arg_tag = builder.block_params(block0)[0];
+            let arg_payload = builder.block_params(block0)[1];
+            builder
+                .ins()
+                .call(internal_ref, &[zero_env, arg_tag, arg_payload])
+        } else {
+            builder.ins().call(internal_ref, &[zero_env])
+        };
         let result_tag = builder.inst_results(internal_call)[0];
         let result_payload = builder.inst_results(internal_call)[1];
         let is_int = builder.ins().icmp_imm(IntCC::Equal, result_tag, TAG_INT);
@@ -1498,65 +1545,55 @@ fn define_zero_arg_int_result_wrapper(
     module.clear_context(&mut ctx);
 }
 
-#[cfg(not(windows))]
-fn generate_c_main(
+fn define_executable_main_int_result_wrapper(
     module: &mut impl CraneliftModule,
     isa: OwnedTargetIsa,
     flags: &settings::Flags,
-    expr_main_id: FuncId,
+    wrapper_id: FuncId,
+    internal_id: FuncId,
+    main_input_count: usize,
 ) {
-    let mut sig = Signature::new(isa.default_call_conv());
-    sig.returns.push(AbiParam::new(types::I32));
-    sig.params.push(AbiParam::new(types::I32)); // argc
-    sig.params.push(AbiParam::new(types::I64)); // argv (pointer)
+    assert!(
+        main_input_count <= 1,
+        "native executable main function supports at most one argument"
+    );
 
-    let main_id = module
-        .declare_function("main", Linkage::Export, &sig)
-        .unwrap();
+    let mut sig = Signature::new(isa.default_call_conv());
+    sig.params.push(AbiParam::new(types::I64));
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
 
     let mut ctx = module.make_context();
     ctx.func.signature = sig;
-    ctx.func.name = UserFuncName::user(0, main_id.as_u32());
+    ctx.func.name = UserFuncName::user(0, wrapper_id.as_u32());
 
-    let expr_main_ref = module.declare_func_in_func(expr_main_id, &mut ctx.func);
+    let internal_ref = module.declare_func_in_func(internal_id, &mut ctx.func);
 
     let mut fn_builder_ctx = FunctionBuilderContext::new();
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
 
-        let block_entry = builder.create_block();
-        let block_fits = builder.create_block();
-        let block_overflow = builder.create_block();
+        let arg_tag = builder.block_params(entry)[0];
+        let arg_payload = builder.block_params(entry)[1];
+        let zero_env = builder.ins().iconst(types::I64, 0);
+        let mut call_args = vec![zero_env];
+        if main_input_count == 1 {
+            call_args.push(arg_tag);
+            call_args.push(arg_payload);
+        }
 
-        builder.append_block_params_for_function_params(block_entry);
-        builder.switch_to_block(block_entry);
-
-        let call = builder.ins().call(expr_main_ref, &[]);
-        let int_result = builder.inst_results(call)[0];
-
-        let min = builder.ins().iconst(types::I64, i32::MIN as i64);
-        let max = builder.ins().iconst(types::I64, i32::MAX as i64);
-        let fits_low = builder
-            .ins()
-            .icmp(IntCC::SignedGreaterThanOrEqual, int_result, min);
-        let fits_high = builder
-            .ins()
-            .icmp(IntCC::SignedLessThanOrEqual, int_result, max);
-        let fits = builder.ins().band(fits_low, fits_high);
+        let internal_call = builder.ins().call(internal_ref, &call_args);
+        let result_tag = builder.inst_results(internal_call)[0];
+        let result_payload = builder.inst_results(internal_call)[1];
+        let is_int = builder.ins().icmp_imm(IntCC::Equal, result_tag, TAG_INT);
         builder
             .ins()
-            .brif(fits, block_fits, &[], block_overflow, &[]);
-        builder.seal_block(block_entry);
-
-        builder.switch_to_block(block_fits);
-        builder.seal_block(block_fits);
-        let narrow = builder.ins().ireduce(types::I32, int_result);
-        builder.ins().return_(&[narrow]);
-
-        builder.switch_to_block(block_overflow);
-        builder.seal_block(block_overflow);
-        let one = builder.ins().iconst(types::I32, 1);
-        builder.ins().return_(&[one]);
+            .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+        builder.ins().return_(&[result_payload]);
 
         builder.finalize();
     }
@@ -1566,7 +1603,7 @@ fn generate_c_main(
         panic!("{}", errors);
     }
 
-    module.define_function(main_id, &mut ctx).unwrap();
+    module.define_function(wrapper_id, &mut ctx).unwrap();
     module.clear_context(&mut ctx);
 }
 
@@ -4827,6 +4864,17 @@ fn assert_backend_executable_output(
     expected_stdout: &str,
     expected_exit: i32,
 ) {
+    assert_backend_executable_output_with_args(src, backend, &[], expected_stdout, expected_exit);
+}
+
+#[cfg(test)]
+fn assert_backend_executable_output_with_args(
+    src: &str,
+    backend: CodegenBackend,
+    args: &[&str],
+    expected_stdout: &str,
+    expected_exit: i32,
+) {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4839,7 +4887,10 @@ fn assert_backend_executable_output(
     let output = std::env::temp_dir().join(format!("__expr_compiler_bigint_test_{unique}"));
 
     Module::from_source(src).compile_to_executable_with_backend(&output, backend);
-    let out = Command::new(&output).output().expect("run failed");
+    let out = Command::new(&output)
+        .args(args)
+        .output()
+        .expect("run failed");
     std::fs::remove_file(&output).ok();
 
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected_stdout);
@@ -4855,6 +4906,27 @@ fn assert_jit_backend_result(src: &str, backend: CodegenBackend, expected: i64) 
         .expect("int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), expected);
+}
+
+#[cfg(test)]
+fn assert_jit_backend_result_with_args(
+    src: &str,
+    backend: CodegenBackend,
+    args: &[&str],
+    expected: i64,
+) {
+    crate::runtime::reset_runtime_arena();
+    let jit = Module::from_source(src).compile_to_jit_with_backend(backend);
+    let ptr = jit
+        .get_int_result_fn_ptr("main")
+        .expect("int-result wrapper should exist");
+    let owned_args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let (arg_tag, arg_payload) = crate::runtime::build_argv_list_value(&owned_args);
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
+    assert_eq!(func(arg_tag, arg_payload), expected);
 }
 
 #[test]
@@ -4931,6 +5003,24 @@ fn print_builtin_executable() {
 
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
     assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn executable_main_can_receive_argument_list() {
+    let src = "fn main(args) do\n    print(list_len(args))\n    print(list_get(args, 0))\n    print(list_get(args, 1))\n    list_len(args)\nend";
+    assert_backend_executable_output_with_args(
+        src,
+        CodegenBackend::Cranelift,
+        &["hello", "world"],
+        "2\nhello\nworld\n",
+        2,
+    );
+}
+
+#[test]
+fn jit_main_can_receive_argument_list() {
+    let src = "fn main(args) do\n    print(list_len(args))\n    print(list_get(args, 0))\n    print(list_get(args, 1))\n    list_len(args)\nend";
+    assert_jit_backend_result_with_args(src, CodegenBackend::Cranelift, &["hello", "world"], 2);
 }
 
 #[test]
@@ -5639,4 +5729,24 @@ fn llvm_compile_to_executable_runs() {
     assert_eq!(status.code(), Some(8));
 
     std::fs::remove_file(&output).ok();
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_executable_main_can_receive_argument_list() {
+    let src = "fn main(args) do\n    print(list_len(args))\n    print(list_get(args, 0))\n    print(list_get(args, 1))\n    list_len(args)\nend";
+    assert_backend_executable_output_with_args(
+        src,
+        CodegenBackend::Llvm,
+        &["hello", "world"],
+        "2\nhello\nworld\n",
+        2,
+    );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_main_can_receive_argument_list() {
+    let src = "fn main(args) do\n    print(list_len(args))\n    print(list_get(args, 0))\n    print(list_get(args, 1))\n    list_len(args)\nend";
+    assert_jit_backend_result_with_args(src, CodegenBackend::Llvm, &["hello", "world"], 2);
 }
