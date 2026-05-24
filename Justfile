@@ -16,6 +16,11 @@ llvm-example name:
 check-matrix:
     if command -v python >/dev/null 2>&1; then python scripts/check-matrix.py --release; else python3 scripts/check-matrix.py --release; fi
 
+crap:
+    cargo llvm-cov --all-features --lcov --output-path lcov.info
+    if command -v python >/dev/null 2>&1; then python scripts/normalize-lcov.py lcov.info lcov.relative.info; else python3 scripts/normalize-lcov.py lcov.info lcov.relative.info; fi
+    cargo crap --lcov lcov.relative.info --exclude 'src/wrapper/*.rs' --exclude 'out/**' --top 20
+
 compile-examples:
     for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file"; done
 

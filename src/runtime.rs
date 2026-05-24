@@ -95,10 +95,9 @@ fn new_int(value: i64) -> i64 {
     with_arena(|arena| alloc_value(arena, ValueTag::Int, value))
 }
 
-fn print_bigint_ref(header: &BigIntHeader) {
+fn format_bigint_ref(header: &BigIntHeader) -> String {
     if header.sign == 0 || header.len == 0 {
-        print!("0");
-        return;
+        return "0".to_string();
     }
 
     let limbs = unsafe { std::slice::from_raw_parts(header.ptr, header.len) };
@@ -119,16 +118,22 @@ fn print_bigint_ref(header: &BigIntHeader) {
         }
     }
 
+    let mut out = String::new();
     if header.sign < 0 {
-        print!("-");
+        out.push('-');
     }
     let mut iter = chunks.iter().rev();
     if let Some(first) = iter.next() {
-        print!("{first}");
+        out.push_str(&first.to_string());
     }
     for chunk in iter {
-        print!("{chunk:09}");
+        out.push_str(&format!("{chunk:09}"));
     }
+    out
+}
+
+fn print_bigint_ref(header: &BigIntHeader) {
+    print!("{}", format_bigint_ref(header));
 }
 
 fn print_string_ref(header: &StringHeader) {
@@ -615,5 +620,38 @@ mod tests {
         let iter = __expr_box_value_host(TAG_STRING_ITER, 789);
         assert_eq!(value_ref(iter).tag, ValueTag::StringIter);
         assert_eq!(value_ref(iter).payload, 789);
+    }
+
+    #[test]
+    fn format_bigint_ref_formats_zero_positive_and_negative_values() {
+        let zero = BigIntHeader { sign: 0, len: 0, cap: 0, ptr: std::ptr::null_mut() };
+        assert_eq!(format_bigint_ref(&zero), "0");
+
+        let positive_limbs = vec![5u32];
+        let positive = BigIntHeader {
+            sign: 1,
+            len: positive_limbs.len(),
+            cap: positive_limbs.len(),
+            ptr: positive_limbs.as_ptr() as *mut u32,
+        };
+        assert_eq!(format_bigint_ref(&positive), "5");
+
+        let billion = vec![0u32, 1u32];
+        let large = BigIntHeader {
+            sign: 1,
+            len: billion.len(),
+            cap: billion.len(),
+            ptr: billion.as_ptr() as *mut u32,
+        };
+        assert_eq!(format_bigint_ref(&large), "4294967296");
+
+        let negative_limbs = vec![42u32];
+        let negative = BigIntHeader {
+            sign: -1,
+            len: negative_limbs.len(),
+            cap: negative_limbs.len(),
+            ptr: negative_limbs.as_ptr() as *mut u32,
+        };
+        assert_eq!(format_bigint_ref(&negative), "-42");
     }
 }

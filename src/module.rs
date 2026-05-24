@@ -930,6 +930,22 @@ fn find_llvm_tool(tool: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(exe_name)
 }
 
+#[cfg(all(test, feature = "llvm-backend"))]
+fn llvm_tool_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+unsafe fn set_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    unsafe { std::env::set_var(key, value) };
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+unsafe fn remove_env_var<K: AsRef<std::ffi::OsStr>>(key: K) {
+    unsafe { std::env::remove_var(key) };
+}
+
 fn declare_internal_function_sig(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -3466,553 +3482,54 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::Index { collection, index } => {
-            let collection_value = compile_ast(
-                builder,
-                collection,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            let index_value = compile_ast(
-                builder,
-                index,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            call_binary(builder, func_refs, "list_get", collection_value, index_value)
-        }
-        Ast::IndexAssign { collection, index, value } => {
-            let collection_value = compile_ast(
-                builder,
-                collection,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            let index_value = compile_ast(
-                builder,
-                index,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            let value = compile_ast(
-                builder,
-                value,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            call_ternary(builder, func_refs, "list_set", collection_value, index_value, value)
-        }
-        Ast::Expression(ExpressionAst { function, args }) => {
-            if function == "not" {
-                assert_eq!(args.len(), 1, "not expects 1 argument");
-                return compile_logical_not(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "and" || function == "or" {
-                assert_eq!(args.len(), 2, "{function} expects 2 arguments");
-                return compile_logical_op(
-                    builder,
-                    function,
-                    &args[0],
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "list_map" {
-                return compile_list_map(
-                    builder,
-                    args,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "list_filter" {
-                return compile_list_filter(
-                    builder,
-                    args,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "list_range" {
-                return compile_list_range(
-                    builder,
-                    args,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "bytes_len" {
-                assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
-                let value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_len(builder, value);
-            }
-            if function == "bytes_get" {
-                assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_get(builder, string_value, index_value);
-            }
-            if function == "bytes_pop" {
-                assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_pop(builder, string_value);
-            }
-            if function == "bytes_push" {
-                assert_eq!(args.len(), 2, "bytes_push expects 2 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let byte_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_push(builder, func_refs, string_value, byte_value);
-            }
-            if function == "bytes_insert" {
-                assert_eq!(args.len(), 3, "bytes_insert expects 3 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let byte_value = compile_ast(
-                    builder,
-                    &args[2],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_insert(
-                    builder,
-                    func_refs,
-                    string_value,
-                    index_value,
-                    byte_value,
-                );
-            }
-            if function == "bytes_remove" {
-                assert_eq!(args.len(), 2, "bytes_remove expects 2 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_remove(builder, string_value, index_value);
-            }
-            if function == "bytes_set" {
-                assert_eq!(args.len(), 3, "bytes_set expects 3 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let byte_value = compile_ast(
-                    builder,
-                    &args[2],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_set(builder, string_value, index_value, byte_value);
-            }
-            if function == "bytes_slice" {
-                assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let start_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let end_value = compile_ast(
-                    builder,
-                    &args[2],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_slice(
-                    builder,
-                    func_refs,
-                    string_value,
-                    start_value,
-                    end_value,
-                );
-            }
-            if function == "string_chars" {
-                assert_eq!(args.len(), 1, "string_chars expects 1 argument");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_chars(builder, func_refs, string_value);
-            }
-            if function == "string_iter_done" {
-                assert_eq!(args.len(), 1, "string_iter_done expects 1 argument");
-                let iter_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_iter_done(builder, iter_value);
-            }
-            if function == "string_iter_next" {
-                assert_eq!(args.len(), 1, "string_iter_next expects 1 argument");
-                let iter_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_iter_next(builder, iter_value);
-            }
-            if function == "string_copy" {
-                assert_eq!(args.len(), 1, "string_copy expects 1 argument");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_copy(builder, func_refs, string_value);
-            }
-            if function == "string_concat" {
-                assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
-                let lhs = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let rhs = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_concat(builder, func_refs, lhs, rhs);
-            }
-            let compiled: Vec<_> = args
-                .iter()
-                .map(|arg| {
-                    compile_ast(
-                        builder,
-                        arg,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    )
-                })
-                .collect();
-            if function.is_empty() {
-                return compiled[0];
-            }
-            match function.as_str() {
-                "add" => call_binary(builder, func_refs, "__op_add", compiled[0], compiled[1]),
-                "subtract" => {
-                    call_binary(builder, func_refs, "__op_subtract", compiled[0], compiled[1])
-                }
-                "multiply" => {
-                    call_binary(builder, func_refs, "__op_multiply", compiled[0], compiled[1])
-                }
-                "divide" => {
-                    call_binary(builder, func_refs, "__op_divide", compiled[0], compiled[1])
-                }
-                "modulo" => {
-                    call_binary(builder, func_refs, "__op_modulo", compiled[0], compiled[1])
-                }
-                "gt" => call_binary(builder, func_refs, "__op_gt", compiled[0], compiled[1]),
-                "lt" => call_binary(builder, func_refs, "__op_lt", compiled[0], compiled[1]),
-                "gte" => call_binary(builder, func_refs, "__op_gte", compiled[0], compiled[1]),
-                "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
-                "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
-                "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
-                "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
-                | "bigint_modulo" | "bigint_compare" => {
-                    compile_bigint_builtin(builder, func_refs, function, &compiled)
-                }
-                name => {
-                    if vars.contains_key(name) || capture_slots.contains_key(name) {
-                        let callee = resolve_named_value(
-                            builder,
-                            name,
-                            vars,
-                            func_refs,
-                            function_ordinals,
-                            closure_metadata,
-                            capture_slots,
-                            env_ptr,
-                        );
-                        return apply_function_value(
-                            builder,
-                            func_refs,
-                            callee,
-                            &compiled,
-                            function_ordinals,
-                            function_arities,
-                        );
-                    }
-                    if function_ordinals.contains_key(name) {
-                        let zero_env = builder.ins().iconst(types::I64, 0);
-                        return call_named_with_env(builder, func_refs, name, zero_env, &compiled);
-                    }
-                    if let Some(func_ref) = func_refs.get(name) {
-                        let mut args = Vec::with_capacity(compiled.len() * 2);
-                        for value in &compiled {
-                            args.push(value.tag);
-                            args.push(value.payload);
-                        }
-                        let call = builder.ins().call(*func_ref, &args);
-                        let results = builder.inst_results(call);
-                        return CompiledValue { tag: results[0], payload: results[1] };
-                    }
-                    panic!("undefined function: {name}");
-                }
-            }
-        }
-        Ast::Block(block) => {
-            let mut last = None;
-            for line in &block.lines {
-                last = Some(compile_ast(
-                    builder,
-                    line,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                ));
-            }
-            last.expect("empty block")
-        }
+        Ast::Index { collection, index } => compile_index_ast(
+            builder,
+            collection,
+            index,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::IndexAssign { collection, index, value } => compile_index_assign_ast(
+            builder,
+            collection,
+            index,
+            value,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::Expression(ExpressionAst { function, args }) => compile_expression_ast(
+            builder,
+            function,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::Block(block) => compile_block_ast(
+            builder,
+            block,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
         Ast::Variable(name) => resolve_named_value(
             builder,
             name,
@@ -4023,10 +3540,428 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::Assign { name, value } => {
-            let val = compile_ast(
+        Ast::Assign { name, value } => compile_assign_ast(
+            builder,
+            name,
+            value,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::If { condition, then, else_ } => compile_if_ast(
+            builder,
+            condition,
+            then,
+            else_,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+    }
+}
+
+fn compile_index_ast(
+    builder: &mut FunctionBuilder,
+    collection: &Ast,
+    index: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let collection_value = compile_ast(
+        builder,
+        collection,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let index_value = compile_ast(
+        builder,
+        index,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    call_binary(builder, func_refs, "list_get", collection_value, index_value)
+}
+
+fn compile_index_assign_ast(
+    builder: &mut FunctionBuilder,
+    collection: &Ast,
+    index: &Ast,
+    value: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let collection_value = compile_ast(
+        builder,
+        collection,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let index_value = compile_ast(
+        builder,
+        index,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let value = compile_ast(
+        builder,
+        value,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    call_ternary(builder, func_refs, "list_set", collection_value, index_value, value)
+}
+
+fn compile_block_ast(
+    builder: &mut FunctionBuilder,
+    block: &BlockAst,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let mut last = None;
+    for line in &block.lines {
+        last = Some(compile_ast(
+            builder,
+            line,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ));
+    }
+    last.expect("empty block")
+}
+
+fn compile_assign_ast(
+    builder: &mut FunctionBuilder,
+    name: &str,
+    value: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let val = compile_ast(
+        builder,
+        value,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let var = vars.get(name).unwrap_or_else(|| panic!("undeclared variable: {name}"));
+    builder.def_var(var.tag, val.tag);
+    builder.def_var(var.payload, val.payload);
+    val
+}
+
+fn compile_if_ast(
+    builder: &mut FunctionBuilder,
+    condition: &Ast,
+    then: &BlockAst,
+    else_: &Option<BlockAst>,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let cond_val = compile_ast(
+        builder,
+        condition,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
+    let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
+
+    let then_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    builder.append_block_param(merge_block, types::I64);
+
+    if let Some(else_block_ast) = else_ {
+        let else_block = builder.create_block();
+        builder.ins().brif(cond_non_zero, then_block, &[], else_block, &[]);
+
+        builder.switch_to_block(then_block);
+        builder.seal_block(then_block);
+        let then_val = compile_block_ast(
+            builder,
+            then,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(then_val.tag), BlockArg::Value(then_val.payload)]);
+
+        builder.switch_to_block(else_block);
+        builder.seal_block(else_block);
+        let else_val = compile_block_ast(
+            builder,
+            else_block_ast,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(else_val.tag), BlockArg::Value(else_val.payload)]);
+    } else {
+        let boxed_zero = boxed_int_const(builder, 0);
+        builder.ins().brif(
+            cond_non_zero,
+            then_block,
+            &[],
+            merge_block,
+            &[BlockArg::Value(boxed_zero.tag), BlockArg::Value(boxed_zero.payload)],
+        );
+
+        builder.switch_to_block(then_block);
+        builder.seal_block(then_block);
+        let then_val = compile_block_ast(
+            builder,
+            then,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(then_val.tag), BlockArg::Value(then_val.payload)]);
+    }
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    let params = builder.block_params(merge_block);
+    CompiledValue { tag: params[0], payload: params[1] }
+}
+
+fn compile_expression_ast(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    args: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    if function == "not" {
+        assert_eq!(args.len(), 1, "not expects 1 argument");
+        return compile_logical_not(
+            builder,
+            &args[0],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "and" || function == "or" {
+        assert_eq!(args.len(), 2, "{function} expects 2 arguments");
+        return compile_logical_op(
+            builder,
+            function,
+            &args[0],
+            &args[1],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "list_map" {
+        return compile_list_map(
+            builder,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "list_filter" {
+        return compile_list_filter(
+            builder,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "list_range" {
+        return compile_list_range(
+            builder,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if let Some(value) = compile_string_expression_ast(
+        builder,
+        function,
+        args,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    ) {
+        return value;
+    }
+
+    let compiled: Vec<_> = args
+        .iter()
+        .map(|arg| {
+            compile_ast(
                 builder,
-                value,
+                arg,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            )
+        })
+        .collect();
+    if function.is_empty() {
+        return compiled[0];
+    }
+    compile_named_expression_ast(
+        builder,
+        function,
+        &compiled,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    )
+}
+
+fn compile_string_expression_ast(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    args: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> Option<CompiledValue> {
+    match function {
+        "bytes_len" => {
+            assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
+            let value = compile_ast(
+                builder,
+                &args[0],
                 vars,
                 func_refs,
                 function_ordinals,
@@ -4035,15 +3970,13 @@ fn compile_ast(
                 capture_slots,
                 env_ptr,
             );
-            let var = vars.get(name).unwrap_or_else(|| panic!("undeclared variable: {name}"));
-            builder.def_var(var.tag, val.tag);
-            builder.def_var(var.payload, val.payload);
-            val
+            Some(compile_bytes_len(builder, value))
         }
-        Ast::If { condition, then, else_ } => {
-            let cond_val = compile_ast(
+        "bytes_get" => {
+            assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
+            let string_value = compile_ast(
                 builder,
-                condition,
+                &args[0],
                 vars,
                 func_refs,
                 function_ordinals,
@@ -4052,97 +3985,352 @@ fn compile_ast(
                 capture_slots,
                 env_ptr,
             );
-            let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
-            let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_get(builder, string_value, index_value))
+        }
+        "bytes_pop" => {
+            assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_pop(builder, string_value))
+        }
+        "bytes_push" => {
+            assert_eq!(args.len(), 2, "bytes_push expects 2 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let byte_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_push(builder, func_refs, string_value, byte_value))
+        }
+        "bytes_insert" => {
+            assert_eq!(args.len(), 3, "bytes_insert expects 3 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let byte_value = compile_ast(
+                builder,
+                &args[2],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_insert(builder, func_refs, string_value, index_value, byte_value))
+        }
+        "bytes_remove" => {
+            assert_eq!(args.len(), 2, "bytes_remove expects 2 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_remove(builder, string_value, index_value))
+        }
+        "bytes_set" => {
+            assert_eq!(args.len(), 3, "bytes_set expects 3 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let byte_value = compile_ast(
+                builder,
+                &args[2],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_set(builder, string_value, index_value, byte_value))
+        }
+        "bytes_slice" => {
+            assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let start_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let end_value = compile_ast(
+                builder,
+                &args[2],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_slice(builder, func_refs, string_value, start_value, end_value))
+        }
+        "string_chars" => {
+            assert_eq!(args.len(), 1, "string_chars expects 1 argument");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_chars(builder, func_refs, string_value))
+        }
+        "string_iter_done" => {
+            assert_eq!(args.len(), 1, "string_iter_done expects 1 argument");
+            let iter_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_iter_done(builder, iter_value))
+        }
+        "string_iter_next" => {
+            assert_eq!(args.len(), 1, "string_iter_next expects 1 argument");
+            let iter_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_iter_next(builder, iter_value))
+        }
+        "string_copy" => {
+            assert_eq!(args.len(), 1, "string_copy expects 1 argument");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_copy(builder, func_refs, string_value))
+        }
+        "string_concat" => {
+            assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
+            let lhs = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let rhs = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_concat(builder, func_refs, lhs, rhs))
+        }
+        _ => None,
+    }
+}
 
-            let then_block = builder.create_block();
-            let merge_block = builder.create_block();
-            builder.append_block_param(merge_block, types::I64);
-            builder.append_block_param(merge_block, types::I64);
-
-            if let Some(else_block_ast) = else_ {
-                let else_block = builder.create_block();
-                builder.ins().brif(cond_non_zero, then_block, &[], else_block, &[]);
-
-                builder.switch_to_block(then_block);
-                builder.seal_block(then_block);
-                let mut then_val = boxed_int_const(builder, 0);
-                for line in &then.lines {
-                    then_val = compile_ast(
-                        builder,
-                        line,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    );
-                }
-                builder.ins().jump(
-                    merge_block,
-                    &[BlockArg::Value(then_val.tag), BlockArg::Value(then_val.payload)],
+fn compile_named_expression_ast(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    compiled: &[CompiledValue],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    match function {
+        "add" => call_binary(builder, func_refs, "__op_add", compiled[0], compiled[1]),
+        "subtract" => call_binary(builder, func_refs, "__op_subtract", compiled[0], compiled[1]),
+        "multiply" => call_binary(builder, func_refs, "__op_multiply", compiled[0], compiled[1]),
+        "divide" => call_binary(builder, func_refs, "__op_divide", compiled[0], compiled[1]),
+        "modulo" => call_binary(builder, func_refs, "__op_modulo", compiled[0], compiled[1]),
+        "gt" => call_binary(builder, func_refs, "__op_gt", compiled[0], compiled[1]),
+        "lt" => call_binary(builder, func_refs, "__op_lt", compiled[0], compiled[1]),
+        "gte" => call_binary(builder, func_refs, "__op_gte", compiled[0], compiled[1]),
+        "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
+        "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
+        "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
+        "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
+        | "bigint_modulo" | "bigint_compare" => {
+            compile_bigint_builtin(builder, func_refs, function, &compiled)
+        }
+        name => {
+            if vars.contains_key(name) || capture_slots.contains_key(name) {
+                let callee = resolve_named_value(
+                    builder,
+                    name,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
                 );
-
-                builder.switch_to_block(else_block);
-                builder.seal_block(else_block);
-                let mut else_val = boxed_int_const(builder, 0);
-                for line in &else_block_ast.lines {
-                    else_val = compile_ast(
-                        builder,
-                        line,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    );
-                }
-                builder.ins().jump(
-                    merge_block,
-                    &[BlockArg::Value(else_val.tag), BlockArg::Value(else_val.payload)],
-                );
-            } else {
-                let boxed_zero = boxed_int_const(builder, 0);
-                builder.ins().brif(
-                    cond_non_zero,
-                    then_block,
-                    &[],
-                    merge_block,
-                    &[BlockArg::Value(boxed_zero.tag), BlockArg::Value(boxed_zero.payload)],
-                );
-
-                builder.switch_to_block(then_block);
-                builder.seal_block(then_block);
-                let mut then_val = boxed_int_const(builder, 0);
-                for line in &then.lines {
-                    then_val = compile_ast(
-                        builder,
-                        line,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    );
-                }
-                builder.ins().jump(
-                    merge_block,
-                    &[BlockArg::Value(then_val.tag), BlockArg::Value(then_val.payload)],
+                return apply_function_value(
+                    builder,
+                    func_refs,
+                    callee,
+                    &compiled,
+                    function_ordinals,
+                    function_arities,
                 );
             }
-
-            builder.switch_to_block(merge_block);
-            builder.seal_block(merge_block);
-            let params = builder.block_params(merge_block);
-            CompiledValue { tag: params[0], payload: params[1] }
+            if function_ordinals.contains_key(name) {
+                let zero_env = builder.ins().iconst(types::I64, 0);
+                return call_named_with_env(builder, func_refs, name, zero_env, &compiled);
+            }
+            if let Some(func_ref) = func_refs.get(name) {
+                let mut args = Vec::with_capacity(compiled.len() * 2);
+                for value in compiled {
+                    args.push(value.tag);
+                    args.push(value.payload);
+                }
+                let call = builder.ins().call(*func_ref, &args);
+                let results = builder.inst_results(call);
+                return CompiledValue { tag: results[0], payload: results[1] };
+            }
+            panic!("undefined function: {name}");
         }
-        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
     }
 }
 
@@ -4797,6 +4985,102 @@ fn llvm_jit_logical_and_or_short_circuit() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn find_llvm_tool_prefers_explicit_tool_env_var() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let env_name = "WASM_LD";
+    let old_tool = std::env::var_os(env_name);
+    let old_prefix = std::env::var_os("LLVM_SYS_201_PREFIX");
+    unsafe {
+        set_env_var(env_name, "custom-wasm-ld");
+        remove_env_var("LLVM_SYS_201_PREFIX");
+    }
+
+    let path = find_llvm_tool("wasm-ld");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var(env_name, value) };
+    } else {
+        unsafe { remove_env_var(env_name) };
+    }
+    if let Some(value) = old_prefix {
+        unsafe { set_env_var("LLVM_SYS_201_PREFIX", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_SYS_201_PREFIX") };
+    }
+
+    assert_eq!(path, std::path::PathBuf::from("custom-wasm-ld"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn find_llvm_tool_uses_prefix_bin_when_tool_exists() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let unique = format!(
+        "expr-compiler-llvm-tool-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+    );
+    let prefix = std::env::temp_dir().join(unique);
+    let bin = prefix.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir should be creatable");
+    let exe_name = if cfg!(windows) { "wasm-ld.exe" } else { "wasm-ld" };
+    let tool_path = bin.join(exe_name);
+    std::fs::write(&tool_path, b"").expect("tool file should be creatable");
+
+    let old_tool = std::env::var_os("WASM_LD");
+    let old_prefix = std::env::var_os("LLVM_SYS_201_PREFIX");
+    unsafe {
+        remove_env_var("WASM_LD");
+        set_env_var("LLVM_SYS_201_PREFIX", &prefix);
+    }
+
+    let path = find_llvm_tool("wasm-ld");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("WASM_LD", value) };
+    } else {
+        unsafe { remove_env_var("WASM_LD") };
+    }
+    if let Some(value) = old_prefix {
+        unsafe { set_env_var("LLVM_SYS_201_PREFIX", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_SYS_201_PREFIX") };
+    }
+    let _ = std::fs::remove_file(&tool_path);
+    let _ = std::fs::remove_dir(&bin);
+    let _ = std::fs::remove_dir(&prefix);
+
+    assert_eq!(path, tool_path);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn find_llvm_tool_falls_back_to_executable_name() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let old_tool = std::env::var_os("WASM_LD");
+    let old_prefix = std::env::var_os("LLVM_SYS_201_PREFIX");
+    unsafe {
+        remove_env_var("WASM_LD");
+        remove_env_var("LLVM_SYS_201_PREFIX");
+    }
+
+    let path = find_llvm_tool("wasm-ld");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("WASM_LD", value) };
+    }
+    if let Some(value) = old_prefix {
+        unsafe { set_env_var("LLVM_SYS_201_PREFIX", value) };
+    }
+
+    let expected = if cfg!(windows) { "wasm-ld.exe" } else { "wasm-ld" };
+    assert_eq!(path, std::path::PathBuf::from(expected));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_jit_main_with_args_can_use_string_helpers() {
     let src =
         "fn main(args) do\n    s = list_get(args, 0)\n    bytes_len(s) + bytes_get(s, 0)\nend";
@@ -4898,6 +5182,105 @@ fn anonymous_functions_record_captures() {
     let metadata =
         module.closure_metadata.get("__lambda_1").expect("missing lifted lambda metadata");
     assert_eq!(metadata.captures, vec!["a".to_string()]);
+}
+
+#[test]
+fn collect_captures_deduplicates_multiple_uses() {
+    let ast = Ast::Block(BlockAst {
+        lines: vec![
+            Ast::Variable("outer".to_string()),
+            Ast::Variable("outer".to_string()),
+            Ast::Expression(ExpressionAst {
+                function: "add".to_string(),
+                args: vec![Ast::Variable("outer".to_string()), Ast::Variable("outer".to_string())],
+            }),
+        ],
+    });
+
+    let captures = collect_captures(&ast, &[], &["outer".to_string()]);
+    assert_eq!(captures, vec!["outer".to_string()]);
+}
+
+#[test]
+fn collect_captures_visits_index_and_index_assign() {
+    let ast = Ast::Block(BlockAst {
+        lines: vec![
+            Ast::Index {
+                collection: Box::new(Ast::Variable("xs".to_string())),
+                index: Box::new(Ast::Variable("i".to_string())),
+            },
+            Ast::IndexAssign {
+                collection: Box::new(Ast::Variable("ys".to_string())),
+                index: Box::new(Ast::Variable("j".to_string())),
+                value: Box::new(Ast::Variable("value".to_string())),
+            },
+        ],
+    });
+
+    let scope = vec![
+        "xs".to_string(),
+        "i".to_string(),
+        "ys".to_string(),
+        "j".to_string(),
+        "value".to_string(),
+    ];
+    let captures = collect_captures(&ast, &[], &scope);
+    assert_eq!(captures, scope);
+}
+
+#[test]
+fn collect_captures_visits_if_else_and_assignment_values() {
+    let ast = Ast::Block(BlockAst {
+        lines: vec![
+            Ast::Assign {
+                name: "local".to_string(),
+                value: Box::new(Ast::Variable("assigned".to_string())),
+            },
+            Ast::If {
+                condition: Box::new(Ast::Variable("cond".to_string())),
+                then: BlockAst { lines: vec![Ast::Variable("then_value".to_string())] },
+                else_: Some(BlockAst { lines: vec![Ast::Variable("else_value".to_string())] }),
+            },
+        ],
+    });
+
+    let scope = vec![
+        "assigned".to_string(),
+        "cond".to_string(),
+        "then_value".to_string(),
+        "else_value".to_string(),
+    ];
+    let captures = collect_captures(&ast, &["local".to_string()], &scope);
+    assert_eq!(captures, scope);
+}
+
+#[test]
+fn collect_captures_respects_nested_lambda_inputs_and_locals() {
+    let ast = Ast::Lambda {
+        inputs: vec!["item".to_string()],
+        body: Box::new(Ast::Block(BlockAst {
+            lines: vec![
+                Ast::Assign {
+                    name: "tmp".to_string(),
+                    value: Box::new(Ast::Variable("item".to_string())),
+                },
+                Ast::Variable("outer".to_string()),
+                Ast::Variable("tmp".to_string()),
+                Ast::Lambda {
+                    inputs: vec!["outer".to_string()],
+                    body: Box::new(Ast::Block(BlockAst {
+                        lines: vec![
+                            Ast::Variable("outer".to_string()),
+                            Ast::Variable("deep".to_string()),
+                        ],
+                    })),
+                },
+            ],
+        })),
+    };
+
+    let captures = collect_captures(&ast, &[], &["outer".to_string(), "deep".to_string()]);
+    assert_eq!(captures, vec!["outer".to_string(), "deep".to_string()]);
 }
 
 #[test]

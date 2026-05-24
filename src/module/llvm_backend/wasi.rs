@@ -1226,3 +1226,45 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.build_return(None).expect("failed to return from bigint writer");
     }
 }
+
+#[cfg(all(test, feature = "wasi"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declare_wasi_preview1_import_supports_known_imports() {
+        let (context, module, _target_machine) =
+            create_codegen_context("wasi_imports_test", LlvmTargetKind::Host);
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);
+
+        compiler.declare_wasi_preview1_import("__test_fd_write", "fd_write");
+        compiler.declare_wasi_preview1_import("__test_args_sizes_get", "args_sizes_get");
+        compiler.declare_wasi_preview1_import("__test_args_get", "args_get");
+        compiler.declare_wasi_preview1_import("__test_proc_exit", "proc_exit");
+
+        let fd_write = compiler.require_func("__test_fd_write");
+        assert_eq!(fd_write.get_type().count_param_types(), 4);
+        assert!(fd_write.get_type().get_return_type().is_some());
+
+        let args_sizes_get = compiler.require_func("__test_args_sizes_get");
+        assert_eq!(args_sizes_get.get_type().count_param_types(), 2);
+        assert!(args_sizes_get.get_type().get_return_type().is_some());
+
+        let args_get = compiler.require_func("__test_args_get");
+        assert_eq!(args_get.get_type().count_param_types(), 2);
+        assert!(args_get.get_type().get_return_type().is_some());
+
+        let proc_exit = compiler.require_func("__test_proc_exit");
+        assert_eq!(proc_exit.get_type().count_param_types(), 1);
+        assert!(proc_exit.get_type().get_return_type().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported WASI Preview 1 import")]
+    fn declare_wasi_preview1_import_rejects_unknown_imports() {
+        let (context, module, _target_machine) =
+            create_codegen_context("wasi_imports_panic_test", LlvmTargetKind::Host);
+        let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);
+        compiler.declare_wasi_preview1_import("__test_unknown", "unknown");
+    }
+}

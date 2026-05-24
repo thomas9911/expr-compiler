@@ -1,4 +1,4 @@
-use crate::tokenizer::{Lexer, LexingError, Token, TokenKind};
+use crate::tokenizer::{Lexer, LexingError, Token};
 use logos::Span;
 use std::collections::VecDeque;
 
@@ -492,8 +492,10 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
             lex.next();
             Ast::Literal(LiteralAst::Integer(0))
         }
-        Some(Ok(x)) if x.kind() == TokenKind::Integer => Ast::Literal(LiteralAst::from_lexer(lex)?),
-        Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
+        Some(Ok(Token::Integer(_) | Token::BigIntLiteral(_) | Token::StringLiteral(_))) => {
+            Ast::Literal(LiteralAst::from_lexer(lex)?)
+        }
+        Some(Ok(Token::Symbol(_))) => {
             let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
             Ast::Variable(name)
         }

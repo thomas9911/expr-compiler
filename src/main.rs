@@ -205,9 +205,9 @@ fn run_ir(ir: &str) -> Result<Option<i64>, String> {
     Ok(None)
 }
 
-fn maybe_handle_ir_modes(cli: &CliArgs, source: &str) -> bool {
+fn maybe_handle_ir_modes(cli: &CliArgs, source: &str) -> Result<bool, String> {
     if !cli.emit_ir && !cli.run_ir {
-        return false;
+        return Ok(false);
     }
 
     let ir = Module::from_source(source).compile_to_ir();
@@ -218,13 +218,10 @@ fn maybe_handle_ir_modes(cli: &CliArgs, source: &str) -> bool {
         match run_ir(&ir) {
             Ok(Some(value)) => println!("{value}"),
             Ok(None) => {}
-            Err(err) => {
-                eprintln!("{err}");
-                std::process::exit(1);
-            }
+            Err(err) => return Err(err),
         }
     }
-    !cli.run_jit
+    Ok(!cli.run_jit)
 }
 
 fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
@@ -288,8 +285,13 @@ fn main() {
         print_cli_error_and_exit(&err);
     }
 
-    if maybe_handle_ir_modes(&cli, &source) {
-        return;
+    match maybe_handle_ir_modes(&cli, &source) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
     }
 
     if cli.run_jit {
@@ -459,6 +461,53 @@ mod tests {
         let ir = "function %main() -> i64 system_v {\nblock0:\n    v0 = iconst.i64 7\n    return v0\n}\n";
         let result = run_ir(&ir).expect("run_ir should succeed");
         assert_eq!(result, Some(7));
+    }
+
+    #[test]
+    fn maybe_handle_ir_modes_returns_false_when_ir_modes_are_disabled() {
+        let cli = parse_ok(&["examples/test.expr"]);
+        let handled = maybe_handle_ir_modes(&cli, "fn main() do\n    7\nend")
+            .expect("ir handling should not fail");
+        assert!(!handled);
+    }
+
+    #[test]
+    fn maybe_handle_ir_modes_writes_ir_file_and_returns_true() {
+        let unique = format!(
+            "expr-compiler-main-test-{}.clif",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let output = std::env::temp_dir().join(unique);
+        let output_str = output.to_string_lossy().into_owned();
+        let cli = parse_ok(&["examples/test.expr", "--emit-ir", "-o", &output_str]);
+
+        let handled = maybe_handle_ir_modes(&cli, "fn main() do\n    7\nend")
+            .expect("emit-ir handling should succeed");
+        assert!(handled);
+
+        let ir = std::fs::read_to_string(&output).expect("ir output should exist");
+        assert!(ir.contains("function"));
+
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn maybe_handle_ir_modes_returns_false_when_run_jit_is_also_requested() {
+        let cli = parse_ok(&["examples/test.expr", "--emit-ir", "--run-jit"]);
+        let handled = maybe_handle_ir_modes(&cli, "fn main() do\n    7\nend")
+            .expect("emit-ir handling should succeed");
+        assert!(!handled);
+    }
+
+    #[test]
+    fn maybe_handle_ir_modes_propagates_run_ir_errors() {
+        let cli = parse_ok(&["examples/test.expr", "--run-ir"]);
+        let err = maybe_handle_ir_modes(&cli, "fn main() do\n    1 / 0\nend")
+            .expect_err("run-ir should propagate traps as errors");
+        assert!(!err.is_empty());
     }
 
     #[test]
