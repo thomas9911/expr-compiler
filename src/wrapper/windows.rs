@@ -565,6 +565,29 @@ pub extern "C" fn __expr_list_pop_host(handle: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_delete_host(handle: i64, index: i64) -> i64 {
+    unsafe {
+        let header = &mut *as_list_header_ptr(handle);
+        let idx_raw = as_int(index);
+        if idx_raw < 0 {
+            runtime_abort();
+        }
+        let idx = idx_raw as usize;
+        if idx >= header.len {
+            runtime_abort();
+        }
+        let removed = *header.ptr.add(idx);
+        let mut cur = idx;
+        while cur + 1 < header.len {
+            *header.ptr.add(cur) = *header.ptr.add(cur + 1);
+            cur += 1;
+        }
+        header.len -= 1;
+        alloc_value(removed.tag, removed.payload)
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_list_copy_host(handle: i64) -> i64 {
     unsafe {
         let src = &*as_list_header_ptr(handle);

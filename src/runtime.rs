@@ -458,6 +458,24 @@ pub extern "C" fn __expr_list_pop_host(list: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_delete_host(list: i64, index: i64) -> i64 {
+    let index = raw_to_index(expect_int(index));
+    let header = list_header_mut(list);
+    if index >= header.len {
+        runtime_trap("list index out of bounds");
+    }
+    let removed = unsafe { *header.ptr.add(index) };
+    unsafe {
+        let dst = header.ptr.add(index);
+        let src = header.ptr.add(index + 1);
+        let count = header.len - index - 1;
+        std::ptr::copy(src, dst, count);
+    }
+    header.len -= 1;
+    box_inline_value(removed)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_list_copy_host(list: i64) -> i64 {
     let header = list_header_ref(list);
     with_arena(|arena| {

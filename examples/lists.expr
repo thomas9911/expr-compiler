@@ -18,3 +18,8 @@ fn main():
     print(list_all([1, 2, 3], positive))
     print(list_all([1, 0, 3], positive))
     print(list_any([1, 0, 3], fn x -> x == 0 end))
+
+    ys = [10, 20, 30]
+    print(list_delete(ys, 1))
+    print(ys[1])
+    print(list_len(ys))

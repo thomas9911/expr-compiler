@@ -108,6 +108,9 @@ Guidance for coding agents working in this repository.
 - Higher-order list builtins are available:
   - `list_map(xs, callback)`
   - `list_filter(xs, callback)`
+- Core list mutation builtins also include:
+  - `list_delete(xs, index)`
+  - it mutates the list in place, shifts later items left, and returns the removed item
 - Callbacks must currently have arity `1`.
 - Top-level named functions can be used as function values in expression position.
 - Function values can be stored in variables and passed around.

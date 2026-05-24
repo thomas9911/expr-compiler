@@ -1325,7 +1325,7 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             }
             if matches!(
                 function.as_str(),
-                "list_insert" | "list_set" | "list_swap" | "list_pop" | "list_copy"
+                "list_insert" | "list_set" | "list_swap" | "list_pop" | "list_delete" | "list_copy"
             ) {
                 features.lists = true;
                 features.list_mutation = true;
@@ -1628,6 +1628,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "list_set"
                 | "list_swap"
                 | "list_pop"
+                | "list_delete"
                 | "list_copy"
                 | "list_range"
                 | "list_map"
@@ -5495,6 +5496,12 @@ fn jit_list_pop_works() {
 }
 
 #[test]
+fn jit_list_delete_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    x = list_delete(xs, 1)\n    x + xs[1] + list_len(xs)\nend";
+    assert_cranelift_jit_result(src, 7);
+}
+
+#[test]
 fn jit_list_copy_works() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
     assert_cranelift_jit_result(src, 8);
@@ -5683,6 +5690,13 @@ fn llvm_jit_list_insert_works() {
 fn llvm_jit_list_swap_works() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    list_swap(xs, 0, 2)\n    xs[0] + xs[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 4);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_list_delete_works() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    x = list_delete(xs, 1)\n    x + xs[1] + list_len(xs)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 7);
 }
 
 #[cfg(feature = "llvm-backend")]

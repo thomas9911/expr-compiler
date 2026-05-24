@@ -70,6 +70,14 @@ def parse_args() -> argparse.Namespace:
         help="LLVM build root used for llvm-backend runs",
     )
     parser.add_argument(
+        "--target-root",
+        help=(
+            "Root directory under which matrix cargo target dirs are created. "
+            "Useful for WSL/Linux runs where build artifacts should live on a "
+            "WSL-owned volume."
+        ),
+    )
+    parser.add_argument(
         "--release",
         action="store_true",
         help="Use release builds for cargo run commands",
@@ -99,7 +107,25 @@ def resolve_examples(values: Iterable[str]) -> list[Path]:
     return resolved
 
 
-def llvm_env(llvm_root_arg: str | None) -> dict[str, str]:
+def resolve_target_dir(
+    *,
+    root_arg: str | None,
+    root_env_var: str,
+    exact_env_var: str,
+    default_leaf: str,
+) -> str:
+    exact = os.environ.get(exact_env_var, "")
+    if exact:
+        return exact
+
+    root_value = root_arg or os.environ.get(root_env_var, "")
+    if root_value:
+        return str(Path(root_value) / default_leaf)
+
+    return str(REPO_ROOT / default_leaf)
+
+
+def llvm_env(llvm_root_arg: str | None, target_root_arg: str | None) -> dict[str, str]:
     llvm_root_value = llvm_root_arg or os.environ.get("LLVM_SYS_201_PREFIX", "")
     if not llvm_root_value:
         raise SystemExit(
@@ -117,18 +143,22 @@ def llvm_env(llvm_root_arg: str | None) -> dict[str, str]:
     env["LLVM_SYS_201_PREFIX"] = str(llvm_root)
     env["LLVM_CONFIG_PATH"] = str(llvm_config)
     env["PATH"] = str(llvm_bin) + os.pathsep + env.get("PATH", "")
-    env["CARGO_TARGET_DIR"] = os.environ.get(
-        "MATRIX_LLVM_TARGET_DIR",
-        str(REPO_ROOT / "target_llvm_backend"),
+    env["CARGO_TARGET_DIR"] = resolve_target_dir(
+        root_arg=target_root_arg,
+        root_env_var="MATRIX_TARGET_ROOT",
+        exact_env_var="MATRIX_LLVM_TARGET_DIR",
+        default_leaf="target_llvm_backend",
     )
     return env
 
 
-def cranelift_env() -> dict[str, str]:
+def cranelift_env(target_root_arg: str | None) -> dict[str, str]:
     env = os.environ.copy()
-    env["CARGO_TARGET_DIR"] = os.environ.get(
-        "MATRIX_CRANELIFT_TARGET_DIR",
-        str(REPO_ROOT / "target_matrix_cranelift"),
+    env["CARGO_TARGET_DIR"] = resolve_target_dir(
+        root_arg=target_root_arg,
+        root_env_var="MATRIX_TARGET_ROOT",
+        exact_env_var="MATRIX_CRANELIFT_TARGET_DIR",
+        default_leaf="target_matrix_cranelift",
     )
     return env
 
@@ -448,11 +478,15 @@ def main() -> int:
     args = parse_args()
     examples = resolve_examples(args.examples)
     failures: list[RunResult] = []
-    cranelift_build_env = cranelift_env()
-    llvm_build_env = llvm_env(args.llvm_root) if any(
+    cranelift_build_env = cranelift_env(args.target_root)
+    llvm_build_env = llvm_env(args.llvm_root, args.target_root) if any(
         mode.startswith("llvm-") for mode in args.modes
     ) else None
-    llvm_wasi_build_env = llvm_env(args.llvm_root) if "llvm-component" in args.modes else None
+    llvm_wasi_build_env = (
+        llvm_env(args.llvm_root, args.target_root)
+        if "llvm-component" in args.modes
+        else None
+    )
 
     cranelift_compiler = ensure_compiler_built(
         release=args.release,

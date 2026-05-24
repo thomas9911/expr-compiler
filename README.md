@@ -158,6 +158,7 @@ Supported forms:
 list_map(xs, fn item -> item * 2 end)
 list_filter(xs, fn item -> item > 2 end)
 list_filter(xs, fn item -> item == limit end)
+list_delete(xs, 1)
 ```
 
 Named top-level functions can also be used as function values:
@@ -186,6 +187,7 @@ end
 
 Current constraints:
 
+- `list_delete(xs, index)` mutates the list in place, shifts later items left, and returns the removed item
 - `list_map` and `list_filter` currently require unary callbacks
 - function values can be stored in variables and passed to `list_map` /
   `list_filter`

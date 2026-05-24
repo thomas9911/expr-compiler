@@ -577,6 +577,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.define_pair_list_set("__rt_list_set", "llvm_rt_list_set");
             self.define_pair_list_swap("__rt_list_swap", "llvm_rt_list_swap");
             self.define_pair_list_pop("__rt_list_pop", "llvm_rt_list_pop");
+            self.define_pair_list_delete("__rt_list_delete", "llvm_rt_list_delete");
             self.define_pair_list_copy("__rt_list_copy", "llvm_rt_list_copy");
         }
     }
@@ -2366,6 +2367,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
                         self.require_func("__rt_list_pop"),
                         &compiled,
                         "list_pop",
+                    ),
+                    "list_delete" => self.build_internal_call(
+                        self.require_func("__rt_list_delete"),
+                        &compiled,
+                        "list_delete",
                     ),
                     "list_copy" => self.build_internal_call(
                         self.require_func("__rt_list_copy"),
@@ -11315,6 +11321,108 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "list_pop_pair",
             )))
             .expect("failed to return list pop");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    fn define_pair_list_delete(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type().fn_type(
+                &[
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                    self.i64_type.into(),
+                ],
+                false,
+            ),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        let loop_block = self.context.append_basic_block(function, "loop");
+        let body_block = self.context.append_basic_block(function, "body");
+        let done_block = self.context.append_basic_block(function, "done");
+        self.builder.position_at_end(entry);
+
+        let list = CompiledValue {
+            tag: function.get_first_param().unwrap().into_int_value(),
+            payload: function.get_nth_param(1).unwrap().into_int_value(),
+        };
+        let index = CompiledValue {
+            tag: function.get_nth_param(2).unwrap().into_int_value(),
+            payload: function.get_nth_param(3).unwrap().into_int_value(),
+        };
+        let list_payload =
+            self.expect_tag_payload(list, TAG_LIST, "list_delete_list", ok_block, trap_block);
+
+        self.builder.position_at_end(ok_block);
+        let idx = self.expect_tag_int(index, "list_delete_index", trap_block);
+        self.build_index_bounds_check(list_payload, idx, "list_delete", trap_block);
+        let bounds_ok_block = self.builder.get_insert_block().unwrap();
+        let len = self.build_list_len_load(list_payload, "list_delete");
+        let removed = self.build_list_value_load(list_payload, idx, "list_delete_removed");
+        let start = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), "list_delete_start")
+            .expect("failed to increment list delete index");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to branch to list_delete loop");
+
+        self.builder.position_at_end(loop_block);
+        let cur_phi = self
+            .builder
+            .build_phi(self.i64_type, "list_delete_cur")
+            .expect("failed to build list_delete phi");
+        cur_phi.add_incoming(&[(&start, bounds_ok_block)]);
+        let cur = cur_phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, cur, len, "list_delete_more")
+            .expect("failed to compare list_delete cursor");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed to branch list_delete loop");
+
+        self.builder.position_at_end(body_block);
+        let moved = self.build_list_value_load(list_payload, cur, "list_delete_src");
+        let dst = self
+            .builder
+            .build_int_sub(cur, self.i64_type.const_int(1, false), "list_delete_dst")
+            .expect("failed to decrement list_delete dst");
+        self.build_list_value_store(list_payload, dst, moved, "list_delete_shift");
+        let next = self
+            .builder
+            .build_int_add(cur, self.i64_type.const_int(1, false), "list_delete_next")
+            .expect("failed to increment list_delete cursor");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed to loop list_delete");
+        cur_phi.add_incoming(&[(&next, body_block)]);
+
+        self.builder.position_at_end(done_block);
+        let new_len = self
+            .builder
+            .build_int_sub(
+                len,
+                self.i64_type.const_int(1, false),
+                "list_delete_new_len",
+            )
+            .expect("failed to decrement list_delete len");
+        self.build_list_len_store(list_payload, new_len, "list_delete");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                removed.tag,
+                removed.payload,
+                "list_delete_result",
+            )))
+            .expect("failed to return list_delete");
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();

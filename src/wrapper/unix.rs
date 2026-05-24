@@ -525,6 +525,28 @@ pub extern "C" fn __expr_list_pop_host(handle: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_delete_host(handle: i64, index: i64) -> i64 {
+    let raw_index = as_int(index);
+    if raw_index < 0 {
+        runtime_trap("list index out of bounds");
+    }
+    let idx = raw_index as usize;
+    let header = unsafe { &mut *as_list_header_ptr(handle) };
+    if idx >= header.len {
+        runtime_trap("list index out of bounds");
+    }
+    unsafe {
+        let removed = *header.ptr.add(idx);
+        let dst = header.ptr.add(idx);
+        let src = header.ptr.add(idx + 1);
+        let count = header.len - idx - 1;
+        ptr::copy(src, dst, count);
+        header.len -= 1;
+        alloc_value(removed.tag, removed.payload)
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_list_copy_host(handle: i64) -> i64 {
     unsafe {
         let src = &*as_list_header_ptr(handle);
