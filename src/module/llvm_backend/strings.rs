@@ -164,6 +164,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         result_phi.as_basic_value().into_int_value()
     }
 
+    #[cfg(feature = "wasi")]
     pub(super) fn get_or_create_static_bytes_global(
         &self,
         name: &str,
