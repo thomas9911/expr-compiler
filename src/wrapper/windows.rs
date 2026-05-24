@@ -8,6 +8,18 @@ use core::ptr;
 #[link(name = "kernel32")]
 extern "system" {
     fn GetStdHandle(nStdHandle: i32) -> *mut core::ffi::c_void;
+    fn GetCommandLineW() -> *const u16;
+    fn LocalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn WideCharToMultiByte(
+        CodePage: u32,
+        dwFlags: u32,
+        lpWideCharStr: *const u16,
+        cchWideChar: i32,
+        lpMultiByteStr: *mut u8,
+        cbMultiByte: i32,
+        lpDefaultChar: *const u8,
+        lpUsedDefaultChar: *mut i32,
+    ) -> i32;
     fn WriteFile(
         hFile: *mut core::ffi::c_void,
         lpBuffer: *const u8,
@@ -18,8 +30,14 @@ extern "system" {
     fn ExitProcess(uExitCode: u32) -> !;
 }
 
+#[link(name = "shell32")]
+extern "system" {
+    fn CommandLineToArgvW(lpCmdLine: *const u16, pNumArgs: *mut i32) -> *mut *mut u16;
+}
+
 const STD_OUTPUT_HANDLE: i32 = -11;
 const STD_ERROR_HANDLE: i32 = -12;
+const CP_UTF8: u32 = 65001;
 const ARENA_BYTES: usize = 16 * 1024 * 1024;
 const LIST_INITIAL_CAPACITY: usize = 1024;
 
@@ -547,6 +565,29 @@ pub extern "C" fn __expr_list_pop_host(handle: i64) -> i64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn __expr_list_delete_host(handle: i64, index: i64) -> i64 {
+    unsafe {
+        let header = &mut *as_list_header_ptr(handle);
+        let idx_raw = as_int(index);
+        if idx_raw < 0 {
+            runtime_abort();
+        }
+        let idx = idx_raw as usize;
+        if idx >= header.len {
+            runtime_abort();
+        }
+        let removed = *header.ptr.add(idx);
+        let mut cur = idx;
+        while cur + 1 < header.len {
+            *header.ptr.add(cur) = *header.ptr.add(cur + 1);
+            cur += 1;
+        }
+        header.len -= 1;
+        alloc_value(removed.tag, removed.payload)
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn __expr_list_copy_host(handle: i64) -> i64 {
     unsafe {
         let src = &*as_list_header_ptr(handle);
@@ -580,13 +621,91 @@ pub extern "C" fn __expr_list_print_host(handle: i64) -> i64 {
     new_int(0)
 }
 
+unsafe fn wide_strlen(mut ptr: *const u16) -> usize {
+    let mut len = 0usize;
+    while !ptr.is_null() && *ptr != 0 {
+        len += 1;
+        ptr = ptr.add(1);
+    }
+    len
+}
+
+unsafe fn new_string_handle_from_wide(ptr: *const u16) -> i64 {
+    let wide_len = wide_strlen(ptr);
+    let byte_len = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        ptr,
+        i32::try_from(wide_len).unwrap_or_else(|_| runtime_abort()),
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null(),
+        core::ptr::null_mut(),
+    );
+    if wide_len != 0 && byte_len <= 0 {
+        runtime_abort();
+    }
+    let byte_len = usize::try_from(byte_len).unwrap_or_else(|_| runtime_abort());
+    let data_ptr = arena_alloc(byte_len.max(1), core::mem::align_of::<u8>());
+    if wide_len != 0 {
+        let written = WideCharToMultiByte(
+            CP_UTF8,
+            0,
+            ptr,
+            i32::try_from(wide_len).unwrap_or_else(|_| runtime_abort()),
+            data_ptr,
+            i32::try_from(byte_len).unwrap_or_else(|_| runtime_abort()),
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+        if written <= 0 {
+            runtime_abort();
+        }
+    }
+    let header_ptr = arena_alloc(
+        core::mem::size_of::<StringHeader>(),
+        core::mem::align_of::<StringHeader>(),
+    ) as *mut StringHeader;
+    (*header_ptr).len = byte_len;
+    (*header_ptr).cap = byte_len;
+    (*header_ptr).ptr = data_ptr;
+    alloc_value(ValueTag::String, header_ptr as usize as i64)
+}
+
+unsafe fn build_argv_list_from_wide(argc: i32, argv: *mut *mut u16) -> i64 {
+    let list = __expr_list_new_host();
+    if argc <= 1 || argv.is_null() {
+        return list;
+    }
+
+    let argc = usize::try_from(argc).unwrap_or_else(|_| runtime_abort());
+    for index in 1..argc {
+        let arg = *argv.add(index);
+        let string = new_string_handle_from_wide(arg);
+        __expr_list_push_host(list, string);
+    }
+    list
+}
+
 unsafe extern "C" {
-    fn expr_main_entry_int() -> i64;
+    fn expr_main_entry_int(arg_tag: i64, arg_payload: i64) -> i64;
 }
 
 #[no_mangle]
 pub extern "C" fn mainCRTStartup() -> ! {
-    let int_code = unsafe { expr_main_entry_int() };
+    let mut argc = 0i32;
+    let argv = unsafe { CommandLineToArgvW(GetCommandLineW(), &mut argc as *mut i32) };
+    if argv.is_null() {
+        unsafe {
+            ExitProcess(1);
+        }
+    }
+    let args = unsafe { build_argv_list_from_wide(argc, argv) };
+    unsafe {
+        LocalFree(argv as *mut core::ffi::c_void);
+    }
+    let args_value = unsafe { &*value_ptr(args) };
+    let int_code = unsafe { expr_main_entry_int(args_value.tag as i64, args_value.payload) };
     let exit_code = if int_code < u32::MIN as i64 || int_code > u32::MAX as i64 {
         1
     } else {

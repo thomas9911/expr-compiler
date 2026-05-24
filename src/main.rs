@@ -1,10 +1,12 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
 use expr_compiler::module::{CodegenBackend, Module, llvm_backend_available};
-use expr_compiler::runtime::{configure_runtime_arena, decode_int, reset_runtime_arena};
+use expr_compiler::runtime::{
+    build_argv_list_value, configure_runtime_arena, decode_int, reset_runtime_arena,
+};
 use pico_args::Arguments;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--backend <cranelift|llvm>] [--arena-mb <n>]";
+const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--backend <cranelift|llvm>] [--arena-mb <n>] [-- <arg>...]";
 
 #[derive(Debug)]
 struct CliArgs {
@@ -15,6 +17,7 @@ struct CliArgs {
     run_jit: bool,
     backend: CodegenBackend,
     arena_mb: usize,
+    program_args: Vec<String>,
 }
 
 fn finalize_output_path(mut output: PathBuf) -> PathBuf {
@@ -65,13 +68,16 @@ where
         .free_from_str::<String>()
         .map_err(|_| USAGE.to_string())?;
 
-    let remaining = args.finish();
-    if !remaining.is_empty() {
-        let unknown = remaining
-            .into_iter()
-            .map(|x| x.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+    let mut program_args = args
+        .finish()
+        .into_iter()
+        .map(|x| x.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    if matches!(program_args.first().map(String::as_str), Some("--")) {
+        program_args.remove(0);
+    }
+    if !run_jit && !program_args.is_empty() {
+        let unknown = program_args.join(" ");
         return Err(format!("unknown arguments: {unknown}\n{USAGE}"));
     }
 
@@ -83,6 +89,7 @@ where
         run_jit,
         backend,
         arena_mb,
+        program_args,
     })
 }
 
@@ -195,20 +202,35 @@ fn main() {
     if cli.run_jit {
         configure_runtime_arena(cli.arena_mb * 1024 * 1024);
         reset_runtime_arena();
-        let jit = Module::from_source(&source).compile_to_jit_with_backend(cli.backend);
-        let func_name = if jit.has_function("main") {
-            "main"
+        let module = Module::from_source(&source);
+        let (func_name, func_arity) =
+            if let Some(main) = module.functions.iter().find(|func| func.name == "main") {
+                (main.name.clone(), main.inputs.len())
+            } else {
+                let func = module.functions.first().unwrap_or_else(|| {
+                    eprintln!("no functions found");
+                    std::process::exit(1);
+                });
+                (func.name.clone(), func.inputs.len())
+            };
+        if func_arity > 1 {
+            eprintln!("jit entry function supports at most one argument");
+            std::process::exit(1);
+        }
+        let jit = module.compile_to_jit_with_backend(cli.backend);
+        let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(&func_name) {
+            if func_arity == 1 {
+                let (arg_tag, arg_payload) = build_argv_list_value(&cli.program_args);
+                let func = unsafe {
+                    std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr)
+                };
+                func(arg_tag, arg_payload)
+            } else {
+                let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+                func()
+            }
         } else {
-            jit.user_function_names().next().unwrap_or_else(|| {
-                eprintln!("no functions found");
-                std::process::exit(1);
-            })
-        };
-        let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(func_name) {
-            let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-            func()
-        } else {
-            let ptr = jit.get_fn_ptr(func_name);
+            let ptr = jit.get_fn_ptr(&func_name);
             let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
             let result = func();
             decode_int(result).unwrap_or_else(|| {
@@ -252,6 +274,12 @@ mod tests {
     }
 
     #[test]
+    fn cli_collects_program_args_for_run_jit() {
+        let cli = parse_ok(&["examples/test.expr", "--run-jit", "--", "hello", "world"]);
+        assert_eq!(cli.program_args, vec!["hello", "world"]);
+    }
+
+    #[test]
     fn cli_rejects_unknown_backend() {
         let err = parse_cli_args_from(["examples/test.expr", "--backend", "nope"])
             .expect_err("cli parse should fail");
@@ -263,5 +291,12 @@ mod tests {
         let err = parse_cli_args_from(["examples/test.expr", "--arena-mb", "0"])
             .expect_err("cli parse should fail");
         assert_eq!(err, "--arena-mb must be > 0");
+    }
+
+    #[test]
+    fn cli_rejects_program_args_without_run_jit() {
+        let err = parse_cli_args_from(["examples/test.expr", "--", "hello"])
+            .expect_err("cli parse should fail");
+        assert!(err.contains("unknown arguments: hello"));
     }
 }

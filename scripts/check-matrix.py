@@ -16,6 +16,9 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 MAX_NATIVE_BINARY_SIZE = 50 * 1024
+EXAMPLE_RUN_ARGS: dict[str, list[str]] = {
+    "args": ["hello", "world"],
+}
 
 
 @dataclass
@@ -67,6 +70,14 @@ def parse_args() -> argparse.Namespace:
         help="LLVM build root used for llvm-backend runs",
     )
     parser.add_argument(
+        "--target-root",
+        help=(
+            "Root directory under which matrix cargo target dirs are created. "
+            "Useful for WSL/Linux runs where build artifacts should live on a "
+            "WSL-owned volume."
+        ),
+    )
+    parser.add_argument(
         "--release",
         action="store_true",
         help="Use release builds for cargo run commands",
@@ -96,7 +107,25 @@ def resolve_examples(values: Iterable[str]) -> list[Path]:
     return resolved
 
 
-def llvm_env(llvm_root_arg: str | None) -> dict[str, str]:
+def resolve_target_dir(
+    *,
+    root_arg: str | None,
+    root_env_var: str,
+    exact_env_var: str,
+    default_leaf: str,
+) -> str:
+    exact = os.environ.get(exact_env_var, "")
+    if exact:
+        return exact
+
+    root_value = root_arg or os.environ.get(root_env_var, "")
+    if root_value:
+        return str(Path(root_value) / default_leaf)
+
+    return str(REPO_ROOT / default_leaf)
+
+
+def llvm_env(llvm_root_arg: str | None, target_root_arg: str | None) -> dict[str, str]:
     llvm_root_value = llvm_root_arg or os.environ.get("LLVM_SYS_201_PREFIX", "")
     if not llvm_root_value:
         raise SystemExit(
@@ -114,18 +143,22 @@ def llvm_env(llvm_root_arg: str | None) -> dict[str, str]:
     env["LLVM_SYS_201_PREFIX"] = str(llvm_root)
     env["LLVM_CONFIG_PATH"] = str(llvm_config)
     env["PATH"] = str(llvm_bin) + os.pathsep + env.get("PATH", "")
-    env["CARGO_TARGET_DIR"] = os.environ.get(
-        "MATRIX_LLVM_TARGET_DIR",
-        str(REPO_ROOT / "target_llvm_backend"),
+    env["CARGO_TARGET_DIR"] = resolve_target_dir(
+        root_arg=target_root_arg,
+        root_env_var="MATRIX_TARGET_ROOT",
+        exact_env_var="MATRIX_LLVM_TARGET_DIR",
+        default_leaf="target_llvm_backend",
     )
     return env
 
 
-def cranelift_env() -> dict[str, str]:
+def cranelift_env(target_root_arg: str | None) -> dict[str, str]:
     env = os.environ.copy()
-    env["CARGO_TARGET_DIR"] = os.environ.get(
-        "MATRIX_CRANELIFT_TARGET_DIR",
-        str(REPO_ROOT / "target_matrix_cranelift"),
+    env["CARGO_TARGET_DIR"] = resolve_target_dir(
+        root_arg=target_root_arg,
+        root_env_var="MATRIX_TARGET_ROOT",
+        exact_env_var="MATRIX_CRANELIFT_TARGET_DIR",
+        default_leaf="target_matrix_cranelift",
     )
     return env
 
@@ -197,6 +230,10 @@ def run_compiler(
     )
 
 
+def example_run_args(example: Path) -> list[str]:
+    return EXAMPLE_RUN_ARGS.get(example.stem, [])
+
+
 def binary_path_for(staging_dir: Path, example: Path) -> Path:
     stem = example.stem
     if os.name == "nt":
@@ -204,8 +241,10 @@ def binary_path_for(staging_dir: Path, example: Path) -> Path:
     return staging_dir / stem
 
 
-def run_binary(name: str, path: Path) -> subprocess.CompletedProcess[str]:
-    argv = [str(path)]
+def run_binary(
+    name: str, path: Path, args: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    argv = [str(path), *(args or [])]
     return subprocess.run(argv, text=True, capture_output=True)
 
 
@@ -282,7 +321,7 @@ def run_cranelift_jit(
 ) -> subprocess.CompletedProcess[str]:
     return run_compiler(
         compiler,
-        [str(example), "--run-jit"],
+        [str(example), "--run-jit", "--", *example_run_args(example)],
         env=env,
     )
 
@@ -301,7 +340,7 @@ def run_cranelift_native(
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
-    run_proc = run_binary("cranelift-native-run", output)
+    run_proc = run_binary("cranelift-native-run", output, example_run_args(example))
     return run_proc, output.stat().st_size
 
 
@@ -330,7 +369,14 @@ def run_llvm_jit(
 ) -> subprocess.CompletedProcess[str]:
     return run_compiler(
         compiler,
-        [str(example), "--run-jit", "--backend", "llvm"],
+        [
+            str(example),
+            "--run-jit",
+            "--backend",
+            "llvm",
+            "--",
+            *example_run_args(example),
+        ],
         env=env,
     )
 
@@ -349,7 +395,7 @@ def run_llvm_native(
     )
     if compile_proc.returncode != 0:
         return compile_proc, 0
-    run_proc = run_binary("llvm-native-run", output)
+    run_proc = run_binary("llvm-native-run", output, example_run_args(example))
     return run_proc, output.stat().st_size
 
 
@@ -369,7 +415,13 @@ def run_llvm_wasm(
         return compile_proc, 0
     run_proc = run_command(
         "llvm-wasm-run",
-        [js_runtime(), str(REPO_ROOT / "scripts" / "run-wasm.js"), str(output)],
+        [
+            js_runtime(),
+            str(REPO_ROOT / "scripts" / "run-wasm.js"),
+            str(output),
+            "--",
+            *example_run_args(example),
+        ],
         env=os.environ.copy(),
     )
     return run_proc, output.stat().st_size
@@ -391,7 +443,7 @@ def run_llvm_component(
         return compile_proc, 0
     run_proc = run_command(
         "llvm-component-run",
-        [wasmtime_runtime(), "run", str(output)],
+        [wasmtime_runtime(), "run", str(output), *example_run_args(example)],
         env=os.environ.copy(),
     )
     return run_proc, output.stat().st_size
@@ -426,11 +478,15 @@ def main() -> int:
     args = parse_args()
     examples = resolve_examples(args.examples)
     failures: list[RunResult] = []
-    cranelift_build_env = cranelift_env()
-    llvm_build_env = llvm_env(args.llvm_root) if any(
+    cranelift_build_env = cranelift_env(args.target_root)
+    llvm_build_env = llvm_env(args.llvm_root, args.target_root) if any(
         mode.startswith("llvm-") for mode in args.modes
     ) else None
-    llvm_wasi_build_env = llvm_env(args.llvm_root) if "llvm-component" in args.modes else None
+    llvm_wasi_build_env = (
+        llvm_env(args.llvm_root, args.target_root)
+        if "llvm-component" in args.modes
+        else None
+    )
 
     cranelift_compiler = ensure_compiler_built(
         release=args.release,

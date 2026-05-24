@@ -9,6 +9,7 @@
 #define VALUE_TAG_STRING 3
 #define VALUE_TAG_FUNCTION 4
 #define VALUE_TAG_BIGINT 5
+#define VALUE_TAG_STRING_ITER 6
 
 typedef struct Value {
     uint8_t tag;
@@ -47,6 +48,59 @@ static const Value *value_ptr(int64_t handle) {
         runtime_trap("null value handle");
     }
     return (const Value *)(uintptr_t)handle;
+}
+
+static int64_t alloc_value_host(uint8_t tag, int64_t payload) {
+    Value *value = (Value *)malloc(sizeof(Value));
+    if (value == NULL) {
+        runtime_trap("out of arena memory");
+    }
+    value->tag = tag;
+    memset(value->padding, 0, sizeof(value->padding));
+    value->payload = payload;
+    return (int64_t)(uintptr_t)value;
+}
+
+static int64_t new_string_from_bytes(const uint8_t *bytes, size_t len) {
+    uint8_t *data = (uint8_t *)malloc(len == 0 ? 1 : len);
+    if (data == NULL) {
+        runtime_trap("out of arena memory");
+    }
+    if (len != 0) {
+        memcpy(data, bytes, len);
+    }
+
+    StringHeader *header = (StringHeader *)malloc(sizeof(StringHeader));
+    if (header == NULL) {
+        runtime_trap("out of arena memory");
+    }
+    header->len = len;
+    header->cap = len;
+    header->ptr = data;
+    return alloc_value_host(VALUE_TAG_STRING, (int64_t)(uintptr_t)header);
+}
+
+static int64_t new_argv_list(int argc, char **argv) {
+    size_t arg_count = argc > 1 ? (size_t)(argc - 1) : 0;
+    size_t cap = arg_count == 0 ? 1 : arg_count;
+    Value *items = (Value *)malloc(cap * sizeof(Value));
+    if (items == NULL) {
+        runtime_trap("out of arena memory");
+    }
+
+    for (size_t i = 0; i < arg_count; i++) {
+        int64_t string = new_string_from_bytes((const uint8_t *)argv[i + 1], strlen(argv[i + 1]));
+        items[i] = *value_ptr(string);
+    }
+
+    ListHeader *header = (ListHeader *)malloc(sizeof(ListHeader));
+    if (header == NULL) {
+        runtime_trap("out of arena memory");
+    }
+    header->ptr = items;
+    header->len = arg_count;
+    header->cap = cap;
+    return alloc_value_host(VALUE_TAG_LIST, (int64_t)(uintptr_t)header);
 }
 
 static void print_value_ref(const Value *value) {
@@ -132,4 +186,16 @@ int64_t __expr_list_print_host(int64_t handle) {
 
 int64_t __expr_runtime_oom_host(void) {
     runtime_trap("out of arena memory");
+}
+
+extern int64_t __expr_main_i64(int64_t arg_tag, int64_t arg_payload);
+
+int main(int argc, char **argv) {
+    int64_t args = new_argv_list(argc, argv);
+    const Value *value = value_ptr(args);
+    int64_t exit_code = __expr_main_i64((int64_t)value->tag, value->payload);
+    if (exit_code < INT32_MIN || exit_code > INT32_MAX) {
+        return 1;
+    }
+    return (int)exit_code;
 }

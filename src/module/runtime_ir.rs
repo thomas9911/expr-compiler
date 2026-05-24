@@ -196,6 +196,7 @@ fn build_builtin_map(
         builtins.insert("list_set".to_string(), runtime.list_set.unwrap());
         builtins.insert("list_swap".to_string(), runtime.list_swap.unwrap());
         builtins.insert("list_pop".to_string(), runtime.list_pop.unwrap());
+        builtins.insert("list_delete".to_string(), runtime.list_delete.unwrap());
         builtins.insert("list_copy".to_string(), runtime.list_copy.unwrap());
     }
     builtins
@@ -233,6 +234,7 @@ struct RuntimeBuiltins {
     list_set: Option<FuncId>,
     list_swap: Option<FuncId>,
     list_pop: Option<FuncId>,
+    list_delete: Option<FuncId>,
     list_copy: Option<FuncId>,
 }
 
@@ -518,6 +520,14 @@ fn declare_runtime_function_ids(
     let list_pop = list_mutation_enabled.then(|| {
         declare_local_pair_builtin(module, isa, "__rt_list_pop", &[types::I64, types::I64])
     });
+    let list_delete = list_mutation_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_list_delete",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
     let list_copy = list_mutation_enabled.then(|| {
         declare_local_pair_builtin(module, isa, "__rt_list_copy", &[types::I64, types::I64])
     });
@@ -558,6 +568,7 @@ fn declare_runtime_function_ids(
             list_set,
             list_swap,
             list_pop,
+            list_delete,
             list_copy,
         },
     }
@@ -812,6 +823,13 @@ fn define_runtime_operations(
             isa,
             flags,
             ids.builtins.list_pop.unwrap(),
+            ids.builtins.value_to_i64,
+        );
+        define_rt_list_delete(
+            module,
+            isa,
+            flags,
+            ids.builtins.list_delete.unwrap(),
             ids.builtins.value_to_i64,
         );
         define_rt_list_copy(
@@ -3179,6 +3197,87 @@ fn define_rt_list_pop(
                 .ins()
                 .load(types::I64, MemFlags::new(), elem_ptr, VALUE_PAYLOAD_OFFSET);
             b.ins().return_(&[tag, payload]);
+        },
+    );
+}
+
+fn define_rt_list_delete(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    _value_to_i64_id: FuncId,
+) {
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, _| {
+            let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_LIST);
+            let idx = pair_payload_for_tag(b, p[2], p[3], TAG_INT);
+            let non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, idx, 0);
+            b.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let len = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_LEN_OFFSET);
+            let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            b.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+            let data_ptr = b
+                .ins()
+                .load(types::I64, MemFlags::new(), header_ptr, LIST_PTR_OFFSET);
+            let removed_off = b.ins().ishl_imm(idx, 4);
+            let removed_ptr = b.ins().iadd(data_ptr, removed_off);
+            let removed_tag = b.ins().load(types::I64, MemFlags::new(), removed_ptr, 0);
+            let removed_payload = b.ins().load(
+                types::I64,
+                MemFlags::new(),
+                removed_ptr,
+                VALUE_PAYLOAD_OFFSET,
+            );
+
+            let loop_block = b.create_block();
+            let body_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(loop_block, types::I64);
+            let start = b.ins().iadd_imm(idx, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(start)]);
+
+            b.switch_to_block(loop_block);
+            let cur = b.block_params(loop_block)[0];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, cur, len);
+            b.ins().brif(more, body_block, &[], done_block, &[]);
+
+            b.switch_to_block(body_block);
+            let src_off = b.ins().ishl_imm(cur, 4);
+            let src_ptr = b.ins().iadd(data_ptr, src_off);
+            let moved_tag = b.ins().load(types::I64, MemFlags::new(), src_ptr, 0);
+            let moved_payload =
+                b.ins()
+                    .load(types::I64, MemFlags::new(), src_ptr, VALUE_PAYLOAD_OFFSET);
+            let dst_index = b.ins().iadd_imm(cur, -1);
+            let dst_off = b.ins().ishl_imm(dst_index, 4);
+            let dst_ptr = b.ins().iadd(data_ptr, dst_off);
+            b.ins().store(MemFlags::new(), moved_tag, dst_ptr, 0);
+            b.ins().store(
+                MemFlags::new(),
+                moved_payload,
+                dst_ptr,
+                VALUE_PAYLOAD_OFFSET,
+            );
+            let next = b.ins().iadd_imm(cur, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+            b.seal_block(body_block);
+
+            b.switch_to_block(done_block);
+            let new_len = b.ins().iadd_imm(len, -1);
+            b.ins()
+                .store(MemFlags::new(), new_len, header_ptr, LIST_LEN_OFFSET);
+            b.ins().return_(&[removed_tag, removed_payload]);
+            b.seal_block(done_block);
+            b.seal_block(loop_block);
         },
     );
 }
