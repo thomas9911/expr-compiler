@@ -6,7 +6,6 @@ Guidance for coding agents working in this repository.
 
 - Language/compiler project in Rust.
 - Supports:
-  - Interpreter path (`src/interpreter.rs`) for tests/experiments.
   - Cranelift JIT path (`--run-jit`).
   - Native executable path (object + link step).
 - Value model is pair-valued internally: `(tag, payload)`.
