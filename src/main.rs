@@ -147,133 +147,172 @@ where
     })
 }
 
-fn main() {
-    let cli = match parse_cli_args() {
-        Ok(cli) => cli,
-        Err(err) => {
-            eprintln!("{err}");
-            let code = if err == USAGE { 0 } else { 1 };
-            std::process::exit(code);
-        }
-    };
+fn print_cli_error_and_exit(err: &str) -> ! {
+    eprintln!("{err}");
+    let code = if err == USAGE { 0 } else { 1 };
+    std::process::exit(code);
+}
 
-    let input = Path::new(&cli.input);
-    let source = std::fs::read_to_string(input).unwrap_or_else(|e| {
+fn read_source_or_exit(input: &Path) -> String {
+    std::fs::read_to_string(input).unwrap_or_else(|e| {
         eprintln!("error reading {}: {e}", input.display());
         std::process::exit(1);
-    });
+    })
+}
 
-    if let Err(err) = validate_cli_runtime(&cli, llvm_backend_available(), cfg!(feature = "wasi")) {
-        eprintln!("{err}");
-        std::process::exit(1);
+fn write_ir_or_stdout(ir: &str, output: Option<&Path>) {
+    if let Some(output) = output {
+        std::fs::write(output, ir).unwrap_or_else(|e| {
+            eprintln!("error writing IR: {e}");
+            std::process::exit(1);
+        });
+    } else {
+        print!("{ir}");
     }
+}
 
-    if cli.emit_ir || cli.run_ir {
-        let ir = Module::from_source(&source).compile_to_ir();
-
-        if cli.emit_ir {
-            if let Some(output) = cli.output.as_ref() {
-                std::fs::write(output, &ir).unwrap_or_else(|e| {
-                    eprintln!("error writing IR: {e}");
-                    std::process::exit(1);
-                });
-            } else {
-                print!("{ir}");
-            }
+fn run_ir(ir: &str) -> Result<Option<i64>, String> {
+    let functions =
+        cranelift_reader::parse_functions(ir).map_err(|e| format!("error parsing IR: {e}"))?;
+    let mut function_store = cranelift::interpreter::environment::FunctionStore::default();
+    let mut fallback_func = None;
+    let mut main_func = None;
+    let mut function_param_counts = std::collections::HashMap::new();
+    for func in functions.iter() {
+        let name = func.name.to_string();
+        if name == "main" {
+            main_func = Some(name.clone());
         }
-
-        if cli.run_ir {
-            let functions = cranelift_reader::parse_functions(&ir).unwrap_or_else(|e| {
-                eprintln!("error parsing IR: {e}");
-                std::process::exit(1);
-            });
-            let mut function_store = cranelift::interpreter::environment::FunctionStore::default();
-            let mut first_func = None;
-            for func in functions.iter() {
-                first_func = Some(func.name.to_string()); // last wins = main
-                function_store.add(func.name.to_string(), func);
-            }
-            let state = cranelift::interpreter::interpreter::InterpreterState::default()
-                .with_function_store(function_store);
-            let mut interpreter = cranelift::interpreter::interpreter::Interpreter::new(state);
-            if let Some(func_name) = first_func {
-                match interpreter.call_by_name(&func_name, &[]) {
-                    Ok(ControlFlow::Return(res)) => {
-                        if let Some(DataValue::I64(x)) = res.first() {
-                            if let Some(decoded) = decode_int(*x) {
-                                println!("{decoded}");
-                            } else {
-                                println!("{x}");
-                            }
-                        }
-                    }
-                    Ok(ControlFlow::Trap(trap)) => {
-                        eprintln!("trap: {trap:?}");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("interpreter error: {e}");
-                        std::process::exit(1);
-                    }
-                    _ => {}
+        fallback_func = Some(name.clone());
+        function_param_counts.insert(name.clone(), func.signature.params.len());
+        function_store.add(name, func);
+    }
+    let state = cranelift::interpreter::interpreter::InterpreterState::default()
+        .with_function_store(function_store);
+    let mut interpreter = cranelift::interpreter::interpreter::Interpreter::new(state);
+    if let Some(func_name) = main_func.or(fallback_func) {
+        let args = vec![DataValue::I64(0); function_param_counts[&func_name]];
+        match interpreter.call_by_name(&func_name, &args) {
+            Ok(ControlFlow::Return(res)) => {
+                if let Some(DataValue::I64(x)) = res.first() {
+                    return Ok(Some(decode_int(*x).unwrap_or(*x)));
                 }
             }
-        }
-
-        if !cli.run_jit {
-            return;
-        }
-    }
-
-    if cli.run_jit {
-        configure_runtime_arena(cli.arena_mb * 1024 * 1024);
-        reset_runtime_arena();
-        let module = Module::from_source(&source);
-        let (func_name, func_arity) =
-            if let Some(main) = module.functions.iter().find(|func| func.name == "main") {
-                (main.name.clone(), main.inputs.len())
-            } else {
-                let func = module.functions.first().unwrap_or_else(|| {
-                    eprintln!("no functions found");
-                    std::process::exit(1);
-                });
-                (func.name.clone(), func.inputs.len())
-            };
-        if func_arity > 1 {
-            eprintln!("jit entry function supports at most one argument");
-            std::process::exit(1);
-        }
-        let jit = module.compile_to_jit_with_backend(cli.backend);
-        let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(&func_name) {
-            if func_arity == 1 {
-                let (arg_tag, arg_payload) = build_argv_list_value(&cli.program_args);
-                let func = unsafe {
-                    std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr)
-                };
-                func(arg_tag, arg_payload)
-            } else {
-                let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-                func()
+            Ok(ControlFlow::Trap(trap)) => {
+                return Err(format!("trap: {trap:?}"));
             }
-        } else {
-            let ptr = jit.get_fn_ptr(&func_name);
-            let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
-            let result = func();
-            decode_int(result).unwrap_or_else(|| {
-                eprintln!("runtime error: main returned non-integer value");
-                std::process::exit(1);
-            })
-        };
-        std::process::exit(int_result as i32);
+            Err(e) => {
+                return Err(format!("interpreter error: {e}"));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn maybe_handle_ir_modes(cli: &CliArgs, source: &str) -> bool {
+    if !cli.emit_ir && !cli.run_ir {
+        return false;
     }
 
+    let ir = Module::from_source(source).compile_to_ir();
+    if cli.emit_ir {
+        write_ir_or_stdout(&ir, cli.output.as_deref());
+    }
+    if cli.run_ir {
+        match run_ir(&ir) {
+            Ok(Some(value)) => println!("{value}"),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    !cli.run_jit
+}
+
+fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
+    if let Some(main) = module.functions.iter().find(|func| func.name == "main") {
+        return Ok((main.name.clone(), main.inputs.len()));
+    }
+
+    let func = module
+        .functions
+        .first()
+        .ok_or_else(|| "no functions found".to_string())?;
+    Ok((func.name.clone(), func.inputs.len()))
+}
+
+fn run_jit(cli: &CliArgs, source: &str) -> Result<i32, String> {
+    configure_runtime_arena(cli.arena_mb * 1024 * 1024);
+    reset_runtime_arena();
+    let module = Module::from_source(source);
+    let (func_name, func_arity) = select_jit_entry(&module)?;
+    if func_arity > 1 {
+        return Err("jit entry function supports at most one argument".to_string());
+    }
+
+    let jit = module.compile_to_jit_with_backend(cli.backend);
+    let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(&func_name) {
+        if func_arity == 1 {
+            let (arg_tag, arg_payload) = build_argv_list_value(&cli.program_args);
+            let func =
+                unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
+            func(arg_tag, arg_payload)
+        } else {
+            let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+            func()
+        }
+    } else {
+        let ptr = jit.get_fn_ptr(&func_name);
+        let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+        let result = func();
+        decode_int(result)
+            .ok_or_else(|| "runtime error: main returned non-integer value".to_string())?
+    };
+    Ok(int_result as i32)
+}
+
+fn compile_native_or_exit(cli: &CliArgs, input: &Path, source: &str) {
     let output = finalize_output_path(
         cli.output
+            .clone()
             .unwrap_or_else(|| input.with_extension("").to_path_buf()),
     );
 
-    Module::from_source(&source).compile_to_executable_with_backend(&output, cli.backend);
+    Module::from_source(source).compile_to_executable_with_backend(&output, cli.backend);
     println!("compiled to {}", output.display());
+}
+
+fn main() {
+    let cli = match parse_cli_args() {
+        Ok(cli) => cli,
+        Err(err) => print_cli_error_and_exit(&err),
+    };
+
+    let input = Path::new(&cli.input);
+    let source = read_source_or_exit(input);
+
+    if let Err(err) = validate_cli_runtime(&cli, llvm_backend_available(), cfg!(feature = "wasi")) {
+        print_cli_error_and_exit(&err);
+    }
+
+    if maybe_handle_ir_modes(&cli, &source) {
+        return;
+    }
+
+    if cli.run_jit {
+        match run_jit(&cli, &source) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    compile_native_or_exit(&cli, input, &source);
 }
 
 #[cfg(test)]
@@ -445,5 +484,31 @@ mod tests {
         let cli = parse_ok(&["examples/test.expr", "--backend", "llvm", "-o", "out.wasm"]);
         let kind = validate_cli_runtime(&cli, true, true).expect("wasm output should be accepted");
         assert_eq!(kind, OutputKind::Wasm);
+    }
+
+    #[test]
+    fn run_ir_executes_compiled_program() {
+        let ir = "function %main() -> i64 system_v {\nblock0:\n    v0 = iconst.i64 7\n    return v0\n}\n";
+        let result = run_ir(&ir).expect("run_ir should succeed");
+        assert_eq!(result, Some(7));
+    }
+
+    #[test]
+    fn run_jit_executes_compiled_program() {
+        let cli = parse_ok(&["examples/test.expr", "--run-jit"]);
+        let result =
+            run_jit(&cli, "fn main() do\n    1 + 2 * 3\nend").expect("run_jit should succeed");
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn run_jit_passes_program_args() {
+        let cli = parse_ok(&["examples/test.expr", "--run-jit", "--", "hello", "world"]);
+        let result = run_jit(
+            &cli,
+            "fn main(args) do\n    list_len(args) + bytes_len(list_get(args, 0))\nend",
+        )
+        .expect("run_jit should succeed");
+        assert_eq!(result, 7);
     }
 }
