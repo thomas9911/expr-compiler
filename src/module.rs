@@ -582,21 +582,31 @@ impl Module {
             .expect("rustc not found");
 
         #[cfg(not(windows))]
-        let wrapper = write_unix_wrapper(output);
-        #[cfg(not(windows))]
-        let status = Command::new("cc")
-            .arg("-no-pie")
-            .arg(&tmp)
-            .arg(&wrapper)
+        let status = Command::new("rustc")
+            .arg(write_unix_rust_wrapper(output))
+            .arg("--crate-name")
+            .arg("expr_unix_wrapper")
+            .arg("-C")
+            .arg("panic=abort")
+            .arg("-C")
+            .arg("opt-level=s")
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("-C")
+            .arg("debuginfo=0")
+            .arg("-C")
+            .arg("link-arg=-no-pie")
+            .arg("-C")
+            .arg(format!("link-arg={}", tmp.display()))
             .arg("-o")
             .arg(output)
             .status()
-            .expect("cc not found — install gcc or clang");
+            .expect("rustc not found");
 
         #[cfg(windows)]
         std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
         #[cfg(not(windows))]
-        std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.c")).ok();
+        std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
         assert!(status.success(), "linker failed with: {status}");
     }
@@ -881,15 +891,6 @@ fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
 }
 
 #[cfg(not(windows))]
-fn write_unix_wrapper(output: &Path) -> std::path::PathBuf {
-    let wrapper = generated_wrapper_path(output, "unix_wrapper.c");
-    let source = include_str!("./wrapper/unix.c");
-    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
-}
-
-#[cfg(all(not(windows), feature = "llvm-backend"))]
 fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
     let wrapper = generated_wrapper_path(output, "unix_wrapper.rs");
     let source = include_str!("./wrapper/unix.rs");

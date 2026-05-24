@@ -23,8 +23,7 @@ Guidance for coding agents working in this repository.
 - `src/module/runtime_ir.rs`: IR runtime builtins (`__rt_*`), list/int operations, allocator wiring.
 - `src/runtime.rs`: host arena helpers, compatibility boxing helpers, print/list-print host functions.
 - `src/wrapper/windows.rs`: Windows executable wrapper symbols.
-- `src/wrapper/unix.rs`: Unix executable wrapper symbols for LLVM/native wrapper flow.
-- `src/wrapper/unix.c`: small Unix C wrapper used by the Cranelift native path.
+- `src/wrapper/unix.rs`: Unix executable wrapper symbols for native executable output.
 - `examples/*.expr`: language examples.
 - `Justfile`: helper commands.
 
@@ -198,7 +197,7 @@ From `Justfile`:
 ## Platform Notes
 
 - Windows executable path uses `src/wrapper/windows.rs`.
-- Unix executable path uses `src/wrapper/unix.c`.
+- Unix executable path uses `src/wrapper/unix.rs`.
 - If JIT fails on Linux with relocation range panics, check for accidental reintroduction of external direct calls or data relocations in JIT runtime path.
 
 ## Change Rules
