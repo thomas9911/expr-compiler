@@ -22,10 +22,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             );
             let digit = self.build_internal_call(
                 self.require_func("bigint_from_int"),
-                &[self.int_value(
-                    self.i64_type
-                        .const_int(ch.to_digit(10).unwrap() as u64, false),
-                )],
+                &[self.int_value(self.i64_type.const_int(ch.to_digit(10).unwrap() as u64, false))],
                 &format!("{label}_digit_{index}"),
             );
             acc = self.build_internal_call(
@@ -45,21 +42,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         label: &str,
     ) -> CompiledValue<'ctx> {
         let entry_block = self.builder.get_insert_block().unwrap();
-        let bigint_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_bigint"));
-        let int_check_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_int_check"));
-        let int_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_int"));
-        let trap_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_trap"));
-        let merge_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_merge"));
+        let bigint_block = self.context.append_basic_block(function, &format!("{label}_bigint"));
+        let int_check_block =
+            self.context.append_basic_block(function, &format!("{label}_int_check"));
+        let int_block = self.context.append_basic_block(function, &format!("{label}_int"));
+        let trap_block = self.context.append_basic_block(function, &format!("{label}_trap"));
+        let merge_block = self.context.append_basic_block(function, &format!("{label}_merge"));
 
         let is_bigint = self
             .builder
@@ -161,12 +149,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_bigint_header_ptr(payload, label);
         let sign_ptr = self
             .builder
-            .build_struct_gep(
-                self.bigint_header_type(),
-                ptr,
-                0,
-                &format!("{label}_sign_ptr"),
-            )
+            .build_struct_gep(self.bigint_header_type(), ptr, 0, &format!("{label}_sign_ptr"))
             .expect("failed to build bigint sign gep");
         self.builder
             .build_load(self.i64_type, sign_ptr, &format!("{label}_sign"))
@@ -183,16 +166,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_bigint_header_ptr(payload, label);
         let sign_ptr = self
             .builder
-            .build_struct_gep(
-                self.bigint_header_type(),
-                ptr,
-                0,
-                &format!("{label}_sign_ptr"),
-            )
+            .build_struct_gep(self.bigint_header_type(), ptr, 0, &format!("{label}_sign_ptr"))
             .expect("failed to build bigint sign gep");
-        self.builder
-            .build_store(sign_ptr, sign)
-            .expect("failed to store bigint sign");
+        self.builder.build_store(sign_ptr, sign).expect("failed to store bigint sign");
     }
 
     pub(super) fn build_bigint_len_load(
@@ -203,12 +179,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_bigint_header_ptr(payload, label);
         let len_ptr = self
             .builder
-            .build_struct_gep(
-                self.bigint_header_type(),
-                ptr,
-                1,
-                &format!("{label}_len_ptr"),
-            )
+            .build_struct_gep(self.bigint_header_type(), ptr, 1, &format!("{label}_len_ptr"))
             .expect("failed to build bigint len gep");
         self.builder
             .build_load(self.i64_type, len_ptr, &format!("{label}_len"))
@@ -225,16 +196,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_bigint_header_ptr(payload, label);
         let len_ptr = self
             .builder
-            .build_struct_gep(
-                self.bigint_header_type(),
-                ptr,
-                1,
-                &format!("{label}_len_ptr"),
-            )
+            .build_struct_gep(self.bigint_header_type(), ptr, 1, &format!("{label}_len_ptr"))
             .expect("failed to build bigint len gep");
-        self.builder
-            .build_store(len_ptr, len)
-            .expect("failed to store bigint len");
+        self.builder.build_store(len_ptr, len).expect("failed to store bigint len");
     }
 
     pub(super) fn build_bigint_cap_store(
@@ -246,16 +210,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_bigint_header_ptr(payload, label);
         let cap_ptr = self
             .builder
-            .build_struct_gep(
-                self.bigint_header_type(),
-                ptr,
-                2,
-                &format!("{label}_cap_ptr"),
-            )
+            .build_struct_gep(self.bigint_header_type(), ptr, 2, &format!("{label}_cap_ptr"))
             .expect("failed to build bigint cap gep");
-        self.builder
-            .build_store(cap_ptr, cap)
-            .expect("failed to store bigint cap");
+        self.builder.build_store(cap_ptr, cap).expect("failed to store bigint cap");
     }
 
     pub(super) fn build_bigint_ptr_load(
@@ -266,12 +223,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_bigint_header_ptr(payload, label);
         let data_ptr_ptr = self
             .builder
-            .build_struct_gep(
-                self.bigint_header_type(),
-                ptr,
-                3,
-                &format!("{label}_ptr_ptr"),
-            )
+            .build_struct_gep(self.bigint_header_type(), ptr, 3, &format!("{label}_ptr_ptr"))
             .expect("failed to build bigint data ptr gep");
         self.builder
             .build_load(
@@ -292,16 +244,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_bigint_header_ptr(payload, label);
         let data_ptr_ptr = self
             .builder
-            .build_struct_gep(
-                self.bigint_header_type(),
-                ptr,
-                3,
-                &format!("{label}_ptr_ptr"),
-            )
+            .build_struct_gep(self.bigint_header_type(), ptr, 3, &format!("{label}_ptr_ptr"))
             .expect("failed to build bigint data ptr gep");
-        self.builder
-            .build_store(data_ptr_ptr, ptr_value)
-            .expect("failed to store bigint data ptr");
+        self.builder.build_store(data_ptr_ptr, ptr_value).expect("failed to store bigint data ptr");
     }
 
     pub(super) fn build_bigint_limb_ptr(
@@ -365,9 +310,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_truncate(limb, self.context.i32_type(), &format!("{label}_limb32"))
             .expect("failed to truncate bigint limb");
-        self.builder
-            .build_store(ptr, limb32)
-            .expect("failed to store bigint limb");
+        self.builder.build_store(ptr, limb32).expect("failed to store bigint limb");
     }
 
     pub(super) fn build_bigint_alloc(&self, cap: IntValue<'ctx>, label: &str) -> IntValue<'ctx> {
@@ -432,15 +375,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .unwrap()
             .get_parent()
             .expect("missing function for bigint normalize");
-        let loop_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_norm_loop"));
-        let body_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_norm_body"));
-        let done_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_norm_done"));
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_norm_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_norm_body"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_norm_done"));
         self.builder
             .build_unconditional_branch(loop_block)
             .expect("failed to branch to bigint normalize loop");
@@ -463,11 +400,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(body_block);
         let last_index = self
             .builder
-            .build_int_sub(
-                len,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_last_idx"),
-            )
+            .build_int_sub(len, self.i64_type.const_int(1, false), &format!("{label}_last_idx"))
             .expect("failed to build bigint normalize last idx");
         let last = self.build_bigint_limb_load(payload, last_index, &format!("{label}_last"));
         let is_zero = self
@@ -479,12 +412,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_norm_is_zero"),
             )
             .expect("failed to compare bigint normalize last limb");
-        let trim_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_norm_trim"));
-        let keep_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_norm_keep"));
+        let trim_block = self.context.append_basic_block(function, &format!("{label}_norm_trim"));
+        let keep_block = self.context.append_basic_block(function, &format!("{label}_norm_keep"));
         self.builder
             .build_conditional_branch(is_zero, trim_block, keep_block)
             .expect("failed to branch bigint normalize zero");
@@ -511,22 +440,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_final_zero"),
             )
             .expect("failed to compare bigint final len");
-        let set_zero_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_set_zero_sign"));
-        let end_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_norm_end"));
+        let set_zero_block =
+            self.context.append_basic_block(function, &format!("{label}_set_zero_sign"));
+        let end_block = self.context.append_basic_block(function, &format!("{label}_norm_end"));
         self.builder
             .build_conditional_branch(is_zero_len, set_zero_block, end_block)
             .expect("failed to branch bigint final zero");
 
         self.builder.position_at_end(set_zero_block);
-        self.build_bigint_sign_store(
-            payload,
-            self.i64_type.const_zero(),
-            &format!("{label}_zero"),
-        );
+        self.build_bigint_sign_store(payload, self.i64_type.const_zero(), &format!("{label}_zero"));
         self.builder
             .build_unconditional_branch(end_block)
             .expect("failed to branch bigint normalize end");
@@ -546,26 +468,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .unwrap()
             .get_parent()
             .expect("missing function for bigint cmp abs");
-        let merge_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_merge"));
+        let merge_block = self.context.append_basic_block(function, &format!("{label}_merge"));
         let lhs_len = self.build_bigint_len_load(lhs, &format!("{label}_lhs"));
         let rhs_len = self.build_bigint_len_load(rhs, &format!("{label}_rhs"));
         let len_eq = self
             .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                lhs_len,
-                rhs_len,
-                &format!("{label}_len_eq"),
-            )
+            .build_int_compare(IntPredicate::EQ, lhs_len, rhs_len, &format!("{label}_len_eq"))
             .expect("failed bigint len eq compare");
-        let len_cmp_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_len_cmp"));
-        let same_len_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_same_len"));
+        let len_cmp_block = self.context.append_basic_block(function, &format!("{label}_len_cmp"));
+        let same_len_block =
+            self.context.append_basic_block(function, &format!("{label}_same_len"));
         self.builder
             .build_conditional_branch(len_eq, same_len_block, len_cmp_block)
             .expect("failed bigint len branch");
@@ -573,12 +485,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(len_cmp_block);
         let lhs_gt = self
             .builder
-            .build_int_compare(
-                IntPredicate::UGT,
-                lhs_len,
-                rhs_len,
-                &format!("{label}_lhs_len_gt"),
-            )
+            .build_int_compare(IntPredicate::UGT, lhs_len, rhs_len, &format!("{label}_lhs_len_gt"))
             .expect("failed bigint len gt compare");
         let len_cmp = self
             .builder
@@ -590,24 +497,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )
             .expect("failed bigint len cmp select")
             .into_int_value();
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .expect("failed bigint len cmp jump");
+        self.builder.build_unconditional_branch(merge_block).expect("failed bigint len cmp jump");
         let len_cmp_block_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(same_len_block);
-        let loop_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_loop"));
-        let body_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_body"));
-        let equal_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_equal"));
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed bigint cmp loop jump");
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let equal_block = self.context.append_basic_block(function, &format!("{label}_equal"));
+        self.builder.build_unconditional_branch(loop_block).expect("failed bigint cmp loop jump");
         let same_len_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(loop_block);
@@ -633,49 +530,29 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(body_block);
         let index = self
             .builder
-            .build_int_sub(
-                remaining,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_index"),
-            )
+            .build_int_sub(remaining, self.i64_type.const_int(1, false), &format!("{label}_index"))
             .expect("failed bigint cmp index");
         let lhs_limb = self.build_bigint_limb_load(lhs, index, &format!("{label}_lhs_limb"));
         let rhs_limb = self.build_bigint_limb_load(rhs, index, &format!("{label}_rhs_limb"));
         let limb_eq = self
             .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                lhs_limb,
-                rhs_limb,
-                &format!("{label}_limb_eq"),
-            )
+            .build_int_compare(IntPredicate::EQ, lhs_limb, rhs_limb, &format!("{label}_limb_eq"))
             .expect("failed bigint cmp limb eq");
-        let next_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_next"));
-        let diff_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_diff"));
+        let next_block = self.context.append_basic_block(function, &format!("{label}_next"));
+        let diff_block = self.context.append_basic_block(function, &format!("{label}_diff"));
         self.builder
             .build_conditional_branch(limb_eq, next_block, diff_block)
             .expect("failed bigint cmp limb branch");
 
         self.builder.position_at_end(next_block);
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed bigint cmp continue");
+        self.builder.build_unconditional_branch(loop_block).expect("failed bigint cmp continue");
         let next_end = self.builder.get_insert_block().unwrap();
         remaining_phi.add_incoming(&[(&index, next_end)]);
 
         self.builder.position_at_end(diff_block);
         let lhs_gt = self
             .builder
-            .build_int_compare(
-                IntPredicate::UGT,
-                lhs_limb,
-                rhs_limb,
-                &format!("{label}_limb_gt"),
-            )
+            .build_int_compare(IntPredicate::UGT, lhs_limb, rhs_limb, &format!("{label}_limb_gt"))
             .expect("failed bigint cmp limb gt");
         let limb_cmp = self
             .builder
@@ -687,15 +564,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )
             .expect("failed bigint cmp limb select")
             .into_int_value();
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .expect("failed bigint cmp diff jump");
+        self.builder.build_unconditional_branch(merge_block).expect("failed bigint cmp diff jump");
         let diff_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(equal_block);
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .expect("failed bigint cmp equal jump");
+        self.builder.build_unconditional_branch(merge_block).expect("failed bigint cmp equal jump");
         let equal_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge_block);
@@ -717,22 +590,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs: IntValue<'ctx>,
         label: &str,
     ) -> IntValue<'ctx> {
-        let function = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let lhs_len = self.build_bigint_len_load(lhs, &format!("{label}_lhs"));
         let rhs_len = self.build_bigint_len_load(rhs, &format!("{label}_rhs"));
         let lhs_ge = self
             .builder
-            .build_int_compare(
-                IntPredicate::UGE,
-                lhs_len,
-                rhs_len,
-                &format!("{label}_lhs_ge"),
-            )
+            .build_int_compare(IntPredicate::UGE, lhs_len, rhs_len, &format!("{label}_lhs_ge"))
             .expect("failed bigint add abs len compare");
         let max_len = self
             .builder
@@ -741,24 +604,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .into_int_value();
         let cap = self
             .builder
-            .build_int_add(
-                max_len,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_cap"),
-            )
+            .build_int_add(max_len, self.i64_type.const_int(1, false), &format!("{label}_cap"))
             .expect("failed bigint add abs cap");
         let result = self.build_bigint_alloc(cap, &format!("{label}_alloc"));
         self.build_bigint_len_store(result, cap, label);
 
-        let loop_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_loop"));
-        let body_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_body"));
-        let done_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_done"));
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
         self.builder
             .build_unconditional_branch(loop_block)
             .expect("failed bigint add abs loop jump");
@@ -790,30 +643,20 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_compare(IntPredicate::ULT, idx, lhs_len, &format!("{label}_lhs_in"))
             .expect("failed bigint add abs lhs in");
-        let lhs_read = self
-            .context
-            .append_basic_block(function, &format!("{label}_lhs_read"));
-        let lhs_zero = self
-            .context
-            .append_basic_block(function, &format!("{label}_lhs_zero"));
-        let lhs_merge = self
-            .context
-            .append_basic_block(function, &format!("{label}_lhs_merge"));
+        let lhs_read = self.context.append_basic_block(function, &format!("{label}_lhs_read"));
+        let lhs_zero = self.context.append_basic_block(function, &format!("{label}_lhs_zero"));
+        let lhs_merge = self.context.append_basic_block(function, &format!("{label}_lhs_merge"));
         self.builder
             .build_conditional_branch(lhs_in, lhs_read, lhs_zero)
             .expect("failed bigint add abs lhs branch");
 
         self.builder.position_at_end(lhs_read);
         let lhs_limb_val = self.build_bigint_limb_load(lhs, idx, &format!("{label}_lhs_limb"));
-        self.builder
-            .build_unconditional_branch(lhs_merge)
-            .expect("failed lhs merge jump");
+        self.builder.build_unconditional_branch(lhs_merge).expect("failed lhs merge jump");
         let lhs_read_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(lhs_zero);
-        self.builder
-            .build_unconditional_branch(lhs_merge)
-            .expect("failed lhs zero merge jump");
+        self.builder.build_unconditional_branch(lhs_merge).expect("failed lhs zero merge jump");
         let lhs_zero_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(lhs_merge);
@@ -831,30 +674,20 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_compare(IntPredicate::ULT, idx, rhs_len, &format!("{label}_rhs_in"))
             .expect("failed bigint add abs rhs in");
-        let rhs_read = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_read"));
-        let rhs_zero = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_zero"));
-        let rhs_merge = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_merge"));
+        let rhs_read = self.context.append_basic_block(function, &format!("{label}_rhs_read"));
+        let rhs_zero = self.context.append_basic_block(function, &format!("{label}_rhs_zero"));
+        let rhs_merge = self.context.append_basic_block(function, &format!("{label}_rhs_merge"));
         self.builder
             .build_conditional_branch(rhs_in, rhs_read, rhs_zero)
             .expect("failed bigint add abs rhs branch");
 
         self.builder.position_at_end(rhs_read);
         let rhs_limb_val = self.build_bigint_limb_load(rhs, idx, &format!("{label}_rhs_limb"));
-        self.builder
-            .build_unconditional_branch(rhs_merge)
-            .expect("failed rhs merge jump");
+        self.builder.build_unconditional_branch(rhs_merge).expect("failed rhs merge jump");
         let rhs_read_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(rhs_zero);
-        self.builder
-            .build_unconditional_branch(rhs_merge)
-            .expect("failed rhs zero merge jump");
+        self.builder.build_unconditional_branch(rhs_merge).expect("failed rhs zero merge jump");
         let rhs_zero_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(rhs_merge);
@@ -878,11 +711,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint add abs sum");
         let low = self
             .builder
-            .build_and(
-                sum,
-                self.i64_type.const_int(0xffff_ffff, false),
-                &format!("{label}_low"),
-            )
+            .build_and(sum, self.i64_type.const_int(0xffff_ffff, false), &format!("{label}_low"))
             .expect("failed bigint add abs low");
         self.build_bigint_limb_store(result, idx, low, &format!("{label}_store"));
         let next_carry = self
@@ -896,11 +725,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint add abs next carry");
         let next_idx = self
             .builder
-            .build_int_add(
-                idx,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_next_idx"),
-            )
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next_idx"))
             .expect("failed bigint add abs next idx");
         self.builder
             .build_unconditional_branch(loop_block)
@@ -922,26 +747,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs: IntValue<'ctx>,
         label: &str,
     ) -> IntValue<'ctx> {
-        let function = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let lhs_len = self.build_bigint_len_load(lhs, &format!("{label}_lhs"));
         let rhs_len = self.build_bigint_len_load(rhs, &format!("{label}_rhs"));
         let result = self.build_bigint_alloc(lhs_len, &format!("{label}_alloc"));
         self.build_bigint_len_store(result, lhs_len, label);
 
-        let loop_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_loop"));
-        let body_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_body"));
-        let done_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_done"));
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
         self.builder
             .build_unconditional_branch(loop_block)
             .expect("failed bigint sub abs loop jump");
@@ -974,15 +788,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_compare(IntPredicate::ULT, idx, rhs_len, &format!("{label}_rhs_in"))
             .expect("failed bigint sub abs rhs in");
-        let rhs_read = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_read"));
-        let rhs_zero = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_zero"));
-        let rhs_merge = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_merge"));
+        let rhs_read = self.context.append_basic_block(function, &format!("{label}_rhs_read"));
+        let rhs_zero = self.context.append_basic_block(function, &format!("{label}_rhs_zero"));
+        let rhs_merge = self.context.append_basic_block(function, &format!("{label}_rhs_merge"));
         self.builder
             .build_conditional_branch(rhs_in, rhs_read, rhs_zero)
             .expect("failed bigint sub abs rhs branch");
@@ -1024,15 +832,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_enough"),
             )
             .expect("failed bigint sub abs enough compare");
-        let no_borrow_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_no_borrow"));
-        let borrow_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_borrow_block"));
-        let merge = self
-            .context
-            .append_basic_block(function, &format!("{label}_merge"));
+        let no_borrow_block =
+            self.context.append_basic_block(function, &format!("{label}_no_borrow"));
+        let borrow_block =
+            self.context.append_basic_block(function, &format!("{label}_borrow_block"));
+        let merge = self.context.append_basic_block(function, &format!("{label}_merge"));
         self.builder
             .build_conditional_branch(enough, no_borrow_block, borrow_block)
             .expect("failed bigint sub abs enough branch");
@@ -1040,11 +844,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(no_borrow_block);
         let diff_no_borrow = self
             .builder
-            .build_int_sub(
-                lhs_limb,
-                rhs_plus_borrow,
-                &format!("{label}_diff_no_borrow"),
-            )
+            .build_int_sub(lhs_limb, rhs_plus_borrow, &format!("{label}_diff_no_borrow"))
             .expect("failed bigint sub abs diff no borrow");
         self.builder
             .build_unconditional_branch(merge)
@@ -1062,15 +862,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint sub abs lhs_with_base");
         let diff_borrow = self
             .builder
-            .build_int_sub(
-                lhs_with_base,
-                rhs_plus_borrow,
-                &format!("{label}_diff_borrow"),
-            )
+            .build_int_sub(lhs_with_base, rhs_plus_borrow, &format!("{label}_diff_borrow"))
             .expect("failed bigint sub abs diff borrow");
-        self.builder
-            .build_unconditional_branch(merge)
-            .expect("failed bigint sub abs borrow jump");
+        self.builder.build_unconditional_branch(merge).expect("failed bigint sub abs borrow jump");
         let borrow_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge);
@@ -1092,11 +886,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_bigint_limb_store(result, idx, out_limb, &format!("{label}_store"));
         let next_idx = self
             .builder
-            .build_int_add(
-                idx,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_next_idx"),
-            )
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next_idx"))
             .expect("failed bigint sub abs next idx");
         self.builder
             .build_unconditional_branch(loop_block)
@@ -1116,12 +906,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs: IntValue<'ctx>,
         label: &str,
     ) -> IntValue<'ctx> {
-        let function = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let lhs_len = self.build_bigint_len_load(lhs, &format!("{label}_lhs"));
         let rhs_len = self.build_bigint_len_load(rhs, &format!("{label}_rhs"));
         let cap = self
@@ -1131,18 +916,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let result = self.build_bigint_alloc(cap, &format!("{label}_alloc"));
         self.build_bigint_len_store(result, cap, label);
 
-        let init_loop = self
-            .context
-            .append_basic_block(function, &format!("{label}_init_loop"));
-        let init_body = self
-            .context
-            .append_basic_block(function, &format!("{label}_init_body"));
-        let init_done = self
-            .context
-            .append_basic_block(function, &format!("{label}_init_done"));
-        self.builder
-            .build_unconditional_branch(init_loop)
-            .expect("failed bigint mul init jump");
+        let init_loop = self.context.append_basic_block(function, &format!("{label}_init_loop"));
+        let init_body = self.context.append_basic_block(function, &format!("{label}_init_body"));
+        let init_done = self.context.append_basic_block(function, &format!("{label}_init_done"));
+        self.builder.build_unconditional_branch(init_loop).expect("failed bigint mul init jump");
         let init_entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(init_loop);
@@ -1154,12 +931,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let init_idx = init_idx_phi.as_basic_value().into_int_value();
         let init_more = self
             .builder
-            .build_int_compare(
-                IntPredicate::ULT,
-                init_idx,
-                cap,
-                &format!("{label}_init_more"),
-            )
+            .build_int_compare(IntPredicate::ULT, init_idx, cap, &format!("{label}_init_more"))
             .expect("failed bigint mul init compare");
         self.builder
             .build_conditional_branch(init_more, init_body, init_done)
@@ -1180,25 +952,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_init_next"),
             )
             .expect("failed bigint mul init next");
-        self.builder
-            .build_unconditional_branch(init_loop)
-            .expect("failed bigint mul init loop");
+        self.builder.build_unconditional_branch(init_loop).expect("failed bigint mul init loop");
         let init_body_end = self.builder.get_insert_block().unwrap();
         init_idx_phi.add_incoming(&[(&init_next, init_body_end)]);
 
         self.builder.position_at_end(init_done);
-        let outer_loop = self
-            .context
-            .append_basic_block(function, &format!("{label}_outer_loop"));
-        let outer_body = self
-            .context
-            .append_basic_block(function, &format!("{label}_outer_body"));
-        let outer_done = self
-            .context
-            .append_basic_block(function, &format!("{label}_outer_done"));
-        self.builder
-            .build_unconditional_branch(outer_loop)
-            .expect("failed bigint mul outer jump");
+        let outer_loop = self.context.append_basic_block(function, &format!("{label}_outer_loop"));
+        let outer_body = self.context.append_basic_block(function, &format!("{label}_outer_body"));
+        let outer_done = self.context.append_basic_block(function, &format!("{label}_outer_done"));
+        self.builder.build_unconditional_branch(outer_loop).expect("failed bigint mul outer jump");
         let outer_entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(outer_loop);
@@ -1210,12 +972,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let i = i_phi.as_basic_value().into_int_value();
         let outer_more = self
             .builder
-            .build_int_compare(
-                IntPredicate::ULT,
-                i,
-                lhs_len,
-                &format!("{label}_outer_more"),
-            )
+            .build_int_compare(IntPredicate::ULT, i, lhs_len, &format!("{label}_outer_more"))
             .expect("failed bigint mul outer compare");
         self.builder
             .build_conditional_branch(outer_more, outer_body, outer_done)
@@ -1223,18 +980,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(outer_body);
         let lhs_limb = self.build_bigint_limb_load(lhs, i, &format!("{label}_lhs_limb"));
-        let inner_loop = self
-            .context
-            .append_basic_block(function, &format!("{label}_inner_loop"));
-        let inner_body = self
-            .context
-            .append_basic_block(function, &format!("{label}_inner_body"));
-        let inner_done = self
-            .context
-            .append_basic_block(function, &format!("{label}_inner_done"));
-        self.builder
-            .build_unconditional_branch(inner_loop)
-            .expect("failed bigint mul inner jump");
+        let inner_loop = self.context.append_basic_block(function, &format!("{label}_inner_loop"));
+        let inner_body = self.context.append_basic_block(function, &format!("{label}_inner_body"));
+        let inner_done = self.context.append_basic_block(function, &format!("{label}_inner_done"));
+        self.builder.build_unconditional_branch(inner_loop).expect("failed bigint mul inner jump");
         let inner_entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(inner_loop);
@@ -1252,12 +1001,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let carry = carry_phi.as_basic_value().into_int_value();
         let inner_more = self
             .builder
-            .build_int_compare(
-                IntPredicate::ULT,
-                j,
-                rhs_len,
-                &format!("{label}_inner_more"),
-            )
+            .build_int_compare(IntPredicate::ULT, j, rhs_len, &format!("{label}_inner_more"))
             .expect("failed bigint mul inner compare");
         self.builder
             .build_conditional_branch(inner_more, inner_body, inner_done)
@@ -1284,11 +1028,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint mul total");
         let low = self
             .builder
-            .build_and(
-                total,
-                self.i64_type.const_int(0xffff_ffff, false),
-                &format!("{label}_low"),
-            )
+            .build_and(total, self.i64_type.const_int(0xffff_ffff, false), &format!("{label}_low"))
             .expect("failed bigint mul low");
         self.build_bigint_limb_store(result, idx, low, &format!("{label}_store"));
         let next_carry = self
@@ -1302,36 +1042,22 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint mul carry shift");
         let next_j = self
             .builder
-            .build_int_add(
-                j,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_next_j"),
-            )
+            .build_int_add(j, self.i64_type.const_int(1, false), &format!("{label}_next_j"))
             .expect("failed bigint mul next j");
-        self.builder
-            .build_unconditional_branch(inner_loop)
-            .expect("failed bigint mul inner loop");
+        self.builder.build_unconditional_branch(inner_loop).expect("failed bigint mul inner loop");
         let inner_body_end = self.builder.get_insert_block().unwrap();
         j_phi.add_incoming(&[(&next_j, inner_body_end)]);
         carry_phi.add_incoming(&[(&next_carry, inner_body_end)]);
 
         self.builder.position_at_end(inner_done);
-        let carry_loop = self
-            .context
-            .append_basic_block(function, &format!("{label}_carry_loop"));
-        let carry_body = self
-            .context
-            .append_basic_block(function, &format!("{label}_carry_body"));
-        let carry_done = self
-            .context
-            .append_basic_block(function, &format!("{label}_carry_done"));
+        let carry_loop = self.context.append_basic_block(function, &format!("{label}_carry_loop"));
+        let carry_body = self.context.append_basic_block(function, &format!("{label}_carry_body"));
+        let carry_done = self.context.append_basic_block(function, &format!("{label}_carry_done"));
         let carry_start_idx = self
             .builder
             .build_int_add(i, rhs_len, &format!("{label}_carry_start_idx"))
             .expect("failed bigint mul carry start idx");
-        self.builder
-            .build_unconditional_branch(carry_loop)
-            .expect("failed bigint mul carry jump");
+        self.builder.build_unconditional_branch(carry_loop).expect("failed bigint mul carry jump");
         let carry_entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(carry_loop);
@@ -1344,10 +1070,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_phi(self.i64_type, &format!("{label}_carry_val"))
             .expect("failed bigint mul carry val phi");
         carry_idx_phi.add_incoming(&[(&carry_start_idx, carry_entry_end)]);
-        carry_val_phi.add_incoming(&[(
-            &carry_phi.as_basic_value().into_int_value(),
-            carry_entry_end,
-        )]);
+        carry_val_phi
+            .add_incoming(&[(&carry_phi.as_basic_value().into_int_value(), carry_entry_end)]);
         let carry_idx = carry_idx_phi.as_basic_value().into_int_value();
         let carry_val = carry_val_phi.as_basic_value().into_int_value();
         let carry_more = self
@@ -1396,9 +1120,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_carry_next_idx"),
             )
             .expect("failed bigint mul carry next idx");
-        self.builder
-            .build_unconditional_branch(carry_loop)
-            .expect("failed bigint mul carry loop");
+        self.builder.build_unconditional_branch(carry_loop).expect("failed bigint mul carry loop");
         let carry_body_end = self.builder.get_insert_block().unwrap();
         carry_idx_phi.add_incoming(&[(&next_idx, carry_body_end)]);
         carry_val_phi.add_incoming(&[(&next_carry, carry_body_end)]);
@@ -1406,15 +1128,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(carry_done);
         let next_i = self
             .builder
-            .build_int_add(
-                i,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_next_i"),
-            )
+            .build_int_add(i, self.i64_type.const_int(1, false), &format!("{label}_next_i"))
             .expect("failed bigint mul next i");
-        self.builder
-            .build_unconditional_branch(outer_loop)
-            .expect("failed bigint mul outer loop");
+        self.builder.build_unconditional_branch(outer_loop).expect("failed bigint mul outer loop");
         let outer_body_end = self.builder.get_insert_block().unwrap();
         i_phi.add_incoming(&[(&next_i, outer_body_end)]);
 
@@ -1431,15 +1147,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs_sign: IntValue<'ctx>,
         label: &str,
     ) -> IntValue<'ctx> {
-        let function = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
-        let merge = self
-            .context
-            .append_basic_block(function, &format!("{label}_merge"));
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let merge = self.context.append_basic_block(function, &format!("{label}_merge"));
         let lhs_zero = self
             .builder
             .build_int_compare(
@@ -1449,20 +1158,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_lhs_zero"),
             )
             .expect("failed bigint signed lhs_zero");
-        let lhs_zero_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_lhs_zero_block"));
-        let rhs_zero_check = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_zero_check"));
+        let lhs_zero_block =
+            self.context.append_basic_block(function, &format!("{label}_lhs_zero_block"));
+        let rhs_zero_check =
+            self.context.append_basic_block(function, &format!("{label}_rhs_zero_check"));
         self.builder
             .build_conditional_branch(lhs_zero, lhs_zero_block, rhs_zero_check)
             .expect("failed bigint signed lhs_zero branch");
 
         self.builder.position_at_end(lhs_zero_block);
-        self.builder
-            .build_unconditional_branch(merge)
-            .expect("failed lhs_zero merge");
+        self.builder.build_unconditional_branch(merge).expect("failed lhs_zero merge");
         let lhs_zero_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(rhs_zero_check);
@@ -1475,20 +1180,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_rhs_zero"),
             )
             .expect("failed bigint signed rhs_zero");
-        let rhs_zero_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_zero_block"));
-        let same_sign_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_same_sign"));
+        let rhs_zero_block =
+            self.context.append_basic_block(function, &format!("{label}_rhs_zero_block"));
+        let same_sign_block =
+            self.context.append_basic_block(function, &format!("{label}_same_sign"));
         self.builder
             .build_conditional_branch(rhs_zero, rhs_zero_block, same_sign_block)
             .expect("failed bigint signed rhs_zero branch");
 
         self.builder.position_at_end(rhs_zero_block);
-        self.builder
-            .build_unconditional_branch(merge)
-            .expect("failed rhs_zero merge");
+        self.builder.build_unconditional_branch(merge).expect("failed rhs_zero merge");
         let rhs_zero_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(same_sign_block);
@@ -1501,12 +1202,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_signs_equal"),
             )
             .expect("failed bigint signed signs_equal");
-        let add_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_add_block"));
-        let diff_sign_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_diff_sign"));
+        let add_block = self.context.append_basic_block(function, &format!("{label}_add_block"));
+        let diff_sign_block =
+            self.context.append_basic_block(function, &format!("{label}_diff_sign"));
         self.builder
             .build_conditional_branch(signs_equal, add_block, diff_sign_block)
             .expect("failed bigint signed sign branch");
@@ -1515,9 +1213,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let sum_ptr = self.build_bigint_add_abs(lhs, rhs, &format!("{label}_add_abs"));
         self.build_bigint_sign_store(sum_ptr, lhs_sign, &format!("{label}_sum_sign"));
         self.build_bigint_normalize(sum_ptr, &format!("{label}_sum_norm"));
-        self.builder
-            .build_unconditional_branch(merge)
-            .expect("failed add merge");
+        self.builder.build_unconditional_branch(merge).expect("failed add merge");
         let add_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(diff_sign_block);
@@ -1531,12 +1227,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_cmp_zero"),
             )
             .expect("failed bigint signed cmp_zero");
-        let equal_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_equal"));
-        let non_zero_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_non_zero"));
+        let equal_block = self.context.append_basic_block(function, &format!("{label}_equal"));
+        let non_zero_block =
+            self.context.append_basic_block(function, &format!("{label}_non_zero"));
         self.builder
             .build_conditional_branch(cmp_zero, equal_block, non_zero_block)
             .expect("failed bigint signed cmp branch");
@@ -1554,9 +1247,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.i64_type.const_zero(),
             &format!("{label}_zero_len"),
         );
-        self.builder
-            .build_unconditional_branch(merge)
-            .expect("failed equal merge");
+        self.builder.build_unconditional_branch(merge).expect("failed equal merge");
         let equal_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(non_zero_block);
@@ -1569,12 +1260,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_lhs_gt"),
             )
             .expect("failed bigint signed lhs_gt");
-        let lhs_gt_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_lhs_gt_block"));
-        let rhs_gt_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_rhs_gt_block"));
+        let lhs_gt_block =
+            self.context.append_basic_block(function, &format!("{label}_lhs_gt_block"));
+        let rhs_gt_block =
+            self.context.append_basic_block(function, &format!("{label}_rhs_gt_block"));
         self.builder
             .build_conditional_branch(lhs_gt, lhs_gt_block, rhs_gt_block)
             .expect("failed bigint signed lhs_gt branch");
@@ -1583,18 +1272,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let lhs_diff = self.build_bigint_sub_abs(lhs, rhs, &format!("{label}_lhs_diff"));
         self.build_bigint_sign_store(lhs_diff, lhs_sign, &format!("{label}_lhs_diff_sign"));
         self.build_bigint_normalize(lhs_diff, &format!("{label}_lhs_diff_norm"));
-        self.builder
-            .build_unconditional_branch(merge)
-            .expect("failed lhs_gt merge");
+        self.builder.build_unconditional_branch(merge).expect("failed lhs_gt merge");
         let lhs_gt_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(rhs_gt_block);
         let rhs_diff = self.build_bigint_sub_abs(rhs, lhs, &format!("{label}_rhs_diff"));
         self.build_bigint_sign_store(rhs_diff, rhs_sign, &format!("{label}_rhs_diff_sign"));
         self.build_bigint_normalize(rhs_diff, &format!("{label}_rhs_diff_norm"));
-        self.builder
-            .build_unconditional_branch(merge)
-            .expect("failed rhs_gt merge");
+        self.builder.build_unconditional_branch(merge).expect("failed rhs_gt merge");
         let rhs_gt_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge);
@@ -1621,21 +1306,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs_sign: IntValue<'ctx>,
         label: &str,
     ) -> IntValue<'ctx> {
-        let function = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
-        let merge = self
-            .context
-            .append_basic_block(function, &format!("{label}_merge"));
-        let signs_equal_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_signs_equal"));
-        let signs_diff_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_signs_diff"));
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let merge = self.context.append_basic_block(function, &format!("{label}_merge"));
+        let signs_equal_block =
+            self.context.append_basic_block(function, &format!("{label}_signs_equal"));
+        let signs_diff_block =
+            self.context.append_basic_block(function, &format!("{label}_signs_diff"));
         let signs_equal = self
             .builder
             .build_int_compare(
@@ -1684,12 +1360,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_sign_zero"),
             )
             .expect("failed bigint signed compare sign_zero");
-        let zero_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_zero"));
-        let cmp_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_cmp"));
+        let zero_block = self.context.append_basic_block(function, &format!("{label}_zero"));
+        let cmp_block = self.context.append_basic_block(function, &format!("{label}_cmp"));
         self.builder
             .build_conditional_branch(sign_zero, zero_block, cmp_block)
             .expect("failed bigint signed compare zero branch");
@@ -1711,12 +1383,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &format!("{label}_sign_negative"),
             )
             .expect("failed bigint signed compare sign_negative");
-        let neg_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_neg"));
-        let pos_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_pos"));
+        let neg_block = self.context.append_basic_block(function, &format!("{label}_neg"));
+        let pos_block = self.context.append_basic_block(function, &format!("{label}_pos"));
         self.builder
             .build_conditional_branch(sign_negative, neg_block, pos_block)
             .expect("failed bigint signed compare neg branch");
@@ -1766,13 +1434,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
     pub(super) fn define_pair_bigint_from_int(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
-            self.pair_type()
-                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
-        self.functions
-            .insert("bigint_from_int".to_string(), function);
+        self.functions.insert("bigint_from_int".to_string(), function);
 
         let entry = self.context.append_basic_block(function, "entry");
         self.builder.position_at_end(entry);
@@ -1804,12 +1470,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(non_zero_block);
         let is_negative = self
             .builder
-            .build_int_compare(
-                IntPredicate::SLT,
-                raw,
-                self.i64_type.const_zero(),
-                "is_negative",
-            )
+            .build_int_compare(IntPredicate::SLT, raw, self.i64_type.const_zero(), "is_negative")
             .expect("failed bigint_from_int neg compare");
         let neg_block = self.context.append_basic_block(function, "neg");
         let pos_block = self.context.append_basic_block(function, "pos");
@@ -1819,10 +1480,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint_from_int sign branch");
 
         self.builder.position_at_end(neg_block);
-        let neg_abs = self
-            .builder
-            .build_int_neg(raw, "neg_abs")
-            .expect("failed bigint_from_int neg abs");
+        let neg_abs =
+            self.builder.build_int_neg(raw, "neg_abs").expect("failed bigint_from_int neg abs");
         self.builder
             .build_unconditional_branch(sign_merge)
             .expect("failed bigint_from_int neg merge");
@@ -1856,12 +1515,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint_from_int high");
         let has_high = self
             .builder
-            .build_int_compare(
-                IntPredicate::NE,
-                high,
-                self.i64_type.const_zero(),
-                "has_high",
-            )
+            .build_int_compare(IntPredicate::NE, high, self.i64_type.const_zero(), "has_high")
             .expect("failed bigint_from_int has_high");
         let cap_merge = self.context.append_basic_block(function, "cap_merge");
         let high_block = self.context.append_basic_block(function, "high_block");
@@ -1928,9 +1582,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(second_done);
         self.build_bigint_normalize(ptr, "bigint_from_int_norm");
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .expect("failed bigint_from_int merge");
+        self.builder.build_unconditional_branch(merge_block).expect("failed bigint_from_int merge");
         let non_zero_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge_block);
@@ -2017,8 +1669,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
-        self.functions
-            .insert("bigint_compare".to_string(), function);
+        self.functions.insert("bigint_compare".to_string(), function);
         let entry = self.context.append_basic_block(function, "entry");
         let trap_block = self.context.append_basic_block(function, "trap");
         self.builder.position_at_end(entry);
@@ -2068,8 +1719,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
-        self.functions
-            .insert("bigint_subtract".to_string(), function);
+        self.functions.insert("bigint_subtract".to_string(), function);
         let entry = self.context.append_basic_block(function, "entry");
         let trap_block = self.context.append_basic_block(function, "trap");
         self.builder.position_at_end(entry);
@@ -2123,8 +1773,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
-        self.functions
-            .insert("bigint_multiply".to_string(), function);
+        self.functions.insert("bigint_multiply".to_string(), function);
 
         let entry = self.context.append_basic_block(function, "entry");
         let trap_block = self.context.append_basic_block(function, "trap");
@@ -2186,9 +1835,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let zero_ptr = self.build_bigint_alloc(self.i64_type.const_zero(), "bigint_mul_zero");
         self.build_bigint_sign_store(zero_ptr, self.i64_type.const_zero(), "bigint_mul_zero");
         self.build_bigint_len_store(zero_ptr, self.i64_type.const_zero(), "bigint_mul_zero");
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .expect("failed bigint_mul zero merge");
+        self.builder.build_unconditional_branch(merge_block).expect("failed bigint_mul zero merge");
         let zero_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(mul_block);
@@ -2209,9 +1856,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .into_int_value();
         self.build_bigint_sign_store(abs_ptr, result_sign, "bigint_mul_sign");
         self.build_bigint_normalize(abs_ptr, "bigint_mul_norm");
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .expect("failed bigint_mul mul merge");
+        self.builder.build_unconditional_branch(merge_block).expect("failed bigint_mul mul merge");
         let mul_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge_block);
@@ -2322,9 +1967,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(init_block);
         let quotient0 = self.build_bigint_zero("bigint_div_q0");
-        self.builder
-            .build_unconditional_branch(outer_loop)
-            .expect("failed bigint_div init jump");
+        self.builder.build_unconditional_branch(outer_loop).expect("failed bigint_div init jump");
         let init_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(outer_loop);
@@ -2359,9 +2002,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let inner_body = self.context.append_basic_block(function, "inner_body");
         let inner_done = self.context.append_basic_block(function, "inner_done");
         let multiple0 = self.build_bigint_one("bigint_div_m1");
-        self.builder
-            .build_unconditional_branch(inner_loop)
-            .expect("failed bigint_div inner jump");
+        self.builder.build_unconditional_branch(inner_loop).expect("failed bigint_div inner jump");
         let inner_entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(inner_loop);
@@ -2395,9 +2036,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(inner_body);
         let doubled_multiple =
             self.build_bigint_add_abs(multiple, multiple, "bigint_div_doubled_multiple");
-        self.builder
-            .build_unconditional_branch(inner_loop)
-            .expect("failed bigint_div inner loop");
+        self.builder.build_unconditional_branch(inner_loop).expect("failed bigint_div inner loop");
         let inner_body_end = self.builder.get_insert_block().unwrap();
         current_phi.add_incoming(&[(&doubled, inner_body_end)]);
         multiple_phi.add_incoming(&[(&doubled_multiple, inner_body_end)]);
@@ -2534,9 +2173,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint_mod zero return");
 
         self.builder.position_at_end(init_block);
-        self.builder
-            .build_unconditional_branch(outer_loop)
-            .expect("failed bigint_mod init jump");
+        self.builder.build_unconditional_branch(outer_loop).expect("failed bigint_mod init jump");
         let init_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(outer_loop);
@@ -2564,9 +2201,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let inner_loop = self.context.append_basic_block(function, "inner_loop");
         let inner_body = self.context.append_basic_block(function, "inner_body");
         let inner_done = self.context.append_basic_block(function, "inner_done");
-        self.builder
-            .build_unconditional_branch(inner_loop)
-            .expect("failed bigint_mod inner jump");
+        self.builder.build_unconditional_branch(inner_loop).expect("failed bigint_mod inner jump");
         let inner_entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(inner_loop);
@@ -2592,9 +2227,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint_mod inner branch");
 
         self.builder.position_at_end(inner_body);
-        self.builder
-            .build_unconditional_branch(inner_loop)
-            .expect("failed bigint_mod inner loop");
+        self.builder.build_unconditional_branch(inner_loop).expect("failed bigint_mod inner loop");
         let inner_body_end = self.builder.get_insert_block().unwrap();
         current_phi.add_incoming(&[(&doubled, inner_body_end)]);
 

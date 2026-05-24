@@ -45,10 +45,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let body_block = self.context.append_basic_block(function, "list_map_body");
         let latch_block = self.context.append_basic_block(function, "list_map_latch");
         let exit_block = self.context.append_basic_block(function, "list_map_exit");
-        let entry_block = self
-            .builder
-            .get_insert_block()
-            .expect("missing list_map entry block");
+        let entry_block = self.builder.get_insert_block().expect("missing list_map entry block");
 
         self.builder
             .build_unconditional_branch(loop_block)
@@ -120,31 +117,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             "list_filter_len",
         );
 
-        let loop_block = self
-            .context
-            .append_basic_block(function, "list_filter_loop");
-        let body_block = self
-            .context
-            .append_basic_block(function, "list_filter_body");
-        let push_block = self
-            .context
-            .append_basic_block(function, "list_filter_push");
-        let skip_block = self
-            .context
-            .append_basic_block(function, "list_filter_skip");
-        let continue_block = self
-            .context
-            .append_basic_block(function, "list_filter_continue");
-        let latch_block = self
-            .context
-            .append_basic_block(function, "list_filter_latch");
-        let exit_block = self
-            .context
-            .append_basic_block(function, "list_filter_exit");
-        let entry_block = self
-            .builder
-            .get_insert_block()
-            .expect("missing list_filter entry block");
+        let loop_block = self.context.append_basic_block(function, "list_filter_loop");
+        let body_block = self.context.append_basic_block(function, "list_filter_body");
+        let push_block = self.context.append_basic_block(function, "list_filter_push");
+        let skip_block = self.context.append_basic_block(function, "list_filter_skip");
+        let continue_block = self.context.append_basic_block(function, "list_filter_continue");
+        let latch_block = self.context.append_basic_block(function, "list_filter_latch");
+        let exit_block = self.context.append_basic_block(function, "list_filter_exit");
+        let entry_block = self.builder.get_insert_block().expect("missing list_filter entry block");
 
         self.builder
             .build_unconditional_branch(loop_block)
@@ -251,14 +231,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         let loop_block = self.context.append_basic_block(function, "list_range_loop");
         let body_block = self.context.append_basic_block(function, "list_range_body");
-        let latch_block = self
-            .context
-            .append_basic_block(function, "list_range_latch");
+        let latch_block = self.context.append_basic_block(function, "list_range_latch");
         let exit_block = self.context.append_basic_block(function, "list_range_exit");
-        let entry_block = self
-            .builder
-            .get_insert_block()
-            .expect("missing list_range entry block");
+        let entry_block = self.builder.get_insert_block().expect("missing list_range entry block");
 
         self.builder
             .build_unconditional_branch(loop_block)
@@ -293,11 +268,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(latch_block);
         let next = self
             .builder
-            .build_int_add(
-                current,
-                self.i64_type.const_int(1, false),
-                "list_range_next",
-            )
+            .build_int_add(current, self.i64_type.const_int(1, false), "list_range_next")
             .expect("failed to increment list_range value");
         self.builder
             .build_unconditional_branch(loop_block)
@@ -316,12 +287,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let list_ptr = self.build_list_header_ptr(payload, label);
         let len_ptr = self
             .builder
-            .build_struct_gep(
-                self.list_header_type(),
-                list_ptr,
-                1,
-                &format!("{label}_len_ptr"),
-            )
+            .build_struct_gep(self.list_header_type(), list_ptr, 1, &format!("{label}_len_ptr"))
             .expect("failed to build list len gep");
         self.builder
             .build_load(self.i64_type, len_ptr, &format!("{label}_len"))
@@ -338,16 +304,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let list_ptr = self.build_list_header_ptr(payload, label);
         let len_ptr = self
             .builder
-            .build_struct_gep(
-                self.list_header_type(),
-                list_ptr,
-                1,
-                &format!("{label}_len_ptr"),
-            )
+            .build_struct_gep(self.list_header_type(), list_ptr, 1, &format!("{label}_len_ptr"))
             .expect("failed to build list len gep");
-        self.builder
-            .build_store(len_ptr, len)
-            .expect("failed to store list len");
+        self.builder.build_store(len_ptr, len).expect("failed to store list len");
     }
 
     pub(super) fn build_list_cap_load(
@@ -358,12 +317,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let list_ptr = self.build_list_header_ptr(payload, label);
         let cap_ptr = self
             .builder
-            .build_struct_gep(
-                self.list_header_type(),
-                list_ptr,
-                2,
-                &format!("{label}_cap_ptr"),
-            )
+            .build_struct_gep(self.list_header_type(), list_ptr, 2, &format!("{label}_cap_ptr"))
             .expect("failed to build list cap gep");
         self.builder
             .build_load(self.i64_type, cap_ptr, &format!("{label}_cap"))
@@ -380,16 +334,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let list_ptr = self.build_list_header_ptr(payload, label);
         let cap_ptr = self
             .builder
-            .build_struct_gep(
-                self.list_header_type(),
-                list_ptr,
-                2,
-                &format!("{label}_cap_ptr"),
-            )
+            .build_struct_gep(self.list_header_type(), list_ptr, 2, &format!("{label}_cap_ptr"))
             .expect("failed to build list cap gep");
-        self.builder
-            .build_store(cap_ptr, cap)
-            .expect("failed to store list cap");
+        self.builder.build_store(cap_ptr, cap).expect("failed to store list cap");
     }
 
     pub(super) fn build_list_data_ptr_load(
@@ -501,12 +448,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let data_ptr = self.build_list_data_ptr_load(payload, label);
         unsafe {
             self.builder
-                .build_gep(
-                    self.value_type(),
-                    data_ptr,
-                    &[index],
-                    &format!("{label}_value_ptr"),
-                )
+                .build_gep(self.value_type(), data_ptr, &[index], &format!("{label}_value_ptr"))
                 .expect("failed to build list value gep")
         }
     }
@@ -519,12 +461,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
     ) -> PointerValue<'ctx> {
         unsafe {
             self.builder
-                .build_gep(
-                    self.value_type(),
-                    data_ptr,
-                    &[index],
-                    &format!("{label}_value_ptr"),
-                )
+                .build_gep(self.value_type(), data_ptr, &[index], &format!("{label}_value_ptr"))
                 .expect("failed to build list value gep from data ptr")
         }
     }
@@ -581,24 +518,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to build list value tag gep");
         let payload_ptr = self
             .builder
-            .build_struct_gep(
-                self.value_type(),
-                value_ptr,
-                2,
-                &format!("{label}_payload_ptr"),
-            )
+            .build_struct_gep(self.value_type(), value_ptr, 2, &format!("{label}_payload_ptr"))
             .expect("failed to build list value payload gep");
         let tag = self
             .builder
-            .build_int_truncate(
-                value.tag,
-                self.context.i8_type(),
-                &format!("{label}_tag_i8"),
-            )
+            .build_int_truncate(value.tag, self.context.i8_type(), &format!("{label}_tag_i8"))
             .expect("failed to truncate list value tag");
-        self.builder
-            .build_store(tag_ptr, tag)
-            .expect("failed to store list value tag");
+        self.builder.build_store(tag_ptr, tag).expect("failed to store list value tag");
         self.builder
             .build_store(payload_ptr, value.payload)
             .expect("failed to store list value payload");
@@ -618,24 +544,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to build list value tag gep");
         let payload_ptr = self
             .builder
-            .build_struct_gep(
-                self.value_type(),
-                value_ptr,
-                2,
-                &format!("{label}_payload_ptr"),
-            )
+            .build_struct_gep(self.value_type(), value_ptr, 2, &format!("{label}_payload_ptr"))
             .expect("failed to build list value payload gep");
         let tag = self
             .builder
-            .build_int_truncate(
-                value.tag,
-                self.context.i8_type(),
-                &format!("{label}_tag_i8"),
-            )
+            .build_int_truncate(value.tag, self.context.i8_type(), &format!("{label}_tag_i8"))
             .expect("failed to truncate list value tag");
-        self.builder
-            .build_store(tag_ptr, tag)
-            .expect("failed to store list value tag");
+        self.builder.build_store(tag_ptr, tag).expect("failed to store list value tag");
         self.builder
             .build_store(payload_ptr, value.payload)
             .expect("failed to store list value payload");
@@ -654,11 +569,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_int_compare(IntPredicate::ULT, idx, len, &format!("{label}_in_bounds"))
             .expect("failed to compare list bounds");
         let ok_block = self.context.append_basic_block(
-            self.builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap(),
+            self.builder.get_insert_block().unwrap().get_parent().unwrap(),
             &format!("{label}_bounds_ok"),
         );
         self.builder
@@ -674,17 +585,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             #[cfg(feature = "wasi")]
             LlvmRuntimeMode::WasiPreview1Command => self.i64_type.into(),
         };
-        self.context.struct_type(
-            &[data_ptr_field, self.i64_type.into(), self.i64_type.into()],
-            false,
-        )
+        self.context
+            .struct_type(&[data_ptr_field, self.i64_type.into(), self.i64_type.into()], false)
     }
 
     pub(super) fn define_pair_list_len(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
-            self.pair_type()
-                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
@@ -817,11 +725,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to multiply list cap");
         let bytes = self
             .builder
-            .build_int_mul(
-                new_cap,
-                self.i64_type.const_int(16, false),
-                "list_push_bytes",
-            )
+            .build_int_mul(new_cap, self.i64_type.const_int(16, false), "list_push_bytes")
             .expect("failed to build list push bytes");
         let align = self.i64_type.const_int(8, false);
         let new_data_raw = self.build_boxed_call(alloc, &[bytes, align], "list_push_new_data");
@@ -861,11 +765,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_list_value_store_from_data_ptr(new_data_ptr, copy_idx, moved, "list_push_new");
         let next = self
             .builder
-            .build_int_add(
-                copy_idx,
-                self.i64_type.const_int(1, false),
-                "list_push_copy_next",
-            )
+            .build_int_add(copy_idx, self.i64_type.const_int(1, false), "list_push_copy_next")
             .expect("failed to increment push copy idx");
         self.builder
             .build_unconditional_branch(copy_loop_block)
@@ -880,11 +780,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to increment list len");
         self.build_list_len_store(list_payload, new_len, "list_push");
         self.builder
-            .build_return(Some(&self.make_pair_value(
-                list.tag,
-                list.payload,
-                "list_push_result",
-            )))
+            .build_return(Some(&self.make_pair_value(list.tag, list.payload, "list_push_result")))
             .expect("failed to return list_push");
 
         self.builder.position_at_end(trap_block);
@@ -928,11 +824,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_index_bounds_check(list_payload, idx, "list_get", trap_block);
         let result = self.build_list_value_load(list_payload, idx, "list_get");
         self.builder
-            .build_return(Some(&self.make_pair_value(
-                result.tag,
-                result.payload,
-                "list_get_pair",
-            )))
+            .build_return(Some(&self.make_pair_value(result.tag, result.payload, "list_get_pair")))
             .expect("failed to return list get");
 
         self.builder.position_at_end(trap_block);
@@ -982,11 +874,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_index_bounds_check(list_payload, idx, "list_set", trap_block);
         self.build_list_value_store(list_payload, idx, value, "list_set");
         self.builder
-            .build_return(Some(&self.make_pair_value(
-                value.tag,
-                value.payload,
-                "list_set_result",
-            )))
+            .build_return(Some(&self.make_pair_value(value.tag, value.payload, "list_set_result")))
             .expect("failed to return list set");
 
         self.builder.position_at_end(trap_block);
@@ -1070,19 +958,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let old_data_ptr = self.build_list_data_ptr_load(list_payload, "list_insert_old_data");
         let new_cap = self
             .builder
-            .build_int_mul(
-                cap,
-                self.i64_type.const_int(2, false),
-                "list_insert_new_cap",
-            )
+            .build_int_mul(cap, self.i64_type.const_int(2, false), "list_insert_new_cap")
             .expect("failed to multiply insert cap");
         let bytes = self
             .builder
-            .build_int_mul(
-                new_cap,
-                self.i64_type.const_int(16, false),
-                "list_insert_bytes",
-            )
+            .build_int_mul(new_cap, self.i64_type.const_int(16, false), "list_insert_bytes")
             .expect("failed to build insert bytes");
         let align = self.i64_type.const_int(8, false);
         let new_data_raw = self.build_boxed_call(alloc, &[bytes, align], "list_insert_new_data");
@@ -1122,11 +1002,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_list_value_store_from_data_ptr(new_data_ptr, copy_idx, moved, "list_insert_new");
         let next = self
             .builder
-            .build_int_add(
-                copy_idx,
-                self.i64_type.const_int(1, false),
-                "list_insert_copy_next",
-            )
+            .build_int_add(copy_idx, self.i64_type.const_int(1, false), "list_insert_copy_next")
             .expect("failed to increment insert copy idx");
         self.builder
             .build_unconditional_branch(copy_loop_block)
@@ -1142,12 +1018,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let shift_idx = shift_idx_phi.as_basic_value().into_int_value();
         let should_shift = self
             .builder
-            .build_int_compare(
-                IntPredicate::UGT,
-                shift_idx,
-                idx,
-                "list_insert_should_shift",
-            )
+            .build_int_compare(IntPredicate::UGT, shift_idx, idx, "list_insert_should_shift")
             .expect("failed to compare insert shift idx");
         self.builder
             .build_conditional_branch(should_shift, shift_body_block, store_block)
@@ -1156,11 +1027,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(shift_body_block);
         let src_idx = self
             .builder
-            .build_int_sub(
-                shift_idx,
-                self.i64_type.const_int(1, false),
-                "list_insert_src_idx",
-            )
+            .build_int_sub(shift_idx, self.i64_type.const_int(1, false), "list_insert_src_idx")
             .expect("failed to decrement insert shift idx");
         let moved = self.build_list_value_load(list_payload, src_idx, "list_insert_src");
         self.build_list_value_store(list_payload, shift_idx, moved, "list_insert_dst");
@@ -1173,19 +1040,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_list_value_store(list_payload, idx, value, "list_insert_store");
         let new_len = self
             .builder
-            .build_int_add(
-                len,
-                self.i64_type.const_int(1, false),
-                "list_insert_new_len",
-            )
+            .build_int_add(len, self.i64_type.const_int(1, false), "list_insert_new_len")
             .expect("failed to increment insert len");
         self.build_list_len_store(list_payload, new_len, "list_insert");
         self.builder
-            .build_return(Some(&self.make_pair_value(
-                list.tag,
-                list.payload,
-                "list_insert_result",
-            )))
+            .build_return(Some(&self.make_pair_value(list.tag, list.payload, "list_insert_result")))
             .expect("failed to return list_insert");
 
         self.builder.position_at_end(trap_block);
@@ -1240,11 +1099,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_list_value_store(list_payload, idx_a, value_b, "list_swap_store_a");
         self.build_list_value_store(list_payload, idx_b, value_a, "list_swap_store_b");
         self.builder
-            .build_return(Some(&self.make_pair_value(
-                list.tag,
-                list.payload,
-                "list_swap_result",
-            )))
+            .build_return(Some(&self.make_pair_value(list.tag, list.payload, "list_swap_result")))
             .expect("failed to return list swap");
 
         self.builder.position_at_end(trap_block);
@@ -1254,8 +1109,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
     pub(super) fn define_pair_list_pop(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
-            self.pair_type()
-                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
@@ -1296,11 +1150,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_list_len_store(list_payload, new_len, "list_pop");
         let result = self.build_list_value_load(list_payload, new_len, "list_pop");
         self.builder
-            .build_return(Some(&self.make_pair_value(
-                result.tag,
-                result.payload,
-                "list_pop_pair",
-            )))
+            .build_return(Some(&self.make_pair_value(result.tag, result.payload, "list_pop_pair")))
             .expect("failed to return list pop");
 
         self.builder.position_at_end(trap_block);
@@ -1382,19 +1232,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_add(cur, self.i64_type.const_int(1, false), "list_delete_next")
             .expect("failed to increment list_delete cursor");
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed to loop list_delete");
+        self.builder.build_unconditional_branch(loop_block).expect("failed to loop list_delete");
         cur_phi.add_incoming(&[(&next, body_block)]);
 
         self.builder.position_at_end(done_block);
         let new_len = self
             .builder
-            .build_int_sub(
-                len,
-                self.i64_type.const_int(1, false),
-                "list_delete_new_len",
-            )
+            .build_int_sub(len, self.i64_type.const_int(1, false), "list_delete_new_len")
             .expect("failed to decrement list_delete len");
         self.build_list_len_store(list_payload, new_len, "list_delete");
         self.builder
@@ -1412,8 +1256,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
     pub(super) fn define_pair_list_copy(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
-            self.pair_type()
-                .fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
@@ -1484,9 +1327,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_add(idx, self.i64_type.const_int(1, false), "list_copy_next")
             .expect("failed to increment list copy idx");
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed to loop list_copy");
+        self.builder.build_unconditional_branch(loop_block).expect("failed to loop list_copy");
         idx_phi.add_incoming(&[(&next, body_block)]);
 
         self.builder.position_at_end(done_block);

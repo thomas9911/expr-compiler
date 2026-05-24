@@ -15,10 +15,7 @@ struct Arena {
 
 impl Arena {
     fn with_capacity(bytes: usize) -> Self {
-        Self {
-            buf: vec![0; bytes],
-            offset: 0,
-        }
+        Self { buf: vec![0; bytes], offset: 0 }
     }
 
     fn reset(&mut self) {
@@ -28,9 +25,8 @@ impl Arena {
     fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         let base = self.buf.as_ptr() as usize;
         let start = align_up(base + self.offset, align) - base;
-        let end = start
-            .checked_add(size)
-            .unwrap_or_else(|| runtime_trap("arena allocation overflow"));
+        let end =
+            start.checked_add(size).unwrap_or_else(|| runtime_trap("arena allocation overflow"));
         if end > self.buf.len() {
             runtime_trap("out of arena memory");
         }
@@ -55,9 +51,7 @@ fn arena() -> &'static Mutex<Arena> {
 }
 
 fn with_arena<T>(f: impl FnOnce(&mut Arena) -> T) -> T {
-    let mut guard = arena()
-        .lock()
-        .unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
+    let mut guard = arena().lock().unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
     f(&mut guard)
 }
 
@@ -92,11 +86,7 @@ fn alloc_value(arena: &mut Arena, tag: ValueTag, payload: i64) -> i64 {
     let ptr =
         arena.alloc(std::mem::size_of::<Value>(), std::mem::align_of::<Value>()) as *mut Value;
     unsafe {
-        *ptr = Value {
-            tag,
-            padding: [0; 7],
-            payload,
-        };
+        *ptr = Value { tag, padding: [0; 7], payload };
     }
     ptr as usize as i64
 }
@@ -189,16 +179,11 @@ fn new_string_handle_from_bytes(bytes: &[u8]) -> i64 {
             }
         }
 
-        let header_ptr = arena.alloc(
-            std::mem::size_of::<StringHeader>(),
-            std::mem::align_of::<StringHeader>(),
-        ) as *mut StringHeader;
+        let header_ptr = arena
+            .alloc(std::mem::size_of::<StringHeader>(), std::mem::align_of::<StringHeader>())
+            as *mut StringHeader;
         unsafe {
-            *header_ptr = StringHeader {
-                len: bytes.len(),
-                cap: bytes.len(),
-                ptr: data_ptr,
-            };
+            *header_ptr = StringHeader { len: bytes.len(), cap: bytes.len(), ptr: data_ptr };
         }
 
         alloc_value(arena, ValueTag::String, header_ptr as usize as i64)
@@ -217,9 +202,7 @@ pub fn configure_runtime_arena(bytes: usize) {
     if bytes == 0 {
         runtime_trap("arena size must be > 0");
     }
-    let mut guard = arena()
-        .lock()
-        .unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
+    let mut guard = arena().lock().unwrap_or_else(|_| runtime_trap("arena mutex poisoned"));
     *guard = Arena::with_capacity(bytes);
 }
 
@@ -302,11 +285,7 @@ fn new_list_handle() -> i64 {
             std::mem::align_of::<ListHeader<Value>>(),
         ) as *mut ListHeader<Value>;
         unsafe {
-            *header_ptr = ListHeader {
-                ptr: data_ptr,
-                len: 0,
-                cap: LIST_INITIAL_CAPACITY,
-            };
+            *header_ptr = ListHeader { ptr: data_ptr, len: 0, cap: LIST_INITIAL_CAPACITY };
         }
 
         alloc_value(arena, ValueTag::List, header_ptr as usize as i64)
@@ -358,10 +337,7 @@ pub extern "C" fn __expr_list_new_host() -> i64 {
 pub extern "C" fn __expr_list_push_host(list: i64, value: i64) -> i64 {
     let header = list_header_ref(list);
     if header.len == header.cap {
-        let new_cap = header
-            .cap
-            .checked_mul(2)
-            .unwrap_or_else(|| runtime_trap("integer overflow"));
+        let new_cap = header.cap.checked_mul(2).unwrap_or_else(|| runtime_trap("integer overflow"));
         list_grow(list, new_cap);
     }
 
@@ -382,10 +358,7 @@ pub extern "C" fn __expr_list_insert_host(list: i64, index: i64, value: i64) -> 
         runtime_trap("list index out of bounds");
     }
     if header.len == header.cap {
-        let new_cap = header
-            .cap
-            .checked_mul(2)
-            .unwrap_or_else(|| runtime_trap("integer overflow"));
+        let new_cap = header.cap.checked_mul(2).unwrap_or_else(|| runtime_trap("integer overflow"));
         list_grow(list, new_cap);
     }
 
@@ -501,11 +474,7 @@ pub extern "C" fn __expr_list_copy_host(list: i64) -> i64 {
             std::mem::align_of::<ListHeader<Value>>(),
         ) as *mut ListHeader<Value>;
         unsafe {
-            *new_header = ListHeader {
-                ptr: new_data,
-                len: header.len,
-                cap: header.cap,
-            };
+            *new_header = ListHeader { ptr: new_data, len: header.len, cap: header.cap };
         }
 
         alloc_value(arena, ValueTag::List, new_header as usize as i64)
@@ -535,9 +504,7 @@ mod tests {
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("test mutex poisoned")
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("test mutex poisoned")
     }
 
     fn reset_for_test() {
@@ -546,9 +513,7 @@ mod tests {
 
     fn list_values(handle: i64) -> Vec<Value> {
         let header = list_header_ref(handle);
-        (0..header.len)
-            .map(|i| unsafe { *header.ptr.add(i) })
-            .collect()
+        (0..header.len).map(|i| unsafe { *header.ptr.add(i) }).collect()
     }
 
     fn string_bytes(handle: i64) -> Vec<u8> {
@@ -573,11 +538,7 @@ mod tests {
         let (tag, payload) = build_argv_list_value(&args);
         assert_eq!(tag, TAG_LIST);
 
-        let list = box_inline_value(Value {
-            tag: ValueTag::List,
-            padding: [0; 7],
-            payload,
-        });
+        let list = box_inline_value(Value { tag: ValueTag::List, padding: [0; 7], payload });
         let items = list_values(list);
         assert_eq!(items.len(), 2);
         assert_eq!(string_bytes(box_inline_value(items[0])), b"hello");
@@ -595,20 +556,14 @@ mod tests {
         assert_eq!(decode_int(__expr_list_len_host(xs)), Some(3));
         assert_eq!(decode_int(__expr_list_get_host(xs, new_int(1))), Some(20));
 
-        assert_eq!(
-            decode_int(__expr_list_set_host(xs, new_int(1), new_int(21))),
-            Some(21)
-        );
+        assert_eq!(decode_int(__expr_list_set_host(xs, new_int(1), new_int(21))), Some(21));
         assert_eq!(decode_int(__expr_list_get_host(xs, new_int(1))), Some(21));
 
         __expr_list_swap_host(xs, new_int(0), new_int(2));
         assert_eq!(decode_int(__expr_list_get_host(xs, new_int(0))), Some(30));
         assert_eq!(decode_int(__expr_list_get_host(xs, new_int(2))), Some(10));
 
-        assert_eq!(
-            decode_int(__expr_list_delete_host(xs, new_int(1))),
-            Some(21)
-        );
+        assert_eq!(decode_int(__expr_list_delete_host(xs, new_int(1))), Some(21));
         assert_eq!(decode_int(__expr_list_len_host(xs)), Some(2));
         assert_eq!(decode_int(__expr_list_get_host(xs, new_int(1))), Some(10));
 

@@ -74,7 +74,7 @@ fn validate_cli_runtime(
     }
     if output_kind == OutputKind::Component && !wasi_available {
         return Err(
-            "component wasm output requires building with the `wasi` cargo feature".to_string(),
+            "component wasm output requires building with the `wasi` cargo feature".to_string()
         );
     }
 
@@ -118,15 +118,10 @@ where
         return Err("--arena-mb must be > 0".to_string());
     }
 
-    let input = args
-        .free_from_str::<String>()
-        .map_err(|_| USAGE.to_string())?;
+    let input = args.free_from_str::<String>().map_err(|_| USAGE.to_string())?;
 
-    let mut program_args = args
-        .finish()
-        .into_iter()
-        .map(|x| x.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+    let mut program_args =
+        args.finish().into_iter().map(|x| x.to_string_lossy().to_string()).collect::<Vec<_>>();
     if matches!(program_args.first().map(String::as_str), Some("--")) {
         program_args.remove(0);
     }
@@ -237,10 +232,7 @@ fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
         return Ok((main.name.clone(), main.inputs.len()));
     }
 
-    let func = module
-        .functions
-        .first()
-        .ok_or_else(|| "no functions found".to_string())?;
+    let func = module.functions.first().ok_or_else(|| "no functions found".to_string())?;
     Ok((func.name.clone(), func.inputs.len()))
 }
 
@@ -276,9 +268,7 @@ fn run_jit(cli: &CliArgs, source: &str) -> Result<i32, String> {
 
 fn compile_native_or_exit(cli: &CliArgs, input: &Path, source: &str) {
     let output = finalize_output_path(
-        cli.output
-            .clone()
-            .unwrap_or_else(|| input.with_extension("").to_path_buf()),
+        cli.output.clone().unwrap_or_else(|| input.with_extension("").to_path_buf()),
     );
 
     Module::from_source(source).compile_to_executable_with_backend(&output, cli.backend);
@@ -385,27 +375,18 @@ mod tests {
 
     #[test]
     fn finalize_output_keeps_existing_extension() {
-        assert_eq!(
-            finalize_output_path(PathBuf::from("demo.bin")),
-            PathBuf::from("demo.bin")
-        );
+        assert_eq!(finalize_output_path(PathBuf::from("demo.bin")), PathBuf::from("demo.bin"));
     }
 
     #[test]
     fn classify_output_detects_native() {
         assert_eq!(classify_output(None), OutputKind::Native);
-        assert_eq!(
-            classify_output(Some(Path::new("examples/out"))),
-            OutputKind::Native
-        );
+        assert_eq!(classify_output(Some(Path::new("examples/out"))), OutputKind::Native);
     }
 
     #[test]
     fn classify_output_detects_wasm() {
-        assert_eq!(
-            classify_output(Some(Path::new("examples/out.wasm"))),
-            OutputKind::Wasm
-        );
+        assert_eq!(classify_output(Some(Path::new("examples/out.wasm"))), OutputKind::Wasm);
     }
 
     #[test]
@@ -450,30 +431,17 @@ mod tests {
 
     #[test]
     fn validate_cli_rejects_component_output_without_wasi_feature() {
-        let cli = parse_ok(&[
-            "examples/test.expr",
-            "--backend",
-            "llvm",
-            "-o",
-            "out.component.wasm",
-        ]);
+        let cli =
+            parse_ok(&["examples/test.expr", "--backend", "llvm", "-o", "out.component.wasm"]);
         let err = validate_cli_runtime(&cli, true, false)
             .expect_err("component output should require wasi");
-        assert_eq!(
-            err,
-            "component wasm output requires building with the `wasi` cargo feature"
-        );
+        assert_eq!(err, "component wasm output requires building with the `wasi` cargo feature");
     }
 
     #[test]
     fn validate_cli_accepts_component_output_when_available() {
-        let cli = parse_ok(&[
-            "examples/test.expr",
-            "--backend",
-            "llvm",
-            "-o",
-            "out.component.wasm",
-        ]);
+        let cli =
+            parse_ok(&["examples/test.expr", "--backend", "llvm", "-o", "out.component.wasm"]);
         let kind =
             validate_cli_runtime(&cli, true, true).expect("component output should be accepted");
         assert_eq!(kind, OutputKind::Component);

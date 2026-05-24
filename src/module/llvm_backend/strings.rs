@@ -26,10 +26,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     .expect("failed to gep string byte ptr")
             };
             self.builder
-                .build_store(
-                    byte_ptr,
-                    self.context.i8_type().const_int(byte as u64, false),
-                )
+                .build_store(byte_ptr, self.context.i8_type().const_int(byte as u64, false))
                 .expect("failed to store string byte");
         }
 
@@ -51,57 +48,32 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs_payload: IntValue<'ctx>,
         label: &str,
     ) -> IntValue<'ctx> {
-        let function = self
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let lhs_len = self.build_string_len_load(lhs_payload, &format!("{label}_lhs"));
         let rhs_len = self.build_string_len_load(rhs_payload, &format!("{label}_rhs"));
         let len_equal = self
             .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                lhs_len,
-                rhs_len,
-                &format!("{label}_len_eq"),
-            )
+            .build_int_compare(IntPredicate::EQ, lhs_len, rhs_len, &format!("{label}_len_eq"))
             .expect("failed to compare string lens");
-        let len_equal_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_len_ok"));
-        let false_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_false"));
-        let loop_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_loop"));
-        let body_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_body"));
-        let continue_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_continue"));
-        let done_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_done"));
+        let len_equal_block = self.context.append_basic_block(function, &format!("{label}_len_ok"));
+        let false_block = self.context.append_basic_block(function, &format!("{label}_false"));
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let continue_block =
+            self.context.append_basic_block(function, &format!("{label}_continue"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
         self.builder
             .build_conditional_branch(len_equal, len_equal_block, false_block)
             .expect("failed string len branch");
 
         self.builder.position_at_end(false_block);
-        self.builder
-            .build_unconditional_branch(done_block)
-            .expect("failed string false branch");
+        self.builder.build_unconditional_branch(done_block).expect("failed string false branch");
         let false_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(len_equal_block);
         let lhs_data = self.build_string_ptr_load(lhs_payload, &format!("{label}_lhs"));
         let rhs_data = self.build_string_ptr_load(rhs_payload, &format!("{label}_rhs"));
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed string loop jump");
+        self.builder.build_unconditional_branch(loop_block).expect("failed string loop jump");
         let len_ok_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(loop_block);
@@ -155,30 +127,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed rhs elem ptr");
         let lhs_byte = self
             .builder
-            .build_load(
-                self.context.i8_type(),
-                lhs_elem_ptr,
-                &format!("{label}_lhs_byte"),
-            )
+            .build_load(self.context.i8_type(), lhs_elem_ptr, &format!("{label}_lhs_byte"))
             .expect("failed lhs byte load")
             .into_int_value();
         let rhs_byte = self
             .builder
-            .build_load(
-                self.context.i8_type(),
-                rhs_elem_ptr,
-                &format!("{label}_rhs_byte"),
-            )
+            .build_load(self.context.i8_type(), rhs_elem_ptr, &format!("{label}_rhs_byte"))
             .expect("failed rhs byte load")
             .into_int_value();
         let bytes_equal = self
             .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                lhs_byte,
-                rhs_byte,
-                &format!("{label}_byte_eq"),
-            )
+            .build_int_compare(IntPredicate::EQ, lhs_byte, rhs_byte, &format!("{label}_byte_eq"))
             .expect("failed byte compare");
         self.builder
             .build_conditional_branch(bytes_equal, continue_block, false_block)
@@ -187,15 +146,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(continue_block);
         let next = self
             .builder
-            .build_int_add(
-                idx,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_next"),
-            )
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next"))
             .expect("failed string next");
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed continue to loop");
+        self.builder.build_unconditional_branch(loop_block).expect("failed continue to loop");
         let continue_end = self.builder.get_insert_block().unwrap();
         idx_phi.add_incoming(&[(&next, continue_end)]);
 
@@ -225,10 +178,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let global = self.module.add_global(array_type, None, name);
         global.set_linkage(Linkage::Internal);
         global.set_constant(true);
-        let values = bytes
-            .iter()
-            .map(|byte| byte_type.const_int(*byte as u64, false))
-            .collect::<Vec<_>>();
+        let values =
+            bytes.iter().map(|byte| byte_type.const_int(*byte as u64, false)).collect::<Vec<_>>();
         global.set_initializer(&byte_type.const_array(&values));
         global
     }
@@ -262,13 +213,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder
             .build_call(
                 write_bytes,
-                &[
-                    ptr.into(),
-                    self.context
-                        .i32_type()
-                        .const_int(bytes.len() as u64, false)
-                        .into(),
-                ],
+                &[ptr.into(), self.context.i32_type().const_int(bytes.len() as u64, false).into()],
                 &format!("{label}_write"),
             )
             .expect("failed to write static bytes");
@@ -313,11 +258,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )
             .expect("failed to compare int index tag");
         let idx_block = self.context.append_basic_block(
-            self.builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap(),
+            self.builder.get_insert_block().unwrap().get_parent().unwrap(),
             &format!("{label}_ok"),
         );
         self.builder
@@ -334,11 +275,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )
             .expect("failed to compare non-negative index");
         let non_neg_block = self.context.append_basic_block(
-            self.builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap(),
+            self.builder.get_insert_block().unwrap().get_parent().unwrap(),
             &format!("{label}_non_neg_ok"),
         );
         self.builder
@@ -384,12 +321,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_string_header_ptr(payload, label);
         let len_ptr = self
             .builder
-            .build_struct_gep(
-                self.string_header_type(),
-                ptr,
-                0,
-                &format!("{label}_len_ptr"),
-            )
+            .build_struct_gep(self.string_header_type(), ptr, 0, &format!("{label}_len_ptr"))
             .expect("failed to build string len gep");
         self.builder
             .build_load(self.i64_type, len_ptr, &format!("{label}_len"))
@@ -406,16 +338,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_string_header_ptr(payload, label);
         let cap_ptr = self
             .builder
-            .build_struct_gep(
-                self.string_header_type(),
-                ptr,
-                1,
-                &format!("{label}_cap_ptr"),
-            )
+            .build_struct_gep(self.string_header_type(), ptr, 1, &format!("{label}_cap_ptr"))
             .expect("failed to build string cap gep");
-        self.builder
-            .build_store(cap_ptr, cap)
-            .expect("failed to store string cap");
+        self.builder.build_store(cap_ptr, cap).expect("failed to store string cap");
     }
 
     pub(super) fn build_string_len_store(
@@ -427,16 +352,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_string_header_ptr(payload, label);
         let len_ptr = self
             .builder
-            .build_struct_gep(
-                self.string_header_type(),
-                ptr,
-                0,
-                &format!("{label}_len_ptr"),
-            )
+            .build_struct_gep(self.string_header_type(), ptr, 0, &format!("{label}_len_ptr"))
             .expect("failed to build string len gep");
-        self.builder
-            .build_store(len_ptr, len)
-            .expect("failed to store string len");
+        self.builder.build_store(len_ptr, len).expect("failed to store string len");
     }
 
     pub(super) fn build_string_ptr_load(
@@ -447,12 +365,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_string_header_ptr(payload, label);
         let data_ptr_ptr = self
             .builder
-            .build_struct_gep(
-                self.string_header_type(),
-                ptr,
-                2,
-                &format!("{label}_ptr_ptr"),
-            )
+            .build_struct_gep(self.string_header_type(), ptr, 2, &format!("{label}_ptr_ptr"))
             .expect("failed to build string ptr gep");
         self.builder
             .build_load(
@@ -473,16 +386,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_string_header_ptr(payload, label);
         let data_ptr_ptr = self
             .builder
-            .build_struct_gep(
-                self.string_header_type(),
-                ptr,
-                2,
-                &format!("{label}_ptr_ptr"),
-            )
+            .build_struct_gep(self.string_header_type(), ptr, 2, &format!("{label}_ptr_ptr"))
             .expect("failed to build string ptr gep");
-        self.builder
-            .build_store(data_ptr_ptr, ptr_value)
-            .expect("failed to store string ptr");
+        self.builder.build_store(data_ptr_ptr, ptr_value).expect("failed to store string ptr");
     }
 
     pub(super) fn build_string_iter_header_ptr(
@@ -549,12 +455,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_string_iter_header_ptr(payload, label);
         let index_ptr = self
             .builder
-            .build_struct_gep(
-                self.string_iter_header_type(),
-                ptr,
-                1,
-                &format!("{label}_index_ptr"),
-            )
+            .build_struct_gep(self.string_iter_header_type(), ptr, 1, &format!("{label}_index_ptr"))
             .expect("failed to build string iter index ptr");
         self.builder
             .build_load(self.i64_type, index_ptr, &format!("{label}_index"))
@@ -571,16 +472,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ptr = self.build_string_iter_header_ptr(payload, label);
         let index_ptr = self
             .builder
-            .build_struct_gep(
-                self.string_iter_header_type(),
-                ptr,
-                1,
-                &format!("{label}_index_ptr"),
-            )
+            .build_struct_gep(self.string_iter_header_type(), ptr, 1, &format!("{label}_index_ptr"))
             .expect("failed to build string iter index store ptr");
-        self.builder
-            .build_store(index_ptr, index)
-            .expect("failed to store string iter index");
+        self.builder.build_store(index_ptr, index).expect("failed to store string iter index");
     }
 
     pub(super) fn build_string_concat(
@@ -589,24 +483,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
         rhs: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let lhs_trap = self
-            .context
-            .append_basic_block(function, "string_concat_lhs_trap");
-        let lhs_ok = self
-            .context
-            .append_basic_block(function, "string_concat_lhs_ok");
+        let lhs_trap = self.context.append_basic_block(function, "string_concat_lhs_trap");
+        let lhs_ok = self.context.append_basic_block(function, "string_concat_lhs_ok");
         let lhs_raw =
             self.expect_tag_payload(lhs, TAG_STRING, "string_concat_lhs", lhs_ok, lhs_trap);
         self.builder.position_at_end(lhs_trap);
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(lhs_ok);
-        let rhs_trap = self
-            .context
-            .append_basic_block(function, "string_concat_rhs_trap");
-        let rhs_ok = self
-            .context
-            .append_basic_block(function, "string_concat_rhs_ok");
+        let rhs_trap = self.context.append_basic_block(function, "string_concat_rhs_trap");
+        let rhs_ok = self.context.append_basic_block(function, "string_concat_rhs_ok");
         let rhs_raw =
             self.expect_tag_payload(rhs, TAG_STRING, "string_concat_rhs", rhs_ok, rhs_trap);
         self.builder.position_at_end(rhs_trap);
@@ -639,21 +525,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
                          start_index: IntValue<'ctx>,
                          copy_len: IntValue<'ctx>,
                          label: &str| {
-            let function = this
-                .builder
-                .get_insert_block()
-                .unwrap()
-                .get_parent()
-                .unwrap();
-            let loop_block = this
-                .context
-                .append_basic_block(function, &format!("{label}_loop"));
-            let body_block = this
-                .context
-                .append_basic_block(function, &format!("{label}_body"));
-            let done_block = this
-                .context
-                .append_basic_block(function, &format!("{label}_done"));
+            let function = this.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let loop_block = this.context.append_basic_block(function, &format!("{label}_loop"));
+            let body_block = this.context.append_basic_block(function, &format!("{label}_body"));
+            let done_block = this.context.append_basic_block(function, &format!("{label}_done"));
             this.builder
                 .build_unconditional_branch(loop_block)
                 .expect("failed to branch to string concat loop");
@@ -717,22 +592,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 .expect("failed string concat dst ptr");
             let byte = this
                 .builder
-                .build_load(
-                    this.context.i8_type(),
-                    src_byte_ptr,
-                    &format!("{label}_byte"),
-                )
+                .build_load(this.context.i8_type(), src_byte_ptr, &format!("{label}_byte"))
                 .expect("failed to load string concat byte");
             this.builder
                 .build_store(dst_byte_ptr, byte)
                 .expect("failed to store string concat byte");
             let next_idx = this
                 .builder
-                .build_int_add(
-                    idx,
-                    this.i64_type.const_int(1, false),
-                    &format!("{label}_next_idx"),
-                )
+                .build_int_add(idx, this.i64_type.const_int(1, false), &format!("{label}_next_idx"))
                 .expect("failed string concat next idx");
             this.builder
                 .build_unconditional_branch(loop_block)
@@ -743,13 +610,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             this.builder.position_at_end(done_block);
         };
 
-        copy_into(
-            self,
-            lhs_data,
-            self.i64_type.const_zero(),
-            lhs_len,
-            "string_concat_lhs_copy",
-        );
+        copy_into(self, lhs_data, self.i64_type.const_zero(), lhs_len, "string_concat_lhs_copy");
         copy_into(self, rhs_data, lhs_len, rhs_len, "string_concat_rhs_copy");
 
         let header_size = self.i64_type.const_int(STRING_HEADER_SIZE as u64, false);
@@ -789,9 +650,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         string_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "string_chars_trap");
+        let string_trap = self.context.append_basic_block(function, "string_chars_trap");
         let string_ok = self.context.append_basic_block(function, "string_chars_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
@@ -806,9 +665,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(string_ok);
         let alloc = self.require_func("__alloc");
         let align = self.i64_type.const_int(8, false);
-        let header_size = self
-            .i64_type
-            .const_int(STRING_ITER_HEADER_SIZE as u64, false);
+        let header_size = self.i64_type.const_int(STRING_ITER_HEADER_SIZE as u64, false);
         let header_raw =
             self.build_boxed_call(alloc, &[header_size, align], "string_chars_iter_header");
         self.build_string_iter_string_store(header_raw, string_raw, "string_chars");
@@ -824,12 +681,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         iter_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let iter_trap = self
-            .context
-            .append_basic_block(function, "string_iter_done_trap");
-        let iter_ok = self
-            .context
-            .append_basic_block(function, "string_iter_done_ok");
+        let iter_trap = self.context.append_basic_block(function, "string_iter_done_trap");
+        let iter_ok = self.context.append_basic_block(function, "string_iter_done_ok");
         let iter_raw = self.expect_tag_payload(
             iter_value,
             TAG_STRING_ITER,
@@ -860,12 +713,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         iter_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let iter_trap = self
-            .context
-            .append_basic_block(function, "string_iter_next_trap");
-        let iter_ok = self
-            .context
-            .append_basic_block(function, "string_iter_next_ok");
+        let iter_trap = self.context.append_basic_block(function, "string_iter_next_trap");
+        let iter_ok = self.context.append_basic_block(function, "string_iter_next_ok");
         let iter_raw = self.expect_tag_payload(
             iter_value,
             TAG_STRING_ITER,
@@ -884,12 +733,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_compare(IntPredicate::ULT, index, len, "string_iter_next_not_done")
             .expect("failed string_iter_next done compare");
-        let done_trap = self
-            .context
-            .append_basic_block(function, "string_iter_next_done_trap");
-        let decode_block = self
-            .context
-            .append_basic_block(function, "string_iter_next_decode");
+        let done_trap = self.context.append_basic_block(function, "string_iter_next_done_trap");
+        let decode_block = self.context.append_basic_block(function, "string_iter_next_decode");
         self.builder
             .build_conditional_branch(not_done, decode_block, done_trap)
             .expect("failed string_iter_next branch");
@@ -913,27 +758,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
         label: &str,
     ) -> (IntValue<'ctx>, IntValue<'ctx>) {
         let lead = self.build_byte_load_at(data_ptr, index, &format!("{label}_lead"));
-        let ascii_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_ascii"));
-        let non_ascii_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_non_ascii"));
-        let two_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_two"));
-        let three_or_more_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_three_or_more"));
-        let three_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_three"));
-        let four_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_four"));
-        let done_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_done"));
+        let ascii_block = self.context.append_basic_block(function, &format!("{label}_ascii"));
+        let non_ascii_block =
+            self.context.append_basic_block(function, &format!("{label}_non_ascii"));
+        let two_block = self.context.append_basic_block(function, &format!("{label}_two"));
+        let three_or_more_block =
+            self.context.append_basic_block(function, &format!("{label}_three_or_more"));
+        let three_block = self.context.append_basic_block(function, &format!("{label}_three"));
+        let four_block = self.context.append_basic_block(function, &format!("{label}_four"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
 
         let is_ascii = self
             .builder
@@ -953,15 +786,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let ascii_cp = lead;
         let ascii_next = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_ascii_next"),
-            )
+            .build_int_add(index, self.i64_type.const_int(1, false), &format!("{label}_ascii_next"))
             .expect("failed utf8 ascii next");
-        self.builder
-            .build_unconditional_branch(done_block)
-            .expect("failed utf8 ascii merge");
+        self.builder.build_unconditional_branch(done_block).expect("failed utf8 ascii merge");
         let ascii_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(non_ascii_block);
@@ -991,20 +818,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_conditional_trap(valid_lead, function, &format!("{label}_two_lead"));
         let two_idx1 = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_two_idx1"),
-            )
+            .build_int_add(index, self.i64_type.const_int(1, false), &format!("{label}_two_idx1"))
             .expect("failed utf8 two idx1");
         let has_second = self
             .builder
-            .build_int_compare(
-                IntPredicate::ULT,
-                two_idx1,
-                len,
-                &format!("{label}_two_has_second"),
-            )
+            .build_int_compare(IntPredicate::ULT, two_idx1, len, &format!("{label}_two_has_second"))
             .expect("failed utf8 two len compare");
         self.build_conditional_trap(has_second, function, &format!("{label}_two_len"));
         let two_b1 = self.build_byte_load_at(data_ptr, two_idx1, &format!("{label}_two_b1"));
@@ -1037,15 +855,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed utf8 two cp");
         let two_next = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(2, false),
-                &format!("{label}_two_next"),
-            )
+            .build_int_add(index, self.i64_type.const_int(2, false), &format!("{label}_two_next"))
             .expect("failed utf8 two next");
-        self.builder
-            .build_unconditional_branch(done_block)
-            .expect("failed utf8 two merge");
+        self.builder.build_unconditional_branch(done_block).expect("failed utf8 two merge");
         let two_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(three_or_more_block);
@@ -1065,19 +877,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(three_block);
         let three_idx1 = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_three_idx1"),
-            )
+            .build_int_add(index, self.i64_type.const_int(1, false), &format!("{label}_three_idx1"))
             .expect("failed utf8 three idx1");
         let three_idx2 = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(2, false),
-                &format!("{label}_three_idx2"),
-            )
+            .build_int_add(index, self.i64_type.const_int(2, false), &format!("{label}_three_idx2"))
             .expect("failed utf8 three idx2");
         let has_third = self
             .builder
@@ -1145,15 +949,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed utf8 three cp");
         let three_next = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(3, false),
-                &format!("{label}_three_next"),
-            )
+            .build_int_add(index, self.i64_type.const_int(3, false), &format!("{label}_three_next"))
             .expect("failed utf8 three next");
-        self.builder
-            .build_unconditional_branch(done_block)
-            .expect("failed utf8 three merge");
+        self.builder.build_unconditional_branch(done_block).expect("failed utf8 three merge");
         let three_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(four_block);
@@ -1169,27 +967,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_conditional_trap(valid_four_lead, function, &format!("{label}_four_lead"));
         let four_idx1 = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_four_idx1"),
-            )
+            .build_int_add(index, self.i64_type.const_int(1, false), &format!("{label}_four_idx1"))
             .expect("failed utf8 four idx1");
         let four_idx2 = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(2, false),
-                &format!("{label}_four_idx2"),
-            )
+            .build_int_add(index, self.i64_type.const_int(2, false), &format!("{label}_four_idx2"))
             .expect("failed utf8 four idx2");
         let four_idx3 = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(3, false),
-                &format!("{label}_four_idx3"),
-            )
+            .build_int_add(index, self.i64_type.const_int(3, false), &format!("{label}_four_idx3"))
             .expect("failed utf8 four idx3");
         let has_fourth = self
             .builder
@@ -1277,15 +1063,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed utf8 four cp");
         let four_next = self
             .builder
-            .build_int_add(
-                index,
-                self.i64_type.const_int(4, false),
-                &format!("{label}_four_next"),
-            )
+            .build_int_add(index, self.i64_type.const_int(4, false), &format!("{label}_four_next"))
             .expect("failed utf8 four next");
-        self.builder
-            .build_unconditional_branch(done_block)
-            .expect("failed utf8 four merge");
+        self.builder.build_unconditional_branch(done_block).expect("failed utf8 four merge");
         let four_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(done_block);
@@ -1309,10 +1089,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             (&three_next, three_end),
             (&four_next, four_end),
         ]);
-        (
-            cp_phi.as_basic_value().into_int_value(),
-            next_phi.as_basic_value().into_int_value(),
-        )
+        (cp_phi.as_basic_value().into_int_value(), next_phi.as_basic_value().into_int_value())
     }
 
     pub(super) fn build_byte_load_at(
@@ -1357,11 +1134,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
     ) {
         let masked = self
             .builder
-            .build_and(
-                byte,
-                self.i64_type.const_int(0xc0, false),
-                &format!("{label}_masked"),
-            )
+            .build_and(byte, self.i64_type.const_int(0xc0, false), &format!("{label}_masked"))
             .expect("failed continuation mask");
         let ok = self
             .builder
@@ -1493,12 +1266,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         function: FunctionValue<'ctx>,
         label: &str,
     ) {
-        let ok_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_ok"));
-        let trap_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_trap"));
+        let ok_block = self.context.append_basic_block(function, &format!("{label}_ok"));
+        let trap_block = self.context.append_basic_block(function, &format!("{label}_trap"));
         self.builder
             .build_conditional_branch(ok, ok_block, trap_block)
             .expect("failed conditional trap branch");
@@ -1513,12 +1282,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         index_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "bytes_get_string_trap");
-        let string_ok = self
-            .context
-            .append_basic_block(function, "bytes_get_string_ok");
+        let string_trap = self.context.append_basic_block(function, "bytes_get_string_trap");
+        let string_ok = self.context.append_basic_block(function, "bytes_get_string_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
             TAG_STRING,
@@ -1530,14 +1295,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(string_ok);
-        let idx_trap = self
-            .context
-            .append_basic_block(function, "bytes_get_idx_trap");
+        let idx_trap = self.context.append_basic_block(function, "bytes_get_idx_trap");
         let idx = self.expect_tag_int(index_value, "bytes_get_index", idx_trap);
 
-        let trap_block = self
-            .context
-            .append_basic_block(function, "bytes_get_bounds_trap");
+        let trap_block = self.context.append_basic_block(function, "bytes_get_bounds_trap");
         let ok_block = self.context.append_basic_block(function, "bytes_get_ok");
         let non_neg = self
             .builder
@@ -1572,17 +1333,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_ptr_to_int(data_ptr, self.i64_type, "bytes_get_base")
             .expect("failed bytes_get ptr-to-int");
-        let addr = self
-            .builder
-            .build_int_add(base, idx, "bytes_get_addr")
-            .expect("failed bytes_get addr");
+        let addr =
+            self.builder.build_int_add(base, idx, "bytes_get_addr").expect("failed bytes_get addr");
         let ptr = self
             .builder
-            .build_int_to_ptr(
-                addr,
-                self.context.ptr_type(Default::default()),
-                "bytes_get_ptr",
-            )
+            .build_int_to_ptr(addr, self.context.ptr_type(Default::default()), "bytes_get_ptr")
             .expect("failed bytes_get ptr");
         let byte = self
             .builder
@@ -1603,12 +1358,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         end_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "bytes_slice_string_trap");
-        let string_ok = self
-            .context
-            .append_basic_block(function, "bytes_slice_string_ok");
+        let string_trap = self.context.append_basic_block(function, "bytes_slice_string_trap");
+        let string_ok = self.context.append_basic_block(function, "bytes_slice_string_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
             TAG_STRING,
@@ -1620,22 +1371,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(string_ok);
-        let start_trap = self
-            .context
-            .append_basic_block(function, "bytes_slice_start_trap");
+        let start_trap = self.context.append_basic_block(function, "bytes_slice_start_trap");
         let start = self.expect_tag_int(start_value, "bytes_slice_start", start_trap);
-        let end_trap = self
-            .context
-            .append_basic_block(function, "bytes_slice_end_trap");
+        let end_trap = self.context.append_basic_block(function, "bytes_slice_end_trap");
         let end = self.expect_tag_int(end_value, "bytes_slice_end", end_trap);
 
         let len = self.build_string_len_load(string_raw, "bytes_slice");
-        let bounds_trap = self
-            .context
-            .append_basic_block(function, "bytes_slice_bounds_trap");
-        let bounds_ok = self
-            .context
-            .append_basic_block(function, "bytes_slice_bounds_ok");
+        let bounds_trap = self.context.append_basic_block(function, "bytes_slice_bounds_trap");
+        let bounds_ok = self.context.append_basic_block(function, "bytes_slice_bounds_ok");
         let start_non_neg = self
             .builder
             .build_int_compare(
@@ -1719,18 +1462,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )
             .expect("failed bytes_slice src ptr");
 
-        let loop_block = self
-            .context
-            .append_basic_block(function, "bytes_slice_loop");
-        let body_block = self
-            .context
-            .append_basic_block(function, "bytes_slice_body");
-        let done_block = self
-            .context
-            .append_basic_block(function, "bytes_slice_done");
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed bytes_slice jump");
+        let loop_block = self.context.append_basic_block(function, "bytes_slice_loop");
+        let body_block = self.context.append_basic_block(function, "bytes_slice_body");
+        let done_block = self.context.append_basic_block(function, "bytes_slice_done");
+        self.builder.build_unconditional_branch(loop_block).expect("failed bytes_slice jump");
         let entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(loop_block);
@@ -1789,20 +1524,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_load(self.context.i8_type(), src_byte_ptr, "bytes_slice_byte")
             .expect("failed bytes_slice load");
-        self.builder
-            .build_store(dst_byte_ptr, byte)
-            .expect("failed bytes_slice store");
+        self.builder.build_store(dst_byte_ptr, byte).expect("failed bytes_slice store");
         let next_idx = self
             .builder
-            .build_int_add(
-                idx,
-                self.i64_type.const_int(1, false),
-                "bytes_slice_next_idx",
-            )
+            .build_int_add(idx, self.i64_type.const_int(1, false), "bytes_slice_next_idx")
             .expect("failed bytes_slice next idx");
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed bytes_slice continue");
+        self.builder.build_unconditional_branch(loop_block).expect("failed bytes_slice continue");
         let body_end = self.builder.get_insert_block().unwrap();
         idx_phi.add_incoming(&[(&next_idx, body_end)]);
 
@@ -1815,12 +1542,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         string_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "bytes_pop_string_trap");
-        let string_ok = self
-            .context
-            .append_basic_block(function, "bytes_pop_string_ok");
+        let string_trap = self.context.append_basic_block(function, "bytes_pop_string_trap");
+        let string_ok = self.context.append_basic_block(function, "bytes_pop_string_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
             TAG_STRING,
@@ -1833,9 +1556,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(string_ok);
         let len = self.build_string_len_load(string_raw, "bytes_pop");
-        let trap_block = self
-            .context
-            .append_basic_block(function, "bytes_pop_empty_trap");
+        let trap_block = self.context.append_basic_block(function, "bytes_pop_empty_trap");
         let ok_block = self.context.append_basic_block(function, "bytes_pop_ok");
         let non_empty = self
             .builder
@@ -1869,11 +1590,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bytes_pop addr");
         let ptr = self
             .builder
-            .build_int_to_ptr(
-                addr,
-                self.context.ptr_type(Default::default()),
-                "bytes_pop_ptr",
-            )
+            .build_int_to_ptr(addr, self.context.ptr_type(Default::default()), "bytes_pop_ptr")
             .expect("failed bytes_pop ptr");
         let byte = self
             .builder
@@ -1893,12 +1610,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         byte_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "bytes_push_string_trap");
-        let string_ok = self
-            .context
-            .append_basic_block(function, "bytes_push_string_ok");
+        let string_trap = self.context.append_basic_block(function, "bytes_push_string_trap");
+        let string_ok = self.context.append_basic_block(function, "bytes_push_string_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
             TAG_STRING,
@@ -1910,9 +1623,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(string_ok);
-        let byte_trap = self
-            .context
-            .append_basic_block(function, "bytes_push_byte_trap");
+        let byte_trap = self.context.append_basic_block(function, "bytes_push_byte_trap");
         let byte_raw = self.expect_tag_int(byte_value, "bytes_push_byte", byte_trap);
 
         let len = self.build_string_len_load(string_raw, "bytes_push");
@@ -1950,12 +1661,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .into_pointer_value();
 
         let grow_block = self.context.append_basic_block(function, "bytes_push_grow");
-        let write_block = self
-            .context
-            .append_basic_block(function, "bytes_push_write");
-        let merge_block = self
-            .context
-            .append_basic_block(function, "bytes_push_merge");
+        let write_block = self.context.append_basic_block(function, "bytes_push_write");
+        let merge_block = self.context.append_basic_block(function, "bytes_push_merge");
         self.builder
             .build_conditional_branch(
                 self.builder
@@ -2008,12 +1715,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder
             .build_store(data_ptr_ptr, new_data_ptr)
             .expect("failed bytes_push store data ptr");
-        self.builder
-            .build_store(cap_ptr, new_cap)
-            .expect("failed bytes_push store cap");
-        self.builder
-            .build_unconditional_branch(merge_block)
-            .expect("failed bytes_push grow merge");
+        self.builder.build_store(cap_ptr, new_cap).expect("failed bytes_push store cap");
+        self.builder.build_unconditional_branch(merge_block).expect("failed bytes_push grow merge");
         let grow_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(write_block);
@@ -2025,10 +1728,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(merge_block);
         let data_phi = self
             .builder
-            .build_phi(
-                self.context.ptr_type(Default::default()),
-                "bytes_push_data_phi",
-            )
+            .build_phi(self.context.ptr_type(Default::default()), "bytes_push_data_phi")
             .expect("failed bytes_push data phi");
         data_phi.add_incoming(&[(&new_data_ptr, grow_end), (&data_ptr, write_end)]);
         let active_data_ptr = data_phi.as_basic_value().into_pointer_value();
@@ -2054,19 +1754,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_truncate(
                 self.builder
-                    .build_and(
-                        byte_raw,
-                        self.i64_type.const_int(0xff, false),
-                        "bytes_push_mask",
-                    )
+                    .build_and(byte_raw, self.i64_type.const_int(0xff, false), "bytes_push_mask")
                     .expect("failed bytes_push mask"),
                 self.context.i8_type(),
                 "bytes_push_i8",
             )
             .expect("failed bytes_push truncate");
-        self.builder
-            .build_store(byte_ptr, byte_i8)
-            .expect("failed bytes_push store byte");
+        self.builder.build_store(byte_ptr, byte_i8).expect("failed bytes_push store byte");
         let new_len = self
             .builder
             .build_int_add(len, self.i64_type.const_int(1, false), "bytes_push_new_len")
@@ -2082,12 +1776,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         byte_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "bytes_set_string_trap");
-        let string_ok = self
-            .context
-            .append_basic_block(function, "bytes_set_string_ok");
+        let string_trap = self.context.append_basic_block(function, "bytes_set_string_trap");
+        let string_ok = self.context.append_basic_block(function, "bytes_set_string_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
             TAG_STRING,
@@ -2099,18 +1789,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(string_ok);
-        let idx_trap = self
-            .context
-            .append_basic_block(function, "bytes_set_idx_trap");
+        let idx_trap = self.context.append_basic_block(function, "bytes_set_idx_trap");
         let idx = self.expect_tag_int(index_value, "bytes_set_index", idx_trap);
-        let byte_trap = self
-            .context
-            .append_basic_block(function, "bytes_set_byte_trap");
+        let byte_trap = self.context.append_basic_block(function, "bytes_set_byte_trap");
         let byte_raw = self.expect_tag_int(byte_value, "bytes_set_byte", byte_trap);
 
-        let trap_block = self
-            .context
-            .append_basic_block(function, "bytes_set_bounds_trap");
+        let trap_block = self.context.append_basic_block(function, "bytes_set_bounds_trap");
         let ok_block = self.context.append_basic_block(function, "bytes_set_ok");
         let len = self.build_string_len_load(string_raw, "bytes_set");
         let in_bounds = self
@@ -2141,29 +1825,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bytes_set addr");
         let byte_ptr = self
             .builder
-            .build_int_to_ptr(
-                addr,
-                self.context.ptr_type(Default::default()),
-                "bytes_set_ptr",
-            )
+            .build_int_to_ptr(addr, self.context.ptr_type(Default::default()), "bytes_set_ptr")
             .expect("failed bytes_set ptr");
         let byte_i8 = self
             .builder
             .build_int_truncate(
                 self.builder
-                    .build_and(
-                        byte_raw,
-                        self.i64_type.const_int(0xff, false),
-                        "bytes_set_mask",
-                    )
+                    .build_and(byte_raw, self.i64_type.const_int(0xff, false), "bytes_set_mask")
                     .expect("failed bytes_set mask"),
                 self.context.i8_type(),
                 "bytes_set_i8",
             )
             .expect("failed bytes_set truncate");
-        self.builder
-            .build_store(byte_ptr, byte_i8)
-            .expect("failed bytes_set store");
+        self.builder.build_store(byte_ptr, byte_i8).expect("failed bytes_set store");
         string_value
     }
 
@@ -2174,12 +1848,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         byte_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "bytes_insert_string_trap");
-        let string_ok = self
-            .context
-            .append_basic_block(function, "bytes_insert_string_ok");
+        let string_trap = self.context.append_basic_block(function, "bytes_insert_string_trap");
+        let string_ok = self.context.append_basic_block(function, "bytes_insert_string_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
             TAG_STRING,
@@ -2191,18 +1861,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(string_ok);
-        let idx_trap = self
-            .context
-            .append_basic_block(function, "bytes_insert_idx_trap");
+        let idx_trap = self.context.append_basic_block(function, "bytes_insert_idx_trap");
         let idx = self.expect_tag_int(index_value, "bytes_insert_index", idx_trap);
-        let byte_trap = self
-            .context
-            .append_basic_block(function, "bytes_insert_byte_trap");
+        let byte_trap = self.context.append_basic_block(function, "bytes_insert_byte_trap");
         let byte_raw = self.expect_tag_int(byte_value, "bytes_insert_byte", byte_trap);
 
-        let trap_block = self
-            .context
-            .append_basic_block(function, "bytes_insert_bounds_trap");
+        let trap_block = self.context.append_basic_block(function, "bytes_insert_bounds_trap");
         let ok_block = self.context.append_basic_block(function, "bytes_insert_ok");
         let len = self.build_string_len_load(string_raw, "bytes_insert");
         let in_bounds = self
@@ -2253,15 +1917,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bytes_insert data ptr load")
             .into_pointer_value();
 
-        let grow_block = self
-            .context
-            .append_basic_block(function, "bytes_insert_grow");
-        let shift_setup_block = self
-            .context
-            .append_basic_block(function, "bytes_insert_shift_setup");
-        let merge_block = self
-            .context
-            .append_basic_block(function, "bytes_insert_merge");
+        let grow_block = self.context.append_basic_block(function, "bytes_insert_grow");
+        let shift_setup_block =
+            self.context.append_basic_block(function, "bytes_insert_shift_setup");
+        let merge_block = self.context.append_basic_block(function, "bytes_insert_merge");
         self.builder
             .build_conditional_branch(
                 self.builder
@@ -2311,9 +1970,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder
             .build_store(data_ptr_ptr, new_data_ptr)
             .expect("failed bytes_insert store data ptr");
-        self.builder
-            .build_store(cap_ptr, new_cap)
-            .expect("failed bytes_insert store cap");
+        self.builder.build_store(cap_ptr, new_cap).expect("failed bytes_insert store cap");
         self.builder
             .build_unconditional_branch(merge_block)
             .expect("failed bytes_insert grow merge");
@@ -2328,23 +1985,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(merge_block);
         let data_phi = self
             .builder
-            .build_phi(
-                self.context.ptr_type(Default::default()),
-                "bytes_insert_data_phi",
-            )
+            .build_phi(self.context.ptr_type(Default::default()), "bytes_insert_data_phi")
             .expect("failed bytes_insert data phi");
         data_phi.add_incoming(&[(&new_data_ptr, grow_end), (&data_ptr, shift_setup_end)]);
         let active_data_ptr = data_phi.as_basic_value().into_pointer_value();
 
-        let shift_loop = self
-            .context
-            .append_basic_block(function, "bytes_insert_shift_loop");
-        let shift_body = self
-            .context
-            .append_basic_block(function, "bytes_insert_shift_body");
-        let insert_block = self
-            .context
-            .append_basic_block(function, "bytes_insert_insert");
+        let shift_loop = self.context.append_basic_block(function, "bytes_insert_shift_loop");
+        let shift_body = self.context.append_basic_block(function, "bytes_insert_shift_body");
+        let insert_block = self.context.append_basic_block(function, "bytes_insert_insert");
         self.builder
             .build_unconditional_branch(shift_loop)
             .expect("failed bytes_insert jump to shift loop");
@@ -2359,12 +2007,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let shift_idx = idx_phi.as_basic_value().into_int_value();
         let needs_shift = self
             .builder
-            .build_int_compare(
-                IntPredicate::UGT,
-                shift_idx,
-                idx,
-                "bytes_insert_needs_shift",
-            )
+            .build_int_compare(IntPredicate::UGT, shift_idx, idx, "bytes_insert_needs_shift")
             .expect("failed bytes_insert shift compare");
         self.builder
             .build_conditional_branch(needs_shift, shift_body, insert_block)
@@ -2373,11 +2016,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(shift_body);
         let src_idx = self
             .builder
-            .build_int_sub(
-                shift_idx,
-                self.i64_type.const_int(1, false),
-                "bytes_insert_src_idx",
-            )
+            .build_int_sub(shift_idx, self.i64_type.const_int(1, false), "bytes_insert_src_idx")
             .expect("failed bytes_insert src idx");
         let src_addr = self
             .builder
@@ -2451,26 +2090,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_int_truncate(
                 self.builder
-                    .build_and(
-                        byte_raw,
-                        self.i64_type.const_int(0xff, false),
-                        "bytes_insert_mask",
-                    )
+                    .build_and(byte_raw, self.i64_type.const_int(0xff, false), "bytes_insert_mask")
                     .expect("failed bytes_insert mask"),
                 self.context.i8_type(),
                 "bytes_insert_i8",
             )
             .expect("failed bytes_insert truncate");
-        self.builder
-            .build_store(insert_ptr, byte_i8)
-            .expect("failed bytes_insert store");
+        self.builder.build_store(insert_ptr, byte_i8).expect("failed bytes_insert store");
         let new_len = self
             .builder
-            .build_int_add(
-                len,
-                self.i64_type.const_int(1, false),
-                "bytes_insert_new_len",
-            )
+            .build_int_add(len, self.i64_type.const_int(1, false), "bytes_insert_new_len")
             .expect("failed bytes_insert new len");
         self.build_string_len_store(string_raw, new_len, "bytes_insert");
         string_value
@@ -2482,12 +2111,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
         index_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "bytes_remove_string_trap");
-        let string_ok = self
-            .context
-            .append_basic_block(function, "bytes_remove_string_ok");
+        let string_trap = self.context.append_basic_block(function, "bytes_remove_string_trap");
+        let string_ok = self.context.append_basic_block(function, "bytes_remove_string_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
             TAG_STRING,
@@ -2499,14 +2124,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(string_ok);
-        let idx_trap = self
-            .context
-            .append_basic_block(function, "bytes_remove_idx_trap");
+        let idx_trap = self.context.append_basic_block(function, "bytes_remove_idx_trap");
         let idx = self.expect_tag_int(index_value, "bytes_remove_index", idx_trap);
 
-        let trap_block = self
-            .context
-            .append_basic_block(function, "bytes_remove_bounds_trap");
+        let trap_block = self.context.append_basic_block(function, "bytes_remove_bounds_trap");
         let ok_block = self.context.append_basic_block(function, "bytes_remove_ok");
         let len = self.build_string_len_load(string_raw, "bytes_remove");
         let in_bounds = self
@@ -2549,22 +2170,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         let last_index = self
             .builder
-            .build_int_sub(
-                len,
-                self.i64_type.const_int(1, false),
-                "bytes_remove_last_index",
-            )
+            .build_int_sub(len, self.i64_type.const_int(1, false), "bytes_remove_last_index")
             .expect("failed bytes_remove last index");
 
-        let shift_loop = self
-            .context
-            .append_basic_block(function, "bytes_remove_shift_loop");
-        let shift_body = self
-            .context
-            .append_basic_block(function, "bytes_remove_shift_body");
-        let done_block = self
-            .context
-            .append_basic_block(function, "bytes_remove_done");
+        let shift_loop = self.context.append_basic_block(function, "bytes_remove_shift_loop");
+        let shift_body = self.context.append_basic_block(function, "bytes_remove_shift_body");
+        let done_block = self.context.append_basic_block(function, "bytes_remove_done");
         self.builder
             .build_unconditional_branch(shift_loop)
             .expect("failed bytes_remove jump to loop");
@@ -2579,12 +2190,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let shift_idx = idx_phi.as_basic_value().into_int_value();
         let more = self
             .builder
-            .build_int_compare(
-                IntPredicate::ULT,
-                shift_idx,
-                last_index,
-                "bytes_remove_more",
-            )
+            .build_int_compare(IntPredicate::ULT, shift_idx, last_index, "bytes_remove_more")
             .expect("failed bytes_remove compare");
         self.builder
             .build_conditional_branch(more, shift_body, done_block)
@@ -2593,11 +2199,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(shift_body);
         let src_idx = self
             .builder
-            .build_int_add(
-                shift_idx,
-                self.i64_type.const_int(1, false),
-                "bytes_remove_src_idx",
-            )
+            .build_int_add(shift_idx, self.i64_type.const_int(1, false), "bytes_remove_src_idx")
             .expect("failed bytes_remove src idx");
         let src_addr = self
             .builder
@@ -2644,26 +2246,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bytes_remove moved byte store");
         let next_idx = self
             .builder
-            .build_int_add(
-                shift_idx,
-                self.i64_type.const_int(1, false),
-                "bytes_remove_next_idx",
-            )
+            .build_int_add(shift_idx, self.i64_type.const_int(1, false), "bytes_remove_next_idx")
             .expect("failed bytes_remove next idx");
-        self.builder
-            .build_unconditional_branch(shift_loop)
-            .expect("failed bytes_remove continue");
+        self.builder.build_unconditional_branch(shift_loop).expect("failed bytes_remove continue");
         let shift_body_end = self.builder.get_insert_block().unwrap();
         idx_phi.add_incoming(&[(&next_idx, shift_body_end)]);
 
         self.builder.position_at_end(done_block);
         let new_len = self
             .builder
-            .build_int_sub(
-                len,
-                self.i64_type.const_int(1, false),
-                "bytes_remove_new_len",
-            )
+            .build_int_sub(len, self.i64_type.const_int(1, false), "bytes_remove_new_len")
             .expect("failed bytes_remove new len");
         self.build_string_len_store(string_raw, new_len, "bytes_remove");
         let removed_i64 = self
@@ -2678,9 +2270,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         string_value: CompiledValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        let string_trap = self
-            .context
-            .append_basic_block(function, "string_copy_trap");
+        let string_trap = self.context.append_basic_block(function, "string_copy_trap");
         let string_ok = self.context.append_basic_block(function, "string_copy_ok");
         let string_raw = self.expect_tag_payload(
             string_value,
@@ -2718,18 +2308,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         function: FunctionValue<'ctx>,
         label: &str,
     ) {
-        let loop_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_loop"));
-        let body_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_body"));
-        let done_block = self
-            .context
-            .append_basic_block(function, &format!("{label}_done"));
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed copy loop jump");
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
+        self.builder.build_unconditional_branch(loop_block).expect("failed copy loop jump");
         let entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(loop_block);
@@ -2786,26 +2368,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed copy dst ptr");
         let byte = self
             .builder
-            .build_load(
-                self.context.i8_type(),
-                src_byte_ptr,
-                &format!("{label}_byte"),
-            )
+            .build_load(self.context.i8_type(), src_byte_ptr, &format!("{label}_byte"))
             .expect("failed copy byte load");
-        self.builder
-            .build_store(dst_byte_ptr, byte)
-            .expect("failed copy byte store");
+        self.builder.build_store(dst_byte_ptr, byte).expect("failed copy byte store");
         let next_idx = self
             .builder
-            .build_int_add(
-                idx,
-                self.i64_type.const_int(1, false),
-                &format!("{label}_next"),
-            )
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next"))
             .expect("failed copy next idx");
-        self.builder
-            .build_unconditional_branch(loop_block)
-            .expect("failed copy continue");
+        self.builder.build_unconditional_branch(loop_block).expect("failed copy continue");
         let body_end = self.builder.get_insert_block().unwrap();
         idx_phi.add_incoming(&[(&next_idx, body_end)]);
 
@@ -2824,7 +2394,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
     }
 
     pub(super) fn string_iter_header_type(&self) -> inkwell::types::StructType<'ctx> {
-        self.context
-            .struct_type(&[self.i64_type.into(), self.i64_type.into()], false)
+        self.context.struct_type(&[self.i64_type.into(), self.i64_type.into()], false)
     }
 }

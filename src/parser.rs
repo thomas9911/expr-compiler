@@ -10,10 +10,7 @@ pub struct ParseLexer<'a> {
 
 impl<'a> ParseLexer<'a> {
     pub fn new(lex: Lexer<'a>) -> Self {
-        ParseLexer {
-            lexer: lex,
-            buf: VecDeque::new(),
-        }
+        ParseLexer { lexer: lex, buf: VecDeque::new() }
     }
 
     pub fn peek(&mut self) -> Option<&Result<Token, LexingError>> {
@@ -56,21 +53,14 @@ pub struct ParseError<'a> {
 
 impl<'a> ParseError<'a> {
     fn unexpected(lex: &mut ParseLexer<'a>) -> ParseError<'a> {
-        ParseError {
-            span: lex.lexer.span(),
-            text: lex.lexer.slice(),
-        }
+        ParseError { span: lex.lexer.span(), text: lex.lexer.slice() }
         // ParseError { span, text }
     }
 }
 
 impl std::fmt::Display for ParseError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unexpected token {:?} at {}..{}",
-            self.text, self.span.start, self.span.end
-        )
+        write!(f, "unexpected token {:?} at {}..{}", self.text, self.span.start, self.span.end)
     }
 }
 
@@ -78,33 +68,16 @@ impl std::fmt::Display for ParseError<'_> {
 pub enum Ast {
     Block(BlockAst),
     FunctionDef(FunctionDefAst),
-    Lambda {
-        inputs: Vec<String>,
-        body: Box<Ast>,
-    },
+    Lambda { inputs: Vec<String>, body: Box<Ast> },
     FunctionRef(String),
     Expression(ExpressionAst),
     Literal(LiteralAst),
     ListLiteral(Vec<Ast>),
-    Index {
-        collection: Box<Ast>,
-        index: Box<Ast>,
-    },
-    IndexAssign {
-        collection: Box<Ast>,
-        index: Box<Ast>,
-        value: Box<Ast>,
-    },
+    Index { collection: Box<Ast>, index: Box<Ast> },
+    IndexAssign { collection: Box<Ast>, index: Box<Ast>, value: Box<Ast> },
     Variable(String),
-    Assign {
-        name: String,
-        value: Box<Ast>,
-    },
-    If {
-        condition: Box<Ast>,
-        then: BlockAst,
-        else_: Option<BlockAst>,
-    },
+    Assign { name: String, value: Box<Ast> },
+    If { condition: Box<Ast>, then: BlockAst, else_: Option<BlockAst> },
 }
 
 fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
@@ -179,9 +152,7 @@ fn parse_block_after_colon<'a>(lex: &mut ParseLexer<'a>) -> Result<BlockAst, Par
                 if matches!(lex.peek(), Some(Ok(Token::Else)) | Some(Ok(Token::Elif))) {
                     break;
                 }
-                block
-                    .lines
-                    .push(Ast::from_lexer_with_indent(lex, block_indent)?);
+                block.lines.push(Ast::from_lexer_with_indent(lex, block_indent)?);
             }
         }
     }
@@ -216,9 +187,7 @@ fn parse_if_after_keyword<'a>(
             Some(Ok(Token::Elif)) => {
                 consume_indents(lex, branch_indent);
                 lex.next();
-                Some(BlockAst {
-                    lines: vec![parse_if_after_keyword(lex, current_indent)?],
-                })
+                Some(BlockAst { lines: vec![parse_if_after_keyword(lex, current_indent)?] })
             }
             _ => None,
         }
@@ -226,11 +195,7 @@ fn parse_if_after_keyword<'a>(
         None
     };
 
-    Ok(Ast::If {
-        condition: Box::new(condition),
-        then,
-        else_,
-    })
+    Ok(Ast::If { condition: Box::new(condition), then, else_ })
 }
 
 impl Ast {
@@ -245,23 +210,16 @@ impl Ast {
         trim_newlines(lex);
 
         if matches!(lex.peek(), Some(Ok(Token::Symbol(_)))) {
-            let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
-                unreachable!()
-            };
+            let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
             let lhs = parse_postfix(lex, Ast::Variable(name))?;
             if lex.peek() == Some(&Ok(Token::Assign)) {
                 lex.next();
                 let value = parse_expr(lex, 0)?;
                 return match lhs {
-                    Ast::Variable(name) => Ok(Ast::Assign {
-                        name,
-                        value: Box::new(value),
-                    }),
-                    Ast::Index { collection, index } => Ok(Ast::IndexAssign {
-                        collection,
-                        index,
-                        value: Box::new(value),
-                    }),
+                    Ast::Variable(name) => Ok(Ast::Assign { name, value: Box::new(value) }),
+                    Ast::Index { collection, index } => {
+                        Ok(Ast::IndexAssign { collection, index, value: Box::new(value) })
+                    }
                     _ => Err(ParseError::unexpected(lex)),
                 };
             }
@@ -332,9 +290,7 @@ impl FunctionDefAst {
         loop {
             match lex.peek() {
                 Some(Ok(Token::Symbol(_))) if first => {
-                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
-                        unreachable!()
-                    };
+                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
                     function_def.name = name;
                     first = false;
                 }
@@ -393,10 +349,7 @@ impl ExpressionAst {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
         match parse_expr(lex, 0)? {
             Ast::Expression(e) => Ok(e),
-            single => Ok(ExpressionAst {
-                function: String::new(),
-                args: vec![single],
-            }),
+            single => Ok(ExpressionAst { function: String::new(), args: vec![single] }),
         }
     }
 }
@@ -516,10 +469,7 @@ fn parse_lambda<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         body
     };
 
-    Ok(Ast::Lambda {
-        inputs,
-        body: Box::new(body),
-    })
+    Ok(Ast::Lambda { inputs, body: Box::new(body) })
 }
 
 fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
@@ -530,10 +480,7 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
     if lex.peek() == Some(&Ok(Token::Not)) {
         lex.next();
         let rhs = parse_expr(lex, 2)?;
-        return Ok(Ast::Expression(ExpressionAst {
-            function: "not".to_string(),
-            args: vec![rhs],
-        }));
+        return Ok(Ast::Expression(ExpressionAst { function: "not".to_string(), args: vec![rhs] }));
     }
 
     let lhs = match lex.peek() {
@@ -547,9 +494,7 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         }
         Some(Ok(x)) if x.kind() == TokenKind::Integer => Ast::Literal(LiteralAst::from_lexer(lex)?),
         Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
-            let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
-                unreachable!()
-            };
+            let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
             Ast::Variable(name)
         }
         Some(Ok(Token::OpenBracket)) => {
@@ -604,10 +549,7 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                         _ => args.push(parse_expr(lex, 0)?),
                     }
                 }
-                lhs = Ast::Expression(ExpressionAst {
-                    function: function_name,
-                    args,
-                });
+                lhs = Ast::Expression(ExpressionAst { function: function_name, args });
             }
             Some(Ok(Token::OpenSquareBracket)) => {
                 lex.next();
@@ -615,10 +557,7 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                 if lex.next() != Some(Ok(Token::CloseSquareBracket)) {
                     return Err(ParseError::unexpected(lex));
                 }
-                lhs = Ast::Index {
-                    collection: Box::new(lhs),
-                    index: Box::new(index),
-                };
+                lhs = Ast::Index { collection: Box::new(lhs), index: Box::new(index) };
             }
             _ => break,
         }
@@ -827,10 +766,7 @@ fn parse_function_call_multi_args() {
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
                 function: "add".to_string(),
-                args: vec![
-                    Literal(LiteralAst::Integer(1)),
-                    Literal(LiteralAst::Integer(2)),
-                ],
+                args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
             })],
         },
     });
@@ -912,9 +848,7 @@ fn parse_if_without_else_elixir() {
                     function: "gt".to_string(),
                     args: vec![Variable("x".to_string()), Literal(LiteralAst::Integer(5))],
                 })),
-                then: BlockAst {
-                    lines: vec![Variable("x".to_string())],
-                },
+                then: BlockAst { lines: vec![Variable("x".to_string())] },
                 else_: None,
             }],
         },
@@ -942,12 +876,8 @@ fn parse_if_with_else_elixir() {
                     function: "gt".to_string(),
                     args: vec![Variable("x".to_string()), Literal(LiteralAst::Integer(5))],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(1))],
-                },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(2))],
-                }),
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(1))] },
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(2))] }),
             }],
         },
     });
@@ -974,12 +904,8 @@ fn parse_if_with_else_python() {
                     function: "gt".to_string(),
                     args: vec![Variable("x".to_string()), Literal(LiteralAst::Integer(5))],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(1))],
-                },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(2))],
-                }),
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(1))] },
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(2))] }),
             }],
         },
     });
@@ -1252,9 +1178,7 @@ fn parse_bigint_literal_expression() {
         name: "main".to_string(),
         inputs: vec![],
         output: None,
-        block: BlockAst {
-            lines: vec![Literal(LiteralAst::BigInt("123".to_string()))],
-        },
+        block: BlockAst { lines: vec![Literal(LiteralAst::BigInt("123".to_string()))] },
     });
 
     assert_eq!(ast, expected);
@@ -1275,9 +1199,7 @@ end"#;
         name: "main".to_string(),
         inputs: vec![],
         output: None,
-        block: BlockAst {
-            lines: vec![Literal(LiteralAst::String("hello\tworld".to_string()))],
-        },
+        block: BlockAst { lines: vec![Literal(LiteralAst::String("hello\tworld".to_string()))] },
     });
 
     assert_eq!(ast, expected);
@@ -1333,10 +1255,7 @@ fn parse_python_style_nested_if_with_inner_else() {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
                     function: "lt".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
                 then: BlockAst {
                     lines: vec![If {
@@ -1347,17 +1266,11 @@ fn parse_python_style_nested_if_with_inner_else() {
                                 Literal(LiteralAst::Integer(1)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(15))],
-                        },
-                        else_: Some(BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(34))],
-                        }),
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(15))] },
+                        else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(34))] }),
                     }],
                 },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(67))],
-                }),
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(67))] }),
             }],
         },
     });
@@ -1383,10 +1296,7 @@ fn parse_python_style_nested_if_without_inner_else() {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
                     function: "lt".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
                 then: BlockAst {
                     lines: vec![If {
@@ -1397,15 +1307,11 @@ fn parse_python_style_nested_if_without_inner_else() {
                                 Literal(LiteralAst::Integer(2)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(15))],
-                        },
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(15))] },
                         else_: None,
                     }],
                 },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(67))],
-                }),
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(67))] }),
             }],
         },
     });
@@ -1430,14 +1336,9 @@ fn parse_python_style_elif() {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
                     function: "eq".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(10))],
-                },
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(10))] },
                 else_: Some(BlockAst {
                     lines: vec![If {
                         condition: Box::new(Expression(ExpressionAst {
@@ -1447,12 +1348,8 @@ fn parse_python_style_elif() {
                                 Literal(LiteralAst::Integer(1)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(20))],
-                        },
-                        else_: Some(BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(30))],
-                        }),
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(20))] },
+                        else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(30))] }),
                     }],
                 }),
             }],
@@ -1479,14 +1376,9 @@ fn parse_python_style_nested_elif() {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
                     function: "eq".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(10))],
-                },
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(10))] },
                 else_: Some(BlockAst {
                     lines: vec![If {
                         condition: Box::new(Expression(ExpressionAst {
@@ -1496,9 +1388,7 @@ fn parse_python_style_nested_elif() {
                                 Literal(LiteralAst::Integer(3)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(20))],
-                        },
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(20))] },
                         else_: Some(BlockAst {
                             lines: vec![If {
                                 condition: Box::new(Expression(ExpressionAst {
@@ -1508,9 +1398,7 @@ fn parse_python_style_nested_elif() {
                                         Literal(LiteralAst::Integer(3)),
                                     ],
                                 })),
-                                then: BlockAst {
-                                    lines: vec![Literal(LiteralAst::Integer(30))],
-                                },
+                                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(30))] },
                                 else_: Some(BlockAst {
                                     lines: vec![Literal(LiteralAst::Integer(40))],
                                 }),
