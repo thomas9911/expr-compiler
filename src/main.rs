@@ -20,11 +20,65 @@ struct CliArgs {
     program_args: Vec<String>,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum OutputKind {
+    Native,
+    Wasm,
+    Component,
+}
+
 fn finalize_output_path(mut output: PathBuf) -> PathBuf {
     if cfg!(windows) && output.extension().is_none() {
         output.set_extension("exe");
     }
     output
+}
+
+fn classify_output(output: Option<&Path>) -> OutputKind {
+    let wants_wasm = output
+        .and_then(|path| path.extension())
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"));
+    let wants_component = output
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".component.wasm"));
+    if wants_component {
+        OutputKind::Component
+    } else if wants_wasm {
+        OutputKind::Wasm
+    } else {
+        OutputKind::Native
+    }
+}
+
+fn validate_cli_runtime(
+    cli: &CliArgs,
+    llvm_available: bool,
+    wasi_available: bool,
+) -> Result<OutputKind, String> {
+    if cli.backend == CodegenBackend::Llvm && !llvm_available {
+        return Err(
+            "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
+                .to_string(),
+        );
+    }
+
+    if cli.backend == CodegenBackend::Llvm && (cli.emit_ir || cli.run_ir) {
+        return Err("llvm backend does not support --emit-ir or --run-ir".to_string());
+    }
+
+    let output_kind = classify_output(cli.output.as_deref());
+    if output_kind == OutputKind::Wasm && cli.backend != CodegenBackend::Llvm {
+        return Err("wasm output currently supports only --backend llvm".to_string());
+    }
+    if output_kind == OutputKind::Component && !wasi_available {
+        return Err(
+            "component wasm output requires building with the `wasi` cargo feature".to_string(),
+        );
+    }
+
+    Ok(output_kind)
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
@@ -109,36 +163,8 @@ fn main() {
         std::process::exit(1);
     });
 
-    if cli.backend == CodegenBackend::Llvm && !llvm_backend_available() {
-        eprintln!(
-            "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-        );
-        std::process::exit(1);
-    }
-
-    if cli.backend == CodegenBackend::Llvm && (cli.emit_ir || cli.run_ir) {
-        eprintln!("llvm backend does not support --emit-ir or --run-ir");
-        std::process::exit(1);
-    }
-
-    let wants_wasm = cli
-        .output
-        .as_ref()
-        .and_then(|path| path.extension())
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"));
-    let wants_component = cli
-        .output
-        .as_ref()
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".component.wasm"));
-    if wants_wasm && cli.backend != CodegenBackend::Llvm {
-        eprintln!("wasm output currently supports only --backend llvm");
-        std::process::exit(1);
-    }
-    if wants_component && !cfg!(feature = "wasi") {
-        eprintln!("component wasm output requires building with the `wasi` cargo feature");
+    if let Err(err) = validate_cli_runtime(&cli, llvm_backend_available(), cfg!(feature = "wasi")) {
+        eprintln!("{err}");
         std::process::exit(1);
     }
 
@@ -298,5 +324,126 @@ mod tests {
         let err = parse_cli_args_from(["examples/test.expr", "--", "hello"])
             .expect_err("cli parse should fail");
         assert!(err.contains("unknown arguments: hello"));
+    }
+
+    #[test]
+    fn cli_help_returns_usage() {
+        let err =
+            parse_cli_args_from(["--help"]).expect_err("help should short-circuit with usage");
+        assert_eq!(err, USAGE);
+    }
+
+    #[test]
+    fn finalize_output_adds_windows_extension_only_when_missing() {
+        let input = PathBuf::from("demo");
+        let output = finalize_output_path(input);
+        if cfg!(windows) {
+            assert_eq!(output, PathBuf::from("demo.exe"));
+        } else {
+            assert_eq!(output, PathBuf::from("demo"));
+        }
+    }
+
+    #[test]
+    fn finalize_output_keeps_existing_extension() {
+        assert_eq!(
+            finalize_output_path(PathBuf::from("demo.bin")),
+            PathBuf::from("demo.bin")
+        );
+    }
+
+    #[test]
+    fn classify_output_detects_native() {
+        assert_eq!(classify_output(None), OutputKind::Native);
+        assert_eq!(
+            classify_output(Some(Path::new("examples/out"))),
+            OutputKind::Native
+        );
+    }
+
+    #[test]
+    fn classify_output_detects_wasm() {
+        assert_eq!(
+            classify_output(Some(Path::new("examples/out.wasm"))),
+            OutputKind::Wasm
+        );
+    }
+
+    #[test]
+    fn classify_output_detects_component_wasm() {
+        assert_eq!(
+            classify_output(Some(Path::new("examples/out.component.wasm"))),
+            OutputKind::Component
+        );
+    }
+
+    #[test]
+    fn validate_cli_rejects_missing_llvm_backend() {
+        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm"]);
+        let err = validate_cli_runtime(&cli, false, true)
+            .expect_err("llvm-less build should reject llvm backend");
+        assert!(err.contains("llvm backend is not available"));
+    }
+
+    #[test]
+    fn validate_cli_rejects_emit_ir_with_llvm_backend() {
+        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm", "--emit-ir"]);
+        let err =
+            validate_cli_runtime(&cli, true, true).expect_err("llvm backend should reject emit-ir");
+        assert_eq!(err, "llvm backend does not support --emit-ir or --run-ir");
+    }
+
+    #[test]
+    fn validate_cli_rejects_run_ir_with_llvm_backend() {
+        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm", "--run-ir"]);
+        let err =
+            validate_cli_runtime(&cli, true, true).expect_err("llvm backend should reject run-ir");
+        assert_eq!(err, "llvm backend does not support --emit-ir or --run-ir");
+    }
+
+    #[test]
+    fn validate_cli_rejects_wasm_output_without_llvm_backend() {
+        let cli = parse_ok(&["examples/test.expr", "-o", "out.wasm"]);
+        let err = validate_cli_runtime(&cli, true, true)
+            .expect_err("cranelift should reject wasm output");
+        assert_eq!(err, "wasm output currently supports only --backend llvm");
+    }
+
+    #[test]
+    fn validate_cli_rejects_component_output_without_wasi_feature() {
+        let cli = parse_ok(&[
+            "examples/test.expr",
+            "--backend",
+            "llvm",
+            "-o",
+            "out.component.wasm",
+        ]);
+        let err = validate_cli_runtime(&cli, true, false)
+            .expect_err("component output should require wasi");
+        assert_eq!(
+            err,
+            "component wasm output requires building with the `wasi` cargo feature"
+        );
+    }
+
+    #[test]
+    fn validate_cli_accepts_component_output_when_available() {
+        let cli = parse_ok(&[
+            "examples/test.expr",
+            "--backend",
+            "llvm",
+            "-o",
+            "out.component.wasm",
+        ]);
+        let kind =
+            validate_cli_runtime(&cli, true, true).expect("component output should be accepted");
+        assert_eq!(kind, OutputKind::Component);
+    }
+
+    #[test]
+    fn validate_cli_accepts_wasm_output_with_llvm_backend() {
+        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm", "-o", "out.wasm"]);
+        let kind = validate_cli_runtime(&cli, true, true).expect("wasm output should be accepted");
+        assert_eq!(kind, OutputKind::Wasm);
     }
 }

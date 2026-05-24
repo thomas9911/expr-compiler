@@ -528,10 +528,137 @@ pub extern "C" fn __expr_list_print_host(handle: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_int;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::*;
+    use crate::value::{TAG_BIGINT, TAG_FUNCTION, TAG_LIST, TAG_STRING, TAG_STRING_ITER};
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test mutex poisoned")
+    }
+
+    fn reset_for_test() {
+        reset_runtime_arena();
+    }
+
+    fn list_values(handle: i64) -> Vec<Value> {
+        let header = list_header_ref(handle);
+        (0..header.len)
+            .map(|i| unsafe { *header.ptr.add(i) })
+            .collect()
+    }
+
+    fn string_bytes(handle: i64) -> Vec<u8> {
+        let value = value_ref(handle);
+        assert_eq!(value.tag, ValueTag::String);
+        let header = unsafe { &*(value.payload as usize as *const StringHeader) };
+        unsafe { std::slice::from_raw_parts(header.ptr, header.len) }.to_vec()
+    }
 
     #[test]
     fn decode_int_rejects_non_runtime_pointer() {
+        let _guard = test_lock();
+        reset_for_test();
         assert_eq!(decode_int(1), None);
+    }
+
+    #[test]
+    fn argv_list_value_builds_string_list() {
+        let _guard = test_lock();
+        reset_for_test();
+        let args = vec!["hello".to_string(), "world".to_string()];
+        let (tag, payload) = build_argv_list_value(&args);
+        assert_eq!(tag, TAG_LIST);
+
+        let list = box_inline_value(Value {
+            tag: ValueTag::List,
+            padding: [0; 7],
+            payload,
+        });
+        let items = list_values(list);
+        assert_eq!(items.len(), 2);
+        assert_eq!(string_bytes(box_inline_value(items[0])), b"hello");
+        assert_eq!(string_bytes(box_inline_value(items[1])), b"world");
+    }
+
+    #[test]
+    fn list_host_mutation_helpers_work() {
+        let _guard = test_lock();
+        reset_for_test();
+        let xs = __expr_list_new_host();
+        __expr_list_push_host(xs, new_int(10));
+        __expr_list_push_host(xs, new_int(30));
+        __expr_list_insert_host(xs, new_int(1), new_int(20));
+        assert_eq!(decode_int(__expr_list_len_host(xs)), Some(3));
+        assert_eq!(decode_int(__expr_list_get_host(xs, new_int(1))), Some(20));
+
+        assert_eq!(
+            decode_int(__expr_list_set_host(xs, new_int(1), new_int(21))),
+            Some(21)
+        );
+        assert_eq!(decode_int(__expr_list_get_host(xs, new_int(1))), Some(21));
+
+        __expr_list_swap_host(xs, new_int(0), new_int(2));
+        assert_eq!(decode_int(__expr_list_get_host(xs, new_int(0))), Some(30));
+        assert_eq!(decode_int(__expr_list_get_host(xs, new_int(2))), Some(10));
+
+        assert_eq!(
+            decode_int(__expr_list_delete_host(xs, new_int(1))),
+            Some(21)
+        );
+        assert_eq!(decode_int(__expr_list_len_host(xs)), Some(2));
+        assert_eq!(decode_int(__expr_list_get_host(xs, new_int(1))), Some(10));
+
+        assert_eq!(decode_int(__expr_list_pop_host(xs)), Some(10));
+        assert_eq!(decode_int(__expr_list_len_host(xs)), Some(1));
+    }
+
+    #[test]
+    fn list_copy_host_is_independent() {
+        let _guard = test_lock();
+        reset_for_test();
+        let xs = __expr_list_new_host();
+        __expr_list_push_host(xs, new_int(1));
+        __expr_list_push_host(xs, new_int(2));
+        __expr_list_push_host(xs, new_int(3));
+        let ys = __expr_list_copy_host(xs);
+        assert_eq!(decode_int(__expr_list_delete_host(xs, new_int(1))), Some(2));
+        assert_eq!(decode_int(__expr_list_len_host(xs)), Some(2));
+        assert_eq!(decode_int(__expr_list_len_host(ys)), Some(3));
+        assert_eq!(decode_int(__expr_list_get_host(ys, new_int(1))), Some(2));
+    }
+
+    #[test]
+    fn box_value_host_supports_all_runtime_tags() {
+        let _guard = test_lock();
+        reset_for_test();
+
+        assert_eq!(decode_int(__expr_box_value_host(TAG_INT, 42)), Some(42));
+
+        let list = __expr_list_new_host();
+        let list_payload = value_ref(list).payload;
+        let boxed_list = __expr_box_value_host(TAG_LIST, list_payload);
+        assert_eq!(value_ref(boxed_list).tag, ValueTag::List);
+
+        let string = new_string_handle_from_bytes(b"abc");
+        let string_payload = value_ref(string).payload;
+        let boxed_string = __expr_box_value_host(TAG_STRING, string_payload);
+        assert_eq!(value_ref(boxed_string).tag, ValueTag::String);
+        assert_eq!(string_bytes(boxed_string), b"abc");
+
+        let function = __expr_box_value_host(TAG_FUNCTION, 123);
+        assert_eq!(value_ref(function).tag, ValueTag::Function);
+        assert_eq!(value_ref(function).payload, 123);
+
+        let bigint = __expr_box_value_host(TAG_BIGINT, 456);
+        assert_eq!(value_ref(bigint).tag, ValueTag::BigInt);
+        assert_eq!(value_ref(bigint).payload, 456);
+
+        let iter = __expr_box_value_host(TAG_STRING_ITER, 789);
+        assert_eq!(value_ref(iter).tag, ValueTag::StringIter);
+        assert_eq!(value_ref(iter).payload, 789);
     }
 }

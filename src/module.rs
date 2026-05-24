@@ -5407,9 +5407,23 @@ fn llvm_strings_bytes_push_and_set_work() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_jit_strings_bytes_push_and_set_work() {
+    let src = "fn main() do\n    s = \"hi\"\n    bytes_push(s, 33)\n    bytes_set(s, 1, 97)\n    bytes_len(s) + bytes_get(s, 0) + bytes_get(s, 1) + bytes_get(s, 2)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 237);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_strings_bytes_insert_and_remove_work() {
     let src = "fn main() do\n    s = \"heo\"\n    bytes_insert(s, 2, 108)\n    bytes_insert(s, 4, 33)\n    print(s)\n    print(bytes_remove(s, 1))\n    print(s)\n    print(bytes_len(s))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "helo!\n101\nhlo!\n4\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_strings_bytes_insert_and_remove_work() {
+    let src = "fn main() do\n    s = \"heo\"\n    bytes_insert(s, 2, 108)\n    bytes_insert(s, 4, 33)\n    removed = bytes_remove(s, 1)\n    removed + bytes_len(s) + bytes_get(s, 1)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 213);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -5421,9 +5435,23 @@ fn llvm_strings_copy_isolated_from_mutation() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_jit_strings_copy_isolated_from_mutation() {
+    let src = "fn main() do\n    s = \"hi\"\n    t = string_copy(s)\n    bytes_push(s, 33)\n    bytes_set(t, 1, 97)\n    bytes_len(s) + bytes_len(t) + bytes_get(s, 2) + bytes_get(t, 1)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 135);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_strings_utf8_iteration_works() {
     let src = "fn walk(it) do\n    if string_iter_done(it) do\n        0\n    else\n        print(string_iter_next(it))\n        walk(it)\n    end\nend\n\nfn main() do\n    walk(string_chars(\"hé🙂\"))\n    print(string_iter_done(string_chars(\"\")))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "104\n233\n128578\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_strings_utf8_iteration_works() {
+    let src = "fn walk(it, count) do\n    if string_iter_done(it) do\n        count\n    else\n        string_iter_next(it)\n        walk(it, count + 1)\n    end\nend\n\nfn main() do\n    walk(string_chars(\"hé🙂\"), 0)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 3);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -5440,6 +5468,13 @@ fn llvm_autoloaded_stdlib_string_helpers_work() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_jit_autoloaded_stdlib_string_helpers_work() {
+    let src = "fn main() do\n    if string_contains(\"banana\", \"nan\") and not string_contains(\"banana\", \"nab\") and string_repeat(\"ab\", 2) == \"abab\" and string_reverse(\"hé🙂\") == \"🙂éh\" do\n        1\n    else\n        0\n    end\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 1);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
     let src = "fn main() do\n    pred = string_is_empty\n    print(pred(\"\"))\n    print(pred(\"x\"))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n0\n", 0);
@@ -5447,9 +5482,24 @@ fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_jit_autoloaded_stdlib_functions_can_be_used_as_values() {
+    let src = "fn main() do\n    pred = string_is_empty\n    if pred(\"\") and not pred(\"x\") do\n        1\n    else\n        0\n    end\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 1);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_jit_logical_and_or_short_circuit() {
     let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\n    print(not 0)\n    print(not 7)\n    print(not 1 == 0)\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n1\n1\n1\n1\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_main_with_args_can_use_string_helpers() {
+    let src =
+        "fn main(args) do\n    s = list_get(args, 0)\n    bytes_len(s) + bytes_get(s, 0)\nend";
+    assert_jit_backend_result_with_args(src, CodegenBackend::Llvm, &["hi"], 106);
 }
 
 #[test]
