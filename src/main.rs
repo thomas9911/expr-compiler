@@ -210,7 +210,10 @@ fn maybe_handle_ir_modes(cli: &CliArgs, source: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let ir = Module::from_source(source).compile_to_ir();
+    let ir = Module::try_from_source(source)
+        .map_err(|err| err.to_string())?
+        .try_compile_to_ir()
+        .map_err(|err| err.to_string())?;
     if cli.emit_ir {
         write_ir_or_stdout(&ir, cli.output.as_deref());
     }
@@ -236,13 +239,13 @@ fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
 fn run_jit(cli: &CliArgs, source: &str) -> Result<i32, String> {
     configure_runtime_arena(cli.arena_mb * 1024 * 1024);
     reset_runtime_arena();
-    let module = Module::from_source(source);
+    let module = Module::try_from_source(source).map_err(|err| err.to_string())?;
     let (func_name, func_arity) = select_jit_entry(&module)?;
     if func_arity > 1 {
         return Err("jit entry function supports at most one argument".to_string());
     }
 
-    let jit = module.compile_to_jit_with_backend(cli.backend);
+    let jit = module.try_compile_to_jit_with_backend(cli.backend).map_err(|err| err.to_string())?;
     let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(&func_name) {
         if func_arity == 1 {
             let (arg_tag, arg_payload) = build_argv_list_value(&cli.program_args);
@@ -268,7 +271,12 @@ fn compile_native_or_exit(cli: &CliArgs, input: &Path, source: &str) {
         cli.output.clone().unwrap_or_else(|| input.with_extension("").to_path_buf()),
     );
 
-    Module::from_source(source).compile_to_executable_with_backend(&output, cli.backend);
+    Module::try_from_source(source)
+        .and_then(|module| module.try_compile_to_executable_with_backend(&output, cli.backend))
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(1);
+        });
     println!("compiled to {}", output.display());
 }
 

@@ -135,10 +135,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .builder
             .build_struct_gep(self.closure_type(), closure_raw_ptr, 1, "closure_env_ptr_ptr")
             .expect("failed to build closure env ptr ptr");
-        let ordinal = *self
-            .function_ordinals
-            .get(name)
-            .unwrap_or_else(|| panic!("missing function ordinal for function reference: {name}"));
+        let ordinal = *self.function_ordinals.get(name).unwrap_or_else(|| {
+            panic!("internal compiler error: validated function reference '{name}' has no ordinal")
+        });
         self.builder
             .build_store(ordinal_ptr, self.i64_type.const_int(ordinal as u64, true))
             .expect("failed to store closure ordinal");
@@ -164,7 +163,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         } else if self.function_ordinals.contains_key(name) {
             self.allocate_closure_for_function(name, vars, capture_slots, env_ptr, function)
         } else {
-            panic!("undefined variable: {name}");
+            unreachable!(
+                "undefined variable should have been rejected before llvm codegen: {name}"
+            );
         }
     }
 

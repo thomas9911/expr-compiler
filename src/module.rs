@@ -15,7 +15,8 @@ use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use thiserror::Error;
 #[cfg(feature = "llvm-backend")]
 mod llvm_backend;
 mod runtime_ir;
@@ -40,6 +41,38 @@ impl std::str::FromStr for CodegenBackend {
 
 pub fn llvm_backend_available() -> bool {
     cfg!(feature = "llvm-backend")
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CompileError {
+    #[error(
+        "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
+    )]
+    TopLevelExpression,
+    #[error("parse error: {0}")]
+    Parse(String),
+    #[error("llvm backend is not available in this build; enable the `llvm-backend` cargo feature")]
+    LlvmBackendUnavailable,
+    #[error(
+        "component wasm output requires the `wasi` cargo feature (which also enables `llvm-backend`)"
+    )]
+    WasiFeatureRequired,
+    #[error("component wasm output currently supports only the llvm backend")]
+    ComponentRequiresLlvm,
+    #[error("core wasm output currently supports only the llvm backend")]
+    WasmRequiresLlvm,
+    #[error("{mode} supports at most {max} argument(s), found {found}")]
+    InvalidMainArity { mode: &'static str, max: usize, found: usize },
+    #[error("{builtin} callback `{function}` must take exactly 1 argument")]
+    CallbackArity { builtin: String, function: String },
+    #[error("undefined function: {0}")]
+    UndefinedFunction(String),
+    #[error("undefined variable: {0}")]
+    UndefinedVariable(String),
+    #[error("{0} is not implemented yet")]
+    UnsupportedFeature(&'static str),
+    #[error("toolchain error: {0}")]
+    Toolchain(String),
 }
 
 pub struct Module {
@@ -85,13 +118,42 @@ struct UsedFeatures {
 }
 
 impl Module {
-    fn assert_native_main_arity(&self) {
+    fn validate_native_main_arity(&self) -> Result<(), CompileError> {
         if let Some(main) = self.functions.iter().find(|func| func.name == "main") {
-            assert!(
-                main.inputs.len() <= 1,
-                "native executable main function supports at most one argument"
-            );
+            if main.inputs.len() > 1 {
+                return Err(CompileError::InvalidMainArity {
+                    mode: "native executable main function",
+                    max: 1,
+                    found: main.inputs.len(),
+                });
+            }
         }
+        Ok(())
+    }
+
+    fn validate_user_facing_constructs(&self) -> Result<(), CompileError> {
+        let function_names =
+            self.functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
+        let function_arities = function_arities(&self.functions);
+        for func in &self.functions {
+            let mut scope_names = func.inputs.clone();
+            if let Some(metadata) = self.closure_metadata.get(&func.name) {
+                for capture in &metadata.captures {
+                    if !scope_names.contains(capture) {
+                        scope_names.push(capture.clone());
+                    }
+                }
+            }
+            collect_var_names(&Ast::Block(func.block.clone()), &mut scope_names);
+            let locals = scope_names.into_iter().collect::<HashSet<_>>();
+            validate_ast_user_facing(
+                &Ast::Block(func.block.clone()),
+                &locals,
+                &function_names,
+                &function_arities,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn new() -> Self {
@@ -107,10 +169,18 @@ impl Module {
     }
 
     pub fn from_source(source: &str) -> Self {
-        Self::from_functions(parse_source_functions(source))
+        Self::try_from_source(source).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_from_source(source: &str) -> Result<Self, CompileError> {
+        Self::try_from_functions(parse_source_functions(source)?)
     }
 
     pub fn from_ast(ast: Ast) -> Self {
+        Self::try_from_ast(ast).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_from_ast(ast: Ast) -> Result<Self, CompileError> {
         let mut functions = vec![];
         match ast {
             Ast::FunctionDef(func) => functions.push(func),
@@ -123,14 +193,18 @@ impl Module {
             }
             _ => {}
         }
-        Self::from_functions(functions)
+        Self::try_from_functions(functions)
     }
 
-    fn from_functions(functions: Vec<FunctionDefAst>) -> Self {
+    fn try_from_functions(functions: Vec<FunctionDefAst>) -> Result<Self, CompileError> {
+        for func in &functions {
+            validate_no_nested_function_defs(&Ast::Block(func.block.clone()))?;
+        }
         let functions = autoload_stdlib_functions(functions);
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
-        let used_features = collect_used_features(&functions);
-        Module { functions, closure_metadata, used_features }
+        let module = Module { functions, closure_metadata, used_features: UsedFeatures::default() };
+        let used_features = collect_used_features(&module.functions);
+        Ok(Module { used_features, ..module })
     }
 
     #[cfg(feature = "llvm-backend")]
@@ -149,23 +223,35 @@ impl Module {
     }
 
     pub fn compile_to_jit(self) -> JitArtifact {
-        self.compile_to_jit_with_backend(CodegenBackend::Cranelift)
+        self.try_compile_to_jit().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_jit(self) -> Result<JitArtifact, CompileError> {
+        self.try_compile_to_jit_with_backend(CodegenBackend::Cranelift)
     }
 
     pub fn compile_to_jit_with_backend(self, backend: CodegenBackend) -> JitArtifact {
+        self.try_compile_to_jit_with_backend(backend).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_jit_with_backend(
+        self,
+        backend: CodegenBackend,
+    ) -> Result<JitArtifact, CompileError> {
+        self.validate_user_facing_constructs()?;
         match backend {
-            CodegenBackend::Cranelift => JitArtifact::Cranelift(self.compile_to_cranelift_jit()),
+            CodegenBackend::Cranelift => {
+                Ok(JitArtifact::Cranelift(self.compile_to_cranelift_jit()))
+            }
             CodegenBackend::Llvm => {
                 #[cfg(feature = "llvm-backend")]
                 {
-                    JitArtifact::Llvm(llvm_backend::compile_to_jit(self))
+                    Ok(JitArtifact::Llvm(llvm_backend::compile_to_jit(self)?))
                 }
                 #[cfg(not(feature = "llvm-backend"))]
                 {
                     let _ = self;
-                    panic!(
-                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                    );
+                    Err(CompileError::LlvmBackendUnavailable)
                 }
             }
         }
@@ -253,6 +339,11 @@ impl Module {
     }
 
     pub fn compile_to_ir(self) -> String {
+        self.try_compile_to_ir().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_ir(self) -> Result<String, CompileError> {
+        self.validate_user_facing_constructs()?;
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -317,16 +408,29 @@ impl Module {
             out.push_str(&ir);
             out.push('\n');
         }
-        out
+        Ok(out)
     }
 
     pub fn compile_to_object(self, name: &str) -> Vec<u8> {
-        self.compile_to_object_with_backend(name, CodegenBackend::Cranelift)
+        self.try_compile_to_object(name).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_object(self, name: &str) -> Result<Vec<u8>, CompileError> {
+        self.try_compile_to_object_with_backend(name, CodegenBackend::Cranelift)
     }
 
     pub fn compile_to_object_with_backend(self, name: &str, backend: CodegenBackend) -> Vec<u8> {
+        self.try_compile_to_object_with_backend(name, backend).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_object_with_backend(
+        self,
+        name: &str,
+        backend: CodegenBackend,
+    ) -> Result<Vec<u8>, CompileError> {
+        self.validate_user_facing_constructs()?;
         match backend {
-            CodegenBackend::Cranelift => self.compile_to_cranelift_object(name),
+            CodegenBackend::Cranelift => Ok(self.compile_to_cranelift_object(name)),
             CodegenBackend::Llvm => {
                 #[cfg(feature = "llvm-backend")]
                 {
@@ -336,9 +440,7 @@ impl Module {
                 {
                     let _ = name;
                     let _ = self;
-                    panic!(
-                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                    );
+                    Err(CompileError::LlvmBackendUnavailable)
                 }
             }
         }
@@ -395,30 +497,42 @@ impl Module {
     }
 
     pub fn compile_to_executable(self, output: &Path) {
-        self.compile_to_executable_with_backend(output, CodegenBackend::Cranelift)
+        self.try_compile_to_executable(output).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_executable(self, output: &Path) -> Result<(), CompileError> {
+        self.try_compile_to_executable_with_backend(output, CodegenBackend::Cranelift)
     }
 
     pub fn compile_to_executable_with_backend(self, output: &Path, backend: CodegenBackend) {
-        self.assert_native_main_arity();
+        self.try_compile_to_executable_with_backend(output, backend)
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_executable_with_backend(
+        self,
+        output: &Path,
+        backend: CodegenBackend,
+    ) -> Result<(), CompileError> {
+        self.validate_user_facing_constructs()?;
+        self.validate_native_main_arity()?;
         if is_component_wasm_output(output) {
             match backend {
                 CodegenBackend::Llvm => {
                     #[cfg(all(feature = "llvm-backend", feature = "wasi"))]
                     {
-                        self.compile_to_llvm_component(output);
-                        return;
+                        self.compile_to_llvm_component(output)?;
+                        return Ok(());
                     }
                     #[cfg(not(all(feature = "llvm-backend", feature = "wasi")))]
                     {
                         let _ = output;
                         let _ = self;
-                        panic!(
-                            "component wasm output requires the `wasi` cargo feature (which also enables `llvm-backend`)"
-                        );
+                        return Err(CompileError::WasiFeatureRequired);
                     }
                 }
                 CodegenBackend::Cranelift => {
-                    panic!("component wasm output currently supports only the llvm backend");
+                    return Err(CompileError::ComponentRequiresLlvm);
                 }
             }
         }
@@ -428,44 +542,41 @@ impl Module {
                 CodegenBackend::Llvm => {
                     #[cfg(feature = "llvm-backend")]
                     {
-                        self.compile_to_llvm_wasm(output);
-                        return;
+                        self.compile_to_llvm_wasm(output)?;
+                        return Ok(());
                     }
                     #[cfg(not(feature = "llvm-backend"))]
                     {
                         let _ = output;
                         let _ = self;
-                        panic!(
-                            "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                        );
+                        return Err(CompileError::LlvmBackendUnavailable);
                     }
                 }
                 CodegenBackend::Cranelift => {
-                    panic!("core wasm output currently supports only the llvm backend");
+                    return Err(CompileError::WasmRequiresLlvm);
                 }
             }
         }
 
         match backend {
-            CodegenBackend::Cranelift => self.compile_to_cranelift_executable(output),
+            CodegenBackend::Cranelift => self.compile_to_cranelift_executable(output)?,
             CodegenBackend::Llvm => {
                 #[cfg(feature = "llvm-backend")]
                 {
-                    self.compile_to_llvm_executable(output);
+                    self.compile_to_llvm_executable(output)?;
                 }
                 #[cfg(not(feature = "llvm-backend"))]
                 {
                     let _ = output;
                     let _ = self;
-                    panic!(
-                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                    );
+                    return Err(CompileError::LlvmBackendUnavailable);
                 }
             }
         }
+        Ok(())
     }
 
-    fn compile_to_cranelift_executable(self, output: &Path) {
+    fn compile_to_cranelift_executable(self, output: &Path) -> Result<(), CompileError> {
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -549,11 +660,11 @@ impl Module {
         let tmp = output.with_extension("obj");
         #[cfg(not(windows))]
         let tmp = output.with_extension("o");
-        std::fs::write(&tmp, &bytes).unwrap();
+        write_file_or_compile_error(&tmp, &bytes, "failed to write native object file")?;
 
         #[cfg(windows)]
         let status = Command::new("rustc")
-            .arg(write_windows_wrapper(output))
+            .arg(write_windows_wrapper(output)?)
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -575,11 +686,11 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("rustc not found");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(not(windows))]
         let status = Command::new("rustc")
-            .arg(write_unix_rust_wrapper(output))
+            .arg(write_unix_rust_wrapper(output)?)
             .arg("--crate-name")
             .arg("expr_unix_wrapper")
             .arg("-C")
@@ -597,28 +708,31 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("rustc not found");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(windows)]
         std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
         #[cfg(not(windows))]
         std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
-        assert!(status.success(), "linker failed with: {status}");
+        if !status.success() {
+            return Err(command_status_error("rustc", "native executable link failed", status));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "llvm-backend")]
-    fn compile_to_llvm_executable(self, output: &Path) {
-        let bytes = llvm_backend::compile_to_object(self, "llvm_exe");
+    fn compile_to_llvm_executable(self, output: &Path) -> Result<(), CompileError> {
+        let bytes = llvm_backend::compile_to_object(self, "llvm_exe")?;
         #[cfg(windows)]
         let tmp = output.with_extension("obj");
         #[cfg(not(windows))]
         let tmp = output.with_extension("o");
-        std::fs::write(&tmp, &bytes).unwrap();
+        write_file_or_compile_error(&tmp, &bytes, "failed to write llvm object file")?;
 
         #[cfg(windows)]
         let status = Command::new("rustc")
-            .arg(write_windows_wrapper(output))
+            .arg(write_windows_wrapper(output)?)
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -640,11 +754,11 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("rustc not found");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(not(windows))]
         let status = Command::new("rustc")
-            .arg(write_unix_rust_wrapper(output))
+            .arg(write_unix_rust_wrapper(output)?)
             .arg("--crate-name")
             .arg("expr_unix_wrapper")
             .arg("-C")
@@ -660,18 +774,25 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("rustc not found");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(windows)]
         std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
         #[cfg(not(windows))]
         std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
-        assert!(status.success(), "linker failed with: {status}");
+        if !status.success() {
+            return Err(command_status_error(
+                "rustc",
+                "llvm native executable link failed",
+                status,
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "llvm-backend")]
-    fn compile_to_llvm_wasm(self, output: &Path) {
+    fn compile_to_llvm_wasm(self, output: &Path) -> Result<(), CompileError> {
         let has_supported_main =
             self.functions.iter().any(|func| func.name == "main" && func.inputs.len() <= 1);
         assert!(
@@ -679,20 +800,19 @@ impl Module {
             "llvm wasm output requires a main function with at most one argument"
         );
 
-        let asm = llvm_backend::compile_to_wasm_assembly(self, "llvm_wasm");
+        let asm = llvm_backend::compile_to_wasm_assembly(self, "llvm_wasm")?;
         let asm_tmp = output.with_extension("s");
         let obj_tmp = output.with_extension("o");
-        std::fs::write(&asm_tmp, &asm).unwrap();
+        write_file_or_compile_error(&asm_tmp, &asm, "failed to write llvm wasm assembly")?;
 
-        let assemble_status = Command::new(find_llvm_tool("llvm-mc"))
+        let mut llvm_mc = Command::new(find_llvm_tool("llvm-mc"));
+        llvm_mc
             .arg("-triple=wasm32-unknown-unknown")
             .arg("-filetype=obj")
             .arg(&asm_tmp)
             .arg("-o")
-            .arg(&obj_tmp)
-            .status()
-            .expect("llvm-mc not found");
-        assert!(assemble_status.success(), "wasm assembler failed with: {assemble_status}");
+            .arg(&obj_tmp);
+        run_command_or_compile_error(llvm_mc, "llvm-mc", "wasm assembly failed")?;
 
         let status = Command::new(find_wasm_ld())
             .arg(&obj_tmp)
@@ -705,7 +825,7 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("wasm-ld not found");
+            .map_err(|err| toolchain_error(format!("failed to launch wasm-ld: {err}")))?;
 
         if status.success() {
             std::fs::remove_file(&asm_tmp).ok();
@@ -717,11 +837,14 @@ impl Module {
                 obj_tmp.display()
             );
         }
-        assert!(status.success(), "wasm linker failed with: {status}");
+        if !status.success() {
+            return Err(command_status_error("wasm-ld", "wasm link failed", status));
+        }
+        Ok(())
     }
 
     #[cfg(all(feature = "llvm-backend", feature = "wasi"))]
-    fn compile_to_llvm_component(self, output: &Path) {
+    fn compile_to_llvm_component(self, output: &Path) -> Result<(), CompileError> {
         let has_supported_main =
             self.functions.iter().any(|func| func.name == "main" && func.inputs.len() <= 1);
         assert!(
@@ -729,21 +852,20 @@ impl Module {
             "llvm component output requires a main function with at most one argument"
         );
 
-        let asm = llvm_backend::compile_to_wasm_preview1_command_assembly(self, "llvm_component");
+        let asm = llvm_backend::compile_to_wasm_preview1_command_assembly(self, "llvm_component")?;
         let asm_tmp = output.with_extension("component.s");
         let obj_tmp = output.with_extension("component.o");
         let core_tmp = output.with_extension("core.wasm");
-        std::fs::write(&asm_tmp, &asm).unwrap();
+        write_file_or_compile_error(&asm_tmp, &asm, "failed to write llvm component assembly")?;
 
-        let assemble_status = Command::new(find_llvm_tool("llvm-mc"))
+        let mut llvm_mc = Command::new(find_llvm_tool("llvm-mc"));
+        llvm_mc
             .arg("-triple=wasm32-unknown-unknown")
             .arg("-filetype=obj")
             .arg(&asm_tmp)
             .arg("-o")
-            .arg(&obj_tmp)
-            .status()
-            .expect("llvm-mc not found");
-        assert!(assemble_status.success(), "wasm assembler failed with: {assemble_status}");
+            .arg(&obj_tmp);
+        run_command_or_compile_error(llvm_mc, "llvm-mc", "component wasm assembly failed")?;
 
         let link_status = Command::new(find_wasm_ld())
             .arg(&obj_tmp)
@@ -755,10 +877,13 @@ impl Module {
             .arg("-o")
             .arg(&core_tmp)
             .status()
-            .expect("wasm-ld not found");
-        assert!(link_status.success(), "wasm linker failed with: {link_status}");
+            .map_err(|err| toolchain_error(format!("failed to launch wasm-ld: {err}")))?;
+        if !link_status.success() {
+            return Err(command_status_error("wasm-ld", "component wasm link failed", link_status));
+        }
 
-        let core_bytes = std::fs::read(&core_tmp).expect("failed to read intermediate core wasm");
+        let core_bytes =
+            read_file_or_compile_error(&core_tmp, "failed to read intermediate core wasm")?;
         let component_bytes = wit_component::ComponentEncoder::default()
             .module(&core_bytes)
             .expect("failed to load core wasm into component encoder")
@@ -770,13 +895,14 @@ impl Module {
             .validate(true)
             .encode()
             .expect("failed to encode wasi component");
-        std::fs::write(output, component_bytes).expect("failed to write component output");
+        write_file_or_compile_error(output, component_bytes, "failed to write component output")?;
 
         if output.exists() {
             std::fs::remove_file(&asm_tmp).ok();
             std::fs::remove_file(&obj_tmp).ok();
             std::fs::remove_file(&core_tmp).ok();
         }
+        Ok(())
     }
 }
 
@@ -858,21 +984,27 @@ impl CraneliftJitModule {
 }
 
 #[cfg(windows)]
-fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
+fn write_windows_wrapper(output: &Path) -> Result<std::path::PathBuf, CompileError> {
     let wrapper = generated_wrapper_path(output, "windows_wrapper.rs");
     let source = include_str!("./wrapper/windows.rs");
-    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
+    let parent = wrapper.parent().unwrap();
+    std::fs::create_dir_all(parent).map_err(|err| {
+        io_toolchain_error("failed to create generated wrapper directory", parent, err)
+    })?;
+    write_file_or_compile_error(&wrapper, source, "failed to write generated windows wrapper")?;
+    Ok(wrapper)
 }
 
 #[cfg(not(windows))]
-fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
+fn write_unix_rust_wrapper(output: &Path) -> Result<std::path::PathBuf, CompileError> {
     let wrapper = generated_wrapper_path(output, "unix_wrapper.rs");
     let source = include_str!("./wrapper/unix.rs");
-    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
+    let parent = wrapper.parent().unwrap();
+    std::fs::create_dir_all(parent).map_err(|err| {
+        io_toolchain_error("failed to create generated wrapper directory", parent, err)
+    })?;
+    write_file_or_compile_error(&wrapper, source, "failed to write generated unix wrapper")?;
+    Ok(wrapper)
 }
 
 fn generated_wrapper_path(output: &Path, suffix: &str) -> std::path::PathBuf {
@@ -984,6 +1116,51 @@ fn executable_main_symbol_name() -> &'static str {
     }
 }
 
+fn toolchain_error(message: impl Into<String>) -> CompileError {
+    CompileError::Toolchain(message.into())
+}
+
+fn io_toolchain_error(context: &str, path: &Path, err: std::io::Error) -> CompileError {
+    toolchain_error(format!("{context} {}: {err}", path.display()))
+}
+
+fn write_file_or_compile_error(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+    context: &str,
+) -> Result<(), CompileError> {
+    std::fs::write(path, contents).map_err(|err| io_toolchain_error(context, path, err))
+}
+
+#[cfg(all(feature = "llvm-backend", feature = "wasi"))]
+fn read_file_or_compile_error(path: &Path, context: &str) -> Result<Vec<u8>, CompileError> {
+    std::fs::read(path).map_err(|err| io_toolchain_error(context, path, err))
+}
+
+#[cfg(feature = "llvm-backend")]
+fn run_command_or_compile_error(
+    mut command: Command,
+    tool_name: &str,
+    failure_context: &str,
+) -> Result<(), CompileError> {
+    let status = command.status().map_err(|err| {
+        toolchain_error(format!("{failure_context}: failed to launch {tool_name}: {err}"))
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(command_status_error(tool_name, failure_context, status))
+    }
+}
+
+fn command_status_error(
+    tool_name: &str,
+    failure_context: &str,
+    status: ExitStatus,
+) -> CompileError {
+    toolchain_error(format!("{failure_context}: {tool_name} exited with {status}"))
+}
+
 fn declare_jit_int_result_sig(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -1029,7 +1206,7 @@ fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
     functions.iter().map(|func| (func.name.clone(), func.inputs.len())).collect()
 }
 
-fn parse_source_functions(source: &str) -> Vec<FunctionDefAst> {
+fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
     use crate::parser::ParseLexer;
     use crate::tokenizer::{Logos, Token};
 
@@ -1046,16 +1223,12 @@ fn parse_source_functions(source: &str) -> Vec<FunctionDefAst> {
         }
         match Ast::from_lexer(&mut lexer) {
             Ok(Ast::FunctionDef(func)) => functions.push(func),
-            Ok(_) => {
-                panic!(
-                    "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
-                )
-            }
-            Err(err) => panic!("parse error: {err}"),
+            Ok(_) => return Err(CompileError::TopLevelExpression),
+            Err(err) => return Err(CompileError::Parse(err.to_string())),
         }
     }
 
-    functions
+    Ok(functions)
 }
 
 fn stdlib_function(name: &str) -> Option<StdlibFunction> {
@@ -1153,7 +1326,9 @@ fn autoload_stdlib_functions(mut functions: Vec<FunctionDefAst>) -> Vec<Function
             let Some(stdlib) = stdlib_function(&name) else {
                 continue;
             };
-            for func in parse_source_functions(stdlib.source) {
+            for func in parse_source_functions(stdlib.source)
+                .unwrap_or_else(|err| panic!("invalid stdlib source for {name}: {err}"))
+            {
                 if defined.insert(func.name.clone()) {
                     added.push(func);
                 }
@@ -1608,6 +1783,288 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
         )
 }
 
+fn is_operator_name(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "=="
+            | "!="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "and"
+            | "or"
+            | "not"
+            | "add"
+            | "subtract"
+            | "multiply"
+            | "divide"
+            | "modulo"
+            | "eq"
+            | "ne"
+            | "lt"
+            | "lte"
+            | "gt"
+            | "gte"
+    )
+}
+
+fn is_known_callable_name(name: &str, function_names: &HashSet<String>) -> bool {
+    is_builtin_name(name) || is_operator_name(name) || function_names.contains(name)
+}
+
+fn validate_unary_callback_reference(
+    ast: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+    builtin: &str,
+) -> Result<(), CompileError> {
+    match ast {
+        Ast::FunctionRef(name) => {
+            if !function_names.contains(name) {
+                return Err(CompileError::UndefinedFunction(name.clone()));
+            }
+            if function_arities.get(name) != Some(&1usize) {
+                return Err(CompileError::CallbackArity {
+                    builtin: builtin.to_string(),
+                    function: name.clone(),
+                });
+            }
+        }
+        Ast::Variable(name) if !locals.contains(name) && function_names.contains(name) => {
+            if function_arities.get(name) != Some(&1usize) {
+                return Err(CompileError::CallbackArity {
+                    builtin: builtin.to_string(),
+                    function: name.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_ast_user_facing(
+    ast: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    match ast {
+        Ast::Literal(_) => Ok(()),
+        Ast::Variable(name) => validate_variable_reference(name, locals, function_names),
+        Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
+        Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::FunctionRef(name) => validate_function_reference(name, function_names),
+        Ast::ListLiteral(items) => {
+            validate_ast_sequence(items, locals, function_names, function_arities)
+        }
+        Ast::Index { collection, index } => {
+            validate_index_ast(collection, index, locals, function_names, function_arities)
+        }
+        Ast::IndexAssign { collection, index, value } => validate_index_assign_ast(
+            collection,
+            index,
+            value,
+            locals,
+            function_names,
+            function_arities,
+        ),
+        Ast::Expression(ExpressionAst { function, args }) => validate_expression_user_facing(
+            function,
+            args,
+            locals,
+            function_names,
+            function_arities,
+        ),
+        Ast::Block(block) => {
+            validate_ast_sequence(&block.lines, locals, function_names, function_arities)
+        }
+        Ast::Assign { value, .. } => {
+            validate_ast_user_facing(value, locals, function_names, function_arities)
+        }
+        Ast::If { condition, then, else_ } => validate_if_ast_user_facing(
+            condition,
+            then,
+            else_,
+            locals,
+            function_names,
+            function_arities,
+        ),
+    }
+}
+
+fn validate_function_reference(
+    name: &str,
+    function_names: &HashSet<String>,
+) -> Result<(), CompileError> {
+    if function_names.contains(name) {
+        Ok(())
+    } else {
+        Err(CompileError::UndefinedFunction(name.to_string()))
+    }
+}
+
+fn validate_variable_reference(
+    name: &str,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+) -> Result<(), CompileError> {
+    if locals.contains(name) || function_names.contains(name) {
+        Ok(())
+    } else {
+        Err(CompileError::UndefinedVariable(name.to_string()))
+    }
+}
+
+fn validate_ast_sequence(
+    items: &[Ast],
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    for item in items {
+        validate_ast_user_facing(item, locals, function_names, function_arities)?;
+    }
+    Ok(())
+}
+
+fn validate_index_ast(
+    collection: &Ast,
+    index: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(collection, locals, function_names, function_arities)?;
+    validate_ast_user_facing(index, locals, function_names, function_arities)
+}
+
+fn validate_index_assign_ast(
+    collection: &Ast,
+    index: &Ast,
+    value: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(collection, locals, function_names, function_arities)?;
+    validate_ast_user_facing(index, locals, function_names, function_arities)?;
+    validate_ast_user_facing(value, locals, function_names, function_arities)
+}
+
+fn validate_expression_user_facing(
+    function: &str,
+    args: &[Ast],
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_callable_name(function, locals, function_names)?;
+    validate_callback_argument(function, args, locals, function_names, function_arities)?;
+    validate_ast_sequence(args, locals, function_names, function_arities)
+}
+
+fn validate_callable_name(
+    function: &str,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+) -> Result<(), CompileError> {
+    if !locals.contains(function) && !is_known_callable_name(function, function_names) {
+        return Err(CompileError::UndefinedFunction(function.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_callback_argument(
+    function: &str,
+    args: &[Ast],
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    if let Some(callback) = args.get(1) {
+        match function {
+            "list_map" | "list_filter" | "list_all" | "list_any" | "string_all" | "string_any" => {
+                validate_unary_callback_reference(
+                    callback,
+                    locals,
+                    function_names,
+                    function_arities,
+                    function,
+                )?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_if_ast_user_facing(
+    condition: &Ast,
+    then: &BlockAst,
+    else_: &Option<BlockAst>,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(condition, locals, function_names, function_arities)?;
+    validate_ast_sequence(&then.lines, locals, function_names, function_arities)?;
+    if let Some(else_) = else_ {
+        validate_ast_sequence(&else_.lines, locals, function_names, function_arities)?;
+    }
+    Ok(())
+}
+
+fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
+    match ast {
+        Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::Lambda { body, .. } => validate_no_nested_function_defs(body),
+        Ast::ListLiteral(items) => {
+            for item in items {
+                validate_no_nested_function_defs(item)?;
+            }
+            Ok(())
+        }
+        Ast::Index { collection, index } => {
+            validate_no_nested_function_defs(collection)?;
+            validate_no_nested_function_defs(index)
+        }
+        Ast::IndexAssign { collection, index, value } => {
+            validate_no_nested_function_defs(collection)?;
+            validate_no_nested_function_defs(index)?;
+            validate_no_nested_function_defs(value)
+        }
+        Ast::Expression(ExpressionAst { args, .. }) => {
+            for arg in args {
+                validate_no_nested_function_defs(arg)?;
+            }
+            Ok(())
+        }
+        Ast::Block(block) => {
+            for line in &block.lines {
+                validate_no_nested_function_defs(line)?;
+            }
+            Ok(())
+        }
+        Ast::Assign { value, .. } => validate_no_nested_function_defs(value),
+        Ast::If { condition, then, else_ } => {
+            validate_no_nested_function_defs(condition)?;
+            validate_no_nested_function_defs(&Ast::Block(then.clone()))?;
+            if let Some(else_) = else_ {
+                validate_no_nested_function_defs(&Ast::Block(else_.clone()))?;
+            }
+            Ok(())
+        }
+        Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => Ok(()),
+    }
+}
+
 fn lift_anonymous_functions(
     functions: Vec<FunctionDefAst>,
 ) -> (Vec<FunctionDefAst>, HashMap<String, ClosureMetadata>) {
@@ -1687,7 +2144,7 @@ impl LambdaLifter {
                     self.lift_block(else_block, scope_names);
                 }
             }
-            Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+            Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
             Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {}
         }
     }
@@ -1761,7 +2218,7 @@ fn collect_captures_into(
         Ast::Assign { value, .. } => {
             collect_captures_into(value, local_names, scope_names, captures);
         }
-        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+        Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
 
@@ -2816,7 +3273,9 @@ fn allocate_closure_for_function(
     let closure_call = builder.ins().call(alloc_ref, &[closure_size, closure_align]);
     let closure_ptr = builder.inst_results(closure_call)[0];
     let ordinal = *function_ordinals.get(function_name).unwrap_or_else(|| {
-        panic!("missing function ordinal for function reference: {function_name}")
+        panic!(
+            "internal compiler error: validated function reference '{function_name}' has no ordinal"
+        )
     });
     let ordinal_value = builder.ins().iconst(types::I64, ordinal);
     builder.ins().store(
@@ -2855,7 +3314,7 @@ fn resolve_named_value(
             env_ptr,
         )
     } else {
-        panic!("undefined variable: {name}");
+        unreachable!("undefined variable should have been rejected before codegen: {name}");
     }
 }
 
@@ -2876,7 +3335,9 @@ fn compile_list_literal(
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
 ) -> CompiledValue {
-    let list_new_ref = *func_refs.get("list_new").expect("builtin function 'list_new' is missing");
+    let list_new_ref = *func_refs
+        .get("list_new")
+        .expect("internal compiler error: builtin function 'list_new' is missing");
     let create_call = builder.ins().call(list_new_ref, &[]);
     let created = builder.inst_results(create_call);
     let handle = CompiledValue { tag: created[0], payload: created[1] };
@@ -2903,7 +3364,9 @@ fn create_empty_list(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
 ) -> CompiledValue {
-    let list_new_ref = *func_refs.get("list_new").expect("builtin function 'list_new' is missing");
+    let list_new_ref = *func_refs
+        .get("list_new")
+        .expect("internal compiler error: builtin function 'list_new' is missing");
     let create_call = builder.ins().call(list_new_ref, &[]);
     let created = builder.inst_results(create_call);
     CompiledValue { tag: created[0], payload: created[1] }
@@ -2919,12 +3382,16 @@ fn validate_unary_callback_ast(
     match ast {
         Ast::FunctionRef(name) => {
             if function_arities.get(name) != Some(&1usize) {
-                panic!("{builtin} callback must take exactly 1 argument");
+                unreachable!(
+                    "{builtin} callback arity should have been validated before codegen: {name}"
+                );
             }
         }
         Ast::Variable(name) if !vars.contains_key(name) && function_ordinals.contains_key(name) => {
             if function_arities.get(name) != Some(&1usize) {
-                panic!("{builtin} callback must take exactly 1 argument");
+                unreachable!(
+                    "{builtin} callback variable arity should have been validated before codegen: {name}"
+                );
             }
         }
         _ => {}
@@ -2950,7 +3417,9 @@ fn call_named_with_env(
     env_ptr: Value,
     args: &[CompiledValue],
 ) -> CompiledValue {
-    let func_ref = *func_refs.get(name).unwrap_or_else(|| panic!("function '{name}' is missing"));
+    let func_ref = *func_refs.get(name).unwrap_or_else(|| {
+        panic!("internal compiler error: validated function '{name}' is missing from func refs")
+    });
     let mut call_args = Vec::with_capacity(1 + args.len() * 2);
     call_args.push(env_ptr);
     for arg in args {
@@ -2990,7 +3459,10 @@ fn apply_function_value(
         .collect();
     candidates.sort_by_key(|(ordinal, _)| *ordinal);
     if candidates.is_empty() {
-        panic!("no unary functions are available for higher-order list builtins");
+        panic!(
+            "internal compiler error: no functions with arity {} are available for higher-order calls",
+            args.len()
+        );
     }
 
     let entry_check = builder.create_block();
@@ -3458,9 +3930,7 @@ fn compile_ast(
         Ast::Literal(LiteralAst::BigInt(digits)) => {
             compile_bigint_literal(builder, func_refs, digits)
         }
-        Ast::Lambda { .. } => {
-            panic!("anonymous functions are not implemented by the compiler yet");
-        }
+        Ast::Lambda { .. } => unimplemented!("anonymous functions"),
         Ast::FunctionRef(name) => allocate_closure_for_function(
             builder,
             vars,
@@ -3565,7 +4035,7 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+        Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
 
@@ -3706,7 +4176,9 @@ fn compile_assign_ast(
         capture_slots,
         env_ptr,
     );
-    let var = vars.get(name).unwrap_or_else(|| panic!("undeclared variable: {name}"));
+    let var = vars.get(name).unwrap_or_else(|| {
+        panic!("internal compiler error: assignment target '{name}' has no local slot")
+    });
     builder.def_var(var.tag, val.tag);
     builder.def_var(var.payload, val.payload);
     val
@@ -4329,7 +4801,7 @@ fn compile_named_expression_ast(
                 let results = builder.inst_results(call);
                 return CompiledValue { tag: results[0], payload: results[1] };
             }
-            panic!("undefined function: {name}");
+            unreachable!("undefined function should have been rejected before codegen: {name}");
         }
     }
 }
@@ -4350,6 +4822,94 @@ fn assert_cranelift_jit_result(src: &str, expected: i64) {
     let ptr = jit.get_int_result_fn_ptr("main").expect("cranelift int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), expected);
+}
+
+#[cfg(test)]
+#[test]
+fn try_from_source_rejects_top_level_expressions() {
+    let err = match Module::try_from_source("1 + 2") {
+        Ok(_) => panic!("top-level expression should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(err, CompileError::TopLevelExpression);
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_jit_rejects_undefined_functions() {
+    let src = "fn main() do\n    missing_fn(1)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("undefined function should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(err, CompileError::UndefinedFunction("missing_fn".to_string()));
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_jit_rejects_undefined_variables() {
+    let src = "fn main() do\n    missing_value\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("undefined variable should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(err, CompileError::UndefinedVariable("missing_value".to_string()));
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_jit_rejects_non_unary_callbacks() {
+    let src =
+        "fn main() do\n    xs = [1, 2, 3]\n    list_map(xs, fn a, b -> a + b end)\n    0\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("non-unary callback should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::CallbackArity {
+            builtin: "list_map".to_string(),
+            function: "__lambda_1".to_string(),
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_executable_rejects_main_with_too_many_arguments() {
+    let src = "fn main(a, b) do\n    a + b\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = module
+        .try_compile_to_executable_with_backend(
+            std::path::Path::new("out"),
+            CodegenBackend::Cranelift,
+        )
+        .expect_err("native executable main arity should be rejected");
+    assert_eq!(
+        err,
+        CompileError::InvalidMainArity {
+            mode: "native executable main function",
+            max: 1,
+            found: 2,
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_object_rejects_llvm_backend_when_unavailable() {
+    if llvm_backend_available() {
+        return;
+    }
+    let src = "fn main() do\n    1\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = module
+        .try_compile_to_object_with_backend("test", CodegenBackend::Llvm)
+        .expect_err("missing llvm feature should be rejected");
+    assert_eq!(err, CompileError::LlvmBackendUnavailable);
 }
 
 #[cfg(test)]
@@ -5088,7 +5648,7 @@ fn llvm_jit_main_with_args_can_use_string_helpers() {
 }
 
 #[test]
-#[should_panic(expected = "list_map callback must take exactly 1 argument")]
+#[should_panic(expected = "list_map callback `__lambda_1` must take exactly 1 argument")]
 fn jit_list_map_rejects_non_unary_callbacks() {
     let src =
         "fn main() do\n    xs = [1, 2, 3]\n    list_map(xs, fn a, b -> a + b end)\n    0\nend";

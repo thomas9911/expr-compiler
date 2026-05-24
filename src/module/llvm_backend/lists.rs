@@ -10,14 +10,18 @@ impl<'ctx> LlvmCompiler<'ctx> {
         match ast {
             Ast::FunctionRef(name) => {
                 if self.function_arities.get(name) != Some(&1usize) {
-                    panic!("{builtin} callback must take exactly 1 argument");
+                    unreachable!(
+                        "{builtin} callback arity should have been validated before llvm codegen: {name}"
+                    );
                 }
             }
             Ast::Variable(name)
                 if !vars.contains_key(name) && self.function_ordinals.contains_key(name) =>
             {
                 if self.function_arities.get(name) != Some(&1usize) {
-                    panic!("{builtin} callback must take exactly 1 argument");
+                    unreachable!(
+                        "{builtin} callback variable arity should have been validated before llvm codegen: {name}"
+                    );
                 }
             }
             _ => {}

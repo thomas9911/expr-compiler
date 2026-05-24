@@ -19,9 +19,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::Literal(LiteralAst::BigInt(digits)) => {
                 self.build_bigint_literal(digits, "bigint_literal")
             }
-            Ast::Lambda { .. } => {
-                panic!("anonymous functions are not implemented by the llvm backend yet");
-            }
+            Ast::Lambda { .. } => unimplemented!("anonymous functions"),
             Ast::FunctionRef(name) => {
                 self.allocate_closure_for_function(name, vars, capture_slots, env_ptr, function)
             }
@@ -55,7 +53,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::If { condition, then, else_ } => {
                 self.compile_if_ast(condition, then, else_, vars, capture_slots, env_ptr, function)
             }
-            Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+            Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
         }
     }
 
@@ -435,7 +433,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
         let value = self.compile_ast(value, vars, capture_slots, env_ptr, function);
-        let ptr = vars.get(name).unwrap_or_else(|| panic!("undeclared variable: {name}"));
+        let ptr = vars.get(name).unwrap_or_else(|| {
+            panic!("internal compiler error: assignment target '{name}' has no llvm local slot")
+        });
         self.builder
             .build_store(*ptr, self.make_pair_value(value.tag, value.payload, name))
             .expect("failed to assign variable");

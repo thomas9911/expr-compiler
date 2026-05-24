@@ -42,7 +42,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.context.void_type().fn_type(&[i32_type.into()], false),
                 None,
             ),
-            other => panic!("unsupported WASI Preview 1 import: {other}"),
+            other => unreachable!(
+                "internal compiler error: unsupported WASI Preview 1 import requested: {other}"
+            ),
         };
 
         let import_module =
@@ -62,10 +64,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .copied()
             .expect("missing main function for wasi command wrapper");
         let int_wrapper_name = int_result_symbol_name("main", LlvmOutputMode::WasiPreview1Command);
-        let int_wrapper = self
-            .module
-            .get_function(&int_wrapper_name)
-            .unwrap_or_else(|| panic!("missing int-result wrapper: {int_wrapper_name}"));
+        let int_wrapper = self.module.get_function(&int_wrapper_name).unwrap_or_else(|| {
+            panic!("internal compiler error: missing int-result wrapper: {int_wrapper_name}")
+        });
         let function = self.module.add_function(
             "_start",
             self.context.void_type().fn_type(&[], false),

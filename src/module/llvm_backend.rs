@@ -1,5 +1,6 @@
 use super::{
-    ClosureMetadata, Module, function_arities, function_ordinals, is_builtin_name, local_var_names,
+    ClosureMetadata, CompileError, Module, function_arities, function_ordinals, is_builtin_name,
+    local_var_names,
 };
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
@@ -91,9 +92,10 @@ impl LlvmJitModule {
     }
 }
 
-pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
-    Target::initialize_native(&InitializationConfig::default())
-        .unwrap_or_else(|e| panic!("failed to initialize LLVM native target: {e}"));
+pub(super) fn compile_to_jit(expr_module: Module) -> Result<LlvmJitModule, CompileError> {
+    Target::initialize_native(&InitializationConfig::default()).map_err(|e| {
+        CompileError::Toolchain(format!("failed to initialize LLVM native target: {e}"))
+    })?;
 
     let (context, module, _machine) = create_codegen_context("expr", LlvmTargetKind::Host);
 
@@ -119,25 +121,27 @@ pub(super) fn compile_to_jit(expr_module: Module) -> LlvmJitModule {
         compiler.into_functions()
     };
 
-    module.verify().unwrap_or_else(|e| panic!("invalid LLVM module: {e}"));
+    module.verify().map_err(|e| CompileError::Toolchain(format!("invalid LLVM module: {e}")))?;
 
-    let execution_engine = module
-        .create_jit_execution_engine(OptimizationLevel::None)
-        .unwrap_or_else(|e| panic!("failed to create LLVM execution engine: {e}"));
+    let execution_engine =
+        module.create_jit_execution_engine(OptimizationLevel::None).map_err(|e| {
+            CompileError::Toolchain(format!("failed to create LLVM execution engine: {e}"))
+        })?;
     install_runtime_mappings(&functions, &execution_engine);
 
-    LlvmJitModule {
+    Ok(LlvmJitModule {
         _context: context,
         _module: module,
         execution_engine,
         function_names: expr_module.functions.iter().map(|func| func.name.clone()).collect(),
         int_result_function_names,
-    }
+    })
 }
 
-pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
-    Target::initialize_native(&InitializationConfig::default())
-        .unwrap_or_else(|e| panic!("failed to initialize LLVM native target: {e}"));
+pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Result<Vec<u8>, CompileError> {
+    Target::initialize_native(&InitializationConfig::default()).map_err(|e| {
+        CompileError::Toolchain(format!("failed to initialize LLVM native target: {e}"))
+    })?;
 
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Host);
     {
@@ -154,15 +158,18 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Vec<u8> {
         compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::Executable);
     }
 
-    module.verify().unwrap_or_else(|e| panic!("invalid LLVM module: {e}"));
+    module.verify().map_err(|e| CompileError::Toolchain(format!("invalid LLVM module: {e}")))?;
 
     let buffer = machine
         .write_to_memory_buffer(module, FileType::Object)
-        .unwrap_or_else(|e| panic!("failed to emit LLVM object: {e}"));
-    buffer.as_slice().to_vec()
+        .map_err(|e| CompileError::Toolchain(format!("failed to emit LLVM object: {e}")))?;
+    Ok(buffer.as_slice().to_vec())
 }
 
-pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u8> {
+pub(super) fn compile_to_wasm_assembly(
+    expr_module: Module,
+    name: &str,
+) -> Result<Vec<u8>, CompileError> {
     Target::initialize_webassembly(&InitializationConfig::default());
     let needs_argv_list =
         expr_module.functions.iter().any(|func| func.name == "main" && func.inputs.len() == 1);
@@ -182,19 +189,19 @@ pub(super) fn compile_to_wasm_assembly(expr_module: Module, name: &str) -> Vec<u
         compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::Wasm);
     }
 
-    module.verify().unwrap_or_else(|e| panic!("invalid LLVM module: {e}"));
+    module.verify().map_err(|e| CompileError::Toolchain(format!("invalid LLVM module: {e}")))?;
 
     let buffer = machine
         .write_to_memory_buffer(module, FileType::Assembly)
-        .unwrap_or_else(|e| panic!("failed to emit LLVM wasm assembly: {e}"));
-    buffer.as_slice().to_vec()
+        .map_err(|e| CompileError::Toolchain(format!("failed to emit LLVM wasm assembly: {e}")))?;
+    Ok(buffer.as_slice().to_vec())
 }
 
 #[cfg(feature = "wasi")]
 pub(super) fn compile_to_wasm_preview1_command_assembly(
     expr_module: Module,
     name: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, CompileError> {
     Target::initialize_webassembly(&InitializationConfig::default());
     let needs_argv_list =
         expr_module.functions.iter().any(|func| func.name == "main" && func.inputs.len() == 1);
@@ -220,12 +227,12 @@ pub(super) fn compile_to_wasm_preview1_command_assembly(
         compiler.define_wasi_preview1_command_start_wrapper();
     }
 
-    module.verify().unwrap_or_else(|e| panic!("invalid LLVM module: {e}"));
+    module.verify().map_err(|e| CompileError::Toolchain(format!("invalid LLVM module: {e}")))?;
 
-    let buffer = machine
-        .write_to_memory_buffer(module, FileType::Assembly)
-        .unwrap_or_else(|e| panic!("failed to emit LLVM preview1 command assembly: {e}"));
-    buffer.as_slice().to_vec()
+    let buffer = machine.write_to_memory_buffer(module, FileType::Assembly).map_err(|e| {
+        CompileError::Toolchain(format!("failed to emit LLVM preview1 command assembly: {e}"))
+    })?;
+    Ok(buffer.as_slice().to_vec())
 }
 
 fn create_codegen_context(
@@ -851,11 +858,21 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 .expect("failed to allocate function param");
             let tag = function
                 .get_nth_param((index * 2 + 1) as u32)
-                .unwrap_or_else(|| panic!("missing tag param {index} for {}", func_def.name))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "internal compiler error: missing tag param {index} for {}",
+                        func_def.name
+                    )
+                })
                 .into_int_value();
             let payload = function
                 .get_nth_param((index * 2 + 2) as u32)
-                .unwrap_or_else(|| panic!("missing payload param {index} for {}", func_def.name))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "internal compiler error: missing payload param {index} for {}",
+                        func_def.name
+                    )
+                })
                 .into_int_value();
             self.builder
                 .build_store(ptr, self.make_pair_value(tag, payload, name))
@@ -916,7 +933,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .collect();
         candidates.sort_by_key(|(ordinal, _)| *ordinal);
         if candidates.is_empty() {
-            panic!("no unary functions are available for higher-order list builtins");
+            panic!(
+                "internal compiler error: no functions with arity {} are available for higher-order calls",
+                args.len()
+            );
         }
 
         let first_check = self.context.append_basic_block(function, &format!("{label}_check0"));
@@ -1107,8 +1127,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     .collect::<Vec<_>>();
                 for (index, value) in compiled.iter().enumerate() {
                     let ptr = vars.get(&current_function_inputs[index]).unwrap_or_else(|| {
-                        panic!("missing param slot {index} for {current_function_name}")
-                    });
+            panic!(
+                "internal compiler error: missing param slot {index} for {current_function_name}"
+            )
+        });
                     self.builder
                         .build_store(
                             *ptr,
@@ -1403,7 +1425,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
     }
 
     fn require_func(&self, name: &str) -> FunctionValue<'ctx> {
-        *self.functions.get(name).unwrap_or_else(|| panic!("missing function declaration: {name}"))
+        *self.functions.get(name).unwrap_or_else(|| {
+            panic!("internal compiler error: missing function declaration: {name}")
+        })
     }
 
     fn define_value_to_i64(&mut self) {
