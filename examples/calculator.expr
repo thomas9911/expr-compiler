@@ -7,12 +7,12 @@ fn main(args) do
         lhs_text = list_get(args, 1)
         rhs_text = list_get(args, 2)
 
-        lhs_ok, lhs, lhs_err = string_parse_bigint(lhs_text)
+        lhs_ok, lhs, lhs_err = string_try_parse_bigint(lhs_text)
         if not lhs_ok do
             print(string_concat("left operand error: ", lhs_err))
             1
         else
-            rhs_ok, rhs, rhs_err = string_parse_bigint(rhs_text)
+            rhs_ok, rhs, rhs_err = string_try_parse_bigint(rhs_text)
             if not rhs_ok do
                 print(string_concat("right operand error: ", rhs_err))
                 1

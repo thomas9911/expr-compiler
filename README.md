@@ -87,18 +87,26 @@ Current behavior:
     - `string_len(s)`
     - `string_first(s)`
     - `string_last(s)`
+    - `string_try_first(s)`
+    - `string_try_last(s)`
     - `string_starts_with(s, prefix)`
     - `string_ends_with(s, suffix)`
     - `string_contains(s, needle)`
+    - `bytes_try_get(s, index)`
+    - `string_try_pop(s)`
     - `string_is_ascii(s)`
     - `string_all(s, predicate)`
     - `string_is_integer(s)`
-    - `string_parse_integer(s)`
-    - `string_parse_bigint(s)`
+    - `string_try_parse_integer(s)`
+    - `string_try_parse_bigint(s)`
     - `string_repeat(s, n)`
     - `string_reverse(s)`
-  - `string_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
-  - `string_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
+  - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
+  - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
+  - `string_try_first(s)` returns `(ok, value, err)` where `value` is the first byte as an `Int`
+  - `string_try_last(s)` returns `(ok, value, err)` where `value` is the last byte as an `Int`
+  - `bytes_try_get(s, index)` returns `(ok, value, err)` where `value` is the byte at `index` as an `Int`
+  - `string_try_pop(s)` returns `(ok, value, err)` and mutates `s` on success
 - `print` can print string values
 - `string_concat(a, b)` concatenates two strings and returns a fresh string
 - `bytes_len(s)` returns the byte length as an `Int`

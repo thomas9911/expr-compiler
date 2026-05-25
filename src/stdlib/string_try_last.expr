@@ -1,0 +1,7 @@
+fn string_try_last(s) do
+    if bytes_len(s) == 0 do
+        false, 0, "expected non-empty string"
+    else
+        true, string_last(s), ""
+    end
+end
