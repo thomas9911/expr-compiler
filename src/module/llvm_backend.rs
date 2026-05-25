@@ -1118,7 +1118,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         current_function_inputs: &[String],
     ) {
         match ast {
-            Ast::Expression(ExpressionAst { function: name, args })
+            Ast::Expression(ExpressionAst { function: name, args, .. })
                 if name == current_function_name && !is_builtin_name(name) =>
             {
                 let compiled = args
@@ -1146,7 +1146,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     .build_unconditional_branch(loop_block)
                     .expect("failed to branch to llvm tail loop");
             }
-            Ast::If { condition, then, else_ } => {
+            Ast::If { condition, then, else_, .. } => {
                 let cond_value =
                     self.compile_ast(condition, vars, capture_slots, env_ptr, function);
                 let truth = self.build_internal_scalar_call(

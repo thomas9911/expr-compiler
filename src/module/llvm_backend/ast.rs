@@ -26,10 +26,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::ListLiteral(items) => {
                 self.compile_list_literal_ast(items, vars, capture_slots, env_ptr, function)
             }
-            Ast::Index { collection, index } => {
+            Ast::Index { collection, index, .. } => {
                 self.compile_index_ast(collection, index, vars, capture_slots, env_ptr, function)
             }
-            Ast::IndexAssign { collection, index, value } => self.compile_index_assign_ast(
+            Ast::IndexAssign { collection, index, value, .. } => self.compile_index_assign_ast(
                 collection,
                 index,
                 value,
@@ -38,7 +38,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 env_ptr,
                 function,
             ),
-            Ast::Expression(ExpressionAst { function: name, args }) => {
+            Ast::Expression(ExpressionAst { function: name, args, .. }) => {
                 self.compile_expression_ast(name, args, vars, capture_slots, env_ptr, function)
             }
             Ast::Block(block) => {
@@ -47,10 +47,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::Variable(name) => {
                 self.resolve_named_value(name, vars, capture_slots, env_ptr, function)
             }
-            Ast::Assign { name, value } => {
+            Ast::Assign { name, value, .. } => {
                 self.compile_assign_ast(name, value, vars, capture_slots, env_ptr, function)
             }
-            Ast::If { condition, then, else_ } => {
+            Ast::If { condition, then, else_, .. } => {
                 self.compile_if_ast(condition, then, else_, vars, capture_slots, env_ptr, function)
             }
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),

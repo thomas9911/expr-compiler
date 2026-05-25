@@ -9,16 +9,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
     ) {
         match ast {
             Ast::FunctionRef(name) => {
-                if self.function_arities.get(name) != Some(&1usize) {
+                if self.function_arities.get(name.as_str()) != Some(&1usize) {
                     unreachable!(
                         "{builtin} callback arity should have been validated before llvm codegen: {name}"
                     );
                 }
             }
             Ast::Variable(name)
-                if !vars.contains_key(name) && self.function_ordinals.contains_key(name) =>
+                if !vars.contains_key(name.as_str())
+                    && self.function_ordinals.contains_key(name.as_str()) =>
             {
-                if self.function_arities.get(name) != Some(&1usize) {
+                if self.function_arities.get(name.as_str()) != Some(&1usize) {
                     unreachable!(
                         "{builtin} callback variable arity should have been validated before llvm codegen: {name}"
                     );
