@@ -5641,6 +5641,86 @@ fn find_llvm_tool_falls_back_to_executable_name() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn try_compile_to_wasm_returns_toolchain_error_when_llvm_mc_is_missing() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let unique = format!(
+        "expr-compiler-missing-llvm-mc-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+    );
+    let missing_tool = std::env::temp_dir().join(if cfg!(windows) {
+        format!("{unique}.exe")
+    } else {
+        unique.clone()
+    });
+    let output = std::env::temp_dir().join(format!("{unique}.wasm"));
+    let old_tool = std::env::var_os("LLVM_MC");
+    unsafe { set_env_var("LLVM_MC", &missing_tool) };
+
+    let module = Module::try_from_source("fn main() do\n    0\nend").expect("source should parse");
+    let err = module
+        .try_compile_to_executable_with_backend(&output, CodegenBackend::Llvm)
+        .expect_err("missing llvm-mc should surface as toolchain error");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("LLVM_MC", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_MC") };
+    }
+    std::fs::remove_file(&output).ok();
+
+    match err {
+        CompileError::Toolchain(message) => {
+            assert!(message.contains("failed to launch llvm-mc"), "{message}");
+        }
+        other => panic!("expected toolchain error, got {other:?}"),
+    }
+}
+
+#[cfg(all(test, feature = "llvm-backend", feature = "wasi"))]
+#[test]
+fn try_compile_to_component_returns_toolchain_error_when_llvm_mc_is_missing() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let unique = format!(
+        "expr-compiler-missing-component-llvm-mc-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+    );
+    let missing_tool = std::env::temp_dir().join(if cfg!(windows) {
+        format!("{unique}.exe")
+    } else {
+        unique.clone()
+    });
+    let output = std::env::temp_dir().join(format!("{unique}.component.wasm"));
+    let old_tool = std::env::var_os("LLVM_MC");
+    unsafe { set_env_var("LLVM_MC", &missing_tool) };
+
+    let module = Module::try_from_source("fn main() do\n    0\nend").expect("source should parse");
+    let err = module
+        .try_compile_to_executable_with_backend(&output, CodegenBackend::Llvm)
+        .expect_err("missing llvm-mc should surface as component toolchain error");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("LLVM_MC", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_MC") };
+    }
+    std::fs::remove_file(&output).ok();
+
+    match err {
+        CompileError::Toolchain(message) => {
+            assert!(message.contains("failed to launch llvm-mc"), "{message}");
+        }
+        other => panic!("expected toolchain error, got {other:?}"),
+    }
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_jit_main_with_args_can_use_string_helpers() {
     let src =
         "fn main(args) do\n    s = list_get(args, 0)\n    bytes_len(s) + bytes_get(s, 0)\nend";
