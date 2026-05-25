@@ -29,10 +29,7 @@ fn parse_integer(lex: &mut Lexer<'_>) -> Result<i64, LexingError> {
                 }
                 _ => LexingErrorKind::InvalidInteger("other error".to_owned()),
             };
-            Err(LexingError {
-                error: kind,
-                span: lex.span(),
-            })
+            Err(LexingError { error: kind, span: lex.span() })
         }
     }
 }
@@ -164,70 +161,6 @@ pub enum Token {
     Ignored,
 }
 
-impl Token {
-    pub fn kind(&self) -> TokenKind {
-        match self {
-            Token::Indent => TokenKind::Space,
-            Token::Newline => TokenKind::Newline,
-            Token::BigIntLiteral(_) => TokenKind::Integer,
-            Token::StringLiteral(_) => TokenKind::Integer,
-            Token::Integer(_) => TokenKind::Integer,
-            Token::Add => TokenKind::InfixOperator,
-            Token::Arrow => TokenKind::Arrow,
-            Token::Subtract => TokenKind::InfixOperator,
-            Token::Multiply => TokenKind::InfixOperator,
-            Token::Divide => TokenKind::InfixOperator,
-            Token::Modulo => TokenKind::InfixOperator,
-            Token::GreaterThan => TokenKind::InfixOperator,
-            Token::LessThan => TokenKind::InfixOperator,
-            Token::GreaterThanOrEqual => TokenKind::InfixOperator,
-            Token::LessThanOrEqual => TokenKind::InfixOperator,
-            Token::EqualEqual => TokenKind::InfixOperator,
-            Token::NotEqual => TokenKind::InfixOperator,
-            Token::OpenBracket => TokenKind::OpenBracket,
-            Token::CloseBracket => TokenKind::CloseBracket,
-            Token::OpenSquareBracket => TokenKind::OpenSquareBracket,
-            Token::CloseSquareBracket => TokenKind::CloseSquareBracket,
-            Token::Comma => TokenKind::Comma,
-            Token::Assign => TokenKind::Assign,
-            Token::DefineFunction => TokenKind::DefineFunction,
-            Token::If => TokenKind::If,
-            Token::And | Token::Or => TokenKind::InfixOperator,
-            Token::Not => TokenKind::PrefixOperator,
-            Token::Elif => TokenKind::Else,
-            Token::Else => TokenKind::Else,
-            Token::True | Token::False => TokenKind::Integer,
-            Token::Comment => unreachable!(),
-            Token::DoBlock | Token::ColonBlock => TokenKind::StartBlock,
-            Token::EndBlock => TokenKind::EndBlock,
-            Token::Symbol(_) => TokenKind::Symbol,
-            Token::Ignored => unreachable!(),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub enum TokenKind {
-    Space,
-    Newline,
-    Integer,
-    InfixOperator,
-    PrefixOperator,
-    Arrow,
-    OpenBracket,
-    CloseBracket,
-    OpenSquareBracket,
-    CloseSquareBracket,
-    Comma,
-    Assign,
-    DefineFunction,
-    If,
-    Else,
-    StartBlock,
-    EndBlock,
-    Symbol,
-}
-
 #[test]
 fn tokenize_function() {
     use Token::*;
@@ -320,10 +253,7 @@ fn tokenize_bigint_literal() {
     use Token::*;
 
     let result: Result<Vec<_>, _> = Token::lexer("123n + 4").collect();
-    assert_eq!(
-        result.unwrap(),
-        vec![BigIntLiteral("123".to_string()), Add, Integer(4)]
-    );
+    assert_eq!(result.unwrap(), vec![BigIntLiteral("123".to_string()), Add, Integer(4)]);
 }
 
 #[test]
@@ -331,10 +261,7 @@ fn tokenize_string_literal() {
     use Token::*;
 
     let result: Result<Vec<_>, _> = Token::lexer("\"hello\\nworld\"").collect();
-    assert_eq!(
-        result.unwrap(),
-        vec![StringLiteral("hello\nworld".to_string())]
-    );
+    assert_eq!(result.unwrap(), vec![StringLiteral("hello\nworld".to_string())]);
 }
 
 #[test]
@@ -403,12 +330,7 @@ fn tokenize_function_call() {
     let result: Result<Vec<_>, _> = Token::lexer("double(x)").collect();
     assert_eq!(
         result.unwrap(),
-        vec![
-            Symbol("double".to_string()),
-            OpenBracket,
-            Symbol("x".to_string()),
-            CloseBracket,
-        ]
+        vec![Symbol("double".to_string()), OpenBracket, Symbol("x".to_string()), CloseBracket,]
     );
 
     let result: Result<Vec<_>, _> = Token::lexer("add(x, y)").collect();
@@ -449,50 +371,29 @@ fn tokenize_comparison_operators() {
     let result: Result<Vec<_>, _> = Token::lexer("a > b").collect();
     assert_eq!(
         result.unwrap(),
-        vec![
-            Symbol("a".to_string()),
-            GreaterThan,
-            Symbol("b".to_string())
-        ]
+        vec![Symbol("a".to_string()), GreaterThan, Symbol("b".to_string())]
     );
 
     let result: Result<Vec<_>, _> = Token::lexer("a < b").collect();
-    assert_eq!(
-        result.unwrap(),
-        vec![Symbol("a".to_string()), LessThan, Symbol("b".to_string())]
-    );
+    assert_eq!(result.unwrap(), vec![Symbol("a".to_string()), LessThan, Symbol("b".to_string())]);
 
     let result: Result<Vec<_>, _> = Token::lexer("a >= b").collect();
     assert_eq!(
         result.unwrap(),
-        vec![
-            Symbol("a".to_string()),
-            GreaterThanOrEqual,
-            Symbol("b".to_string())
-        ]
+        vec![Symbol("a".to_string()), GreaterThanOrEqual, Symbol("b".to_string())]
     );
 
     let result: Result<Vec<_>, _> = Token::lexer("a <= b").collect();
     assert_eq!(
         result.unwrap(),
-        vec![
-            Symbol("a".to_string()),
-            LessThanOrEqual,
-            Symbol("b".to_string())
-        ]
+        vec![Symbol("a".to_string()), LessThanOrEqual, Symbol("b".to_string())]
     );
 
     let result: Result<Vec<_>, _> = Token::lexer("a == b").collect();
-    assert_eq!(
-        result.unwrap(),
-        vec![Symbol("a".to_string()), EqualEqual, Symbol("b".to_string())]
-    );
+    assert_eq!(result.unwrap(), vec![Symbol("a".to_string()), EqualEqual, Symbol("b".to_string())]);
 
     let result: Result<Vec<_>, _> = Token::lexer("a != b").collect();
-    assert_eq!(
-        result.unwrap(),
-        vec![Symbol("a".to_string()), NotEqual, Symbol("b".to_string())]
-    );
+    assert_eq!(result.unwrap(), vec![Symbol("a".to_string()), NotEqual, Symbol("b".to_string())]);
 }
 
 #[test]
@@ -529,13 +430,7 @@ fn tokenize_logical_keywords() {
     let result: Result<Vec<_>, _> = Token::lexer("a and b or c").collect();
     assert_eq!(
         result.unwrap(),
-        vec![
-            Symbol("a".to_string()),
-            And,
-            Symbol("b".to_string()),
-            Or,
-            Symbol("c".to_string()),
-        ]
+        vec![Symbol("a".to_string()), And, Symbol("b".to_string()), Or, Symbol("c".to_string()),]
     );
 }
 

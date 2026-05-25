@@ -1,4 +1,5 @@
-use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
+use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst};
+use crate::source::Span;
 use crate::value::{
     CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, STRING_CAP_OFFSET,
     STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
@@ -15,7 +16,8 @@ use cranelift::object::{ObjectBuilder, ObjectModule};
 use cranelift::prelude::{isa::OwnedTargetIsa, settings, *};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use thiserror::Error;
 #[cfg(feature = "llvm-backend")]
 mod llvm_backend;
 mod runtime_ir;
@@ -42,8 +44,54 @@ pub fn llvm_backend_available() -> bool {
     cfg!(feature = "llvm-backend")
 }
 
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CompileError {
+    #[error(
+        "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
+    )]
+    TopLevelExpression,
+    #[error("parse error: {message}")]
+    Parse { message: String, span: Option<Span> },
+    #[error("llvm backend is not available in this build; enable the `llvm-backend` cargo feature")]
+    LlvmBackendUnavailable,
+    #[error(
+        "component wasm output requires the `wasi` cargo feature (which also enables `llvm-backend`)"
+    )]
+    WasiFeatureRequired,
+    #[error("component wasm output currently supports only the llvm backend")]
+    ComponentRequiresLlvm,
+    #[error("core wasm output currently supports only the llvm backend")]
+    WasmRequiresLlvm,
+    #[error("{mode} supports at most {max} argument(s), found {found}")]
+    InvalidMainArity { mode: &'static str, max: usize, found: usize, span: Option<Span> },
+    #[error("{builtin} callback `{function}` must take exactly 1 argument")]
+    CallbackArity { builtin: String, function: String, span: Option<Span> },
+    #[error("undefined function: {name}")]
+    UndefinedFunction { name: String, span: Option<Span> },
+    #[error("undefined variable: {name}")]
+    UndefinedVariable { name: String, span: Option<Span> },
+    #[error("{0} is not implemented yet")]
+    UnsupportedFeature(&'static str),
+    #[error("toolchain error: {0}")]
+    Toolchain(String),
+}
+
+impl CompileError {
+    pub fn span(&self) -> Option<&Span> {
+        match self {
+            Self::CallbackArity { span, .. }
+            | Self::Parse { span, .. }
+            | Self::InvalidMainArity { span, .. }
+            | Self::UndefinedFunction { span, .. }
+            | Self::UndefinedVariable { span, .. } => span.as_ref(),
+            _ => None,
+        }
+    }
+}
+
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
+    source: Option<String>,
     closure_metadata: HashMap<String, ClosureMetadata>,
     used_features: UsedFeatures,
 }
@@ -85,18 +133,49 @@ struct UsedFeatures {
 }
 
 impl Module {
-    fn assert_native_main_arity(&self) {
+    fn validate_native_main_arity(&self) -> Result<(), CompileError> {
         if let Some(main) = self.functions.iter().find(|func| func.name == "main") {
-            assert!(
-                main.inputs.len() <= 1,
-                "native executable main function supports at most one argument"
-            );
+            if main.inputs.len() > 1 {
+                return Err(CompileError::InvalidMainArity {
+                    mode: "native executable main function",
+                    max: 1,
+                    found: main.inputs.len(),
+                    span: main.span.clone(),
+                });
+            }
         }
+        Ok(())
+    }
+
+    fn validate_user_facing_constructs(&self) -> Result<(), CompileError> {
+        let function_names =
+            self.functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
+        let function_arities = function_arities(&self.functions);
+        for func in &self.functions {
+            let mut scope_names = func.inputs.clone();
+            if let Some(metadata) = self.closure_metadata.get(&func.name) {
+                for capture in &metadata.captures {
+                    if !scope_names.contains(capture) {
+                        scope_names.push(capture.clone());
+                    }
+                }
+            }
+            collect_var_names(&Ast::Block(func.block.clone()), &mut scope_names);
+            let locals = scope_names.into_iter().collect::<HashSet<_>>();
+            validate_ast_user_facing(
+                &Ast::Block(func.block.clone()),
+                &locals,
+                &function_names,
+                &function_arities,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn new() -> Self {
         Module {
             functions: vec![],
+            source: None,
             closure_metadata: HashMap::new(),
             used_features: UsedFeatures::default(),
         }
@@ -107,10 +186,20 @@ impl Module {
     }
 
     pub fn from_source(source: &str) -> Self {
-        Self::from_functions(parse_source_functions(source))
+        Self::try_from_source(source).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_from_source(source: &str) -> Result<Self, CompileError> {
+        let mut module = Self::try_from_functions(parse_source_functions(source)?)?;
+        module.source = Some(source.to_string());
+        Ok(module)
     }
 
     pub fn from_ast(ast: Ast) -> Self {
+        Self::try_from_ast(ast).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_from_ast(ast: Ast) -> Result<Self, CompileError> {
         let mut functions = vec![];
         match ast {
             Ast::FunctionDef(func) => functions.push(func),
@@ -123,18 +212,23 @@ impl Module {
             }
             _ => {}
         }
-        Self::from_functions(functions)
+        Self::try_from_functions(functions)
     }
 
-    fn from_functions(functions: Vec<FunctionDefAst>) -> Self {
+    fn try_from_functions(functions: Vec<FunctionDefAst>) -> Result<Self, CompileError> {
+        for func in &functions {
+            validate_no_nested_function_defs(&Ast::Block(func.block.clone()))?;
+        }
         let functions = autoload_stdlib_functions(functions);
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
-        let used_features = collect_used_features(&functions);
-        Module {
+        let module = Module {
             functions,
+            source: None,
             closure_metadata,
-            used_features,
-        }
+            used_features: UsedFeatures::default(),
+        };
+        let used_features = collect_used_features(&module.functions);
+        Ok(Module { used_features, ..module })
     }
 
     #[cfg(feature = "llvm-backend")]
@@ -153,23 +247,35 @@ impl Module {
     }
 
     pub fn compile_to_jit(self) -> JitArtifact {
-        self.compile_to_jit_with_backend(CodegenBackend::Cranelift)
+        self.try_compile_to_jit().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_jit(self) -> Result<JitArtifact, CompileError> {
+        self.try_compile_to_jit_with_backend(CodegenBackend::Cranelift)
     }
 
     pub fn compile_to_jit_with_backend(self, backend: CodegenBackend) -> JitArtifact {
+        self.try_compile_to_jit_with_backend(backend).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_jit_with_backend(
+        self,
+        backend: CodegenBackend,
+    ) -> Result<JitArtifact, CompileError> {
+        self.validate_user_facing_constructs()?;
         match backend {
-            CodegenBackend::Cranelift => JitArtifact::Cranelift(self.compile_to_cranelift_jit()),
+            CodegenBackend::Cranelift => {
+                Ok(JitArtifact::Cranelift(self.compile_to_cranelift_jit()))
+            }
             CodegenBackend::Llvm => {
                 #[cfg(feature = "llvm-backend")]
                 {
-                    JitArtifact::Llvm(llvm_backend::compile_to_jit(self))
+                    Ok(JitArtifact::Llvm(llvm_backend::compile_to_jit(self)?))
                 }
                 #[cfg(not(feature = "llvm-backend"))]
                 {
                     let _ = self;
-                    panic!(
-                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                    );
+                    Err(CompileError::LlvmBackendUnavailable)
                 }
             }
         }
@@ -257,6 +363,11 @@ impl Module {
     }
 
     pub fn compile_to_ir(self) -> String {
+        self.try_compile_to_ir().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_ir(self) -> Result<String, CompileError> {
+        self.validate_user_facing_constructs()?;
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -321,16 +432,29 @@ impl Module {
             out.push_str(&ir);
             out.push('\n');
         }
-        out
+        Ok(out)
     }
 
     pub fn compile_to_object(self, name: &str) -> Vec<u8> {
-        self.compile_to_object_with_backend(name, CodegenBackend::Cranelift)
+        self.try_compile_to_object(name).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_object(self, name: &str) -> Result<Vec<u8>, CompileError> {
+        self.try_compile_to_object_with_backend(name, CodegenBackend::Cranelift)
     }
 
     pub fn compile_to_object_with_backend(self, name: &str, backend: CodegenBackend) -> Vec<u8> {
+        self.try_compile_to_object_with_backend(name, backend).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_object_with_backend(
+        self,
+        name: &str,
+        backend: CodegenBackend,
+    ) -> Result<Vec<u8>, CompileError> {
+        self.validate_user_facing_constructs()?;
         match backend {
-            CodegenBackend::Cranelift => self.compile_to_cranelift_object(name),
+            CodegenBackend::Cranelift => Ok(self.compile_to_cranelift_object(name)),
             CodegenBackend::Llvm => {
                 #[cfg(feature = "llvm-backend")]
                 {
@@ -340,9 +464,7 @@ impl Module {
                 {
                     let _ = name;
                     let _ = self;
-                    panic!(
-                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                    );
+                    Err(CompileError::LlvmBackendUnavailable)
                 }
             }
         }
@@ -399,30 +521,42 @@ impl Module {
     }
 
     pub fn compile_to_executable(self, output: &Path) {
-        self.compile_to_executable_with_backend(output, CodegenBackend::Cranelift)
+        self.try_compile_to_executable(output).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_executable(self, output: &Path) -> Result<(), CompileError> {
+        self.try_compile_to_executable_with_backend(output, CodegenBackend::Cranelift)
     }
 
     pub fn compile_to_executable_with_backend(self, output: &Path, backend: CodegenBackend) {
-        self.assert_native_main_arity();
+        self.try_compile_to_executable_with_backend(output, backend)
+            .unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_compile_to_executable_with_backend(
+        self,
+        output: &Path,
+        backend: CodegenBackend,
+    ) -> Result<(), CompileError> {
+        self.validate_user_facing_constructs()?;
+        self.validate_native_main_arity()?;
         if is_component_wasm_output(output) {
             match backend {
                 CodegenBackend::Llvm => {
                     #[cfg(all(feature = "llvm-backend", feature = "wasi"))]
                     {
-                        self.compile_to_llvm_component(output);
-                        return;
+                        self.compile_to_llvm_component(output)?;
+                        return Ok(());
                     }
                     #[cfg(not(all(feature = "llvm-backend", feature = "wasi")))]
                     {
                         let _ = output;
                         let _ = self;
-                        panic!(
-                            "component wasm output requires the `wasi` cargo feature (which also enables `llvm-backend`)"
-                        );
+                        return Err(CompileError::WasiFeatureRequired);
                     }
                 }
                 CodegenBackend::Cranelift => {
-                    panic!("component wasm output currently supports only the llvm backend");
+                    return Err(CompileError::ComponentRequiresLlvm);
                 }
             }
         }
@@ -432,44 +566,41 @@ impl Module {
                 CodegenBackend::Llvm => {
                     #[cfg(feature = "llvm-backend")]
                     {
-                        self.compile_to_llvm_wasm(output);
-                        return;
+                        self.compile_to_llvm_wasm(output)?;
+                        return Ok(());
                     }
                     #[cfg(not(feature = "llvm-backend"))]
                     {
                         let _ = output;
                         let _ = self;
-                        panic!(
-                            "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                        );
+                        return Err(CompileError::LlvmBackendUnavailable);
                     }
                 }
                 CodegenBackend::Cranelift => {
-                    panic!("core wasm output currently supports only the llvm backend");
+                    return Err(CompileError::WasmRequiresLlvm);
                 }
             }
         }
 
         match backend {
-            CodegenBackend::Cranelift => self.compile_to_cranelift_executable(output),
+            CodegenBackend::Cranelift => self.compile_to_cranelift_executable(output)?,
             CodegenBackend::Llvm => {
                 #[cfg(feature = "llvm-backend")]
                 {
-                    self.compile_to_llvm_executable(output);
+                    self.compile_to_llvm_executable(output)?;
                 }
                 #[cfg(not(feature = "llvm-backend"))]
                 {
                     let _ = output;
                     let _ = self;
-                    panic!(
-                        "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                    );
+                    return Err(CompileError::LlvmBackendUnavailable);
                 }
             }
         }
+        Ok(())
     }
 
-    fn compile_to_cranelift_executable(self, output: &Path) {
+    fn compile_to_cranelift_executable(self, output: &Path) -> Result<(), CompileError> {
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -553,11 +684,11 @@ impl Module {
         let tmp = output.with_extension("obj");
         #[cfg(not(windows))]
         let tmp = output.with_extension("o");
-        std::fs::write(&tmp, &bytes).unwrap();
+        write_file_or_compile_error(&tmp, &bytes, "failed to write native object file")?;
 
         #[cfg(windows)]
         let status = Command::new("rustc")
-            .arg(write_windows_wrapper(output))
+            .arg(write_windows_wrapper(output)?)
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -579,40 +710,53 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("rustc not found");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(not(windows))]
-        let wrapper = write_unix_wrapper(output);
-        #[cfg(not(windows))]
-        let status = Command::new("cc")
-            .arg("-no-pie")
-            .arg(&tmp)
-            .arg(&wrapper)
+        let status = Command::new("rustc")
+            .arg(write_unix_rust_wrapper(output)?)
+            .arg("--crate-name")
+            .arg("expr_unix_wrapper")
+            .arg("-C")
+            .arg("panic=abort")
+            .arg("-C")
+            .arg("opt-level=s")
+            .arg("-C")
+            .arg("strip=symbols")
+            .arg("-C")
+            .arg("debuginfo=0")
+            .arg("-C")
+            .arg("link-arg=-no-pie")
+            .arg("-C")
+            .arg(format!("link-arg={}", tmp.display()))
             .arg("-o")
             .arg(output)
             .status()
-            .expect("cc not found — install gcc or clang");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(windows)]
         std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
         #[cfg(not(windows))]
-        std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.c")).ok();
+        std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
-        assert!(status.success(), "linker failed with: {status}");
+        if !status.success() {
+            return Err(command_status_error("rustc", "native executable link failed", status));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "llvm-backend")]
-    fn compile_to_llvm_executable(self, output: &Path) {
-        let bytes = llvm_backend::compile_to_object(self, "llvm_exe");
+    fn compile_to_llvm_executable(self, output: &Path) -> Result<(), CompileError> {
+        let bytes = llvm_backend::compile_to_object(self, "llvm_exe")?;
         #[cfg(windows)]
         let tmp = output.with_extension("obj");
         #[cfg(not(windows))]
         let tmp = output.with_extension("o");
-        std::fs::write(&tmp, &bytes).unwrap();
+        write_file_or_compile_error(&tmp, &bytes, "failed to write llvm object file")?;
 
         #[cfg(windows)]
         let status = Command::new("rustc")
-            .arg(write_windows_wrapper(output))
+            .arg(write_windows_wrapper(output)?)
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -634,11 +778,11 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("rustc not found");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(not(windows))]
         let status = Command::new("rustc")
-            .arg(write_unix_rust_wrapper(output))
+            .arg(write_unix_rust_wrapper(output)?)
             .arg("--crate-name")
             .arg("expr_unix_wrapper")
             .arg("-C")
@@ -654,44 +798,45 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("rustc not found");
+            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(windows)]
         std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
         #[cfg(not(windows))]
         std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
-        assert!(status.success(), "linker failed with: {status}");
+        if !status.success() {
+            return Err(command_status_error(
+                "rustc",
+                "llvm native executable link failed",
+                status,
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "llvm-backend")]
-    fn compile_to_llvm_wasm(self, output: &Path) {
-        let has_supported_main = self
-            .functions
-            .iter()
-            .any(|func| func.name == "main" && func.inputs.len() <= 1);
+    fn compile_to_llvm_wasm(self, output: &Path) -> Result<(), CompileError> {
+        let has_supported_main =
+            self.functions.iter().any(|func| func.name == "main" && func.inputs.len() <= 1);
         assert!(
             has_supported_main,
             "llvm wasm output requires a main function with at most one argument"
         );
 
-        let asm = llvm_backend::compile_to_wasm_assembly(self, "llvm_wasm");
+        let asm = llvm_backend::compile_to_wasm_assembly(self, "llvm_wasm")?;
         let asm_tmp = output.with_extension("s");
         let obj_tmp = output.with_extension("o");
-        std::fs::write(&asm_tmp, &asm).unwrap();
+        write_file_or_compile_error(&asm_tmp, &asm, "failed to write llvm wasm assembly")?;
 
-        let assemble_status = Command::new(find_llvm_tool("llvm-mc"))
+        let mut llvm_mc = Command::new(find_llvm_tool("llvm-mc"));
+        llvm_mc
             .arg("-triple=wasm32-unknown-unknown")
             .arg("-filetype=obj")
             .arg(&asm_tmp)
             .arg("-o")
-            .arg(&obj_tmp)
-            .status()
-            .expect("llvm-mc not found");
-        assert!(
-            assemble_status.success(),
-            "wasm assembler failed with: {assemble_status}"
-        );
+            .arg(&obj_tmp);
+        run_command_or_compile_error(llvm_mc, "llvm-mc", "wasm assembly failed")?;
 
         let status = Command::new(find_wasm_ld())
             .arg(&obj_tmp)
@@ -704,7 +849,7 @@ impl Module {
             .arg("-o")
             .arg(output)
             .status()
-            .expect("wasm-ld not found");
+            .map_err(|err| toolchain_error(format!("failed to launch wasm-ld: {err}")))?;
 
         if status.success() {
             std::fs::remove_file(&asm_tmp).ok();
@@ -716,38 +861,35 @@ impl Module {
                 obj_tmp.display()
             );
         }
-        assert!(status.success(), "wasm linker failed with: {status}");
+        if !status.success() {
+            return Err(command_status_error("wasm-ld", "wasm link failed", status));
+        }
+        Ok(())
     }
 
     #[cfg(all(feature = "llvm-backend", feature = "wasi"))]
-    fn compile_to_llvm_component(self, output: &Path) {
-        let has_supported_main = self
-            .functions
-            .iter()
-            .any(|func| func.name == "main" && func.inputs.len() <= 1);
+    fn compile_to_llvm_component(self, output: &Path) -> Result<(), CompileError> {
+        let has_supported_main =
+            self.functions.iter().any(|func| func.name == "main" && func.inputs.len() <= 1);
         assert!(
             has_supported_main,
             "llvm component output requires a main function with at most one argument"
         );
 
-        let asm = llvm_backend::compile_to_wasm_preview1_command_assembly(self, "llvm_component");
+        let asm = llvm_backend::compile_to_wasm_preview1_command_assembly(self, "llvm_component")?;
         let asm_tmp = output.with_extension("component.s");
         let obj_tmp = output.with_extension("component.o");
         let core_tmp = output.with_extension("core.wasm");
-        std::fs::write(&asm_tmp, &asm).unwrap();
+        write_file_or_compile_error(&asm_tmp, &asm, "failed to write llvm component assembly")?;
 
-        let assemble_status = Command::new(find_llvm_tool("llvm-mc"))
+        let mut llvm_mc = Command::new(find_llvm_tool("llvm-mc"));
+        llvm_mc
             .arg("-triple=wasm32-unknown-unknown")
             .arg("-filetype=obj")
             .arg(&asm_tmp)
             .arg("-o")
-            .arg(&obj_tmp)
-            .status()
-            .expect("llvm-mc not found");
-        assert!(
-            assemble_status.success(),
-            "wasm assembler failed with: {assemble_status}"
-        );
+            .arg(&obj_tmp);
+        run_command_or_compile_error(llvm_mc, "llvm-mc", "component wasm assembly failed")?;
 
         let link_status = Command::new(find_wasm_ld())
             .arg(&obj_tmp)
@@ -759,13 +901,13 @@ impl Module {
             .arg("-o")
             .arg(&core_tmp)
             .status()
-            .expect("wasm-ld not found");
-        assert!(
-            link_status.success(),
-            "wasm linker failed with: {link_status}"
-        );
+            .map_err(|err| toolchain_error(format!("failed to launch wasm-ld: {err}")))?;
+        if !link_status.success() {
+            return Err(command_status_error("wasm-ld", "component wasm link failed", link_status));
+        }
 
-        let core_bytes = std::fs::read(&core_tmp).expect("failed to read intermediate core wasm");
+        let core_bytes =
+            read_file_or_compile_error(&core_tmp, "failed to read intermediate core wasm")?;
         let component_bytes = wit_component::ComponentEncoder::default()
             .module(&core_bytes)
             .expect("failed to load core wasm into component encoder")
@@ -777,13 +919,14 @@ impl Module {
             .validate(true)
             .encode()
             .expect("failed to encode wasi component");
-        std::fs::write(output, component_bytes).expect("failed to write component output");
+        write_file_or_compile_error(output, component_bytes, "failed to write component output")?;
 
         if output.exists() {
             std::fs::remove_file(&asm_tmp).ok();
             std::fs::remove_file(&obj_tmp).ok();
             std::fs::remove_file(&core_tmp).ok();
         }
+        Ok(())
     }
 }
 
@@ -852,61 +995,46 @@ impl CraneliftJitModule {
     }
 
     pub fn get_internal_fn_ptr(&self, name: &str) -> Option<*const u8> {
-        self.internal_func_ids
-            .get(name)
-            .map(|id| self.module.get_finalized_function(*id))
+        self.internal_func_ids.get(name).map(|id| self.module.get_finalized_function(*id))
     }
 
     pub fn get_int_result_fn_ptr(&self, name: &str) -> Option<*const u8> {
-        self.int_result_func_ids
-            .get(name)
-            .map(|id| self.module.get_finalized_function(*id))
+        self.int_result_func_ids.get(name).map(|id| self.module.get_finalized_function(*id))
     }
 
     pub fn user_function_names(&self) -> impl Iterator<Item = &str> {
-        self.func_ids
-            .keys()
-            .filter(|n| !is_builtin_name(n))
-            .map(|s| s.as_str())
+        self.func_ids.keys().filter(|n| !is_builtin_name(n)).map(|s| s.as_str())
     }
 }
 
 #[cfg(windows)]
-fn write_windows_wrapper(output: &Path) -> std::path::PathBuf {
+fn write_windows_wrapper(output: &Path) -> Result<std::path::PathBuf, CompileError> {
     let wrapper = generated_wrapper_path(output, "windows_wrapper.rs");
     let source = include_str!("./wrapper/windows.rs");
-    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
+    let parent = wrapper.parent().unwrap();
+    std::fs::create_dir_all(parent).map_err(|err| {
+        io_toolchain_error("failed to create generated wrapper directory", parent, err)
+    })?;
+    write_file_or_compile_error(&wrapper, source, "failed to write generated windows wrapper")?;
+    Ok(wrapper)
 }
 
 #[cfg(not(windows))]
-fn write_unix_wrapper(output: &Path) -> std::path::PathBuf {
-    let wrapper = generated_wrapper_path(output, "unix_wrapper.c");
-    let source = include_str!("./wrapper/unix.c");
-    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
-}
-
-#[cfg(all(not(windows), feature = "llvm-backend"))]
-fn write_unix_rust_wrapper(output: &Path) -> std::path::PathBuf {
+fn write_unix_rust_wrapper(output: &Path) -> Result<std::path::PathBuf, CompileError> {
     let wrapper = generated_wrapper_path(output, "unix_wrapper.rs");
     let source = include_str!("./wrapper/unix.rs");
-    std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
-    std::fs::write(&wrapper, source).unwrap();
-    wrapper
+    let parent = wrapper.parent().unwrap();
+    std::fs::create_dir_all(parent).map_err(|err| {
+        io_toolchain_error("failed to create generated wrapper directory", parent, err)
+    })?;
+    write_file_or_compile_error(&wrapper, source, "failed to write generated unix wrapper")?;
+    Ok(wrapper)
 }
 
 fn generated_wrapper_path(output: &Path, suffix: &str) -> std::path::PathBuf {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let stem = output
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    parent
-        .join(".expr-compiler")
-        .join(format!("{stem}.{suffix}"))
+    let stem = output.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    parent.join(".expr-compiler").join(format!("{stem}.{suffix}"))
 }
 
 fn is_wasm_output(output: &Path) -> bool {
@@ -958,6 +1086,22 @@ fn find_llvm_tool(tool: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(exe_name)
 }
 
+#[cfg(all(test, feature = "llvm-backend"))]
+fn llvm_tool_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+unsafe fn set_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+    unsafe { std::env::set_var(key, value) };
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+unsafe fn remove_env_var<K: AsRef<std::ffi::OsStr>>(key: K) {
+    unsafe { std::env::remove_var(key) };
+}
+
 fn declare_internal_function_sig(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -996,6 +1140,51 @@ fn executable_main_symbol_name() -> &'static str {
     }
 }
 
+fn toolchain_error(message: impl Into<String>) -> CompileError {
+    CompileError::Toolchain(message.into())
+}
+
+fn io_toolchain_error(context: &str, path: &Path, err: std::io::Error) -> CompileError {
+    toolchain_error(format!("{context} {}: {err}", path.display()))
+}
+
+fn write_file_or_compile_error(
+    path: &Path,
+    contents: impl AsRef<[u8]>,
+    context: &str,
+) -> Result<(), CompileError> {
+    std::fs::write(path, contents).map_err(|err| io_toolchain_error(context, path, err))
+}
+
+#[cfg(all(feature = "llvm-backend", feature = "wasi"))]
+fn read_file_or_compile_error(path: &Path, context: &str) -> Result<Vec<u8>, CompileError> {
+    std::fs::read(path).map_err(|err| io_toolchain_error(context, path, err))
+}
+
+#[cfg(feature = "llvm-backend")]
+fn run_command_or_compile_error(
+    mut command: Command,
+    tool_name: &str,
+    failure_context: &str,
+) -> Result<(), CompileError> {
+    let status = command.status().map_err(|err| {
+        toolchain_error(format!("{failure_context}: failed to launch {tool_name}: {err}"))
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(command_status_error(tool_name, failure_context, status))
+    }
+}
+
+fn command_status_error(
+    tool_name: &str,
+    failure_context: &str,
+    status: ExitStatus,
+) -> CompileError {
+    toolchain_error(format!("{failure_context}: {tool_name} exited with {status}"))
+}
+
 fn declare_jit_int_result_sig(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -1021,9 +1210,7 @@ fn declare_executable_main_int_result_sig(
     sig.params.push(AbiParam::new(types::I64));
     sig.params.push(AbiParam::new(types::I64));
     sig.returns.push(AbiParam::new(types::I64));
-    module
-        .declare_function(executable_main_symbol_name(), linkage, &sig)
-        .unwrap()
+    module.declare_function(executable_main_symbol_name(), linkage, &sig).unwrap()
 }
 
 fn function_ordinals(functions: &[FunctionDefAst]) -> HashMap<String, i64> {
@@ -1040,13 +1227,10 @@ fn function_ordinals(functions: &[FunctionDefAst]) -> HashMap<String, i64> {
 }
 
 fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
-    functions
-        .iter()
-        .map(|func| (func.name.clone(), func.inputs.len()))
-        .collect()
+    functions.iter().map(|func| (func.name.clone(), func.inputs.len())).collect()
 }
 
-fn parse_source_functions(source: &str) -> Vec<FunctionDefAst> {
+fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
     use crate::parser::ParseLexer;
     use crate::tokenizer::{Logos, Token};
 
@@ -1063,16 +1247,17 @@ fn parse_source_functions(source: &str) -> Vec<FunctionDefAst> {
         }
         match Ast::from_lexer(&mut lexer) {
             Ok(Ast::FunctionDef(func)) => functions.push(func),
-            Ok(_) => {
-                panic!(
-                    "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
-                )
+            Ok(_) => return Err(CompileError::TopLevelExpression),
+            Err(err) => {
+                return Err(CompileError::Parse {
+                    message: err.to_string(),
+                    span: Some(err.span.clone()),
+                });
             }
-            Err(err) => panic!("parse error: {err}"),
         }
     }
 
-    functions
+    Ok(functions)
 }
 
 fn stdlib_function(name: &str) -> Option<StdlibFunction> {
@@ -1146,10 +1331,7 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
 }
 
 fn autoload_stdlib_functions(mut functions: Vec<FunctionDefAst>) -> Vec<FunctionDefAst> {
-    let mut defined = functions
-        .iter()
-        .map(|func| func.name.clone())
-        .collect::<HashSet<_>>();
+    let mut defined = functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
 
     loop {
         let mut needed = collect_stdlib_references(&functions);
@@ -1173,7 +1355,9 @@ fn autoload_stdlib_functions(mut functions: Vec<FunctionDefAst>) -> Vec<Function
             let Some(stdlib) = stdlib_function(&name) else {
                 continue;
             };
-            for func in parse_source_functions(stdlib.source) {
+            for func in parse_source_functions(stdlib.source)
+                .unwrap_or_else(|err| panic!("invalid stdlib source for {name}: {err}"))
+            {
                 if defined.insert(func.name.clone()) {
                     added.push(func);
                 }
@@ -1217,7 +1401,7 @@ fn collect_stdlib_references_from_ast(
     refs: &mut HashSet<String>,
 ) {
     match ast {
-        Ast::Expression(ExpressionAst { function, args }) => {
+        Ast::Expression(ExpressionAst { function, args, .. }) => {
             if !function.is_empty()
                 && !scope.contains(function)
                 && stdlib_function(function).is_some()
@@ -1229,16 +1413,12 @@ fn collect_stdlib_references_from_ast(
             }
         }
         Ast::Variable(name) | Ast::FunctionRef(name) => {
-            if !scope.contains(name) && stdlib_function(name).is_some() {
-                refs.insert(name.clone());
+            if !scope.contains(name.as_str()) && stdlib_function(name.as_ref()).is_some() {
+                refs.insert(name.to_string());
             }
         }
         Ast::Assign { value, .. } => collect_stdlib_references_from_ast(value, scope, refs),
-        Ast::If {
-            condition,
-            then,
-            else_,
-        } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_stdlib_references_from_ast(condition, scope, refs);
             let mut then_scope = scope.clone();
             collect_stdlib_references_from_block(then, &mut then_scope, refs);
@@ -1261,15 +1441,11 @@ fn collect_stdlib_references_from_ast(
                 collect_stdlib_references_from_ast(item, scope, refs);
             }
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
         }
-        Ast::IndexAssign {
-            collection,
-            index,
-            value,
-        } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
             collect_stdlib_references_from_ast(value, scope, refs);
@@ -1298,7 +1474,7 @@ fn collect_used_features_from_block(block: &BlockAst, features: &mut UsedFeature
 
 fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
     match ast {
-        Ast::Expression(ExpressionAst { function, args }) => {
+        Ast::Expression(ExpressionAst { function, args, .. }) => {
             if matches!(
                 function.as_str(),
                 "bigint_from_int"
@@ -1340,16 +1516,12 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                 collect_used_features_from_ast(item, features);
             }
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             features.lists = true;
             collect_used_features_from_ast(collection, features);
             collect_used_features_from_ast(index, features);
         }
-        Ast::IndexAssign {
-            collection,
-            index,
-            value,
-        } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             features.lists = true;
             features.list_mutation = true;
             collect_used_features_from_ast(collection, features);
@@ -1357,11 +1529,7 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             collect_used_features_from_ast(value, features);
         }
         Ast::Assign { value, .. } => collect_used_features_from_ast(value, features),
-        Ast::If {
-            condition,
-            then,
-            else_,
-        } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_used_features_from_ast(condition, features);
             collect_used_features_from_block(then, features);
             if let Some(else_block) = else_ {
@@ -1492,10 +1660,7 @@ fn define_jit_int_result_wrapper(
     internal_id: FuncId,
     input_count: usize,
 ) {
-    assert!(
-        input_count <= 1,
-        "jit int-result wrapper supports at most one argument"
-    );
+    assert!(input_count <= 1, "jit int-result wrapper supports at most one argument");
     let mut sig = Signature::new(isa.default_call_conv());
     if input_count == 1 {
         sig.params.push(AbiParam::new(types::I64));
@@ -1521,18 +1686,14 @@ fn define_jit_int_result_wrapper(
         let internal_call = if input_count == 1 {
             let arg_tag = builder.block_params(block0)[0];
             let arg_payload = builder.block_params(block0)[1];
-            builder
-                .ins()
-                .call(internal_ref, &[zero_env, arg_tag, arg_payload])
+            builder.ins().call(internal_ref, &[zero_env, arg_tag, arg_payload])
         } else {
             builder.ins().call(internal_ref, &[zero_env])
         };
         let result_tag = builder.inst_results(internal_call)[0];
         let result_payload = builder.inst_results(internal_call)[1];
         let is_int = builder.ins().icmp_imm(IntCC::Equal, result_tag, TAG_INT);
-        builder
-            .ins()
-            .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+        builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
         builder.ins().return_(&[result_payload]);
         builder.finalize();
     }
@@ -1553,10 +1714,7 @@ fn define_executable_main_int_result_wrapper(
     internal_id: FuncId,
     main_input_count: usize,
 ) {
-    assert!(
-        main_input_count <= 1,
-        "native executable main function supports at most one argument"
-    );
+    assert!(main_input_count <= 1, "native executable main function supports at most one argument");
 
     let mut sig = Signature::new(isa.default_call_conv());
     sig.params.push(AbiParam::new(types::I64));
@@ -1590,9 +1748,7 @@ fn define_executable_main_int_result_wrapper(
         let result_tag = builder.inst_results(internal_call)[0];
         let result_payload = builder.inst_results(internal_call)[1];
         let is_int = builder.ins().icmp_imm(IntCC::Equal, result_tag, TAG_INT);
-        builder
-            .ins()
-            .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+        builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
         builder.ins().return_(&[result_payload]);
 
         builder.finalize();
@@ -1656,14 +1812,307 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
         )
 }
 
+fn is_operator_name(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "=="
+            | "!="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "and"
+            | "or"
+            | "not"
+            | "add"
+            | "subtract"
+            | "multiply"
+            | "divide"
+            | "modulo"
+            | "eq"
+            | "ne"
+            | "lt"
+            | "lte"
+            | "gt"
+            | "gte"
+    )
+}
+
+fn is_known_callable_name(name: &str, function_names: &HashSet<String>) -> bool {
+    is_builtin_name(name) || is_operator_name(name) || function_names.contains(name)
+}
+
+fn validate_unary_callback_reference(
+    ast: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+    builtin: &str,
+) -> Result<(), CompileError> {
+    match ast {
+        Ast::FunctionRef(name) => {
+            if !function_names.contains(name.as_str()) {
+                return Err(CompileError::UndefinedFunction {
+                    name: name.to_string(),
+                    span: name.span.clone(),
+                });
+            }
+            if function_arities.get(name.as_str()) != Some(&1usize) {
+                return Err(CompileError::CallbackArity {
+                    builtin: builtin.to_string(),
+                    function: name.to_string(),
+                    span: name.span.clone(),
+                });
+            }
+        }
+        Ast::Variable(name)
+            if !locals.contains(name.as_str()) && function_names.contains(name.as_str()) =>
+        {
+            if function_arities.get(name.as_str()) != Some(&1usize) {
+                return Err(CompileError::CallbackArity {
+                    builtin: builtin.to_string(),
+                    function: name.to_string(),
+                    span: name.span.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_ast_user_facing(
+    ast: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    match ast {
+        Ast::Literal(_) => Ok(()),
+        Ast::Variable(name) => validate_variable_reference(name, locals, function_names),
+        Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
+        Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::FunctionRef(name) => validate_function_reference(name, function_names),
+        Ast::ListLiteral(items) => {
+            validate_ast_sequence(items, locals, function_names, function_arities)
+        }
+        Ast::Index { collection, index, .. } => {
+            validate_index_ast(collection, index, locals, function_names, function_arities)
+        }
+        Ast::IndexAssign { collection, index, value, .. } => validate_index_assign_ast(
+            collection,
+            index,
+            value,
+            locals,
+            function_names,
+            function_arities,
+        ),
+        Ast::Expression(ExpressionAst { function, args, function_span }) => {
+            validate_expression_user_facing(
+                function,
+                args,
+                function_span.clone(),
+                locals,
+                function_names,
+                function_arities,
+            )
+        }
+        Ast::Block(block) => {
+            validate_ast_sequence(&block.lines, locals, function_names, function_arities)
+        }
+        Ast::Assign { value, .. } => {
+            validate_ast_user_facing(value, locals, function_names, function_arities)
+        }
+        Ast::If { condition, then, else_, .. } => validate_if_ast_user_facing(
+            condition,
+            then,
+            else_,
+            locals,
+            function_names,
+            function_arities,
+        ),
+    }
+}
+
+fn validate_function_reference(
+    name: &Ident,
+    function_names: &HashSet<String>,
+) -> Result<(), CompileError> {
+    if function_names.contains(name.as_str()) {
+        Ok(())
+    } else {
+        Err(CompileError::UndefinedFunction { name: name.to_string(), span: name.span.clone() })
+    }
+}
+
+fn validate_variable_reference(
+    name: &Ident,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+) -> Result<(), CompileError> {
+    if locals.contains(name.as_str()) || function_names.contains(name.as_str()) {
+        Ok(())
+    } else {
+        Err(CompileError::UndefinedVariable { name: name.to_string(), span: name.span.clone() })
+    }
+}
+
+fn validate_ast_sequence(
+    items: &[Ast],
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    for item in items {
+        validate_ast_user_facing(item, locals, function_names, function_arities)?;
+    }
+    Ok(())
+}
+
+fn validate_index_ast(
+    collection: &Ast,
+    index: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(collection, locals, function_names, function_arities)?;
+    validate_ast_user_facing(index, locals, function_names, function_arities)
+}
+
+fn validate_index_assign_ast(
+    collection: &Ast,
+    index: &Ast,
+    value: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(collection, locals, function_names, function_arities)?;
+    validate_ast_user_facing(index, locals, function_names, function_arities)?;
+    validate_ast_user_facing(value, locals, function_names, function_arities)
+}
+
+fn validate_expression_user_facing(
+    function: &str,
+    args: &[Ast],
+    function_span: Option<Span>,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_callable_name(function, function_span.clone(), locals, function_names)?;
+    validate_callback_argument(function, args, locals, function_names, function_arities)?;
+    validate_ast_sequence(args, locals, function_names, function_arities)
+}
+
+fn validate_callable_name(
+    function: &str,
+    function_span: Option<Span>,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+) -> Result<(), CompileError> {
+    if !locals.contains(function) && !is_known_callable_name(function, function_names) {
+        return Err(CompileError::UndefinedFunction {
+            name: function.to_string(),
+            span: function_span,
+        });
+    }
+    Ok(())
+}
+
+fn validate_callback_argument(
+    function: &str,
+    args: &[Ast],
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    if let Some(callback) = args.get(1) {
+        match function {
+            "list_map" | "list_filter" | "list_all" | "list_any" | "string_all" | "string_any" => {
+                validate_unary_callback_reference(
+                    callback,
+                    locals,
+                    function_names,
+                    function_arities,
+                    function,
+                )?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_if_ast_user_facing(
+    condition: &Ast,
+    then: &BlockAst,
+    else_: &Option<BlockAst>,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(condition, locals, function_names, function_arities)?;
+    validate_ast_sequence(&then.lines, locals, function_names, function_arities)?;
+    if let Some(else_) = else_ {
+        validate_ast_sequence(&else_.lines, locals, function_names, function_arities)?;
+    }
+    Ok(())
+}
+
+fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
+    match ast {
+        Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::Lambda { body, .. } => validate_no_nested_function_defs(body),
+        Ast::ListLiteral(items) => {
+            for item in items {
+                validate_no_nested_function_defs(item)?;
+            }
+            Ok(())
+        }
+        Ast::Index { collection, index, .. } => {
+            validate_no_nested_function_defs(collection)?;
+            validate_no_nested_function_defs(index)
+        }
+        Ast::IndexAssign { collection, index, value, .. } => {
+            validate_no_nested_function_defs(collection)?;
+            validate_no_nested_function_defs(index)?;
+            validate_no_nested_function_defs(value)
+        }
+        Ast::Expression(ExpressionAst { args, .. }) => {
+            for arg in args {
+                validate_no_nested_function_defs(arg)?;
+            }
+            Ok(())
+        }
+        Ast::Block(block) => {
+            for line in &block.lines {
+                validate_no_nested_function_defs(line)?;
+            }
+            Ok(())
+        }
+        Ast::Assign { value, .. } => validate_no_nested_function_defs(value),
+        Ast::If { condition, then, else_, .. } => {
+            validate_no_nested_function_defs(condition)?;
+            validate_no_nested_function_defs(&Ast::Block(then.clone()))?;
+            if let Some(else_) = else_ {
+                validate_no_nested_function_defs(&Ast::Block(else_.clone()))?;
+            }
+            Ok(())
+        }
+        Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => Ok(()),
+    }
+}
+
 fn lift_anonymous_functions(
     functions: Vec<FunctionDefAst>,
 ) -> (Vec<FunctionDefAst>, HashMap<String, ClosureMetadata>) {
-    let mut lifter = LambdaLifter {
-        next_id: 0,
-        lifted: vec![],
-        metadata: HashMap::new(),
-    };
+    let mut lifter = LambdaLifter { next_id: 0, lifted: vec![], metadata: HashMap::new() };
     let mut transformed = Vec::with_capacity(functions.len());
     for mut function in functions {
         let mut scope_names = function.inputs.clone();
@@ -1702,17 +2151,15 @@ impl LambdaLifter {
                 self.lift_ast(body, &nested_scope);
                 let captures = collect_captures(&capture_source, &lambda_scope, scope_names);
                 let name = self.fresh_name();
-                self.metadata
-                    .insert(name.clone(), ClosureMetadata { captures });
+                self.metadata.insert(name.clone(), ClosureMetadata { captures });
                 self.lifted.push(FunctionDefAst {
-                    name: name.clone(),
+                    name: name.to_string(),
                     inputs: inputs.clone(),
                     output: None,
-                    block: BlockAst {
-                        lines: vec![(**body).clone()],
-                    },
+                    block: BlockAst { lines: vec![(**body).clone()] },
+                    span: None,
                 });
-                *ast = Ast::FunctionRef(name);
+                *ast = Ast::FunctionRef(crate::parser::Ident::synthetic(name));
             }
             Ast::Block(block) => self.lift_block(block, scope_names),
             Ast::Expression(ExpressionAst { args, .. }) => {
@@ -1725,32 +2172,24 @@ impl LambdaLifter {
                     self.lift_ast(item, scope_names);
                 }
             }
-            Ast::Index { collection, index } => {
+            Ast::Index { collection, index, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
             }
-            Ast::IndexAssign {
-                collection,
-                index,
-                value,
-            } => {
+            Ast::IndexAssign { collection, index, value, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
                 self.lift_ast(value, scope_names);
             }
             Ast::Assign { value, .. } => self.lift_ast(value, scope_names),
-            Ast::If {
-                condition,
-                then,
-                else_,
-            } => {
+            Ast::If { condition, then, else_, .. } => {
                 self.lift_ast(condition, scope_names);
                 self.lift_block(then, scope_names);
                 if let Some(else_block) = else_ {
                     self.lift_block(else_block, scope_names);
                 }
             }
-            Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+            Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
             Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {}
         }
     }
@@ -1770,9 +2209,11 @@ fn collect_captures_into(
 ) {
     match ast {
         Ast::Variable(name) => {
-            if !local_names.contains(name) && scope_names.contains(name) && !captures.contains(name)
+            if !local_names.contains(&name.name)
+                && scope_names.contains(&name.name)
+                && !captures.contains(&name.name)
             {
-                captures.push(name.clone());
+                captures.push(name.to_string());
             }
         }
         Ast::Expression(ExpressionAst { args, .. }) => {
@@ -1785,24 +2226,16 @@ fn collect_captures_into(
                 collect_captures_into(item, local_names, scope_names, captures);
             }
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
             collect_captures_into(index, local_names, scope_names, captures);
         }
-        Ast::IndexAssign {
-            collection,
-            index,
-            value,
-        } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
             collect_captures_into(index, local_names, scope_names, captures);
             collect_captures_into(value, local_names, scope_names, captures);
         }
-        Ast::If {
-            condition,
-            then,
-            else_,
-        } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_captures_into(condition, local_names, scope_names, captures);
             for line in &then.lines {
                 collect_captures_into(line, local_names, scope_names, captures);
@@ -1832,7 +2265,7 @@ fn collect_captures_into(
         Ast::Assign { value, .. } => {
             collect_captures_into(value, local_names, scope_names, captures);
         }
-        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+        Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
 
@@ -1847,26 +2280,18 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             }
         }
         Ast::FunctionRef(_) => {}
-        Ast::Assign { name, value } => {
+        Ast::Assign { name, value, .. } => {
             if !names.contains(name) {
                 names.push(name.clone());
             }
             collect_var_names(value, names);
         }
-        Ast::IndexAssign {
-            collection,
-            index,
-            value,
-        } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             collect_var_names(collection, names);
             collect_var_names(index, names);
             collect_var_names(value, names);
         }
-        Ast::If {
-            condition,
-            then,
-            else_,
-        } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_var_names(condition, names);
             for line in &then.lines {
                 collect_var_names(line, names);
@@ -1882,9 +2307,7 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
 }
 
 fn require_func(func_refs: &HashMap<String, FuncRef>, name: &str) -> FuncRef {
-    *func_refs
-        .get(name)
-        .unwrap_or_else(|| panic!("builtin function '{name}' is missing"))
+    *func_refs.get(name).unwrap_or_else(|| panic!("builtin function '{name}' is missing"))
 }
 
 fn call_unary_scalar(
@@ -1931,23 +2354,15 @@ fn compile_logical_op(
     builder.append_block_param(merge_block, types::I64);
 
     if function == "and" {
-        builder
-            .ins()
-            .brif(lhs_non_zero, rhs_block, &[], short_block, &[]);
+        builder.ins().brif(lhs_non_zero, rhs_block, &[], short_block, &[]);
     } else {
-        builder
-            .ins()
-            .brif(lhs_non_zero, short_block, &[], rhs_block, &[]);
+        builder.ins().brif(lhs_non_zero, short_block, &[], rhs_block, &[]);
     }
 
     builder.switch_to_block(short_block);
     builder.seal_block(short_block);
-    let short_payload = builder
-        .ins()
-        .iconst(types::I64, if function == "and" { 0 } else { 1 });
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(short_payload)]);
+    let short_payload = builder.ins().iconst(types::I64, if function == "and" { 0 } else { 1 });
+    builder.ins().jump(merge_block, &[BlockArg::Value(short_payload)]);
 
     builder.switch_to_block(rhs_block);
     builder.seal_block(rhs_block);
@@ -1963,9 +2378,7 @@ fn compile_logical_op(
         env_ptr,
     );
     let rhs_truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", rhs);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(rhs_truth)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(rhs_truth)]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
@@ -2002,10 +2415,7 @@ fn compile_logical_not(
     let one = builder.ins().iconst(types::I64, 1);
     let zero = builder.ins().iconst(types::I64, 0);
     let payload = builder.ins().select(is_zero, one, zero);
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload,
-    }
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload }
 }
 
 fn call_binary(
@@ -2016,14 +2426,9 @@ fn call_binary(
     rhs: CompiledValue,
 ) -> CompiledValue {
     let func_ref = require_func(func_refs, name);
-    let call = builder
-        .ins()
-        .call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
+    let call = builder.ins().call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
     let results = builder.inst_results(call);
-    CompiledValue {
-        tag: results[0],
-        payload: results[1],
-    }
+    CompiledValue { tag: results[0], payload: results[1] }
 }
 
 fn promote_value_to_bigint(
@@ -2039,16 +2444,11 @@ fn promote_value_to_bigint(
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, types::I64);
     builder.append_block_param(merge_block, types::I64);
-    builder
-        .ins()
-        .brif(is_bigint, bigint_block, &[], int_check_block, &[]);
+    builder.ins().brif(is_bigint, bigint_block, &[], int_check_block, &[]);
 
     builder.switch_to_block(bigint_block);
     builder.seal_block(bigint_block);
-    builder.ins().jump(
-        merge_block,
-        &[BlockArg::Value(value.tag), BlockArg::Value(value.payload)],
-    );
+    builder.ins().jump(merge_block, &[BlockArg::Value(value.tag), BlockArg::Value(value.payload)]);
 
     builder.switch_to_block(int_check_block);
     builder.seal_block(int_check_block);
@@ -2058,16 +2458,13 @@ fn promote_value_to_bigint(
     builder.switch_to_block(int_block);
     builder.seal_block(int_block);
     let bigint_from_int = require_func(func_refs, "bigint_from_int");
-    let call = builder
-        .ins()
-        .call(bigint_from_int, &[value.tag, value.payload]);
+    let call = builder.ins().call(bigint_from_int, &[value.tag, value.payload]);
     let results = builder.inst_results(call);
     let result_tag = results[0];
     let result_payload = results[1];
-    builder.ins().jump(
-        merge_block,
-        &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
-    );
+    builder
+        .ins()
+        .jump(merge_block, &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)]);
 
     builder.switch_to_block(trap_block);
     builder.seal_block(trap_block);
@@ -2091,14 +2488,9 @@ fn compile_bigint_builtin(
     let lhs = promote_value_to_bigint(builder, func_refs, args[0]);
     let rhs = promote_value_to_bigint(builder, func_refs, args[1]);
     let func_ref = require_func(func_refs, name);
-    let call = builder
-        .ins()
-        .call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
+    let call = builder.ins().call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
     let results = builder.inst_results(call);
-    CompiledValue {
-        tag: results[0],
-        payload: results[1],
-    }
+    CompiledValue { tag: results[0], payload: results[1] }
 }
 
 fn call_ternary(
@@ -2110,15 +2502,10 @@ fn call_ternary(
     c: CompiledValue,
 ) -> CompiledValue {
     let func_ref = require_func(func_refs, name);
-    let call = builder.ins().call(
-        func_ref,
-        &[a.tag, a.payload, b.tag, b.payload, c.tag, c.payload],
-    );
+    let call =
+        builder.ins().call(func_ref, &[a.tag, a.payload, b.tag, b.payload, c.tag, c.payload]);
     let results = builder.inst_results(call);
-    CompiledValue {
-        tag: results[0],
-        payload: results[1],
-    }
+    CompiledValue { tag: results[0], payload: results[1] }
 }
 
 fn boxed_int_const(builder: &mut FunctionBuilder, value: i64) -> CompiledValue {
@@ -2138,53 +2525,27 @@ fn compile_bigint_literal(
     let bigint_add = require_func(func_refs, "bigint_add");
 
     let zero = boxed_int_const(builder, 0);
-    let init = builder
-        .ins()
-        .call(bigint_from_int, &[zero.tag, zero.payload]);
+    let init = builder.ins().call(bigint_from_int, &[zero.tag, zero.payload]);
     let init_results = builder.inst_results(init);
-    let mut acc = CompiledValue {
-        tag: init_results[0],
-        payload: init_results[1],
-    };
+    let mut acc = CompiledValue { tag: init_results[0], payload: init_results[1] };
     let ten_int = boxed_int_const(builder, 10);
-    let ten_call = builder
-        .ins()
-        .call(bigint_from_int, &[ten_int.tag, ten_int.payload]);
+    let ten_call = builder.ins().call(bigint_from_int, &[ten_int.tag, ten_int.payload]);
     let ten_results = builder.inst_results(ten_call);
-    let ten = CompiledValue {
-        tag: ten_results[0],
-        payload: ten_results[1],
-    };
+    let ten = CompiledValue { tag: ten_results[0], payload: ten_results[1] };
 
     for ch in digits.chars() {
-        let mul = builder.ins().call(
-            bigint_multiply,
-            &[acc.tag, acc.payload, ten.tag, ten.payload],
-        );
+        let mul =
+            builder.ins().call(bigint_multiply, &[acc.tag, acc.payload, ten.tag, ten.payload]);
         let mul_results = builder.inst_results(mul);
-        acc = CompiledValue {
-            tag: mul_results[0],
-            payload: mul_results[1],
-        };
+        acc = CompiledValue { tag: mul_results[0], payload: mul_results[1] };
 
         let digit_int = boxed_int_const(builder, ch.to_digit(10).unwrap() as i64);
-        let digit_call = builder
-            .ins()
-            .call(bigint_from_int, &[digit_int.tag, digit_int.payload]);
+        let digit_call = builder.ins().call(bigint_from_int, &[digit_int.tag, digit_int.payload]);
         let digit_results = builder.inst_results(digit_call);
-        let digit = CompiledValue {
-            tag: digit_results[0],
-            payload: digit_results[1],
-        };
-        let add = builder.ins().call(
-            bigint_add,
-            &[acc.tag, acc.payload, digit.tag, digit.payload],
-        );
+        let digit = CompiledValue { tag: digit_results[0], payload: digit_results[1] };
+        let add = builder.ins().call(bigint_add, &[acc.tag, acc.payload, digit.tag, digit.payload]);
         let add_results = builder.inst_results(add);
-        acc = CompiledValue {
-            tag: add_results[0],
-            payload: add_results[1],
-        };
+        acc = CompiledValue { tag: add_results[0], payload: add_results[1] };
     }
 
     acc
@@ -2206,45 +2567,24 @@ fn compile_string_literal(
     for (index, byte) in bytes.iter().copied().enumerate() {
         let offset = i32::try_from(index).expect("string literal offset overflow");
         let byte_value = builder.ins().iconst(types::I8, i64::from(byte));
-        builder
-            .ins()
-            .store(MemFlags::new(), byte_value, data_ptr, offset);
+        builder.ins().store(MemFlags::new(), byte_value, data_ptr, offset);
     }
 
     let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
     let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
     let header_ptr = builder.inst_results(header_call)[0];
-    builder
-        .ins()
-        .store(MemFlags::new(), len_value, header_ptr, STRING_LEN_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), len_value, header_ptr, STRING_CAP_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+    builder.ins().store(MemFlags::new(), len_value, header_ptr, STRING_LEN_OFFSET);
+    builder.ins().store(MemFlags::new(), len_value, header_ptr, STRING_CAP_OFFSET);
+    builder.ins().store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
 
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_STRING),
-        payload: header_ptr,
-    }
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING), payload: header_ptr }
 }
 
 fn compile_bytes_len(builder: &mut FunctionBuilder, value: CompiledValue) -> CompiledValue {
     let is_string = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        value.payload,
-        STRING_LEN_OFFSET,
-    );
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload: len,
-    }
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let len = builder.ins().load(types::I64, MemFlags::new(), value.payload, STRING_LEN_OFFSET);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: len }
 }
 
 fn compile_bytes_get(
@@ -2252,47 +2592,24 @@ fn compile_bytes_get(
     string_value: CompiledValue,
     index_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_int = builder.ins().icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
-    let non_neg = builder
-        .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
+    let non_neg = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
     builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let in_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, index_value.payload, len);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index_value.payload, len);
     builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
 
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let addr = builder.ins().iadd(data_ptr, index_value.payload);
     let byte = builder.ins().load(types::I8, MemFlags::new(), addr, 0);
     let byte_i64 = builder.ins().uextend(types::I64, byte);
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload: byte_i64,
-    }
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: byte_i64 }
 }
 
 fn compile_bytes_slice(
@@ -2302,64 +2619,29 @@ fn compile_bytes_slice(
     start_value: CompiledValue,
     end_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let start_is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, start_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(start_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let start_is_int = builder.ins().icmp_imm(IntCC::Equal, start_value.tag, TAG_INT);
+    builder.ins().trapz(start_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let end_is_int = builder.ins().icmp_imm(IntCC::Equal, end_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(end_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(end_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
     let start_non_neg =
-        builder
-            .ins()
-            .icmp_imm(IntCC::SignedGreaterThanOrEqual, start_value.payload, 0);
-    builder
-        .ins()
-        .trapz(start_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let end_non_neg = builder
-        .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, end_value.payload, 0);
-    builder
-        .ins()
-        .trapz(end_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let start_le_end = builder.ins().icmp(
-        IntCC::UnsignedLessThanOrEqual,
-        start_value.payload,
-        end_value.payload,
-    );
-    builder
-        .ins()
-        .trapz(start_le_end, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let end_in_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThanOrEqual, end_value.payload, len);
-    builder
-        .ins()
-        .trapz(end_in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+        builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, start_value.payload, 0);
+    builder.ins().trapz(start_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let end_non_neg = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, end_value.payload, 0);
+    builder.ins().trapz(end_non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let start_le_end =
+        builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, start_value.payload, end_value.payload);
+    builder.ins().trapz(start_le_end, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let end_in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, end_value.payload, len);
+    builder.ins().trapz(end_in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
 
     let slice_len = builder.ins().isub(end_value.payload, start_value.payload);
-    let src_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let src_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let slice_src_ptr = builder.ins().iadd(src_ptr, start_value.payload);
 
     let alloc_ref = require_func(func_refs, "__alloc");
@@ -2372,60 +2654,31 @@ fn compile_bytes_slice(
     let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
     let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
     let header_ptr = builder.inst_results(header_call)[0];
-    builder
-        .ins()
-        .store(MemFlags::new(), slice_len, header_ptr, STRING_LEN_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), slice_len, header_ptr, STRING_CAP_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+    builder.ins().store(MemFlags::new(), slice_len, header_ptr, STRING_LEN_OFFSET);
+    builder.ins().store(MemFlags::new(), slice_len, header_ptr, STRING_CAP_OFFSET);
+    builder.ins().store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
 
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_STRING),
-        payload: header_ptr,
-    }
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING), payload: header_ptr }
 }
 
 fn compile_bytes_pop(builder: &mut FunctionBuilder, string_value: CompiledValue) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
     let non_empty = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
     builder.ins().trapz(non_empty, TrapCode::HEAP_OUT_OF_BOUNDS);
 
     let new_len = builder.ins().iadd_imm(len, -1);
-    builder.ins().store(
-        MemFlags::new(),
-        new_len,
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
+    builder.ins().store(MemFlags::new(), new_len, string_value.payload, STRING_LEN_OFFSET);
 
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let addr = builder.ins().iadd(data_ptr, new_len);
     let byte = builder.ins().load(types::I8, MemFlags::new(), addr, 0);
     let byte_i64 = builder.ins().uextend(types::I64, byte);
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload: byte_i64,
-    }
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: byte_i64 }
 }
 
 fn compile_bytes_push(
@@ -2434,37 +2687,17 @@ fn compile_bytes_push(
     string_value: CompiledValue,
     byte_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_int = builder.ins().icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
+    builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
-    let cap = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_CAP_OFFSET,
-    );
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
+    let cap =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_CAP_OFFSET);
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let alloc_ref = require_func(func_refs, "__alloc");
 
     let grow_block = builder.create_block();
@@ -2473,9 +2706,7 @@ fn compile_bytes_push(
     builder.append_block_param(merge_block, types::I64);
 
     let has_capacity = builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
-    builder
-        .ins()
-        .brif(has_capacity, write_block, &[], grow_block, &[]);
+    builder.ins().brif(has_capacity, write_block, &[], grow_block, &[]);
 
     builder.switch_to_block(grow_block);
     let zero = builder.ins().iconst(types::I64, 0);
@@ -2487,27 +2718,13 @@ fn compile_bytes_push(
     let new_data_call = builder.ins().call(alloc_ref, &[new_cap, align]);
     let new_data_ptr = builder.inst_results(new_data_call)[0];
     copy_string_bytes(builder, data_ptr, new_data_ptr, len, zero);
-    builder.ins().store(
-        MemFlags::new(),
-        new_data_ptr,
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
-    builder.ins().store(
-        MemFlags::new(),
-        new_cap,
-        string_value.payload,
-        STRING_CAP_OFFSET,
-    );
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(new_data_ptr)]);
+    builder.ins().store(MemFlags::new(), new_data_ptr, string_value.payload, STRING_PTR_OFFSET);
+    builder.ins().store(MemFlags::new(), new_cap, string_value.payload, STRING_CAP_OFFSET);
+    builder.ins().jump(merge_block, &[BlockArg::Value(new_data_ptr)]);
     builder.seal_block(grow_block);
 
     builder.switch_to_block(write_block);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(data_ptr)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(data_ptr)]);
     builder.seal_block(write_block);
 
     builder.switch_to_block(merge_block);
@@ -2517,12 +2734,7 @@ fn compile_bytes_push(
     let addr = builder.ins().iadd(active_data_ptr, len);
     builder.ins().store(MemFlags::new(), byte_i8, addr, 0);
     let new_len = builder.ins().iadd_imm(len, 1);
-    builder.ins().store(
-        MemFlags::new(),
-        new_len,
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
+    builder.ins().store(MemFlags::new(), new_len, string_value.payload, STRING_LEN_OFFSET);
     builder.seal_block(merge_block);
     string_value
 }
@@ -2534,52 +2746,24 @@ fn compile_bytes_insert(
     index_value: CompiledValue,
     byte_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let idx_is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let byte_is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(byte_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let idx_is_int = builder.ins().icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder.ins().trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let byte_is_int = builder.ins().icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
+    builder.ins().trapz(byte_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
-    let non_neg = builder
-        .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
+    let non_neg = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
     builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let in_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThanOrEqual, index_value.payload, len);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, index_value.payload, len);
     builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
 
-    let cap = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_CAP_OFFSET,
-    );
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let cap =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_CAP_OFFSET);
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let alloc_ref = require_func(func_refs, "__alloc");
 
     let grow_block = builder.create_block();
@@ -2588,9 +2772,7 @@ fn compile_bytes_insert(
     builder.append_block_param(merge_block, types::I64);
 
     let has_capacity = builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
-    builder
-        .ins()
-        .brif(has_capacity, shift_init_block, &[], grow_block, &[]);
+    builder.ins().brif(has_capacity, shift_init_block, &[], grow_block, &[]);
 
     builder.switch_to_block(grow_block);
     let zero = builder.ins().iconst(types::I64, 0);
@@ -2602,27 +2784,13 @@ fn compile_bytes_insert(
     let new_data_call = builder.ins().call(alloc_ref, &[new_cap, align]);
     let new_data_ptr = builder.inst_results(new_data_call)[0];
     copy_string_bytes(builder, data_ptr, new_data_ptr, len, zero);
-    builder.ins().store(
-        MemFlags::new(),
-        new_data_ptr,
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
-    builder.ins().store(
-        MemFlags::new(),
-        new_cap,
-        string_value.payload,
-        STRING_CAP_OFFSET,
-    );
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(new_data_ptr)]);
+    builder.ins().store(MemFlags::new(), new_data_ptr, string_value.payload, STRING_PTR_OFFSET);
+    builder.ins().store(MemFlags::new(), new_cap, string_value.payload, STRING_CAP_OFFSET);
+    builder.ins().jump(merge_block, &[BlockArg::Value(new_data_ptr)]);
     builder.seal_block(grow_block);
 
     builder.switch_to_block(shift_init_block);
-    builder
-        .ins()
-        .jump(merge_block, &[BlockArg::Value(data_ptr)]);
+    builder.ins().jump(merge_block, &[BlockArg::Value(data_ptr)]);
     builder.seal_block(shift_init_block);
 
     builder.switch_to_block(merge_block);
@@ -2636,12 +2804,8 @@ fn compile_bytes_insert(
     builder.ins().jump(shift_loop, &[BlockArg::Value(len)]);
     builder.switch_to_block(shift_loop);
     let idx = builder.block_params(shift_loop)[0];
-    let needs_shift = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThan, idx, index_value.payload);
-    builder
-        .ins()
-        .brif(needs_shift, shift_body, &[], insert_block, &[]);
+    let needs_shift = builder.ins().icmp(IntCC::UnsignedGreaterThan, idx, index_value.payload);
+    builder.ins().brif(needs_shift, shift_body, &[], insert_block, &[]);
 
     builder.switch_to_block(shift_body);
     let src_idx = builder.ins().iadd_imm(idx, -1);
@@ -2655,16 +2819,9 @@ fn compile_bytes_insert(
     let clamped = builder.ins().band_imm(byte_value.payload, 0xff);
     let byte_i8 = builder.ins().ireduce(types::I8, clamped);
     let insert_addr = builder.ins().iadd(active_data_ptr, index_value.payload);
-    builder
-        .ins()
-        .store(MemFlags::new(), byte_i8, insert_addr, 0);
+    builder.ins().store(MemFlags::new(), byte_i8, insert_addr, 0);
     let new_len = builder.ins().iadd_imm(len, 1);
-    builder.ins().store(
-        MemFlags::new(),
-        new_len,
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
+    builder.ins().store(MemFlags::new(), new_len, string_value.payload, STRING_LEN_OFFSET);
 
     builder.seal_block(merge_block);
     builder.seal_block(shift_body);
@@ -2678,44 +2835,22 @@ fn compile_bytes_remove(
     string_value: CompiledValue,
     index_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let idx_is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let idx_is_int = builder.ins().icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder.ins().trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
-    let non_neg = builder
-        .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
+    let non_neg = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
     builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let in_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, index_value.payload, len);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index_value.payload, len);
     builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
 
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let removed_addr = builder.ins().iadd(data_ptr, index_value.payload);
-    let removed_byte = builder
-        .ins()
-        .load(types::I8, MemFlags::new(), removed_addr, 0);
+    let removed_byte = builder.ins().load(types::I8, MemFlags::new(), removed_addr, 0);
 
     let shift_loop = builder.create_block();
     let shift_body = builder.create_block();
@@ -2724,9 +2859,7 @@ fn compile_bytes_remove(
 
     let one = builder.ins().iconst(types::I64, 1);
     let last_index = builder.ins().isub(len, one);
-    builder
-        .ins()
-        .jump(shift_loop, &[BlockArg::Value(index_value.payload)]);
+    builder.ins().jump(shift_loop, &[BlockArg::Value(index_value.payload)]);
     builder.switch_to_block(shift_loop);
     let idx = builder.block_params(shift_loop)[0];
     let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, last_index);
@@ -2743,12 +2876,7 @@ fn compile_bytes_remove(
 
     builder.switch_to_block(done_block);
     let new_len = builder.ins().iadd_imm(len, -1);
-    builder.ins().store(
-        MemFlags::new(),
-        new_len,
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
+    builder.ins().store(MemFlags::new(), new_len, string_value.payload, STRING_LEN_OFFSET);
     builder.seal_block(shift_body);
     builder.seal_block(shift_loop);
     builder.seal_block(done_block);
@@ -2765,46 +2893,22 @@ fn compile_bytes_set(
     index_value: CompiledValue,
     byte_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let idx_is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let byte_is_int = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(byte_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let idx_is_int = builder.ins().icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+    builder.ins().trapz(idx_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let byte_is_int = builder.ins().icmp_imm(IntCC::Equal, byte_value.tag, TAG_INT);
+    builder.ins().trapz(byte_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
-    let non_neg = builder
-        .ins()
-        .icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
+    let non_neg = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
     builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let in_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, index_value.payload, len);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index_value.payload, len);
     builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
 
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let addr = builder.ins().iadd(data_ptr, index_value.payload);
     let clamped = builder.ins().band_imm(byte_value.payload, 0xff);
     let byte_i8 = builder.ins().ireduce(types::I8, clamped);
@@ -2817,24 +2921,12 @@ fn compile_string_copy(
     func_refs: &HashMap<String, FuncRef>,
     string_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_LEN_OFFSET,
-    );
-    let src_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        string_value.payload,
-        STRING_PTR_OFFSET,
-    );
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
+    let src_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
     let alloc_ref = require_func(func_refs, "__alloc");
     let align = builder.ins().iconst(types::I64, 8);
     let data_call = builder.ins().call(alloc_ref, &[len, align]);
@@ -2845,19 +2937,10 @@ fn compile_string_copy(
     let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
     let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
     let header_ptr = builder.inst_results(header_call)[0];
-    builder
-        .ins()
-        .store(MemFlags::new(), len, header_ptr, STRING_LEN_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), len, header_ptr, STRING_CAP_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_STRING),
-        payload: header_ptr,
-    }
+    builder.ins().store(MemFlags::new(), len, header_ptr, STRING_LEN_OFFSET);
+    builder.ins().store(MemFlags::new(), len, header_ptr, STRING_CAP_OFFSET);
+    builder.ins().store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING), payload: header_ptr }
 }
 
 fn compile_string_concat(
@@ -2867,27 +2950,15 @@ fn compile_string_concat(
     rhs: CompiledValue,
 ) -> CompiledValue {
     let lhs_is_string = builder.ins().icmp_imm(IntCC::Equal, lhs.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(lhs_is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(lhs_is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let rhs_is_string = builder.ins().icmp_imm(IntCC::Equal, rhs.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(rhs_is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(rhs_is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
-    let lhs_len = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), lhs.payload, STRING_LEN_OFFSET);
-    let rhs_len = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), rhs.payload, STRING_LEN_OFFSET);
+    let lhs_len = builder.ins().load(types::I64, MemFlags::new(), lhs.payload, STRING_LEN_OFFSET);
+    let rhs_len = builder.ins().load(types::I64, MemFlags::new(), rhs.payload, STRING_LEN_OFFSET);
     let total_len = builder.ins().iadd(lhs_len, rhs_len);
-    let lhs_ptr = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), lhs.payload, STRING_PTR_OFFSET);
-    let rhs_ptr = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), rhs.payload, STRING_PTR_OFFSET);
+    let lhs_ptr = builder.ins().load(types::I64, MemFlags::new(), lhs.payload, STRING_PTR_OFFSET);
+    let rhs_ptr = builder.ins().load(types::I64, MemFlags::new(), rhs.payload, STRING_PTR_OFFSET);
 
     let alloc_ref = require_func(func_refs, "__alloc");
     let align = builder.ins().iconst(types::I64, 8);
@@ -2900,20 +2971,11 @@ fn compile_string_concat(
     let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
     let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
     let header_ptr = builder.inst_results(header_call)[0];
-    builder
-        .ins()
-        .store(MemFlags::new(), total_len, header_ptr, STRING_LEN_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), total_len, header_ptr, STRING_CAP_OFFSET);
-    builder
-        .ins()
-        .store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+    builder.ins().store(MemFlags::new(), total_len, header_ptr, STRING_LEN_OFFSET);
+    builder.ins().store(MemFlags::new(), total_len, header_ptr, STRING_CAP_OFFSET);
+    builder.ins().store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
 
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_STRING),
-        payload: header_ptr,
-    }
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING), payload: header_ptr }
 }
 
 fn compile_string_chars(
@@ -2921,12 +2983,8 @@ fn compile_string_chars(
     func_refs: &HashMap<String, FuncRef>,
     string_value: CompiledValue,
 ) -> CompiledValue {
-    let is_string = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder
-        .ins()
-        .trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
     let alloc_ref = require_func(func_refs, "__alloc");
     let align = builder.ins().iconst(types::I64, 8);
@@ -2940,25 +2998,16 @@ fn compile_string_chars(
         header_ptr,
         STRING_ITER_STRING_OFFSET,
     );
-    builder
-        .ins()
-        .store(MemFlags::new(), zero, header_ptr, STRING_ITER_INDEX_OFFSET);
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_STRING_ITER),
-        payload: header_ptr,
-    }
+    builder.ins().store(MemFlags::new(), zero, header_ptr, STRING_ITER_INDEX_OFFSET);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING_ITER), payload: header_ptr }
 }
 
 fn compile_string_iter_done(
     builder: &mut FunctionBuilder,
     iter_value: CompiledValue,
 ) -> CompiledValue {
-    let is_iter = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, iter_value.tag, TAG_STRING_ITER);
-    builder
-        .ins()
-        .trapz(is_iter, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_iter = builder.ins().icmp_imm(IntCC::Equal, iter_value.tag, TAG_STRING_ITER);
+    builder.ins().trapz(is_iter, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let string_ptr = builder.ins().load(
         types::I64,
         MemFlags::new(),
@@ -2971,12 +3020,8 @@ fn compile_string_iter_done(
         iter_value.payload,
         STRING_ITER_INDEX_OFFSET,
     );
-    let len = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), string_ptr, STRING_LEN_OFFSET);
-    let done = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let len = builder.ins().load(types::I64, MemFlags::new(), string_ptr, STRING_LEN_OFFSET);
+    let done = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
     CompiledValue {
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: builder.ins().uextend(types::I64, done),
@@ -2987,12 +3032,8 @@ fn compile_string_iter_next(
     builder: &mut FunctionBuilder,
     iter_value: CompiledValue,
 ) -> CompiledValue {
-    let is_iter = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, iter_value.tag, TAG_STRING_ITER);
-    builder
-        .ins()
-        .trapz(is_iter, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_iter = builder.ins().icmp_imm(IntCC::Equal, iter_value.tag, TAG_STRING_ITER);
+    builder.ins().trapz(is_iter, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let string_ptr = builder.ins().load(
         types::I64,
         MemFlags::new(),
@@ -3005,26 +3046,14 @@ fn compile_string_iter_next(
         iter_value.payload,
         STRING_ITER_INDEX_OFFSET,
     );
-    let len = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), string_ptr, STRING_LEN_OFFSET);
+    let len = builder.ins().load(types::I64, MemFlags::new(), string_ptr, STRING_LEN_OFFSET);
     let not_done = builder.ins().icmp(IntCC::UnsignedLessThan, index, len);
     builder.ins().trapz(not_done, TrapCode::HEAP_OUT_OF_BOUNDS);
-    let data_ptr = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), string_ptr, STRING_PTR_OFFSET);
+    let data_ptr = builder.ins().load(types::I64, MemFlags::new(), string_ptr, STRING_PTR_OFFSET);
 
     let (codepoint, next_index) = decode_utf8_forward(builder, data_ptr, len, index);
-    builder.ins().store(
-        MemFlags::new(),
-        next_index,
-        iter_value.payload,
-        STRING_ITER_INDEX_OFFSET,
-    );
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload: codepoint,
-    }
+    builder.ins().store(MemFlags::new(), next_index, iter_value.payload, STRING_ITER_INDEX_OFFSET);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: codepoint }
 }
 
 fn decode_utf8_forward(
@@ -3045,35 +3074,22 @@ fn decode_utf8_forward(
     builder.append_block_param(done_block, types::I64);
     builder.append_block_param(done_block, types::I64);
 
-    builder
-        .ins()
-        .brif(lead_lt_80, ascii_block, &[], non_ascii_block, &[]);
+    builder.ins().brif(lead_lt_80, ascii_block, &[], non_ascii_block, &[]);
 
     builder.switch_to_block(ascii_block);
     let ascii_next = builder.ins().iadd_imm(index, 1);
-    builder.ins().jump(
-        done_block,
-        &[BlockArg::Value(lead), BlockArg::Value(ascii_next)],
-    );
+    builder.ins().jump(done_block, &[BlockArg::Value(lead), BlockArg::Value(ascii_next)]);
 
     builder.switch_to_block(non_ascii_block);
     let lead_lt_e0 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, lead, 0xe0);
-    builder
-        .ins()
-        .brif(lead_lt_e0, two_block, &[], three_or_more_block, &[]);
+    builder.ins().brif(lead_lt_e0, two_block, &[], three_or_more_block, &[]);
 
     builder.switch_to_block(two_block);
-    let valid_lead = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, lead, 0xc2);
-    builder
-        .ins()
-        .trapz(valid_lead, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let valid_lead = builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, lead, 0xc2);
+    builder.ins().trapz(valid_lead, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let next1 = builder.ins().iadd_imm(index, 1);
     let has_second = builder.ins().icmp(IntCC::UnsignedLessThan, next1, len);
-    builder
-        .ins()
-        .trapz(has_second, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(has_second, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let b1 = load_u8_at(builder, data_ptr, next1);
     trap_if_not_continuation_byte(builder, b1);
     let lead_mask = builder.ins().band_imm(lead, 0x1f);
@@ -3081,28 +3097,19 @@ fn decode_utf8_forward(
     let b1_mask = builder.ins().band_imm(b1, 0x3f);
     let cp = builder.ins().bor(lead_shift, b1_mask);
     let next_index = builder.ins().iadd_imm(index, 2);
-    builder.ins().jump(
-        done_block,
-        &[BlockArg::Value(cp), BlockArg::Value(next_index)],
-    );
+    builder.ins().jump(done_block, &[BlockArg::Value(cp), BlockArg::Value(next_index)]);
 
     builder.switch_to_block(three_or_more_block);
     let lead_lt_f0 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, lead, 0xf0);
-    builder
-        .ins()
-        .brif(lead_lt_f0, three_block, &[], four_block, &[]);
+    builder.ins().brif(lead_lt_f0, three_block, &[], four_block, &[]);
 
     builder.switch_to_block(three_block);
     let lead_lt_f0_again = builder.ins().icmp_imm(IntCC::UnsignedLessThan, lead, 0xf0);
-    builder
-        .ins()
-        .trapz(lead_lt_f0_again, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(lead_lt_f0_again, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let idx1 = builder.ins().iadd_imm(index, 1);
     let idx2 = builder.ins().iadd_imm(index, 2);
     let has_third = builder.ins().icmp(IntCC::UnsignedLessThan, idx2, len);
-    builder
-        .ins()
-        .trapz(has_third, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(has_third, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let b1 = load_u8_at(builder, data_ptr, idx1);
     let b2 = load_u8_at(builder, data_ptr, idx2);
     trap_if_not_continuation_byte(builder, b1);
@@ -3116,23 +3123,16 @@ fn decode_utf8_forward(
     let hi = builder.ins().bor(lead_shift, b1_shift);
     let cp = builder.ins().bor(hi, b2_mask);
     let next_index = builder.ins().iadd_imm(index, 3);
-    builder.ins().jump(
-        done_block,
-        &[BlockArg::Value(cp), BlockArg::Value(next_index)],
-    );
+    builder.ins().jump(done_block, &[BlockArg::Value(cp), BlockArg::Value(next_index)]);
 
     builder.switch_to_block(four_block);
     let lead_lt_f5 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, lead, 0xf5);
-    builder
-        .ins()
-        .trapz(lead_lt_f5, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(lead_lt_f5, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let idx1 = builder.ins().iadd_imm(index, 1);
     let idx2 = builder.ins().iadd_imm(index, 2);
     let idx3 = builder.ins().iadd_imm(index, 3);
     let has_fourth = builder.ins().icmp(IntCC::UnsignedLessThan, idx3, len);
-    builder
-        .ins()
-        .trapz(has_fourth, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(has_fourth, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let b1 = load_u8_at(builder, data_ptr, idx1);
     let b2 = load_u8_at(builder, data_ptr, idx2);
     let b3 = load_u8_at(builder, data_ptr, idx3);
@@ -3151,10 +3151,7 @@ fn decode_utf8_forward(
     let hi_b = builder.ins().bor(hi_a, b2_shift);
     let cp = builder.ins().bor(hi_b, b3_mask);
     let next_index = builder.ins().iadd_imm(index, 4);
-    builder.ins().jump(
-        done_block,
-        &[BlockArg::Value(cp), BlockArg::Value(next_index)],
-    );
+    builder.ins().jump(done_block, &[BlockArg::Value(cp), BlockArg::Value(next_index)]);
     builder.switch_to_block(done_block);
     builder.seal_block(ascii_block);
     builder.seal_block(non_ascii_block);
@@ -3176,9 +3173,7 @@ fn load_u8_at(builder: &mut FunctionBuilder, base_ptr: Value, index: Value) -> V
 fn trap_if_not_continuation_byte(builder: &mut FunctionBuilder, byte: Value) {
     let masked = builder.ins().band_imm(byte, 0xc0);
     let is_cont = builder.ins().icmp_imm(IntCC::Equal, masked, 0x80);
-    builder
-        .ins()
-        .trapz(is_cont, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(is_cont, TrapCode::BAD_CONVERSION_TO_INTEGER);
 }
 
 fn if_continuation_requires_extra_validation(
@@ -3189,44 +3184,32 @@ fn if_continuation_requires_extra_validation(
     let one = builder.ins().iconst(types::I64, 1);
     let zero = builder.ins().iconst(types::I64, 0);
     let lead_is_e0 = builder.ins().icmp_imm(IntCC::Equal, lead, 0xe0);
-    let b1_ge_a0 = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b1, 0xa0);
+    let b1_ge_a0 = builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b1, 0xa0);
     let b1_ge_a0_i64 = builder.ins().select(b1_ge_a0, one, zero);
     let e0_ok = builder.ins().select(lead_is_e0, b1_ge_a0_i64, one);
-    builder
-        .ins()
-        .trapz(e0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(e0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
     let lead_is_ed = builder.ins().icmp_imm(IntCC::Equal, lead, 0xed);
     let b1_lt_a0 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, b1, 0xa0);
     let b1_lt_a0_i64 = builder.ins().select(b1_lt_a0, one, zero);
     let ed_ok = builder.ins().select(lead_is_ed, b1_lt_a0_i64, one);
-    builder
-        .ins()
-        .trapz(ed_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(ed_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 }
 
 fn trap_if_special_four_byte_invalid(builder: &mut FunctionBuilder, lead: Value, b1: Value) {
     let one = builder.ins().iconst(types::I64, 1);
     let zero = builder.ins().iconst(types::I64, 0);
     let lead_is_f0 = builder.ins().icmp_imm(IntCC::Equal, lead, 0xf0);
-    let b1_ge_90 = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b1, 0x90);
+    let b1_ge_90 = builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b1, 0x90);
     let b1_ge_90_i64 = builder.ins().select(b1_ge_90, one, zero);
     let f0_ok = builder.ins().select(lead_is_f0, b1_ge_90_i64, one);
-    builder
-        .ins()
-        .trapz(f0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(f0_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 
     let lead_is_f4 = builder.ins().icmp_imm(IntCC::Equal, lead, 0xf4);
     let b1_lt_90 = builder.ins().icmp_imm(IntCC::UnsignedLessThan, b1, 0x90);
     let b1_lt_90_i64 = builder.ins().select(b1_lt_90, one, zero);
     let f4_ok = builder.ins().select(lead_is_f4, b1_lt_90_i64, one);
-    builder
-        .ins()
-        .trapz(f4_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(f4_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
 }
 
 fn copy_string_bytes(
@@ -3271,9 +3254,7 @@ fn load_value_from_env(
 ) -> CompiledValue {
     let slot_offset = i32::try_from(i64::try_from(slot).unwrap() * VALUE_SIZE)
         .expect("closure env offset overflow");
-    let tag_i8 = builder
-        .ins()
-        .load(types::I8, MemFlags::new(), env_ptr, slot_offset);
+    let tag_i8 = builder.ins().load(types::I8, MemFlags::new(), env_ptr, slot_offset);
     let tag = builder.ins().uextend(types::I64, tag_i8);
     let payload = builder.ins().load(
         types::I64,
@@ -3306,9 +3287,7 @@ fn allocate_closure_for_function(
             .checked_mul(VALUE_SIZE)
             .expect("closure env size overflow");
         let env_size = builder.ins().iconst(types::I64, env_bytes);
-        let env_align = builder
-            .ins()
-            .iconst(types::I64, std::mem::align_of::<i64>() as i64);
+        let env_align = builder.ins().iconst(types::I64, std::mem::align_of::<i64>() as i64);
         let env_call = builder.ins().call(alloc_ref, &[env_size, env_align]);
         let env_ptr_raw = builder.inst_results(env_call)[0];
         for (index, capture_name) in captures.iter().enumerate() {
@@ -3325,9 +3304,7 @@ fn allocate_closure_for_function(
             let slot_offset = i32::try_from(i64::try_from(index).unwrap() * VALUE_SIZE)
                 .expect("closure env offset overflow");
             let tag_i8 = builder.ins().ireduce(types::I8, capture_value.tag);
-            builder
-                .ins()
-                .store(MemFlags::new(), tag_i8, env_ptr_raw, slot_offset);
+            builder.ins().store(MemFlags::new(), tag_i8, env_ptr_raw, slot_offset);
             builder.ins().store(
                 MemFlags::new(),
                 capture_value.payload,
@@ -3339,15 +3316,13 @@ fn allocate_closure_for_function(
     };
 
     let closure_size = builder.ins().iconst(types::I64, CLOSURE_SIZE);
-    let closure_align = builder
-        .ins()
-        .iconst(types::I64, std::mem::align_of::<i64>() as i64);
-    let closure_call = builder
-        .ins()
-        .call(alloc_ref, &[closure_size, closure_align]);
+    let closure_align = builder.ins().iconst(types::I64, std::mem::align_of::<i64>() as i64);
+    let closure_call = builder.ins().call(alloc_ref, &[closure_size, closure_align]);
     let closure_ptr = builder.inst_results(closure_call)[0];
     let ordinal = *function_ordinals.get(function_name).unwrap_or_else(|| {
-        panic!("missing function ordinal for function reference: {function_name}")
+        panic!(
+            "internal compiler error: validated function reference '{function_name}' has no ordinal"
+        )
     });
     let ordinal_value = builder.ins().iconst(types::I64, ordinal);
     builder.ins().store(
@@ -3356,16 +3331,8 @@ fn allocate_closure_for_function(
         closure_ptr,
         CLOSURE_FUNCTION_ORDINAL_OFFSET,
     );
-    builder.ins().store(
-        MemFlags::new(),
-        env_raw,
-        closure_ptr,
-        CLOSURE_ENV_PTR_OFFSET,
-    );
-    CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_FUNCTION),
-        payload: closure_ptr,
-    }
+    builder.ins().store(MemFlags::new(), env_raw, closure_ptr, CLOSURE_ENV_PTR_OFFSET);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_FUNCTION), payload: closure_ptr }
 }
 
 fn resolve_named_value(
@@ -3379,10 +3346,7 @@ fn resolve_named_value(
     env_ptr: Value,
 ) -> CompiledValue {
     if let Some(var) = vars.get(name) {
-        CompiledValue {
-            tag: builder.use_var(var.tag),
-            payload: builder.use_var(var.payload),
-        }
+        CompiledValue { tag: builder.use_var(var.tag), payload: builder.use_var(var.payload) }
     } else if let Some(&slot) = capture_slots.get(name) {
         load_value_from_env(builder, env_ptr, slot)
     } else if function_ordinals.contains_key(name) {
@@ -3397,15 +3361,13 @@ fn resolve_named_value(
             env_ptr,
         )
     } else {
-        panic!("undefined variable: {name}");
+        unreachable!("undefined variable should have been rejected before codegen: {name}");
     }
 }
 
 fn expect_int_payload(builder: &mut FunctionBuilder, value: CompiledValue) -> Value {
     let is_int = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_INT);
-    builder
-        .ins()
-        .trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
     value.payload
 }
 
@@ -3422,13 +3384,10 @@ fn compile_list_literal(
 ) -> CompiledValue {
     let list_new_ref = *func_refs
         .get("list_new")
-        .expect("builtin function 'list_new' is missing");
+        .expect("internal compiler error: builtin function 'list_new' is missing");
     let create_call = builder.ins().call(list_new_ref, &[]);
     let created = builder.inst_results(create_call);
-    let handle = CompiledValue {
-        tag: created[0],
-        payload: created[1],
-    };
+    let handle = CompiledValue { tag: created[0], payload: created[1] };
 
     for item in items {
         let value = compile_ast(
@@ -3454,13 +3413,10 @@ fn create_empty_list(
 ) -> CompiledValue {
     let list_new_ref = *func_refs
         .get("list_new")
-        .expect("builtin function 'list_new' is missing");
+        .expect("internal compiler error: builtin function 'list_new' is missing");
     let create_call = builder.ins().call(list_new_ref, &[]);
     let created = builder.inst_results(create_call);
-    CompiledValue {
-        tag: created[0],
-        payload: created[1],
-    }
+    CompiledValue { tag: created[0], payload: created[1] }
 }
 
 fn validate_unary_callback_ast(
@@ -3472,13 +3428,20 @@ fn validate_unary_callback_ast(
 ) {
     match ast {
         Ast::FunctionRef(name) => {
-            if function_arities.get(name) != Some(&1usize) {
-                panic!("{builtin} callback must take exactly 1 argument");
+            if function_arities.get(name.as_str()) != Some(&1usize) {
+                unreachable!(
+                    "{builtin} callback arity should have been validated before codegen: {name}"
+                );
             }
         }
-        Ast::Variable(name) if !vars.contains_key(name) && function_ordinals.contains_key(name) => {
-            if function_arities.get(name) != Some(&1usize) {
-                panic!("{builtin} callback must take exactly 1 argument");
+        Ast::Variable(name)
+            if !vars.contains_key(name.as_str())
+                && function_ordinals.contains_key(name.as_str()) =>
+        {
+            if function_arities.get(name.as_str()) != Some(&1usize) {
+                unreachable!(
+                    "{builtin} callback variable arity should have been validated before codegen: {name}"
+                );
             }
         }
         _ => {}
@@ -3494,10 +3457,7 @@ fn call_unary(
     let func_ref = require_func(func_refs, name);
     let call = builder.ins().call(func_ref, &[arg.tag, arg.payload]);
     let results = builder.inst_results(call);
-    CompiledValue {
-        tag: results[0],
-        payload: results[1],
-    }
+    CompiledValue { tag: results[0], payload: results[1] }
 }
 
 fn call_named_with_env(
@@ -3507,9 +3467,9 @@ fn call_named_with_env(
     env_ptr: Value,
     args: &[CompiledValue],
 ) -> CompiledValue {
-    let func_ref = *func_refs
-        .get(name)
-        .unwrap_or_else(|| panic!("function '{name}' is missing"));
+    let func_ref = *func_refs.get(name).unwrap_or_else(|| {
+        panic!("internal compiler error: validated function '{name}' is missing from func refs")
+    });
     let mut call_args = Vec::with_capacity(1 + args.len() * 2);
     call_args.push(env_ptr);
     for arg in args {
@@ -3518,10 +3478,7 @@ fn call_named_with_env(
     }
     let call = builder.ins().call(func_ref, &call_args);
     let results = builder.inst_results(call);
-    CompiledValue {
-        tag: results[0],
-        payload: results[1],
-    }
+    CompiledValue { tag: results[0], payload: results[1] }
 }
 
 fn apply_function_value(
@@ -3532,12 +3489,8 @@ fn apply_function_value(
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
 ) -> CompiledValue {
-    let is_function = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, function_value.tag, TAG_FUNCTION);
-    builder
-        .ins()
-        .trapz(is_function, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_function = builder.ins().icmp_imm(IntCC::Equal, function_value.tag, TAG_FUNCTION);
+    builder.ins().trapz(is_function, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let closure_ptr = function_value.payload;
     let closure_ordinal = builder.ins().load(
         types::I64,
@@ -3545,22 +3498,22 @@ fn apply_function_value(
         closure_ptr,
         CLOSURE_FUNCTION_ORDINAL_OFFSET,
     );
-    let closure_env_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        closure_ptr,
-        CLOSURE_ENV_PTR_OFFSET,
-    );
+    let closure_env_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), closure_ptr, CLOSURE_ENV_PTR_OFFSET);
 
     let mut candidates: Vec<_> = function_ordinals
         .iter()
         .filter_map(|(name, &ordinal)| {
-            (function_arities.get(name) == Some(&args.len())).then_some((ordinal, name.as_str()))
+            (function_arities.get(name.as_str()) == Some(&args.len()))
+                .then_some((ordinal, name.as_str()))
         })
         .collect();
     candidates.sort_by_key(|(ordinal, _)| *ordinal);
     if candidates.is_empty() {
-        panic!("no unary functions are available for higher-order list builtins");
+        panic!(
+            "internal compiler error: no functions with arity {} are available for higher-order calls",
+            args.len()
+        );
     }
 
     let entry_check = builder.create_block();
@@ -3572,33 +3525,25 @@ fn apply_function_value(
     let mut check_block = entry_check;
     for (index, (ordinal, name)) in candidates.iter().enumerate() {
         builder.switch_to_block(check_block);
-        let matched = builder
-            .ins()
-            .icmp_imm(IntCC::Equal, closure_ordinal, *ordinal);
+        let matched = builder.ins().icmp_imm(IntCC::Equal, closure_ordinal, *ordinal);
         let call_block = builder.create_block();
-        let next_block = if index + 1 == candidates.len() {
-            None
-        } else {
-            Some(builder.create_block())
-        };
+        let next_block =
+            if index + 1 == candidates.len() { None } else { Some(builder.create_block()) };
         match next_block {
             Some(next) => {
                 builder.ins().brif(matched, call_block, &[], next, &[]);
             }
             None => {
-                builder
-                    .ins()
-                    .trapz(matched, TrapCode::BAD_CONVERSION_TO_INTEGER);
+                builder.ins().trapz(matched, TrapCode::BAD_CONVERSION_TO_INTEGER);
                 builder.ins().jump(call_block, &[]);
             }
         }
 
         builder.switch_to_block(call_block);
         let result = call_named_with_env(builder, func_refs, name, closure_env_ptr, args);
-        builder.ins().jump(
-            merge_block,
-            &[BlockArg::Value(result.tag), BlockArg::Value(result.payload)],
-        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(result.tag), BlockArg::Value(result.payload)]);
         builder.seal_block(call_block);
         builder.seal_block(check_block);
 
@@ -3610,10 +3555,7 @@ fn apply_function_value(
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
     let params = builder.block_params(merge_block);
-    CompiledValue {
-        tag: params[0],
-        payload: params[1],
-    }
+    CompiledValue { tag: params[0], payload: params[1] }
 }
 
 fn compile_list_map(
@@ -3628,13 +3570,7 @@ fn compile_list_map(
     env_ptr: Value,
 ) -> CompiledValue {
     assert_eq!(args.len(), 2, "list_map expects 2 arguments");
-    validate_unary_callback_ast(
-        &args[1],
-        vars,
-        function_ordinals,
-        function_arities,
-        "list_map",
-    );
+    validate_unary_callback_ast(&args[1], vars, function_ordinals, function_arities, "list_map");
     let input = compile_ast(
         builder,
         &args[0],
@@ -3670,18 +3606,12 @@ fn compile_list_map(
 
     builder.switch_to_block(loop_block);
     let idx = builder.block_params(loop_block)[0];
-    let has_more = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, idx, len.payload);
-    builder
-        .ins()
-        .brif(has_more, body_block, &[], exit_block, &[]);
+    let has_more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len.payload);
+    builder.ins().brif(has_more, body_block, &[], exit_block, &[]);
 
     builder.switch_to_block(body_block);
-    let index_value = CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload: idx,
-    };
+    let index_value =
+        CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: idx };
     let item = call_binary(builder, func_refs, "list_get", input, index_value);
     let mapped = apply_function_value(
         builder,
@@ -3714,13 +3644,7 @@ fn compile_list_filter(
     env_ptr: Value,
 ) -> CompiledValue {
     assert_eq!(args.len(), 2, "list_filter expects 2 arguments");
-    validate_unary_callback_ast(
-        &args[1],
-        vars,
-        function_ordinals,
-        function_arities,
-        "list_filter",
-    );
+    validate_unary_callback_ast(&args[1], vars, function_ordinals, function_arities, "list_filter");
     let input = compile_ast(
         builder,
         &args[0],
@@ -3759,18 +3683,12 @@ fn compile_list_filter(
 
     builder.switch_to_block(loop_block);
     let idx = builder.block_params(loop_block)[0];
-    let has_more = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, idx, len.payload);
-    builder
-        .ins()
-        .brif(has_more, body_block, &[], exit_block, &[]);
+    let has_more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len.payload);
+    builder.ins().brif(has_more, body_block, &[], exit_block, &[]);
 
     builder.switch_to_block(body_block);
-    let index_value = CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload: idx,
-    };
+    let index_value =
+        CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: idx };
     let item = call_binary(builder, func_refs, "list_get", input, index_value);
     let predicate = apply_function_value(
         builder,
@@ -3853,15 +3771,11 @@ fn compile_list_range(
     builder.switch_to_block(loop_block);
     let current = builder.block_params(loop_block)[0];
     let has_more = builder.ins().icmp(IntCC::SignedLessThan, current, end);
-    builder
-        .ins()
-        .brif(has_more, body_block, &[], exit_block, &[]);
+    builder.ins().brif(has_more, body_block, &[], exit_block, &[]);
 
     builder.switch_to_block(body_block);
-    let current_value = CompiledValue {
-        tag: builder.ins().iconst(types::I64, TAG_INT),
-        payload: current,
-    };
+    let current_value =
+        CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: current };
     let _ = call_binary(builder, func_refs, "list_push", output, current_value);
     let next = builder.ins().iadd_imm(current, 1);
     builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
@@ -3935,7 +3849,7 @@ fn compile_tail_ast(
     loop_block: Block,
 ) {
     match ast {
-        Ast::Expression(ExpressionAst { function, args })
+        Ast::Expression(ExpressionAst { function, args, .. })
             if function == current_function_name && !is_builtin_name(function) =>
         {
             let compiled_args: Vec<_> = args
@@ -3962,11 +3876,7 @@ fn compile_tail_ast(
             }
             builder.ins().jump(loop_block, &jump_args);
         }
-        Ast::If {
-            condition,
-            then,
-            else_,
-        } => {
+        Ast::If { condition, then, else_, .. } => {
             let cond_val = compile_ast(
                 builder,
                 condition,
@@ -3983,9 +3893,7 @@ fn compile_tail_ast(
 
             let then_block = builder.create_block();
             let else_block = builder.create_block();
-            builder
-                .ins()
-                .brif(cond_non_zero, then_block, &[], else_block, &[]);
+            builder.ins().brif(cond_non_zero, then_block, &[], else_block, &[]);
 
             builder.switch_to_block(then_block);
             compile_tail_block(
@@ -4073,9 +3981,7 @@ fn compile_ast(
         Ast::Literal(LiteralAst::BigInt(digits)) => {
             compile_bigint_literal(builder, func_refs, digits)
         }
-        Ast::Lambda { .. } => {
-            panic!("anonymous functions are not implemented by the compiler yet");
-        }
+        Ast::Lambda { .. } => unimplemented!("anonymous functions"),
         Ast::FunctionRef(name) => allocate_closure_for_function(
             builder,
             vars,
@@ -4097,581 +4003,54 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::Index { collection, index } => {
-            let collection_value = compile_ast(
-                builder,
-                collection,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            let index_value = compile_ast(
-                builder,
-                index,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            call_binary(
-                builder,
-                func_refs,
-                "list_get",
-                collection_value,
-                index_value,
-            )
-        }
-        Ast::IndexAssign {
+        Ast::Index { collection, index, .. } => compile_index_ast(
+            builder,
+            collection,
+            index,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::IndexAssign { collection, index, value, .. } => compile_index_assign_ast(
+            builder,
             collection,
             index,
             value,
-        } => {
-            let collection_value = compile_ast(
-                builder,
-                collection,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            let index_value = compile_ast(
-                builder,
-                index,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            let value = compile_ast(
-                builder,
-                value,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            call_ternary(
-                builder,
-                func_refs,
-                "list_set",
-                collection_value,
-                index_value,
-                value,
-            )
-        }
-        Ast::Expression(ExpressionAst { function, args }) => {
-            if function == "not" {
-                assert_eq!(args.len(), 1, "not expects 1 argument");
-                return compile_logical_not(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "and" || function == "or" {
-                assert_eq!(args.len(), 2, "{function} expects 2 arguments");
-                return compile_logical_op(
-                    builder,
-                    function,
-                    &args[0],
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "list_map" {
-                return compile_list_map(
-                    builder,
-                    args,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "list_filter" {
-                return compile_list_filter(
-                    builder,
-                    args,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "list_range" {
-                return compile_list_range(
-                    builder,
-                    args,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-            }
-            if function == "bytes_len" {
-                assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
-                let value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_len(builder, value);
-            }
-            if function == "bytes_get" {
-                assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_get(builder, string_value, index_value);
-            }
-            if function == "bytes_pop" {
-                assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_pop(builder, string_value);
-            }
-            if function == "bytes_push" {
-                assert_eq!(args.len(), 2, "bytes_push expects 2 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let byte_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_push(builder, func_refs, string_value, byte_value);
-            }
-            if function == "bytes_insert" {
-                assert_eq!(args.len(), 3, "bytes_insert expects 3 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let byte_value = compile_ast(
-                    builder,
-                    &args[2],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_insert(
-                    builder,
-                    func_refs,
-                    string_value,
-                    index_value,
-                    byte_value,
-                );
-            }
-            if function == "bytes_remove" {
-                assert_eq!(args.len(), 2, "bytes_remove expects 2 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_remove(builder, string_value, index_value);
-            }
-            if function == "bytes_set" {
-                assert_eq!(args.len(), 3, "bytes_set expects 3 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let index_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let byte_value = compile_ast(
-                    builder,
-                    &args[2],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_set(builder, string_value, index_value, byte_value);
-            }
-            if function == "bytes_slice" {
-                assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let start_value = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let end_value = compile_ast(
-                    builder,
-                    &args[2],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_bytes_slice(
-                    builder,
-                    func_refs,
-                    string_value,
-                    start_value,
-                    end_value,
-                );
-            }
-            if function == "string_chars" {
-                assert_eq!(args.len(), 1, "string_chars expects 1 argument");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_chars(builder, func_refs, string_value);
-            }
-            if function == "string_iter_done" {
-                assert_eq!(args.len(), 1, "string_iter_done expects 1 argument");
-                let iter_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_iter_done(builder, iter_value);
-            }
-            if function == "string_iter_next" {
-                assert_eq!(args.len(), 1, "string_iter_next expects 1 argument");
-                let iter_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_iter_next(builder, iter_value);
-            }
-            if function == "string_copy" {
-                assert_eq!(args.len(), 1, "string_copy expects 1 argument");
-                let string_value = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_copy(builder, func_refs, string_value);
-            }
-            if function == "string_concat" {
-                assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
-                let lhs = compile_ast(
-                    builder,
-                    &args[0],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                let rhs = compile_ast(
-                    builder,
-                    &args[1],
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                );
-                return compile_string_concat(builder, func_refs, lhs, rhs);
-            }
-            let compiled: Vec<_> = args
-                .iter()
-                .map(|arg| {
-                    compile_ast(
-                        builder,
-                        arg,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    )
-                })
-                .collect();
-            if function.is_empty() {
-                return compiled[0];
-            }
-            match function.as_str() {
-                "add" => call_binary(builder, func_refs, "__op_add", compiled[0], compiled[1]),
-                "subtract" => call_binary(
-                    builder,
-                    func_refs,
-                    "__op_subtract",
-                    compiled[0],
-                    compiled[1],
-                ),
-                "multiply" => call_binary(
-                    builder,
-                    func_refs,
-                    "__op_multiply",
-                    compiled[0],
-                    compiled[1],
-                ),
-                "divide" => {
-                    call_binary(builder, func_refs, "__op_divide", compiled[0], compiled[1])
-                }
-                "modulo" => {
-                    call_binary(builder, func_refs, "__op_modulo", compiled[0], compiled[1])
-                }
-                "gt" => call_binary(builder, func_refs, "__op_gt", compiled[0], compiled[1]),
-                "lt" => call_binary(builder, func_refs, "__op_lt", compiled[0], compiled[1]),
-                "gte" => call_binary(builder, func_refs, "__op_gte", compiled[0], compiled[1]),
-                "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
-                "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
-                "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
-                "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
-                | "bigint_modulo" | "bigint_compare" => {
-                    compile_bigint_builtin(builder, func_refs, function, &compiled)
-                }
-                name => {
-                    if vars.contains_key(name) || capture_slots.contains_key(name) {
-                        let callee = resolve_named_value(
-                            builder,
-                            name,
-                            vars,
-                            func_refs,
-                            function_ordinals,
-                            closure_metadata,
-                            capture_slots,
-                            env_ptr,
-                        );
-                        return apply_function_value(
-                            builder,
-                            func_refs,
-                            callee,
-                            &compiled,
-                            function_ordinals,
-                            function_arities,
-                        );
-                    }
-                    if function_ordinals.contains_key(name) {
-                        let zero_env = builder.ins().iconst(types::I64, 0);
-                        return call_named_with_env(builder, func_refs, name, zero_env, &compiled);
-                    }
-                    if let Some(func_ref) = func_refs.get(name) {
-                        let mut args = Vec::with_capacity(compiled.len() * 2);
-                        for value in &compiled {
-                            args.push(value.tag);
-                            args.push(value.payload);
-                        }
-                        let call = builder.ins().call(*func_ref, &args);
-                        let results = builder.inst_results(call);
-                        return CompiledValue {
-                            tag: results[0],
-                            payload: results[1],
-                        };
-                    }
-                    panic!("undefined function: {name}");
-                }
-            }
-        }
-        Ast::Block(block) => {
-            let mut last = None;
-            for line in &block.lines {
-                last = Some(compile_ast(
-                    builder,
-                    line,
-                    vars,
-                    func_refs,
-                    function_ordinals,
-                    function_arities,
-                    closure_metadata,
-                    capture_slots,
-                    env_ptr,
-                ));
-            }
-            last.expect("empty block")
-        }
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::Expression(ExpressionAst { function, args, .. }) => compile_expression_ast(
+            builder,
+            function,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::Block(block) => compile_block_ast(
+            builder,
+            block,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
         Ast::Variable(name) => resolve_named_value(
             builder,
             name,
@@ -4682,33 +4061,430 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::Assign { name, value } => {
-            let val = compile_ast(
-                builder,
-                value,
-                vars,
-                func_refs,
-                function_ordinals,
-                function_arities,
-                closure_metadata,
-                capture_slots,
-                env_ptr,
-            );
-            let var = vars
-                .get(name)
-                .unwrap_or_else(|| panic!("undeclared variable: {name}"));
-            builder.def_var(var.tag, val.tag);
-            builder.def_var(var.payload, val.payload);
-            val
-        }
-        Ast::If {
+        Ast::Assign { name, value, .. } => compile_assign_ast(
+            builder,
+            name,
+            value,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::If { condition, then, else_, .. } => compile_if_ast(
+            builder,
             condition,
             then,
             else_,
-        } => {
-            let cond_val = compile_ast(
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
+    }
+}
+
+fn compile_index_ast(
+    builder: &mut FunctionBuilder,
+    collection: &Ast,
+    index: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let collection_value = compile_ast(
+        builder,
+        collection,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let index_value = compile_ast(
+        builder,
+        index,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    call_binary(builder, func_refs, "list_get", collection_value, index_value)
+}
+
+fn compile_index_assign_ast(
+    builder: &mut FunctionBuilder,
+    collection: &Ast,
+    index: &Ast,
+    value: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let collection_value = compile_ast(
+        builder,
+        collection,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let index_value = compile_ast(
+        builder,
+        index,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let value = compile_ast(
+        builder,
+        value,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    call_ternary(builder, func_refs, "list_set", collection_value, index_value, value)
+}
+
+fn compile_block_ast(
+    builder: &mut FunctionBuilder,
+    block: &BlockAst,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let mut last = None;
+    for line in &block.lines {
+        last = Some(compile_ast(
+            builder,
+            line,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ));
+    }
+    last.expect("empty block")
+}
+
+fn compile_assign_ast(
+    builder: &mut FunctionBuilder,
+    name: &str,
+    value: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let val = compile_ast(
+        builder,
+        value,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let var = vars.get(name).unwrap_or_else(|| {
+        panic!("internal compiler error: assignment target '{name}' has no local slot")
+    });
+    builder.def_var(var.tag, val.tag);
+    builder.def_var(var.payload, val.payload);
+    val
+}
+
+fn compile_if_ast(
+    builder: &mut FunctionBuilder,
+    condition: &Ast,
+    then: &BlockAst,
+    else_: &Option<BlockAst>,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let cond_val = compile_ast(
+        builder,
+        condition,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
+    let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
+
+    let then_block = builder.create_block();
+    let merge_block = builder.create_block();
+    builder.append_block_param(merge_block, types::I64);
+    builder.append_block_param(merge_block, types::I64);
+
+    if let Some(else_block_ast) = else_ {
+        let else_block = builder.create_block();
+        builder.ins().brif(cond_non_zero, then_block, &[], else_block, &[]);
+
+        builder.switch_to_block(then_block);
+        builder.seal_block(then_block);
+        let then_val = compile_block_ast(
+            builder,
+            then,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(then_val.tag), BlockArg::Value(then_val.payload)]);
+
+        builder.switch_to_block(else_block);
+        builder.seal_block(else_block);
+        let else_val = compile_block_ast(
+            builder,
+            else_block_ast,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(else_val.tag), BlockArg::Value(else_val.payload)]);
+    } else {
+        let boxed_zero = boxed_int_const(builder, 0);
+        builder.ins().brif(
+            cond_non_zero,
+            then_block,
+            &[],
+            merge_block,
+            &[BlockArg::Value(boxed_zero.tag), BlockArg::Value(boxed_zero.payload)],
+        );
+
+        builder.switch_to_block(then_block);
+        builder.seal_block(then_block);
+        let then_val = compile_block_ast(
+            builder,
+            then,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(then_val.tag), BlockArg::Value(then_val.payload)]);
+    }
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    let params = builder.block_params(merge_block);
+    CompiledValue { tag: params[0], payload: params[1] }
+}
+
+fn compile_expression_ast(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    args: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    if function == "not" {
+        assert_eq!(args.len(), 1, "not expects 1 argument");
+        return compile_logical_not(
+            builder,
+            &args[0],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "and" || function == "or" {
+        assert_eq!(args.len(), 2, "{function} expects 2 arguments");
+        return compile_logical_op(
+            builder,
+            function,
+            &args[0],
+            &args[1],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "list_map" {
+        return compile_list_map(
+            builder,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "list_filter" {
+        return compile_list_filter(
+            builder,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if function == "list_range" {
+        return compile_list_range(
+            builder,
+            args,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        );
+    }
+    if let Some(value) = compile_string_expression_ast(
+        builder,
+        function,
+        args,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    ) {
+        return value;
+    }
+
+    let compiled: Vec<_> = args
+        .iter()
+        .map(|arg| {
+            compile_ast(
                 builder,
-                condition,
+                arg,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            )
+        })
+        .collect();
+    if function.is_empty() {
+        return compiled[0];
+    }
+    compile_named_expression_ast(
+        builder,
+        function,
+        &compiled,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    )
+}
+
+fn compile_string_expression_ast(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    args: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> Option<CompiledValue> {
+    match function {
+        "bytes_len" => {
+            assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
+            let value = compile_ast(
+                builder,
+                &args[0],
                 vars,
                 func_refs,
                 function_ordinals,
@@ -4717,114 +4493,367 @@ fn compile_ast(
                 capture_slots,
                 env_ptr,
             );
-            let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
-            let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
-
-            let then_block = builder.create_block();
-            let merge_block = builder.create_block();
-            builder.append_block_param(merge_block, types::I64);
-            builder.append_block_param(merge_block, types::I64);
-
-            if let Some(else_block_ast) = else_ {
-                let else_block = builder.create_block();
-                builder
-                    .ins()
-                    .brif(cond_non_zero, then_block, &[], else_block, &[]);
-
-                builder.switch_to_block(then_block);
-                builder.seal_block(then_block);
-                let mut then_val = boxed_int_const(builder, 0);
-                for line in &then.lines {
-                    then_val = compile_ast(
-                        builder,
-                        line,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    );
-                }
-                builder.ins().jump(
-                    merge_block,
-                    &[
-                        BlockArg::Value(then_val.tag),
-                        BlockArg::Value(then_val.payload),
-                    ],
-                );
-
-                builder.switch_to_block(else_block);
-                builder.seal_block(else_block);
-                let mut else_val = boxed_int_const(builder, 0);
-                for line in &else_block_ast.lines {
-                    else_val = compile_ast(
-                        builder,
-                        line,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    );
-                }
-                builder.ins().jump(
-                    merge_block,
-                    &[
-                        BlockArg::Value(else_val.tag),
-                        BlockArg::Value(else_val.payload),
-                    ],
-                );
-            } else {
-                let boxed_zero = boxed_int_const(builder, 0);
-                builder.ins().brif(
-                    cond_non_zero,
-                    then_block,
-                    &[],
-                    merge_block,
-                    &[
-                        BlockArg::Value(boxed_zero.tag),
-                        BlockArg::Value(boxed_zero.payload),
-                    ],
-                );
-
-                builder.switch_to_block(then_block);
-                builder.seal_block(then_block);
-                let mut then_val = boxed_int_const(builder, 0);
-                for line in &then.lines {
-                    then_val = compile_ast(
-                        builder,
-                        line,
-                        vars,
-                        func_refs,
-                        function_ordinals,
-                        function_arities,
-                        closure_metadata,
-                        capture_slots,
-                        env_ptr,
-                    );
-                }
-                builder.ins().jump(
-                    merge_block,
-                    &[
-                        BlockArg::Value(then_val.tag),
-                        BlockArg::Value(then_val.payload),
-                    ],
-                );
-            }
-
-            builder.switch_to_block(merge_block);
-            builder.seal_block(merge_block);
-            let params = builder.block_params(merge_block);
-            CompiledValue {
-                tag: params[0],
-                payload: params[1],
-            }
+            Some(compile_bytes_len(builder, value))
         }
-        Ast::FunctionDef(_) => panic!("nested function definitions are not supported"),
+        "bytes_get" => {
+            assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_get(builder, string_value, index_value))
+        }
+        "bytes_pop" => {
+            assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_pop(builder, string_value))
+        }
+        "bytes_push" => {
+            assert_eq!(args.len(), 2, "bytes_push expects 2 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let byte_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_push(builder, func_refs, string_value, byte_value))
+        }
+        "bytes_insert" => {
+            assert_eq!(args.len(), 3, "bytes_insert expects 3 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let byte_value = compile_ast(
+                builder,
+                &args[2],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_insert(builder, func_refs, string_value, index_value, byte_value))
+        }
+        "bytes_remove" => {
+            assert_eq!(args.len(), 2, "bytes_remove expects 2 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_remove(builder, string_value, index_value))
+        }
+        "bytes_set" => {
+            assert_eq!(args.len(), 3, "bytes_set expects 3 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let index_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let byte_value = compile_ast(
+                builder,
+                &args[2],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_set(builder, string_value, index_value, byte_value))
+        }
+        "bytes_slice" => {
+            assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let start_value = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let end_value = compile_ast(
+                builder,
+                &args[2],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_bytes_slice(builder, func_refs, string_value, start_value, end_value))
+        }
+        "string_chars" => {
+            assert_eq!(args.len(), 1, "string_chars expects 1 argument");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_chars(builder, func_refs, string_value))
+        }
+        "string_iter_done" => {
+            assert_eq!(args.len(), 1, "string_iter_done expects 1 argument");
+            let iter_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_iter_done(builder, iter_value))
+        }
+        "string_iter_next" => {
+            assert_eq!(args.len(), 1, "string_iter_next expects 1 argument");
+            let iter_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_iter_next(builder, iter_value))
+        }
+        "string_copy" => {
+            assert_eq!(args.len(), 1, "string_copy expects 1 argument");
+            let string_value = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_copy(builder, func_refs, string_value))
+        }
+        "string_concat" => {
+            assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
+            let lhs = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            let rhs = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            );
+            Some(compile_string_concat(builder, func_refs, lhs, rhs))
+        }
+        _ => None,
+    }
+}
+
+fn compile_named_expression_ast(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    compiled: &[CompiledValue],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    match function {
+        "add" => call_binary(builder, func_refs, "__op_add", compiled[0], compiled[1]),
+        "subtract" => call_binary(builder, func_refs, "__op_subtract", compiled[0], compiled[1]),
+        "multiply" => call_binary(builder, func_refs, "__op_multiply", compiled[0], compiled[1]),
+        "divide" => call_binary(builder, func_refs, "__op_divide", compiled[0], compiled[1]),
+        "modulo" => call_binary(builder, func_refs, "__op_modulo", compiled[0], compiled[1]),
+        "gt" => call_binary(builder, func_refs, "__op_gt", compiled[0], compiled[1]),
+        "lt" => call_binary(builder, func_refs, "__op_lt", compiled[0], compiled[1]),
+        "gte" => call_binary(builder, func_refs, "__op_gte", compiled[0], compiled[1]),
+        "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
+        "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
+        "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
+        "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
+        | "bigint_modulo" | "bigint_compare" => {
+            compile_bigint_builtin(builder, func_refs, function, &compiled)
+        }
+        name => {
+            if vars.contains_key(name) || capture_slots.contains_key(name) {
+                let callee = resolve_named_value(
+                    builder,
+                    name,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                );
+                return apply_function_value(
+                    builder,
+                    func_refs,
+                    callee,
+                    &compiled,
+                    function_ordinals,
+                    function_arities,
+                );
+            }
+            if function_ordinals.contains_key(name) {
+                let zero_env = builder.ins().iconst(types::I64, 0);
+                return call_named_with_env(builder, func_refs, name, zero_env, &compiled);
+            }
+            if let Some(func_ref) = func_refs.get(name) {
+                let mut args = Vec::with_capacity(compiled.len() * 2);
+                for value in compiled {
+                    args.push(value.tag);
+                    args.push(value.payload);
+                }
+                let call = builder.ins().call(*func_ref, &args);
+                let results = builder.inst_results(call);
+                return CompiledValue { tag: results[0], payload: results[1] };
+            }
+            unreachable!("undefined function should have been rejected before codegen: {name}");
+        }
     }
 }
 
@@ -4841,11 +4870,127 @@ fn windows_temp_exe_path(base: &str) -> std::path::PathBuf {
 fn assert_cranelift_jit_result(src: &str, expected: i64) {
     crate::runtime::reset_runtime_arena();
     let jit = Module::from_source(src).compile_to_jit();
-    let ptr = jit
-        .get_int_result_fn_ptr("main")
-        .expect("cranelift int-result wrapper should exist");
+    let ptr = jit.get_int_result_fn_ptr("main").expect("cranelift int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), expected);
+}
+
+#[cfg(test)]
+#[test]
+fn try_from_source_rejects_top_level_expressions() {
+    let err = match Module::try_from_source("1 + 2") {
+        Ok(_) => panic!("top-level expression should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(err, CompileError::TopLevelExpression);
+}
+
+#[cfg(test)]
+#[test]
+fn try_from_source_preserves_parse_error_span() {
+    let err = match Module::try_from_source("fn main()) do\n    1\nend") {
+        Ok(_) => panic!("invalid source should return a parse error"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::Parse {
+            message: "unexpected token \")\"".to_string(),
+            span: Some(Span { start: 9, end: 10 }),
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_jit_rejects_undefined_functions() {
+    let src = "fn main() do\n    missing_fn(1)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("undefined function should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UndefinedFunction {
+            name: "missing_fn".to_string(),
+            span: Some(Span { start: 17, end: 27 }),
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_jit_rejects_undefined_variables() {
+    let src = "fn main() do\n    missing_value\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("undefined variable should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UndefinedVariable {
+            name: "missing_value".to_string(),
+            span: Some(Span { start: 17, end: 30 }),
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_jit_rejects_non_unary_callbacks() {
+    let src =
+        "fn main() do\n    xs = [1, 2, 3]\n    list_map(xs, fn a, b -> a + b end)\n    0\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("non-unary callback should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::CallbackArity {
+            builtin: "list_map".to_string(),
+            function: "__lambda_1".to_string(),
+            span: None,
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_executable_rejects_main_with_too_many_arguments() {
+    let src = "fn main(a, b) do\n    a + b\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = module
+        .try_compile_to_executable_with_backend(
+            std::path::Path::new("out"),
+            CodegenBackend::Cranelift,
+        )
+        .expect_err("native executable main arity should be rejected");
+    assert_eq!(
+        err,
+        CompileError::InvalidMainArity {
+            mode: "native executable main function",
+            max: 1,
+            found: 2,
+            span: Some(Span { start: 0, end: 30 }),
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn try_compile_to_object_rejects_llvm_backend_when_unavailable() {
+    if llvm_backend_available() {
+        return;
+    }
+    let src = "fn main() do\n    1\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = module
+        .try_compile_to_object_with_backend("test", CodegenBackend::Llvm)
+        .expect_err("missing llvm feature should be rejected");
+    assert_eq!(err, CompileError::LlvmBackendUnavailable);
 }
 
 #[cfg(test)]
@@ -4888,10 +5033,7 @@ fn assert_backend_executable_output_with_args(
     let output = std::env::temp_dir().join(format!("__expr_compiler_bigint_test_{unique}"));
 
     Module::from_source(src).compile_to_executable_with_backend(&output, backend);
-    let out = Command::new(&output)
-        .args(args)
-        .output()
-        .expect("run failed");
+    let out = Command::new(&output).args(args).output().expect("run failed");
     std::fs::remove_file(&output).ok();
 
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected_stdout);
@@ -4902,9 +5044,7 @@ fn assert_backend_executable_output_with_args(
 fn assert_jit_backend_result(src: &str, backend: CodegenBackend, expected: i64) {
     crate::runtime::reset_runtime_arena();
     let jit = Module::from_source(src).compile_to_jit_with_backend(backend);
-    let ptr = jit
-        .get_int_result_fn_ptr("main")
-        .expect("int-result wrapper should exist");
+    let ptr = jit.get_int_result_fn_ptr("main").expect("int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), expected);
 }
@@ -4918,13 +5058,8 @@ fn assert_jit_backend_result_with_args(
 ) {
     crate::runtime::reset_runtime_arena();
     let jit = Module::from_source(src).compile_to_jit_with_backend(backend);
-    let ptr = jit
-        .get_int_result_fn_ptr("main")
-        .expect("int-result wrapper should exist");
-    let owned_args = args
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect::<Vec<_>>();
+    let ptr = jit.get_int_result_fn_ptr("main").expect("int-result wrapper should exist");
+    let owned_args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
     let (arg_tag, arg_payload) = crate::runtime::build_argv_list_value(&owned_args);
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
     assert_eq!(func(arg_tag, arg_payload), expected);
@@ -4947,9 +5082,7 @@ fn text_to_native_execute() {
     let ast = Ast::from_lexer(&mut lexer).unwrap();
 
     let jit = Module::from_ast(ast).compile_to_jit();
-    let ptr = jit
-        .get_int_result_fn_ptr("main")
-        .expect("cranelift int-result wrapper should exist");
+    let ptr = jit.get_int_result_fn_ptr("main").expect("cranelift int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), 8);
 }
@@ -4982,9 +5115,7 @@ fn compile_to_executable_runs() {
     let output = std::env::temp_dir().join("__expr_compiler_test_exe");
     Module::from_ast(ast).compile_to_executable(&output);
 
-    let status = Command::new(&output)
-        .status()
-        .expect("failed to run executable");
+    let status = Command::new(&output).status().expect("failed to run executable");
     assert_eq!(status.code(), Some(8)); // 7 + 5 - 4 = 8
 
     std::fs::remove_file(&output).ok();
@@ -5406,9 +5537,23 @@ fn llvm_strings_bytes_push_and_set_work() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_jit_strings_bytes_push_and_set_work() {
+    let src = "fn main() do\n    s = \"hi\"\n    bytes_push(s, 33)\n    bytes_set(s, 1, 97)\n    bytes_len(s) + bytes_get(s, 0) + bytes_get(s, 1) + bytes_get(s, 2)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 237);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_strings_bytes_insert_and_remove_work() {
     let src = "fn main() do\n    s = \"heo\"\n    bytes_insert(s, 2, 108)\n    bytes_insert(s, 4, 33)\n    print(s)\n    print(bytes_remove(s, 1))\n    print(s)\n    print(bytes_len(s))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "helo!\n101\nhlo!\n4\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_strings_bytes_insert_and_remove_work() {
+    let src = "fn main() do\n    s = \"heo\"\n    bytes_insert(s, 2, 108)\n    bytes_insert(s, 4, 33)\n    removed = bytes_remove(s, 1)\n    removed + bytes_len(s) + bytes_get(s, 1)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 213);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -5420,9 +5565,23 @@ fn llvm_strings_copy_isolated_from_mutation() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_jit_strings_copy_isolated_from_mutation() {
+    let src = "fn main() do\n    s = \"hi\"\n    t = string_copy(s)\n    bytes_push(s, 33)\n    bytes_set(t, 1, 97)\n    bytes_len(s) + bytes_len(t) + bytes_get(s, 2) + bytes_get(t, 1)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 135);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_strings_utf8_iteration_works() {
     let src = "fn walk(it) do\n    if string_iter_done(it) do\n        0\n    else\n        print(string_iter_next(it))\n        walk(it)\n    end\nend\n\nfn main() do\n    walk(string_chars(\"hé🙂\"))\n    print(string_iter_done(string_chars(\"\")))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "104\n233\n128578\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_strings_utf8_iteration_works() {
+    let src = "fn walk(it, count) do\n    if string_iter_done(it) do\n        count\n    else\n        string_iter_next(it)\n        walk(it, count + 1)\n    end\nend\n\nfn main() do\n    walk(string_chars(\"hé🙂\"), 0)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 3);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -5439,9 +5598,23 @@ fn llvm_autoloaded_stdlib_string_helpers_work() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_jit_autoloaded_stdlib_string_helpers_work() {
+    let src = "fn main() do\n    if string_contains(\"banana\", \"nan\") and not string_contains(\"banana\", \"nab\") and string_repeat(\"ab\", 2) == \"abab\" and string_reverse(\"hé🙂\") == \"🙂éh\" do\n        1\n    else\n        0\n    end\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 1);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
     let src = "fn main() do\n    pred = string_is_empty\n    print(pred(\"\"))\n    print(pred(\"x\"))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n0\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_autoloaded_stdlib_functions_can_be_used_as_values() {
+    let src = "fn main() do\n    pred = string_is_empty\n    if pred(\"\") and not pred(\"x\") do\n        1\n    else\n        0\n    end\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 1);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -5451,8 +5624,192 @@ fn llvm_jit_logical_and_or_short_circuit() {
     assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n1\n1\n1\n1\n0\n1\n", 0);
 }
 
+#[cfg(all(test, feature = "llvm-backend"))]
 #[test]
-#[should_panic(expected = "list_map callback must take exactly 1 argument")]
+fn find_llvm_tool_prefers_explicit_tool_env_var() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let env_name = "WASM_LD";
+    let old_tool = std::env::var_os(env_name);
+    let old_prefix = std::env::var_os("LLVM_SYS_201_PREFIX");
+    unsafe {
+        set_env_var(env_name, "custom-wasm-ld");
+        remove_env_var("LLVM_SYS_201_PREFIX");
+    }
+
+    let path = find_llvm_tool("wasm-ld");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var(env_name, value) };
+    } else {
+        unsafe { remove_env_var(env_name) };
+    }
+    if let Some(value) = old_prefix {
+        unsafe { set_env_var("LLVM_SYS_201_PREFIX", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_SYS_201_PREFIX") };
+    }
+
+    assert_eq!(path, std::path::PathBuf::from("custom-wasm-ld"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn find_llvm_tool_uses_prefix_bin_when_tool_exists() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let unique = format!(
+        "expr-compiler-llvm-tool-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+    );
+    let prefix = std::env::temp_dir().join(unique);
+    let bin = prefix.join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir should be creatable");
+    let exe_name = if cfg!(windows) { "wasm-ld.exe" } else { "wasm-ld" };
+    let tool_path = bin.join(exe_name);
+    std::fs::write(&tool_path, b"").expect("tool file should be creatable");
+
+    let old_tool = std::env::var_os("WASM_LD");
+    let old_prefix = std::env::var_os("LLVM_SYS_201_PREFIX");
+    unsafe {
+        remove_env_var("WASM_LD");
+        set_env_var("LLVM_SYS_201_PREFIX", &prefix);
+    }
+
+    let path = find_llvm_tool("wasm-ld");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("WASM_LD", value) };
+    } else {
+        unsafe { remove_env_var("WASM_LD") };
+    }
+    if let Some(value) = old_prefix {
+        unsafe { set_env_var("LLVM_SYS_201_PREFIX", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_SYS_201_PREFIX") };
+    }
+    let _ = std::fs::remove_file(&tool_path);
+    let _ = std::fs::remove_dir(&bin);
+    let _ = std::fs::remove_dir(&prefix);
+
+    assert_eq!(path, tool_path);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn find_llvm_tool_falls_back_to_executable_name() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let old_tool = std::env::var_os("WASM_LD");
+    let old_prefix = std::env::var_os("LLVM_SYS_201_PREFIX");
+    unsafe {
+        remove_env_var("WASM_LD");
+        remove_env_var("LLVM_SYS_201_PREFIX");
+    }
+
+    let path = find_llvm_tool("wasm-ld");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("WASM_LD", value) };
+    }
+    if let Some(value) = old_prefix {
+        unsafe { set_env_var("LLVM_SYS_201_PREFIX", value) };
+    }
+
+    let expected = if cfg!(windows) { "wasm-ld.exe" } else { "wasm-ld" };
+    assert_eq!(path, std::path::PathBuf::from(expected));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn try_compile_to_wasm_returns_toolchain_error_when_llvm_mc_is_missing() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let unique = format!(
+        "expr-compiler-missing-llvm-mc-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+    );
+    let missing_tool = std::env::temp_dir().join(if cfg!(windows) {
+        format!("{unique}.exe")
+    } else {
+        unique.clone()
+    });
+    let output = std::env::temp_dir().join(format!("{unique}.wasm"));
+    let old_tool = std::env::var_os("LLVM_MC");
+    unsafe { set_env_var("LLVM_MC", &missing_tool) };
+
+    let module = Module::try_from_source("fn main() do\n    0\nend").expect("source should parse");
+    let err = module
+        .try_compile_to_executable_with_backend(&output, CodegenBackend::Llvm)
+        .expect_err("missing llvm-mc should surface as toolchain error");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("LLVM_MC", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_MC") };
+    }
+    std::fs::remove_file(&output).ok();
+
+    match err {
+        CompileError::Toolchain(message) => {
+            assert!(message.contains("failed to launch llvm-mc"), "{message}");
+        }
+        other => panic!("expected toolchain error, got {other:?}"),
+    }
+}
+
+#[cfg(all(test, feature = "llvm-backend", feature = "wasi"))]
+#[test]
+fn try_compile_to_component_returns_toolchain_error_when_llvm_mc_is_missing() {
+    let _guard = llvm_tool_test_lock().lock().unwrap();
+    let unique = format!(
+        "expr-compiler-missing-component-llvm-mc-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+    );
+    let missing_tool = std::env::temp_dir().join(if cfg!(windows) {
+        format!("{unique}.exe")
+    } else {
+        unique.clone()
+    });
+    let output = std::env::temp_dir().join(format!("{unique}.component.wasm"));
+    let old_tool = std::env::var_os("LLVM_MC");
+    unsafe { set_env_var("LLVM_MC", &missing_tool) };
+
+    let module = Module::try_from_source("fn main() do\n    0\nend").expect("source should parse");
+    let err = module
+        .try_compile_to_executable_with_backend(&output, CodegenBackend::Llvm)
+        .expect_err("missing llvm-mc should surface as component toolchain error");
+
+    if let Some(value) = old_tool {
+        unsafe { set_env_var("LLVM_MC", value) };
+    } else {
+        unsafe { remove_env_var("LLVM_MC") };
+    }
+    std::fs::remove_file(&output).ok();
+
+    match err {
+        CompileError::Toolchain(message) => {
+            assert!(message.contains("failed to launch llvm-mc"), "{message}");
+        }
+        other => panic!("expected toolchain error, got {other:?}"),
+    }
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_main_with_args_can_use_string_helpers() {
+    let src =
+        "fn main(args) do\n    s = list_get(args, 0)\n    bytes_len(s) + bytes_get(s, 0)\nend";
+    assert_jit_backend_result_with_args(src, CodegenBackend::Llvm, &["hi"], 106);
+}
+
+#[test]
+#[should_panic(expected = "list_map callback `__lambda_1` must take exactly 1 argument")]
 fn jit_list_map_rejects_non_unary_callbacks() {
     let src =
         "fn main() do\n    xs = [1, 2, 3]\n    list_map(xs, fn a, b -> a + b end)\n    0\nend";
@@ -5530,7 +5887,7 @@ fn anonymous_functions_are_lifted_into_hidden_functions() {
     assert_eq!(module.functions[1].inputs, vec!["item".to_string()]);
 
     match &module.functions[0].block.lines[0] {
-        Ast::Expression(ExpressionAst { function, args }) => {
+        Ast::Expression(ExpressionAst { function, args, .. }) => {
             assert_eq!(function, "list_map");
             assert!(matches!(args[1], Ast::FunctionRef(_)));
         }
@@ -5543,11 +5900,121 @@ fn anonymous_functions_record_captures() {
     let module = Module::from_source(
         "fn main() do\n    a = 2\n    list_filter(xs, fn item -> item == a end)\nend",
     );
-    let metadata = module
-        .closure_metadata
-        .get("__lambda_1")
-        .expect("missing lifted lambda metadata");
+    let metadata =
+        module.closure_metadata.get("__lambda_1").expect("missing lifted lambda metadata");
     assert_eq!(metadata.captures, vec!["a".to_string()]);
+}
+
+#[test]
+fn collect_captures_deduplicates_multiple_uses() {
+    let ast = Ast::Block(BlockAst {
+        lines: vec![
+            Ast::Variable(Ident::synthetic("outer".to_string())),
+            Ast::Variable(Ident::synthetic("outer".to_string())),
+            Ast::Expression(ExpressionAst {
+                function_span: None,
+                function: "add".to_string(),
+                args: vec![
+                    Ast::Variable(Ident::synthetic("outer".to_string())),
+                    Ast::Variable(Ident::synthetic("outer".to_string())),
+                ],
+            }),
+        ],
+    });
+
+    let captures = collect_captures(&ast, &[], &["outer".to_string()]);
+    assert_eq!(captures, vec!["outer".to_string()]);
+}
+
+#[test]
+fn collect_captures_visits_index_and_index_assign() {
+    let ast = Ast::Block(BlockAst {
+        lines: vec![
+            Ast::Index {
+                collection: Box::new(Ast::Variable(Ident::synthetic("xs".to_string()))),
+                index: Box::new(Ast::Variable(Ident::synthetic("i".to_string()))),
+                span: None,
+            },
+            Ast::IndexAssign {
+                collection: Box::new(Ast::Variable(Ident::synthetic("ys".to_string()))),
+                index: Box::new(Ast::Variable(Ident::synthetic("j".to_string()))),
+                value: Box::new(Ast::Variable(Ident::synthetic("value".to_string()))),
+                span: None,
+            },
+        ],
+    });
+
+    let scope = vec![
+        "xs".to_string(),
+        "i".to_string(),
+        "ys".to_string(),
+        "j".to_string(),
+        "value".to_string(),
+    ];
+    let captures = collect_captures(&ast, &[], &scope);
+    assert_eq!(captures, scope);
+}
+
+#[test]
+fn collect_captures_visits_if_else_and_assignment_values() {
+    let ast = Ast::Block(BlockAst {
+        lines: vec![
+            Ast::Assign {
+                name: "local".to_string(),
+                value: Box::new(Ast::Variable(Ident::synthetic("assigned".to_string()))),
+                span: None,
+            },
+            Ast::If {
+                condition: Box::new(Ast::Variable(Ident::synthetic("cond".to_string()))),
+                then: BlockAst {
+                    lines: vec![Ast::Variable(Ident::synthetic("then_value".to_string()))],
+                },
+                else_: Some(BlockAst {
+                    lines: vec![Ast::Variable(Ident::synthetic("else_value".to_string()))],
+                }),
+                span: None,
+            },
+        ],
+    });
+
+    let scope = vec![
+        "assigned".to_string(),
+        "cond".to_string(),
+        "then_value".to_string(),
+        "else_value".to_string(),
+    ];
+    let captures = collect_captures(&ast, &["local".to_string()], &scope);
+    assert_eq!(captures, scope);
+}
+
+#[test]
+fn collect_captures_respects_nested_lambda_inputs_and_locals() {
+    let ast = Ast::Lambda {
+        inputs: vec!["item".to_string()],
+        body: Box::new(Ast::Block(BlockAst {
+            lines: vec![
+                Ast::Assign {
+                    name: "tmp".to_string(),
+                    value: Box::new(Ast::Variable(Ident::synthetic("item".to_string()))),
+                    span: None,
+                },
+                Ast::Variable(Ident::synthetic("outer".to_string())),
+                Ast::Variable(Ident::synthetic("tmp".to_string())),
+                Ast::Lambda {
+                    inputs: vec!["outer".to_string()],
+                    body: Box::new(Ast::Block(BlockAst {
+                        lines: vec![
+                            Ast::Variable(Ident::synthetic("outer".to_string())),
+                            Ast::Variable(Ident::synthetic("deep".to_string())),
+                        ],
+                    })),
+                },
+            ],
+        })),
+    };
+
+    let captures = collect_captures(&ast, &[], &["outer".to_string(), "deep".to_string()]);
+    assert_eq!(captures, vec!["outer".to_string(), "deep".to_string()]);
 }
 
 #[test]
@@ -5711,9 +6178,7 @@ fn llvm_jit_list_print_returns_zero() {
 fn llvm_jit_int_result_wrapper_works() {
     let src = "fn main() do\n    7 + 5 - 4\nend";
     let jit = Module::from_source(src).compile_to_jit_with_backend(CodegenBackend::Llvm);
-    let ptr = jit
-        .get_int_result_fn_ptr("main")
-        .expect("llvm int-result wrapper should exist");
+    let ptr = jit.get_int_result_fn_ptr("main").expect("llvm int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), 8);
 }
@@ -5723,9 +6188,7 @@ fn llvm_jit_int_result_wrapper_works() {
 fn cranelift_jit_int_result_wrapper_works() {
     let src = "fn main() do\n    7 + 5 - 4\nend";
     let jit = Module::from_source(src).compile_to_jit_with_backend(CodegenBackend::Cranelift);
-    let ptr = jit
-        .get_int_result_fn_ptr("main")
-        .expect("cranelift int-result wrapper should exist");
+    let ptr = jit.get_int_result_fn_ptr("main").expect("cranelift int-result wrapper should exist");
     let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
     assert_eq!(func(), 8);
 }
@@ -5737,9 +6200,7 @@ fn llvm_compile_to_executable_runs() {
     let output = windows_temp_exe_path("__expr_compiler_llvm_test_exe");
     Module::from_source(src).compile_to_executable_with_backend(&output, CodegenBackend::Llvm);
 
-    let status = Command::new(&output)
-        .status()
-        .expect("failed to run llvm executable");
+    let status = Command::new(&output).status().expect("failed to run llvm executable");
     assert_eq!(status.code(), Some(8));
 
     std::fs::remove_file(&output).ok();

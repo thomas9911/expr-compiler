@@ -342,6 +342,7 @@ dependencies = [
  "inkwell",
  "logos",
  "pico-args",
+ "thiserror",
  "wasi-preview1-component-adapter-provider",
  "wit-component",
 ]

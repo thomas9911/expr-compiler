@@ -1,30 +1,19 @@
 // pub mod compiler;
-pub mod interpreter;
 pub mod module;
 pub mod parser;
 pub mod runtime;
+pub mod source;
 pub mod tokenizer;
 pub mod value;
-// pub mod instruction;
 
 #[cfg(test)]
-use crate::{
-    interpreter::Interpreter,
-    parser::{Ast, LiteralAst, ParseLexer},
-};
-#[cfg(test)]
-use logos::Logos;
+use crate::{module::Module, runtime::reset_runtime_arena};
 
 #[test]
-fn execute_test() {
-    let lex = tokenizer::Token::lexer("1 + 5 - 2 + 7 - 6 - 2");
-    let mut lexer = ParseLexer::new(lex);
-    let ast = Ast::from_lexer(&mut lexer).unwrap();
-
-    let mut interpreter = Interpreter::default();
-
-    interpreter.execute(ast);
-    let output = interpreter.get_output();
-
-    assert_eq!(Ast::Literal(LiteralAst::Integer(3)), *output);
+fn jit_smoke_test() {
+    reset_runtime_arena();
+    let jit = Module::from_source("fn main() do\n    1 + 2 * 3\nend").compile_to_jit();
+    let ptr = jit.get_int_result_fn_ptr("main").expect("cranelift int-result wrapper should exist");
+    let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+    assert_eq!(func(), 7);
 }

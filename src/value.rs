@@ -92,3 +92,13 @@ pub struct BigIntHeader {
     pub cap: usize,
     pub ptr: *mut u32,
 }
+
+#[test]
+fn verify_value() {
+    assert_eq!(ValueTag::from_raw(TAG_INT as u8).unwrap(), ValueTag::Int);
+    assert_eq!(ValueTag::from_raw(TAG_LIST as u8).unwrap(), ValueTag::List);
+    assert_eq!(ValueTag::from_raw(TAG_STRING as u8).unwrap(), ValueTag::String);
+    assert_eq!(ValueTag::from_raw(TAG_FUNCTION as u8).unwrap(), ValueTag::Function);
+    assert_eq!(ValueTag::from_raw(TAG_BIGINT as u8).unwrap(), ValueTag::BigInt);
+    assert_eq!(ValueTag::from_raw(TAG_STRING_ITER as u8).unwrap(), ValueTag::StringIter);
+}

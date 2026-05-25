@@ -21,3 +21,4 @@ logos = "0.16.0"
 pico-args = "0.5.0"
 wit-component = { version = "0.227.0", optional = true }
 wasi-preview1-component-adapter-provider = { version = "44.0.0", optional = true }
+thiserror = "2.0.18"

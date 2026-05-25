@@ -1,25 +1,75 @@
-use crate::tokenizer::{Lexer, LexingError, Token, TokenKind};
-use logos::Span;
+use crate::source::Span;
+use crate::tokenizer::{Lexer, LexingError, Token};
 use std::collections::VecDeque;
+use std::ops::Deref;
+
+#[derive(Debug, Clone)]
+pub struct Ident {
+    pub name: String,
+    pub span: Option<Span>,
+}
+
+impl Ident {
+    pub fn synthetic(name: String) -> Self {
+        Self { name, span: None }
+    }
+
+    pub fn spanned(name: String, span: Span) -> Self {
+        Self { name, span: Some(span) }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Deref for Ident {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.name
+    }
+}
+
+impl std::fmt::Display for Ident {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.name.fmt(f)
+    }
+}
+
+impl AsRef<str> for Ident {
+    fn as_ref(&self) -> &str {
+        &self.name
+    }
+}
+
+impl PartialEq for Ident {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Ident {}
 
 #[derive(Debug)]
 pub struct ParseLexer<'a> {
     lexer: Lexer<'a>,
     buf: VecDeque<Result<Token, LexingError>>,
+    spans: VecDeque<Span>,
+    last_span: Option<Span>,
 }
 
 impl<'a> ParseLexer<'a> {
     pub fn new(lex: Lexer<'a>) -> Self {
-        ParseLexer {
-            lexer: lex,
-            buf: VecDeque::new(),
-        }
+        ParseLexer { lexer: lex, buf: VecDeque::new(), spans: VecDeque::new(), last_span: None }
     }
 
     pub fn peek(&mut self) -> Option<&Result<Token, LexingError>> {
         if self.buf.is_empty() {
             let token = self.lexer.next()?;
             self.buf.push_back(token);
+            self.spans
+                .push_back(Span { start: self.lexer.span().start, end: self.lexer.span().end });
         }
         self.buf.front()
     }
@@ -28,12 +78,24 @@ impl<'a> ParseLexer<'a> {
         while self.buf.len() <= index {
             let token = self.lexer.next()?;
             self.buf.push_back(token);
+            self.spans
+                .push_back(Span { start: self.lexer.span().start, end: self.lexer.span().end });
         }
         self.buf.get(index)
     }
 
-    pub fn push_back(&mut self, token: Result<Token, LexingError>) {
+    pub fn push_back(&mut self, token: Result<Token, LexingError>, span: Span) {
         self.buf.push_front(token);
+        self.spans.push_front(span);
+    }
+
+    pub fn last_span(&self) -> Option<Span> {
+        self.last_span.clone()
+    }
+
+    pub fn peek_span(&mut self) -> Option<Span> {
+        self.peek()?;
+        self.spans.front().cloned()
     }
 }
 
@@ -42,9 +104,12 @@ impl<'a> Iterator for ParseLexer<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(tok) = self.buf.pop_front() {
+            self.last_span = self.spans.pop_front();
             return Some(tok);
         }
-        self.lexer.next()
+        let token = self.lexer.next()?;
+        self.last_span = Some(Span { start: self.lexer.span().start, end: self.lexer.span().end });
+        Some(token)
     }
 }
 
@@ -56,55 +121,72 @@ pub struct ParseError<'a> {
 
 impl<'a> ParseError<'a> {
     fn unexpected(lex: &mut ParseLexer<'a>) -> ParseError<'a> {
-        ParseError {
-            span: lex.lexer.span(),
-            text: lex.lexer.slice(),
-        }
+        let span =
+            lex.peek_span().unwrap_or_else(|| lex.last_span().unwrap_or(Span { start: 0, end: 0 }));
+        ParseError { span, text: lex.lexer.slice() }
         // ParseError { span, text }
     }
 }
 
 impl std::fmt::Display for ParseError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unexpected token {:?} at {}..{}",
-            self.text, self.span.start, self.span.end
-        )
+        write!(f, "unexpected token {:?}", self.text)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Ast {
     Block(BlockAst),
     FunctionDef(FunctionDefAst),
-    Lambda {
-        inputs: Vec<String>,
-        body: Box<Ast>,
-    },
-    FunctionRef(String),
+    Lambda { inputs: Vec<String>, body: Box<Ast> },
+    FunctionRef(Ident),
     Expression(ExpressionAst),
     Literal(LiteralAst),
     ListLiteral(Vec<Ast>),
-    Index {
-        collection: Box<Ast>,
-        index: Box<Ast>,
-    },
-    IndexAssign {
-        collection: Box<Ast>,
-        index: Box<Ast>,
-        value: Box<Ast>,
-    },
-    Variable(String),
-    Assign {
-        name: String,
-        value: Box<Ast>,
-    },
-    If {
-        condition: Box<Ast>,
-        then: BlockAst,
-        else_: Option<BlockAst>,
-    },
+    Index { collection: Box<Ast>, index: Box<Ast>, span: Option<Span> },
+    IndexAssign { collection: Box<Ast>, index: Box<Ast>, value: Box<Ast>, span: Option<Span> },
+    Variable(Ident),
+    Assign { name: String, value: Box<Ast>, span: Option<Span> },
+    If { condition: Box<Ast>, then: BlockAst, else_: Option<BlockAst>, span: Option<Span> },
+}
+
+impl PartialEq for Ast {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Ast::Block(a), Ast::Block(b)) => a == b,
+            (Ast::FunctionDef(a), Ast::FunctionDef(b)) => a == b,
+            (
+                Ast::Lambda { inputs: a_inputs, body: a_body },
+                Ast::Lambda { inputs: b_inputs, body: b_body },
+            ) => a_inputs == b_inputs && a_body == b_body,
+            (Ast::FunctionRef(a), Ast::FunctionRef(b)) => a == b,
+            (Ast::Expression(a), Ast::Expression(b)) => a == b,
+            (Ast::Literal(a), Ast::Literal(b)) => a == b,
+            (Ast::ListLiteral(a), Ast::ListLiteral(b)) => a == b,
+            (
+                Ast::Index { collection: a_collection, index: a_index, .. },
+                Ast::Index { collection: b_collection, index: b_index, .. },
+            ) => a_collection == b_collection && a_index == b_index,
+            (
+                Ast::IndexAssign {
+                    collection: a_collection, index: a_index, value: a_value, ..
+                },
+                Ast::IndexAssign {
+                    collection: b_collection, index: b_index, value: b_value, ..
+                },
+            ) => a_collection == b_collection && a_index == b_index && a_value == b_value,
+            (Ast::Variable(a), Ast::Variable(b)) => a == b,
+            (
+                Ast::Assign { name: a_name, value: a_value, .. },
+                Ast::Assign { name: b_name, value: b_value, .. },
+            ) => a_name == b_name && a_value == b_value,
+            (
+                Ast::If { condition: a_condition, then: a_then, else_: a_else, .. },
+                Ast::If { condition: b_condition, then: b_then, else_: b_else, .. },
+            ) => a_condition == b_condition && a_then == b_then && a_else == b_else,
+            _ => false,
+        }
+    }
 }
 
 fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
@@ -179,9 +261,7 @@ fn parse_block_after_colon<'a>(lex: &mut ParseLexer<'a>) -> Result<BlockAst, Par
                 if matches!(lex.peek(), Some(Ok(Token::Else)) | Some(Ok(Token::Elif))) {
                     break;
                 }
-                block
-                    .lines
-                    .push(Ast::from_lexer_with_indent(lex, block_indent)?);
+                block.lines.push(Ast::from_lexer_with_indent(lex, block_indent)?);
             }
         }
     }
@@ -193,6 +273,7 @@ fn parse_if_after_keyword<'a>(
     lex: &mut ParseLexer<'a>,
     current_indent: usize,
 ) -> Result<Ast, ParseError<'a>> {
+    let if_span = lex.last_span();
     let condition = parse_expr(lex, 0)?;
     let then = match lex.peek() {
         Some(Ok(Token::DoBlock)) => BlockAst::from_lexer(lex)?,
@@ -216,9 +297,7 @@ fn parse_if_after_keyword<'a>(
             Some(Ok(Token::Elif)) => {
                 consume_indents(lex, branch_indent);
                 lex.next();
-                Some(BlockAst {
-                    lines: vec![parse_if_after_keyword(lex, current_indent)?],
-                })
+                Some(BlockAst { lines: vec![parse_if_after_keyword(lex, current_indent)?] })
             }
             _ => None,
         }
@@ -230,6 +309,7 @@ fn parse_if_after_keyword<'a>(
         condition: Box::new(condition),
         then,
         else_,
+        span: if_span.zip(lex.last_span()).map(|(start, end)| Span::cover(start, end)),
     })
 }
 
@@ -245,22 +325,37 @@ impl Ast {
         trim_newlines(lex);
 
         if matches!(lex.peek(), Some(Ok(Token::Symbol(_)))) {
-            let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
-                unreachable!()
-            };
-            let lhs = parse_postfix(lex, Ast::Variable(name))?;
+            let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
+            let lhs = parse_postfix(
+                lex,
+                Ast::Variable(Ident::spanned(
+                    name,
+                    lex.last_span().expect("consumed symbol should have a span"),
+                )),
+            )?;
             if lex.peek() == Some(&Ok(Token::Assign)) {
                 lex.next();
+                let assign_span = lex.last_span();
                 let value = parse_expr(lex, 0)?;
                 return match lhs {
                     Ast::Variable(name) => Ok(Ast::Assign {
-                        name,
+                        name: name.name,
                         value: Box::new(value),
+                        span: name
+                            .span
+                            .clone()
+                            .or(assign_span)
+                            .zip(lex.last_span())
+                            .map(|(start, end)| Span::cover(start, end)),
                     }),
-                    Ast::Index { collection, index } => Ok(Ast::IndexAssign {
+                    Ast::Index { collection, index, span } => Ok(Ast::IndexAssign {
                         collection,
                         index,
                         value: Box::new(value),
+                        span: span
+                            .or(assign_span)
+                            .zip(lex.last_span())
+                            .map(|(start, end)| Span::cover(start, end)),
                     }),
                     _ => Err(ParseError::unexpected(lex)),
                 };
@@ -314,27 +409,36 @@ impl BlockAst {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone)]
 pub struct FunctionDefAst {
     pub name: String,
     pub inputs: Vec<String>,
     pub output: Option<String>,
     pub block: BlockAst,
+    pub span: Option<Span>,
+}
+
+impl PartialEq for FunctionDefAst {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.inputs == other.inputs
+            && self.output == other.output
+            && self.block == other.block
+    }
 }
 
 impl FunctionDefAst {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
         let mut function_def = FunctionDefAst::default();
         assert!(lex.next() == Some(Ok(Token::DefineFunction)));
+        let start_span = lex.last_span();
         let mut first = true;
         let mut bracket_counter = 0;
 
         loop {
             match lex.peek() {
                 Some(Ok(Token::Symbol(_))) if first => {
-                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
-                        unreachable!()
-                    };
+                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
                     function_def.name = name;
                     first = false;
                 }
@@ -362,10 +466,14 @@ impl FunctionDefAst {
                 }
                 Some(Ok(Token::DoBlock)) => {
                     function_def.block = BlockAst::from_lexer(lex)?;
+                    function_def.span =
+                        start_span.zip(lex.last_span()).map(|(start, end)| Span::cover(start, end));
                     break;
                 }
                 Some(Ok(Token::ColonBlock)) => {
                     function_def.block = parse_block_after_colon(lex)?;
+                    function_def.span =
+                        start_span.zip(lex.last_span()).map(|(start, end)| Span::cover(start, end));
                     break;
                 }
                 None | Some(Ok(Token::DefineFunction)) => {
@@ -383,10 +491,17 @@ impl FunctionDefAst {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone)]
 pub struct ExpressionAst {
     pub function: String,
     pub args: Vec<Ast>,
+    pub function_span: Option<Span>,
+}
+
+impl PartialEq for ExpressionAst {
+    fn eq(&self, other: &Self) -> bool {
+        self.function == other.function && self.args == other.args
+    }
 }
 
 impl ExpressionAst {
@@ -394,6 +509,7 @@ impl ExpressionAst {
         match parse_expr(lex, 0)? {
             Ast::Expression(e) => Ok(e),
             single => Ok(ExpressionAst {
+                function_span: None,
                 function: String::new(),
                 args: vec![single],
             }),
@@ -452,6 +568,7 @@ fn parse_expr<'a>(lex: &mut ParseLexer<'a>, min_prec: u8) -> Result<Ast, ParseEr
         let rhs = parse_expr(lex, prec + 1)?;
 
         lhs = Ast::Expression(ExpressionAst {
+            function_span: lex.last_span(),
             function: infix_name(&op).to_string(),
             args: vec![lhs, rhs],
         });
@@ -516,10 +633,7 @@ fn parse_lambda<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         body
     };
 
-    Ok(Ast::Lambda {
-        inputs,
-        body: Box::new(body),
-    })
+    Ok(Ast::Lambda { inputs, body: Box::new(body) })
 }
 
 fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
@@ -531,6 +645,7 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         lex.next();
         let rhs = parse_expr(lex, 2)?;
         return Ok(Ast::Expression(ExpressionAst {
+            function_span: lex.last_span(),
             function: "not".to_string(),
             args: vec![rhs],
         }));
@@ -545,12 +660,15 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
             lex.next();
             Ast::Literal(LiteralAst::Integer(0))
         }
-        Some(Ok(x)) if x.kind() == TokenKind::Integer => Ast::Literal(LiteralAst::from_lexer(lex)?),
-        Some(Ok(x)) if x.kind() == TokenKind::Symbol => {
-            let Token::Symbol(name) = lex.next().unwrap().unwrap() else {
-                unreachable!()
-            };
-            Ast::Variable(name)
+        Some(Ok(Token::Integer(_) | Token::BigIntLiteral(_) | Token::StringLiteral(_))) => {
+            Ast::Literal(LiteralAst::from_lexer(lex)?)
+        }
+        Some(Ok(Token::Symbol(_))) => {
+            let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
+            Ast::Variable(Ident::spanned(
+                name,
+                lex.last_span().expect("consumed symbol should have a span"),
+            ))
         }
         Some(Ok(Token::OpenBracket)) => {
             lex.next();
@@ -590,6 +708,7 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                 let Ast::Variable(function_name) = lhs else {
                     return Err(ParseError::unexpected(lex));
                 };
+                let function_span = function_name.span.clone();
                 lex.next();
                 let mut args = vec![];
                 loop {
@@ -605,11 +724,13 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                     }
                 }
                 lhs = Ast::Expression(ExpressionAst {
-                    function: function_name,
+                    function_span,
+                    function: function_name.name,
                     args,
                 });
             }
             Some(Ok(Token::OpenSquareBracket)) => {
+                let start_span = lex.peek_span();
                 lex.next();
                 let index = parse_expr(lex, 0)?;
                 if lex.next() != Some(Ok(Token::CloseSquareBracket)) {
@@ -618,6 +739,9 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                 lhs = Ast::Index {
                     collection: Box::new(lhs),
                     index: Box::new(index),
+                    span: start_span
+                        .zip(lex.last_span())
+                        .map(|(start, end)| Span::cover(start, end)),
                 };
             }
             _ => break,
@@ -645,6 +769,7 @@ fn parse_expr_with_lhs<'a>(
         let rhs = parse_expr(lex, prec + 1)?;
 
         lhs = Ast::Expression(ExpressionAst {
+            function_span: lex.last_span(),
             function: infix_name(&op).to_string(),
             args: vec![lhs, rhs],
         });
@@ -696,9 +821,11 @@ end
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "subtract".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "add".to_string(),
                         args: vec![
                             Literal(LiteralAst::Integer(1)),
@@ -709,6 +836,7 @@ end
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -735,9 +863,11 @@ fn main():
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "subtract".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "add".to_string(),
                         args: vec![
                             Literal(LiteralAst::Integer(1)),
@@ -748,6 +878,7 @@ fn main():
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -769,10 +900,12 @@ fn parse_operator_precedence() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "add".to_string(),
                 args: vec![
                     Literal(LiteralAst::Integer(2)),
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "multiply".to_string(),
                         args: vec![
                             Literal(LiteralAst::Integer(3)),
@@ -782,6 +915,7 @@ fn parse_operator_precedence() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -802,10 +936,12 @@ fn parse_function_call_single_arg() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "double".to_string(),
                 args: vec![Literal(LiteralAst::Integer(21))],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -826,13 +962,12 @@ fn parse_function_call_multi_args() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "add".to_string(),
-                args: vec![
-                    Literal(LiteralAst::Integer(1)),
-                    Literal(LiteralAst::Integer(2)),
-                ],
+                args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -854,9 +989,11 @@ fn parse_function_call_in_expression() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "add".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "double".to_string(),
                         args: vec![Literal(LiteralAst::Integer(3))],
                     }),
@@ -864,6 +1001,7 @@ fn parse_function_call_in_expression() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -884,10 +1022,15 @@ fn parse_function_calling_other_with_params() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "add".to_string(),
-                args: vec![Variable("x".to_string()), Variable("x".to_string())],
+                args: vec![
+                    Variable(Ident::synthetic("x".to_string())),
+                    Variable(Ident::synthetic("x".to_string())),
+                ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -909,15 +1052,19 @@ fn parse_if_without_else_elixir() {
         block: BlockAst {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
+                    function_span: None,
                     function: "gt".to_string(),
-                    args: vec![Variable("x".to_string()), Literal(LiteralAst::Integer(5))],
+                    args: vec![
+                        Variable(Ident::synthetic("x".to_string())),
+                        Literal(LiteralAst::Integer(5)),
+                    ],
                 })),
-                then: BlockAst {
-                    lines: vec![Variable("x".to_string())],
-                },
+                then: BlockAst { lines: vec![Variable(Ident::synthetic("x".to_string()))] },
                 else_: None,
+                span: None,
             }],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -939,17 +1086,19 @@ fn parse_if_with_else_elixir() {
         block: BlockAst {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
+                    function_span: None,
                     function: "gt".to_string(),
-                    args: vec![Variable("x".to_string()), Literal(LiteralAst::Integer(5))],
+                    args: vec![
+                        Variable(Ident::synthetic("x".to_string())),
+                        Literal(LiteralAst::Integer(5)),
+                    ],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(1))],
-                },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(2))],
-                }),
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(1))] },
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(2))] }),
+                span: None,
             }],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -971,17 +1120,19 @@ fn parse_if_with_else_python() {
         block: BlockAst {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
+                    function_span: None,
                     function: "gt".to_string(),
-                    args: vec![Variable("x".to_string()), Literal(LiteralAst::Integer(5))],
+                    args: vec![
+                        Variable(Ident::synthetic("x".to_string())),
+                        Literal(LiteralAst::Integer(5)),
+                    ],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(1))],
-                },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(2))],
-                }),
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(1))] },
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(2))] }),
+                span: None,
             }],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1003,9 +1154,11 @@ fn parse_comparison_precedence() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "gt".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "add".to_string(),
                         args: vec![
                             Literal(LiteralAst::Integer(1)),
@@ -1013,6 +1166,7 @@ fn parse_comparison_precedence() {
                         ],
                     }),
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "subtract".to_string(),
                         args: vec![
                             Literal(LiteralAst::Integer(3)),
@@ -1022,6 +1176,7 @@ fn parse_comparison_precedence() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1043,9 +1198,11 @@ fn parse_test_python_style_crlf() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "subtract".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "add".to_string(),
                         args: vec![
                             Literal(LiteralAst::Integer(1)),
@@ -1056,6 +1213,7 @@ fn parse_test_python_style_crlf() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1091,6 +1249,7 @@ fn parse_list_literal() {
                 Literal(LiteralAst::Integer(3)),
             ])],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1118,13 +1277,16 @@ fn parse_index_expression() {
                         Literal(LiteralAst::Integer(2)),
                         Literal(LiteralAst::Integer(3)),
                     ])),
+                    span: None,
                 },
                 Index {
-                    collection: Box::new(Variable("xs".to_string())),
+                    collection: Box::new(Variable(Ident::synthetic("xs".to_string()))),
                     index: Box::new(Literal(LiteralAst::Integer(1))),
+                    span: None,
                 },
             ],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1152,14 +1314,17 @@ fn parse_index_assignment_expression() {
                         Literal(LiteralAst::Integer(2)),
                         Literal(LiteralAst::Integer(3)),
                     ])),
+                    span: None,
                 },
                 IndexAssign {
-                    collection: Box::new(Variable("xs".to_string())),
+                    collection: Box::new(Variable(Ident::synthetic("xs".to_string()))),
                     index: Box::new(Literal(LiteralAst::Integer(1))),
                     value: Box::new(Literal(LiteralAst::Integer(9))),
+                    span: None,
                 },
             ],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1180,15 +1345,17 @@ fn parse_lambda_expression() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "list_map".to_string(),
                 args: vec![
-                    Variable("xs".to_string()),
+                    Variable(Ident::synthetic("xs".to_string())),
                     Lambda {
                         inputs: vec!["item".to_string()],
                         body: Box::new(Expression(ExpressionAst {
+                            function_span: None,
                             function: "multiply".to_string(),
                             args: vec![
-                                Variable("item".to_string()),
+                                Variable(Ident::synthetic("item".to_string())),
                                 Literal(LiteralAst::Integer(2)),
                             ],
                         })),
@@ -1196,6 +1363,7 @@ fn parse_lambda_expression() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1216,16 +1384,18 @@ fn parse_multiline_lambda_expression() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "list_map".to_string(),
                 args: vec![
-                    Variable("xs".to_string()),
+                    Variable(Ident::synthetic("xs".to_string())),
                     Lambda {
                         inputs: vec!["item".to_string()],
                         body: Box::new(Block(BlockAst {
                             lines: vec![Expression(ExpressionAst {
+                                function_span: None,
                                 function: "multiply".to_string(),
                                 args: vec![
-                                    Variable("item".to_string()),
+                                    Variable(Ident::synthetic("item".to_string())),
                                     Literal(LiteralAst::Integer(2)),
                                 ],
                             })],
@@ -1234,6 +1404,7 @@ fn parse_multiline_lambda_expression() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1252,9 +1423,8 @@ fn parse_bigint_literal_expression() {
         name: "main".to_string(),
         inputs: vec![],
         output: None,
-        block: BlockAst {
-            lines: vec![Literal(LiteralAst::BigInt("123".to_string()))],
-        },
+        block: BlockAst { lines: vec![Literal(LiteralAst::BigInt("123".to_string()))] },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1275,9 +1445,8 @@ end"#;
         name: "main".to_string(),
         inputs: vec![],
         output: None,
-        block: BlockAst {
-            lines: vec![Literal(LiteralAst::String("hello\tworld".to_string()))],
-        },
+        block: BlockAst { lines: vec![Literal(LiteralAst::String("hello\tworld".to_string()))] },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1298,9 +1467,11 @@ fn parse_parenthesized_expression() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "multiply".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "add".to_string(),
                         args: vec![
                             Literal(LiteralAst::Integer(2)),
@@ -1311,6 +1482,7 @@ fn parse_parenthesized_expression() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1332,34 +1504,30 @@ fn parse_python_style_nested_if_with_inner_else() {
         block: BlockAst {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
+                    function_span: None,
                     function: "lt".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
                 then: BlockAst {
                     lines: vec![If {
                         condition: Box::new(Expression(ExpressionAst {
+                            function_span: None,
                             function: "ne".to_string(),
                             args: vec![
                                 Literal(LiteralAst::Integer(1)),
                                 Literal(LiteralAst::Integer(1)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(15))],
-                        },
-                        else_: Some(BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(34))],
-                        }),
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(15))] },
+                        else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(34))] }),
+                        span: None,
                     }],
                 },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(67))],
-                }),
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(67))] }),
+                span: None,
             }],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1382,32 +1550,30 @@ fn parse_python_style_nested_if_without_inner_else() {
         block: BlockAst {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
+                    function_span: None,
                     function: "lt".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
                 then: BlockAst {
                     lines: vec![If {
                         condition: Box::new(Expression(ExpressionAst {
+                            function_span: None,
                             function: "eq".to_string(),
                             args: vec![
                                 Literal(LiteralAst::Integer(1)),
                                 Literal(LiteralAst::Integer(2)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(15))],
-                        },
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(15))] },
                         else_: None,
+                        span: None,
                     }],
                 },
-                else_: Some(BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(67))],
-                }),
+                else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(67))] }),
+                span: None,
             }],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1429,34 +1595,30 @@ fn parse_python_style_elif() {
         block: BlockAst {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
+                    function_span: None,
                     function: "eq".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(10))],
-                },
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(10))] },
                 else_: Some(BlockAst {
                     lines: vec![If {
                         condition: Box::new(Expression(ExpressionAst {
+                            function_span: None,
                             function: "eq".to_string(),
                             args: vec![
                                 Literal(LiteralAst::Integer(1)),
                                 Literal(LiteralAst::Integer(1)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(20))],
-                        },
-                        else_: Some(BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(30))],
-                        }),
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(20))] },
+                        else_: Some(BlockAst { lines: vec![Literal(LiteralAst::Integer(30))] }),
+                        span: None,
                     }],
                 }),
+                span: None,
             }],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1478,48 +1640,46 @@ fn parse_python_style_nested_elif() {
         block: BlockAst {
             lines: vec![If {
                 condition: Box::new(Expression(ExpressionAst {
+                    function_span: None,
                     function: "eq".to_string(),
-                    args: vec![
-                        Literal(LiteralAst::Integer(1)),
-                        Literal(LiteralAst::Integer(2)),
-                    ],
+                    args: vec![Literal(LiteralAst::Integer(1)), Literal(LiteralAst::Integer(2))],
                 })),
-                then: BlockAst {
-                    lines: vec![Literal(LiteralAst::Integer(10))],
-                },
+                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(10))] },
                 else_: Some(BlockAst {
                     lines: vec![If {
                         condition: Box::new(Expression(ExpressionAst {
+                            function_span: None,
                             function: "eq".to_string(),
                             args: vec![
                                 Literal(LiteralAst::Integer(2)),
                                 Literal(LiteralAst::Integer(3)),
                             ],
                         })),
-                        then: BlockAst {
-                            lines: vec![Literal(LiteralAst::Integer(20))],
-                        },
+                        then: BlockAst { lines: vec![Literal(LiteralAst::Integer(20))] },
                         else_: Some(BlockAst {
                             lines: vec![If {
                                 condition: Box::new(Expression(ExpressionAst {
+                                    function_span: None,
                                     function: "eq".to_string(),
                                     args: vec![
                                         Literal(LiteralAst::Integer(3)),
                                         Literal(LiteralAst::Integer(3)),
                                     ],
                                 })),
-                                then: BlockAst {
-                                    lines: vec![Literal(LiteralAst::Integer(30))],
-                                },
+                                then: BlockAst { lines: vec![Literal(LiteralAst::Integer(30))] },
                                 else_: Some(BlockAst {
                                     lines: vec![Literal(LiteralAst::Integer(40))],
                                 }),
+                                span: None,
                             }],
                         }),
+                        span: None,
                     }],
                 }),
+                span: None,
             }],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1540,10 +1700,15 @@ fn parse_identifier_with_digits() {
             output: None,
             block: BlockAst {
                 lines: vec![Expression(ExpressionAst {
+                    function_span: None,
                     function: "add".to_string(),
-                    args: vec![Variable("x1".to_string()), Literal(LiteralAst::Integer(1))],
+                    args: vec![
+                        Variable(Ident::synthetic("x1".to_string())),
+                        Literal(LiteralAst::Integer(1))
+                    ],
                 })],
             },
+            span: None,
         })
     );
 }
@@ -1563,12 +1728,15 @@ fn parse_logical_operator_precedence() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "or".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "and".to_string(),
                         args: vec![
                             Expression(ExpressionAst {
+                                function_span: None,
                                 function: "eq".to_string(),
                                 args: vec![
                                     Literal(LiteralAst::Integer(1)),
@@ -1576,6 +1744,7 @@ fn parse_logical_operator_precedence() {
                                 ],
                             }),
                             Expression(ExpressionAst {
+                                function_span: None,
                                 function: "eq".to_string(),
                                 args: vec![
                                     Literal(LiteralAst::Integer(2)),
@@ -1588,6 +1757,7 @@ fn parse_logical_operator_precedence() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1607,11 +1777,14 @@ fn parse_not_operator_precedence() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "and".to_string(),
                 args: vec![
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "not".to_string(),
                         args: vec![Expression(ExpressionAst {
+                            function_span: None,
                             function: "eq".to_string(),
                             args: vec![
                                 Literal(LiteralAst::Integer(1)),
@@ -1623,6 +1796,7 @@ fn parse_not_operator_precedence() {
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);
@@ -1643,16 +1817,19 @@ fn parse_boolean_alias_literals() {
         output: None,
         block: BlockAst {
             lines: vec![Expression(ExpressionAst {
+                function_span: None,
                 function: "and".to_string(),
                 args: vec![
                     Literal(LiteralAst::Integer(1)),
                     Expression(ExpressionAst {
+                        function_span: None,
                         function: "not".to_string(),
                         args: vec![Literal(LiteralAst::Integer(0))],
                     }),
                 ],
             })],
         },
+        span: None,
     });
 
     assert_eq!(ast, expected);

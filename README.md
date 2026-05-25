@@ -1,6 +1,6 @@
 # another programming language (or expression thing)
 
-Concept, have an interpreter and compiled output.
+Concept, have compiled output plus JIT and IR execution paths.
 
 ## Runtime model
 
