@@ -68,6 +68,8 @@ Guidance for coding agents working in this repository.
   - `string_is_ascii(s)`
   - `string_all(s, predicate)`
   - `string_is_integer(s)`
+  - `string_parse_integer(s)`
+  - `string_parse_bigint(s)`
   - `string_repeat(s, n)`
   - `string_reverse(s)`
   - `"a" == "a"`
@@ -88,6 +90,8 @@ Guidance for coding agents working in this repository.
   - `string_copy(s)` returns a fresh independent string copy
   - some higher-level helpers can be autoloaded from compiler-managed `.expr` stdlib source instead of being backend builtins
   - current autoloaded helpers include `string_is_empty(s)`, `string_is_not_empty(s)`, `string_len(s)`, `string_first(s)`, `string_last(s)`, `string_starts_with(s, prefix)`, `string_ends_with(s, suffix)`, `string_contains(s, needle)`, `string_is_ascii(s)`, `string_all(s, predicate)`, `string_is_integer(s)`, `string_repeat(s, n)`, and `string_reverse(s)`
+  - `string_parse_integer(s)` returns `(ok, value, err)` where `ok` is a boolean alias, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short message on failure
+  - `string_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
   - UTF-8 iterator operations validate encoding and trap on invalid byte sequences
   - string equality compares byte contents
   - `String == non-String` is false

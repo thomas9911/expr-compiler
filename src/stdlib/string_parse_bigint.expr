@@ -1,0 +1,30 @@
+fn string_parse_bigint(string) do
+    if not bytes_len(string) do
+        false, bigint_from_int(0), "expected at least one digit"
+    else if bytes_get(string, 0) == 45 do
+        if bytes_len(string) == 1 do
+            false, bigint_from_int(0), "expected digits after '-'"
+        else
+            __string_parse_bigint_digits(string, 1, bigint_from_int(0), true)
+        end
+    else
+        __string_parse_bigint_digits(string, 0, bigint_from_int(0), false)
+    end
+end
+
+fn __string_parse_bigint_digits(string, index, acc, negative) do
+    if index == bytes_len(string) do
+        if negative do
+            true, bigint_from_int(0) - acc, ""
+        else
+            true, acc, ""
+        end
+    else
+        ch = bytes_get(string, index)
+        if ch >= 48 and ch <= 57 do
+            __string_parse_bigint_digits(string, index + 1, acc * 10 + (ch - 48), negative)
+        else
+            false, bigint_from_int(0), "invalid integer"
+        end
+    end
+end

@@ -141,12 +141,14 @@ pub enum Ast {
     Lambda { inputs: Vec<String>, body: Box<Ast> },
     FunctionRef(Ident),
     Expression(ExpressionAst),
+    MultiValue(Vec<Ast>),
     Literal(LiteralAst),
     ListLiteral(Vec<Ast>),
     Index { collection: Box<Ast>, index: Box<Ast>, span: Option<Span> },
     IndexAssign { collection: Box<Ast>, index: Box<Ast>, value: Box<Ast>, span: Option<Span> },
     Variable(Ident),
     Assign { name: String, value: Box<Ast>, span: Option<Span> },
+    MultiAssign { names: Vec<String>, value: Box<Ast>, span: Option<Span> },
     If { condition: Box<Ast>, then: BlockAst, else_: Option<BlockAst>, span: Option<Span> },
 }
 
@@ -161,6 +163,7 @@ impl PartialEq for Ast {
             ) => a_inputs == b_inputs && a_body == b_body,
             (Ast::FunctionRef(a), Ast::FunctionRef(b)) => a == b,
             (Ast::Expression(a), Ast::Expression(b)) => a == b,
+            (Ast::MultiValue(a), Ast::MultiValue(b)) => a == b,
             (Ast::Literal(a), Ast::Literal(b)) => a == b,
             (Ast::ListLiteral(a), Ast::ListLiteral(b)) => a == b,
             (
@@ -180,6 +183,10 @@ impl PartialEq for Ast {
                 Ast::Assign { name: a_name, value: a_value, .. },
                 Ast::Assign { name: b_name, value: b_value, .. },
             ) => a_name == b_name && a_value == b_value,
+            (
+                Ast::MultiAssign { names: a_names, value: a_value, .. },
+                Ast::MultiAssign { names: b_names, value: b_value, .. },
+            ) => a_names == b_names && a_value == b_value,
             (
                 Ast::If { condition: a_condition, then: a_then, else_: a_else, .. },
                 Ast::If { condition: b_condition, then: b_then, else_: b_else, .. },
@@ -325,6 +332,32 @@ impl Ast {
         trim_newlines(lex);
 
         if matches!(lex.peek(), Some(Ok(Token::Symbol(_)))) {
+            if matches!(lex.peek_n(1), Some(Ok(Token::Comma))) {
+                let mut names = vec![];
+                let start_span = lex.peek_span();
+                loop {
+                    let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
+                    names.push(name);
+                    match lex.peek() {
+                        Some(Ok(Token::Comma)) => {
+                            lex.next();
+                        }
+                        Some(Ok(Token::Assign)) if names.len() >= 2 => {
+                            lex.next();
+                            let value = parse_statement_expr(lex)?;
+                            return Ok(Ast::MultiAssign {
+                                names,
+                                value: Box::new(value),
+                                span: start_span
+                                    .zip(lex.last_span())
+                                    .map(|(start, end)| Span::cover(start, end)),
+                            });
+                        }
+                        _ => break,
+                    }
+                }
+                return Err(ParseError::unexpected(lex));
+            }
             let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
             let lhs = parse_postfix(
                 lex,
@@ -336,7 +369,7 @@ impl Ast {
             if lex.peek() == Some(&Ok(Token::Assign)) {
                 lex.next();
                 let assign_span = lex.last_span();
-                let value = parse_expr(lex, 0)?;
+                let value = parse_statement_expr(lex)?;
                 return match lhs {
                     Ast::Variable(name) => Ok(Ast::Assign {
                         name: name.name,
@@ -375,7 +408,7 @@ impl Ast {
                 lex.next();
                 parse_if_after_keyword(lex, current_indent)
             }
-            _ => parse_expr(lex, 0),
+            _ => parse_statement_expr(lex),
         }
     }
 }
@@ -506,7 +539,7 @@ impl PartialEq for ExpressionAst {
 
 impl ExpressionAst {
     pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
-        match parse_expr(lex, 0)? {
+        match parse_statement_expr(lex)? {
             Ast::Expression(e) => Ok(e),
             single => Ok(ExpressionAst {
                 function_span: None,
@@ -575,6 +608,20 @@ fn parse_expr<'a>(lex: &mut ParseLexer<'a>, min_prec: u8) -> Result<Ast, ParseEr
     }
 
     Ok(lhs)
+}
+
+fn parse_statement_expr<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    let first = parse_expr(lex, 0)?;
+    if lex.peek() != Some(&Ok(Token::Comma)) {
+        return Ok(first);
+    }
+
+    let mut values = vec![first];
+    while lex.peek() == Some(&Ok(Token::Comma)) {
+        lex.next();
+        values.push(parse_expr(lex, 0)?);
+    }
+    Ok(Ast::MultiValue(values))
 }
 
 fn is_lambda_start<'a>(lex: &mut ParseLexer<'a>) -> bool {
@@ -1828,6 +1875,61 @@ fn parse_boolean_alias_literals() {
                     }),
                 ],
             })],
+        },
+        span: None,
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_multi_value_expression() {
+    use Ast::*;
+
+    let text = "fn pair() do\n    1, 2\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "pair".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![MultiValue(vec![
+                Literal(LiteralAst::Integer(1)),
+                Literal(LiteralAst::Integer(2)),
+            ])],
+        },
+        span: None,
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_multi_assign_statement() {
+    use Ast::*;
+
+    let text = "fn main() do\n    a, b = pair()\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![MultiAssign {
+                names: vec!["a".to_string(), "b".to_string()],
+                value: Box::new(Expression(ExpressionAst {
+                    function_span: None,
+                    function: "pair".to_string(),
+                    args: vec![],
+                })),
+                span: None,
+            }],
         },
         span: None,
     });

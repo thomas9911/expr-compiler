@@ -1,0 +1,30 @@
+fn string_parse_integer(string) do
+    if not bytes_len(string) do
+        false, 0, "expected at least one digit"
+    else if bytes_get(string, 0) == 45 do
+        if bytes_len(string) == 1 do
+            false, 0, "expected digits after '-'"
+        else
+            __string_parse_integer_digits(string, 1, 0, true)
+        end
+    else
+        __string_parse_integer_digits(string, 0, 0, false)
+    end
+end
+
+fn __string_parse_integer_digits(string, index, acc, negative) do
+    if index == bytes_len(string) do
+        if negative do
+            true, 0 - acc, ""
+        else
+            true, acc, ""
+        end
+    else
+        ch = bytes_get(string, index)
+        if ch >= 48 and ch <= 57 do
+            __string_parse_integer_digits(string, index + 1, acc * 10 + (ch - 48), negative)
+        else
+            false, 0, "invalid integer"
+        end
+    end
+end

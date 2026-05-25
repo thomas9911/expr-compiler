@@ -1,10 +1,11 @@
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst};
 use crate::source::Span;
 use crate::value::{
-    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, STRING_CAP_OFFSET,
-    STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
-    STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION,
-    TAG_INT, TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, MULTI_HEADER_SIZE,
+    MULTI_LEN_OFFSET, MULTI_PTR_OFFSET, STRING_CAP_OFFSET, STRING_HEADER_SIZE,
+    STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET, STRING_ITER_STRING_OFFSET,
+    STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_MULTI, TAG_STRING,
+    TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
@@ -70,6 +71,14 @@ pub enum CompileError {
     UndefinedFunction { name: String, span: Option<Span> },
     #[error("undefined variable: {name}")]
     UndefinedVariable { name: String, span: Option<Span> },
+    #[error("function `{function}` returns {expected} values in one path and {found} in another")]
+    ReturnArityMismatch { function: String, expected: usize, found: usize, span: Option<Span> },
+    #[error("destructuring assignment expects {expected} values, found {found}")]
+    DestructuringArityMismatch { expected: usize, found: usize, span: Option<Span> },
+    #[error("multi-return values are not supported in this context")]
+    UnsupportedMultiValueContext { span: Option<Span> },
+    #[error("{mode} must return exactly 1 value in phase 1 multi-return mode, found {found}")]
+    InvalidMainReturnArity { mode: &'static str, found: usize, span: Option<Span> },
     #[error("{0} is not implemented yet")]
     UnsupportedFeature(&'static str),
     #[error("toolchain error: {0}")]
@@ -83,7 +92,11 @@ impl CompileError {
             | Self::Parse { span, .. }
             | Self::InvalidMainArity { span, .. }
             | Self::UndefinedFunction { span, .. }
-            | Self::UndefinedVariable { span, .. } => span.as_ref(),
+            | Self::UndefinedVariable { span, .. }
+            | Self::ReturnArityMismatch { span, .. }
+            | Self::DestructuringArityMismatch { span, .. }
+            | Self::UnsupportedMultiValueContext { span }
+            | Self::InvalidMainReturnArity { span, .. } => span.as_ref(),
             _ => None,
         }
     }
@@ -151,6 +164,7 @@ impl Module {
         let function_names =
             self.functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
         let function_arities = function_arities(&self.functions);
+        let function_return_arities = function_return_arities(&self.functions)?;
         for func in &self.functions {
             let mut scope_names = func.inputs.clone();
             if let Some(metadata) = self.closure_metadata.get(&func.name) {
@@ -168,6 +182,32 @@ impl Module {
                 &function_names,
                 &function_arities,
             )?;
+            validate_block_multi_return_usage(
+                &func.block,
+                &func.name,
+                &locals,
+                &function_names,
+                &function_return_arities,
+                *function_return_arities.get(&func.name).unwrap_or(&1),
+            )?;
+        }
+        self.validate_main_return_arity(&function_return_arities)?;
+        Ok(())
+    }
+
+    fn validate_main_return_arity(
+        &self,
+        function_return_arities: &HashMap<String, usize>,
+    ) -> Result<(), CompileError> {
+        if let Some(main) = self.functions.iter().find(|func| func.name == "main") {
+            let found = *function_return_arities.get("main").unwrap_or(&1);
+            if found != 1 {
+                return Err(CompileError::InvalidMainReturnArity {
+                    mode: "runnable main function",
+                    found,
+                    span: main.span.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -1230,6 +1270,101 @@ fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
     functions.iter().map(|func| (func.name.clone(), func.inputs.len())).collect()
 }
 
+fn function_return_arities(
+    functions: &[FunctionDefAst],
+) -> Result<HashMap<String, usize>, CompileError> {
+    let mut arities = functions
+        .iter()
+        .map(|func| (func.name.clone(), explicit_function_return_arity(func.block.lines.last())))
+        .collect::<HashMap<_, _>>();
+    for _ in 0..functions.len() {
+        let mut changed = false;
+        for func in functions {
+            let inferred = infer_block_return_arity(&func.block, &func.name, &arities)?;
+            let entry = arities.entry(func.name.clone()).or_insert(inferred);
+            if *entry != inferred {
+                *entry = inferred;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(arities)
+}
+
+fn explicit_function_return_arity(last: Option<&Ast>) -> usize {
+    last.and_then(explicit_ast_return_arity).unwrap_or(1)
+}
+
+fn explicit_block_return_arity(block: &BlockAst) -> Option<usize> {
+    block.lines.last().and_then(explicit_ast_return_arity)
+}
+
+fn explicit_ast_return_arity(ast: &Ast) -> Option<usize> {
+    match ast {
+        Ast::MultiValue(values) => Some(values.len()),
+        Ast::Block(block) => explicit_block_return_arity(block),
+        Ast::If { then, else_, .. } => {
+            let then_arity = explicit_block_return_arity(then);
+            let else_arity = else_.as_ref().and_then(explicit_block_return_arity);
+            match (then_arity, else_arity) {
+                (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                (Some(lhs), None) | (None, Some(lhs)) => Some(lhs),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn infer_block_return_arity(
+    block: &BlockAst,
+    current_function: &str,
+    function_return_arities: &HashMap<String, usize>,
+) -> Result<usize, CompileError> {
+    match block.lines.last() {
+        Some(ast) => infer_ast_return_arity(ast, current_function, function_return_arities),
+        None => Ok(1),
+    }
+}
+
+fn infer_ast_return_arity(
+    ast: &Ast,
+    current_function: &str,
+    function_return_arities: &HashMap<String, usize>,
+) -> Result<usize, CompileError> {
+    match ast {
+        Ast::MultiValue(values) => Ok(values.len()),
+        Ast::Block(block) => {
+            infer_block_return_arity(block, current_function, function_return_arities)
+        }
+        Ast::If { then, else_, span, .. } => {
+            let then_arity =
+                infer_block_return_arity(then, current_function, function_return_arities)?;
+            let else_arity = if let Some(else_block) = else_ {
+                infer_block_return_arity(else_block, current_function, function_return_arities)?
+            } else {
+                1
+            };
+            if then_arity != else_arity {
+                return Err(CompileError::ReturnArityMismatch {
+                    function: current_function.to_string(),
+                    expected: then_arity,
+                    found: else_arity,
+                    span: span.clone(),
+                });
+            }
+            Ok(then_arity)
+        }
+        Ast::Expression(ExpressionAst { function, .. }) if !function.is_empty() => {
+            Ok(*function_return_arities.get(function).unwrap_or(&1))
+        }
+        _ => Ok(1),
+    }
+}
+
 fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
     use crate::parser::ParseLexer;
     use crate::tokenizer::{Logos, Token};
@@ -1310,6 +1445,14 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
             source: include_str!("./stdlib/string_is_integer.expr"),
             stdlib_deps: &["string_all"],
         }),
+        "string_parse_integer" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_parse_integer.expr"),
+            stdlib_deps: &[],
+        }),
+        "string_parse_bigint" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_parse_bigint.expr"),
+            stdlib_deps: &[],
+        }),
         "string_repeat" => Some(StdlibFunction {
             source: include_str!("./stdlib/string_repeat.expr"),
             stdlib_deps: &[],
@@ -1389,8 +1532,14 @@ fn collect_stdlib_references_from_block(
 ) {
     for line in &block.lines {
         collect_stdlib_references_from_ast(line, scope, refs);
-        if let Ast::Assign { name, .. } = line {
-            scope.insert(name.clone());
+        match line {
+            Ast::Assign { name, .. } => {
+                scope.insert(name.clone());
+            }
+            Ast::MultiAssign { names, .. } => {
+                scope.extend(names.iter().cloned());
+            }
+            _ => {}
         }
     }
 }
@@ -1412,12 +1561,18 @@ fn collect_stdlib_references_from_ast(
                 collect_stdlib_references_from_ast(arg, scope, refs);
             }
         }
+        Ast::MultiValue(values) => {
+            for value in values {
+                collect_stdlib_references_from_ast(value, scope, refs);
+            }
+        }
         Ast::Variable(name) | Ast::FunctionRef(name) => {
             if !scope.contains(name.as_str()) && stdlib_function(name.as_ref()).is_some() {
                 refs.insert(name.to_string());
             }
         }
         Ast::Assign { value, .. } => collect_stdlib_references_from_ast(value, scope, refs),
+        Ast::MultiAssign { value, .. } => collect_stdlib_references_from_ast(value, scope, refs),
         Ast::If { condition, then, else_, .. } => {
             collect_stdlib_references_from_ast(condition, scope, refs);
             let mut then_scope = scope.clone();
@@ -1510,6 +1665,11 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                 collect_used_features_from_ast(arg, features);
             }
         }
+        Ast::MultiValue(values) => {
+            for value in values {
+                collect_used_features_from_ast(value, features);
+            }
+        }
         Ast::ListLiteral(items) => {
             features.lists = true;
             for item in items {
@@ -1529,6 +1689,7 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             collect_used_features_from_ast(value, features);
         }
         Ast::Assign { value, .. } => collect_used_features_from_ast(value, features),
+        Ast::MultiAssign { value, .. } => collect_used_features_from_ast(value, features),
         Ast::If { condition, then, else_, .. } => {
             collect_used_features_from_ast(condition, features);
             collect_used_features_from_block(then, features);
@@ -1897,6 +2058,9 @@ fn validate_ast_user_facing(
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
         Ast::FunctionRef(name) => validate_function_reference(name, function_names),
+        Ast::MultiValue(values) => {
+            validate_ast_sequence(values, locals, function_names, function_arities)
+        }
         Ast::ListLiteral(items) => {
             validate_ast_sequence(items, locals, function_names, function_arities)
         }
@@ -1925,6 +2089,9 @@ fn validate_ast_user_facing(
             validate_ast_sequence(&block.lines, locals, function_names, function_arities)
         }
         Ast::Assign { value, .. } => {
+            validate_ast_user_facing(value, locals, function_names, function_arities)
+        }
+        Ast::MultiAssign { value, .. } => {
             validate_ast_user_facing(value, locals, function_names, function_arities)
         }
         Ast::If { condition, then, else_, .. } => validate_if_ast_user_facing(
@@ -1958,6 +2125,284 @@ fn validate_variable_reference(
         Ok(())
     } else {
         Err(CompileError::UndefinedVariable { name: name.to_string(), span: name.span.clone() })
+    }
+}
+
+fn expression_return_arity(
+    function: &str,
+    function_return_arities: &HashMap<String, usize>,
+) -> usize {
+    if function.is_empty() { 1 } else { *function_return_arities.get(function).unwrap_or(&1) }
+}
+
+fn validate_block_multi_return_usage(
+    block: &BlockAst,
+    current_function: &str,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_return_arities: &HashMap<String, usize>,
+    expected_tail_arity: usize,
+) -> Result<(), CompileError> {
+    if block.lines.is_empty() {
+        return Ok(());
+    }
+    for line in &block.lines[..block.lines.len() - 1] {
+        validate_ast_multi_return_usage(
+            line,
+            current_function,
+            locals,
+            function_names,
+            function_return_arities,
+            1,
+            false,
+        )?;
+    }
+    validate_ast_multi_return_usage(
+        &block.lines[block.lines.len() - 1],
+        current_function,
+        locals,
+        function_names,
+        function_return_arities,
+        expected_tail_arity,
+        true,
+    )
+}
+
+fn validate_ast_multi_return_usage(
+    ast: &Ast,
+    current_function: &str,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_return_arities: &HashMap<String, usize>,
+    expected_arity: usize,
+    is_tail: bool,
+) -> Result<(), CompileError> {
+    match ast {
+        Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {
+            if expected_arity == 1 {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: None })
+            }
+        }
+        Ast::Lambda { .. } | Ast::FunctionDef(_) => Ok(()),
+        Ast::MultiValue(values) => {
+            if !is_tail {
+                return Err(CompileError::UnsupportedMultiValueContext { span: None });
+            }
+            if values.len() != expected_arity {
+                return Err(CompileError::DestructuringArityMismatch {
+                    expected: expected_arity,
+                    found: values.len(),
+                    span: None,
+                });
+            }
+            for value in values {
+                validate_ast_multi_return_usage(
+                    value,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                    1,
+                    false,
+                )?;
+            }
+            Ok(())
+        }
+        Ast::Expression(ExpressionAst { function, args, function_span }) => {
+            for arg in args {
+                validate_ast_multi_return_usage(
+                    arg,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                    1,
+                    false,
+                )?;
+            }
+            let arity = expression_return_arity(function, function_return_arities);
+            if arity > 1 && !(is_tail && arity == expected_arity) {
+                return Err(CompileError::UnsupportedMultiValueContext {
+                    span: function_span.clone(),
+                });
+            }
+            if expected_arity == 1 || (is_tail && arity == expected_arity) {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: function_span.clone() })
+            }
+        }
+        Ast::ListLiteral(items) => {
+            for item in items {
+                validate_ast_multi_return_usage(
+                    item,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                    1,
+                    false,
+                )?;
+            }
+            if expected_arity == 1 {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: None })
+            }
+        }
+        Ast::Index { collection, index, span } => {
+            validate_ast_multi_return_usage(
+                collection,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                1,
+                false,
+            )?;
+            validate_ast_multi_return_usage(
+                index,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                1,
+                false,
+            )?;
+            if expected_arity == 1 {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: span.clone() })
+            }
+        }
+        Ast::IndexAssign { collection, index, value, span } => {
+            validate_ast_multi_return_usage(
+                collection,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                1,
+                false,
+            )?;
+            validate_ast_multi_return_usage(
+                index,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                1,
+                false,
+            )?;
+            validate_ast_multi_return_usage(
+                value,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                1,
+                false,
+            )?;
+            if expected_arity == 1 {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: span.clone() })
+            }
+        }
+        Ast::Assign { value, span, .. } => {
+            let actual_arity =
+                infer_ast_return_arity(value, current_function, function_return_arities)?;
+            if actual_arity != 1 {
+                return Err(CompileError::UnsupportedMultiValueContext { span: span.clone() });
+            }
+            validate_ast_multi_return_usage(
+                value,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                1,
+                false,
+            )?;
+            if expected_arity == 1 {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: span.clone() })
+            }
+        }
+        Ast::MultiAssign { names, value, span } => {
+            match value.as_ref() {
+                Ast::Expression(ExpressionAst { function, .. }) if !function.is_empty() => {}
+                _ => {
+                    return Err(CompileError::UnsupportedMultiValueContext { span: span.clone() });
+                }
+            }
+            let actual_arity =
+                infer_ast_return_arity(value, current_function, function_return_arities)?;
+            if actual_arity != names.len() {
+                return Err(CompileError::DestructuringArityMismatch {
+                    expected: names.len(),
+                    found: actual_arity,
+                    span: span.clone(),
+                });
+            }
+            validate_ast_multi_return_usage(
+                value,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                names.len(),
+                true,
+            )?;
+            if expected_arity == 1 {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: span.clone() })
+            }
+        }
+        Ast::If { condition, then, else_, span } => {
+            validate_ast_multi_return_usage(
+                condition,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                1,
+                false,
+            )?;
+            validate_block_multi_return_usage(
+                then,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+                expected_arity,
+            )?;
+            if let Some(else_block) = else_ {
+                validate_block_multi_return_usage(
+                    else_block,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                    expected_arity,
+                )?;
+            } else if expected_arity != 1 {
+                return Err(CompileError::UnsupportedMultiValueContext { span: span.clone() });
+            }
+            Ok(())
+        }
+        Ast::Block(block) => validate_block_multi_return_usage(
+            block,
+            current_function,
+            locals,
+            function_names,
+            function_return_arities,
+            expected_arity,
+        ),
     }
 }
 
@@ -2069,6 +2514,12 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
     match ast {
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
         Ast::Lambda { body, .. } => validate_no_nested_function_defs(body),
+        Ast::MultiValue(values) => {
+            for value in values {
+                validate_no_nested_function_defs(value)?;
+            }
+            Ok(())
+        }
         Ast::ListLiteral(items) => {
             for item in items {
                 validate_no_nested_function_defs(item)?;
@@ -2097,6 +2548,7 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
             Ok(())
         }
         Ast::Assign { value, .. } => validate_no_nested_function_defs(value),
+        Ast::MultiAssign { value, .. } => validate_no_nested_function_defs(value),
         Ast::If { condition, then, else_, .. } => {
             validate_no_nested_function_defs(condition)?;
             validate_no_nested_function_defs(&Ast::Block(then.clone()))?;
@@ -2167,6 +2619,11 @@ impl LambdaLifter {
                     self.lift_ast(arg, scope_names);
                 }
             }
+            Ast::MultiValue(values) => {
+                for value in values {
+                    self.lift_ast(value, scope_names);
+                }
+            }
             Ast::ListLiteral(items) => {
                 for item in items {
                     self.lift_ast(item, scope_names);
@@ -2182,6 +2639,7 @@ impl LambdaLifter {
                 self.lift_ast(value, scope_names);
             }
             Ast::Assign { value, .. } => self.lift_ast(value, scope_names),
+            Ast::MultiAssign { value, .. } => self.lift_ast(value, scope_names),
             Ast::If { condition, then, else_, .. } => {
                 self.lift_ast(condition, scope_names);
                 self.lift_block(then, scope_names);
@@ -2219,6 +2677,11 @@ fn collect_captures_into(
         Ast::Expression(ExpressionAst { args, .. }) => {
             for arg in args {
                 collect_captures_into(arg, local_names, scope_names, captures);
+            }
+        }
+        Ast::MultiValue(values) => {
+            for value in values {
+                collect_captures_into(value, local_names, scope_names, captures);
             }
         }
         Ast::ListLiteral(items) => {
@@ -2265,6 +2728,9 @@ fn collect_captures_into(
         Ast::Assign { value, .. } => {
             collect_captures_into(value, local_names, scope_names, captures);
         }
+        Ast::MultiAssign { value, .. } => {
+            collect_captures_into(value, local_names, scope_names, captures);
+        }
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
@@ -2280,9 +2746,22 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             }
         }
         Ast::FunctionRef(_) => {}
+        Ast::MultiValue(values) => {
+            for value in values {
+                collect_var_names(value, names);
+            }
+        }
         Ast::Assign { name, value, .. } => {
             if !names.contains(name) {
                 names.push(name.clone());
+            }
+            collect_var_names(value, names);
+        }
+        Ast::MultiAssign { names: assigned_names, value, .. } => {
+            for name in assigned_names {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
             }
             collect_var_names(value, names);
         }
@@ -3419,6 +3898,123 @@ fn create_empty_list(
     CompiledValue { tag: created[0], payload: created[1] }
 }
 
+fn load_multi_value_item(
+    builder: &mut FunctionBuilder,
+    multi_value: CompiledValue,
+    index: usize,
+) -> CompiledValue {
+    let is_multi = builder.ins().icmp_imm(IntCC::Equal, multi_value.tag, TAG_MULTI);
+    builder.ins().trapz(is_multi, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), multi_value.payload, MULTI_LEN_OFFSET);
+    let index_value = builder.ins().iconst(types::I64, index as i64);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index_value, len);
+    builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), multi_value.payload, MULTI_PTR_OFFSET);
+    let slot_offset = i32::try_from(i64::try_from(index).unwrap() * VALUE_SIZE)
+        .expect("multi slot offset overflow");
+    let tag_i8 = builder.ins().load(types::I8, MemFlags::new(), data_ptr, slot_offset);
+    let tag = builder.ins().uextend(types::I64, tag_i8);
+    let payload = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        data_ptr,
+        slot_offset + VALUE_PAYLOAD_OFFSET,
+    );
+    CompiledValue { tag, payload }
+}
+
+fn compile_multi_value(
+    builder: &mut FunctionBuilder,
+    values: &[Ast],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let compiled = values
+        .iter()
+        .map(|value| {
+            compile_ast(
+                builder,
+                value,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+            )
+        })
+        .collect::<Vec<_>>();
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let data_bytes =
+        builder.ins().iconst(types::I64, i64::try_from(compiled.len()).unwrap() * VALUE_SIZE);
+    let data_call = builder.ins().call(alloc_ref, &[data_bytes, align]);
+    let data_ptr = builder.inst_results(data_call)[0];
+    let header_size = builder.ins().iconst(types::I64, MULTI_HEADER_SIZE);
+    let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
+    let header_ptr = builder.inst_results(header_call)[0];
+    let len_value = builder.ins().iconst(types::I64, compiled.len() as i64);
+    builder.ins().store(MemFlags::new(), len_value, header_ptr, MULTI_LEN_OFFSET);
+    builder.ins().store(MemFlags::new(), data_ptr, header_ptr, MULTI_PTR_OFFSET);
+    for (index, value) in compiled.into_iter().enumerate() {
+        let slot_offset = i32::try_from(i64::try_from(index).unwrap() * VALUE_SIZE)
+            .expect("multi slot offset overflow");
+        let tag_i8 = builder.ins().ireduce(types::I8, value.tag);
+        builder.ins().store(MemFlags::new(), tag_i8, data_ptr, slot_offset);
+        builder.ins().store(
+            MemFlags::new(),
+            value.payload,
+            data_ptr,
+            slot_offset + VALUE_PAYLOAD_OFFSET,
+        );
+    }
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_MULTI), payload: header_ptr }
+}
+
+fn compile_multi_assign_ast(
+    builder: &mut FunctionBuilder,
+    names: &[String],
+    value: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+) -> CompiledValue {
+    let multi_value = compile_ast(
+        builder,
+        value,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+    );
+    let mut last = None;
+    for (index, name) in names.iter().enumerate() {
+        let unpacked = load_multi_value_item(builder, multi_value, index);
+        let var = vars.get(name).unwrap_or_else(|| {
+            panic!("internal compiler error: assignment target '{name}' has no local slot")
+        });
+        builder.def_var(var.tag, unpacked.tag);
+        builder.def_var(var.payload, unpacked.payload);
+        last = Some(unpacked);
+    }
+    last.expect("multi assignment must have at least one target")
+}
+
 fn validate_unary_callback_ast(
     ast: &Ast,
     vars: &HashMap<String, LocalValueVar>,
@@ -3992,6 +4588,17 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
+        Ast::MultiValue(values) => compile_multi_value(
+            builder,
+            values,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
         Ast::ListLiteral(items) => compile_list_literal(
             builder,
             items,
@@ -4064,6 +4671,18 @@ fn compile_ast(
         Ast::Assign { name, value, .. } => compile_assign_ast(
             builder,
             name,
+            value,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+        ),
+        Ast::MultiAssign { names, value, .. } => compile_multi_assign_ast(
+            builder,
+            names,
             value,
             vars,
             func_refs,
@@ -5322,14 +5941,14 @@ fn bigint_modulo_works() {
 
 #[test]
 fn bigint_mixed_arithmetic_and_compare_work() {
-    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
-    assert_cranelift_executable_output(src, "15\n15\n7\n15\n30\n30\n14\n2\n1\n1\n1\n", 0);
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(5 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
+    assert_cranelift_executable_output(src, "15\n15\n7\n15\n-5\n30\n30\n14\n2\n1\n1\n1\n", 0);
 }
 
 #[test]
 fn bigint_builtins_accept_mixed_int_and_bigint_operands() {
-    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
-    assert_cranelift_executable_output(src, "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n", 0);
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_subtract(5, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
+    assert_cranelift_executable_output(src, "15\n15\n7\n15\n-5\n30\n30\n10\n0\n1\n-1\n3\n", 0);
 }
 
 #[test]
@@ -5388,10 +6007,10 @@ fn strings_utf8_iteration_works() {
 
 #[test]
 fn autoloaded_stdlib_string_helpers_work() {
-    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_all(\"1234\", __all_digits))\n    print(string_all(\"12a4\", __all_digits))\n    print(string_all(\"\", __all_digits))\n    print(string_any(\"12a4\", __all_digits))\n    print(string_any(\"abcd\", __all_digits))\n    print(string_any(\"\", __all_digits))\n    print(string_is_integer(\"11234\"))\n    print(string_is_integer(\"11T234\"))\n    print(list_all([1, 2, 3], __positive_item))\n    print(list_all([1, 0, 3], __positive_item))\n    print(list_all([], __positive_item))\n    print(list_any([1, 0, 3], __zero_item))\n    print(list_any([1, 2, 3], __zero_item))\n    print(list_any([], __zero_item))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend\n\nfn __all_digits(ch) do\n    if ch >= 48 do\n        ch <= 57\n    else\n        0\n    end\nend\n\nfn __positive_item(item) do\n    if item > 0 do\n        1\n    else\n        0\n    end\nend\n\nfn __zero_item(item) do\n    if item == 0 do\n        1\n    else\n        0\n    end\nend";
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_all(\"1234\", __all_digits))\n    print(string_all(\"12a4\", __all_digits))\n    print(string_all(\"\", __all_digits))\n    print(string_any(\"12a4\", __all_digits))\n    print(string_any(\"abcd\", __all_digits))\n    print(string_any(\"\", __all_digits))\n    print(string_is_integer(\"11234\"))\n    print(string_is_integer(\"11T234\"))\n    ok1, value1, err1 = string_parse_integer(\"123\")\n    print(ok1)\n    print(value1)\n    print(err1 == \"\")\n    ok2, value2, err2 = string_parse_integer(\"-45\")\n    print(ok2)\n    print(value2)\n    print(err2 == \"\")\n    ok3, value3, err3 = string_parse_integer(\"12a\")\n    print(ok3)\n    print(value3)\n    print(err3 == \"invalid integer\")\n    ok4, value4, err4 = string_parse_integer(\"\")\n    print(ok4)\n    print(value4)\n    print(err4 == \"expected at least one digit\")\n    ok5, value5, err5 = string_parse_integer(\"-\")\n    print(ok5)\n    print(value5)\n    print(err5 == \"expected digits after '-'\" )\n    ok6, value6, err6 = string_parse_bigint(\"12345678901234567890\")\n    print(ok6)\n    print(value6)\n    print(err6 == \"\")\n    ok7, value7, err7 = string_parse_bigint(\"-9007199254740993\")\n    print(ok7)\n    print(value7)\n    print(err7 == \"\")\n    ok8, value8, err8 = string_parse_bigint(\"x\")\n    print(ok8)\n    print(value8)\n    print(err8 == \"invalid integer\")\n    print(list_all([1, 2, 3], __positive_item))\n    print(list_all([1, 0, 3], __positive_item))\n    print(list_all([], __positive_item))\n    print(list_any([1, 0, 3], __zero_item))\n    print(list_any([1, 2, 3], __zero_item))\n    print(list_any([], __zero_item))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend\n\nfn __all_digits(ch) do\n    if ch >= 48 do\n        ch <= 57\n    else\n        0\n    end\nend\n\nfn __positive_item(item) do\n    if item > 0 do\n        1\n    else\n        0\n    end\nend\n\nfn __zero_item(item) do\n    if item == 0 do\n        1\n    else\n        0\n    end\nend";
     assert_cranelift_executable_output(
         src,
-        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n0\n0\n1\n0\n1\n0\n0\n1\n0\n0\nababab\n1\n",
+        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n0\n0\n1\n0\n1\n123\n1\n1\n-45\n1\n0\n0\n1\n0\n0\n1\n0\n0\n1\n1\n12345678901234567890\n1\n1\n-9007199254740993\n1\n0\n0\n1\n1\n0\n0\n1\n0\n0\nababab\n1\n",
         0,
     );
 }
@@ -5472,11 +6091,11 @@ fn llvm_bigint_modulo_works() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_bigint_mixed_arithmetic_and_compare_work() {
-    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(a + 5)\n    print(5 + a)\n    print(a - 3)\n    print(25 - a)\n    print(5 - a)\n    print(a * 3)\n    print(3 * a)\n    print(bigint_from_int(100) / 7)\n    print(bigint_from_int(100) % 7)\n    print(a > 5)\n    print(5 < a)\n    print(a == 10)\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "15\n15\n7\n15\n30\n30\n14\n2\n1\n1\n1\n",
+        "15\n15\n7\n15\n-5\n30\n30\n14\n2\n1\n1\n1\n",
         0,
     );
 }
@@ -5484,11 +6103,11 @@ fn llvm_bigint_mixed_arithmetic_and_compare_work() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_bigint_builtins_accept_mixed_int_and_bigint_operands() {
-    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
+    let src = "fn main() do\n    a = bigint_from_int(10)\n    print(bigint_add(a, 5))\n    print(bigint_add(5, a))\n    print(bigint_subtract(a, 3))\n    print(bigint_subtract(25, a))\n    print(bigint_subtract(5, a))\n    print(bigint_multiply(a, 3))\n    print(bigint_multiply(3, a))\n    print(bigint_divide(100, a))\n    print(bigint_modulo(100, a))\n    print(bigint_compare(a, 5))\n    print(bigint_compare(5, a))\n    print(bigint_add(1, 2))\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "15\n15\n7\n15\n30\n30\n10\n0\n1\n-1\n3\n",
+        "15\n15\n7\n15\n-5\n30\n30\n10\n0\n1\n-1\n3\n",
         0,
     );
 }
@@ -5587,11 +6206,11 @@ fn llvm_jit_strings_utf8_iteration_works() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_autoloaded_stdlib_string_helpers_work() {
-    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_all(\"1234\", __all_digits))\n    print(string_all(\"12a4\", __all_digits))\n    print(string_all(\"\", __all_digits))\n    print(string_any(\"12a4\", __all_digits))\n    print(string_any(\"abcd\", __all_digits))\n    print(string_any(\"\", __all_digits))\n    print(string_is_integer(\"11234\"))\n    print(string_is_integer(\"11T234\"))\n    print(list_all([1, 2, 3], __positive_item))\n    print(list_all([1, 0, 3], __positive_item))\n    print(list_all([], __positive_item))\n    print(list_any([1, 0, 3], __zero_item))\n    print(list_any([1, 2, 3], __zero_item))\n    print(list_any([], __zero_item))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend\n\nfn __all_digits(ch) do\n    if ch >= 48 do\n        ch <= 57\n    else\n        0\n    end\nend\n\nfn __positive_item(item) do\n    if item > 0 do\n        1\n    else\n        0\n    end\nend\n\nfn __zero_item(item) do\n    if item == 0 do\n        1\n    else\n        0\n    end\nend";
+    let src = "fn main() do\n    print(string_is_empty(\"\"))\n    print(string_is_empty(\"x\"))\n    print(string_is_not_empty(\"\"))\n    print(string_is_not_empty(\"x\"))\n    print(string_len(\"hé🙂\"))\n    print(string_first(\"hé🙂\"))\n    print(string_last(\"hé🙂\"))\n    print(string_starts_with(\"banana\", \"ban\"))\n    print(string_starts_with(\"banana\", \"ana\"))\n    print(string_ends_with(\"banana\", \"nana\"))\n    print(string_ends_with(\"banana\", \"ban\"))\n    print(string_contains(\"banana\", \"nan\"))\n    print(string_contains(\"banana\", \"nab\"))\n    print(string_contains(\"banana\", \"\"))\n    print(string_is_ascii(\"hello\"))\n    print(string_is_ascii(\"hé\"))\n    print(string_all(\"1234\", __all_digits))\n    print(string_all(\"12a4\", __all_digits))\n    print(string_all(\"\", __all_digits))\n    print(string_any(\"12a4\", __all_digits))\n    print(string_any(\"abcd\", __all_digits))\n    print(string_any(\"\", __all_digits))\n    print(string_is_integer(\"11234\"))\n    print(string_is_integer(\"11T234\"))\n    ok1, value1, err1 = string_parse_integer(\"123\")\n    print(ok1)\n    print(value1)\n    print(err1 == \"\")\n    ok2, value2, err2 = string_parse_integer(\"-45\")\n    print(ok2)\n    print(value2)\n    print(err2 == \"\")\n    ok3, value3, err3 = string_parse_integer(\"12a\")\n    print(ok3)\n    print(value3)\n    print(err3 == \"invalid integer\")\n    ok4, value4, err4 = string_parse_integer(\"\")\n    print(ok4)\n    print(value4)\n    print(err4 == \"expected at least one digit\")\n    ok5, value5, err5 = string_parse_integer(\"-\")\n    print(ok5)\n    print(value5)\n    print(err5 == \"expected digits after '-'\" )\n    ok6, value6, err6 = string_parse_bigint(\"12345678901234567890\")\n    print(ok6)\n    print(value6)\n    print(err6 == \"\")\n    ok7, value7, err7 = string_parse_bigint(\"-9007199254740993\")\n    print(ok7)\n    print(value7)\n    print(err7 == \"\")\n    ok8, value8, err8 = string_parse_bigint(\"x\")\n    print(ok8)\n    print(value8)\n    print(err8 == \"invalid integer\")\n    print(list_all([1, 2, 3], __positive_item))\n    print(list_all([1, 0, 3], __positive_item))\n    print(list_all([], __positive_item))\n    print(list_any([1, 0, 3], __zero_item))\n    print(list_any([1, 2, 3], __zero_item))\n    print(list_any([], __zero_item))\n    print(string_repeat(\"ab\", 3))\n    print(string_reverse(\"hé🙂\") == \"🙂éh\")\nend\n\nfn __all_digits(ch) do\n    if ch >= 48 do\n        ch <= 57\n    else\n        0\n    end\nend\n\nfn __positive_item(item) do\n    if item > 0 do\n        1\n    else\n        0\n    end\nend\n\nfn __zero_item(item) do\n    if item == 0 do\n        1\n    else\n        0\n    end\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n0\n0\n1\n0\n1\n0\n0\n1\n0\n0\nababab\n1\n",
+        "1\n0\n0\n1\n3\n104\n128578\n1\n0\n1\n0\n1\n0\n1\n1\n0\n1\n0\n0\n1\n0\n0\n1\n0\n1\n123\n1\n1\n-45\n1\n0\n0\n1\n0\n0\n1\n0\n0\n1\n1\n12345678901234567890\n1\n1\n-9007199254740993\n1\n0\n0\n1\n1\n0\n0\n1\n0\n0\nababab\n1\n",
         0,
     );
 }
@@ -5826,6 +6445,82 @@ fn jit_index_syntax_works() {
 fn jit_list_set_works() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    list_set(xs, 1, 9)\n    xs[1]\nend";
     assert_cranelift_jit_result(src, 9);
+}
+
+#[test]
+fn jit_multi_return_destructuring_works() {
+    let src = "fn pair() do\n    20, 22\nend\n\nfn main() do\n    a, b = pair()\n    a + b\nend";
+    assert_cranelift_jit_result(src, 42);
+}
+
+#[test]
+fn try_compile_to_jit_rejects_destructuring_arity_mismatch() {
+    let src = "fn pair() do\n    1, 2\nend\n\nfn main() do\n    only = pair()\n    only\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("compilation should fail for single assignment from multi-return"),
+        Err(err) => err,
+    };
+
+    match err {
+        CompileError::UnsupportedMultiValueContext { .. } => {}
+        other => panic!("expected unsupported multi-value context, got {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_multi_assign_arity_mismatch() {
+    let src = "fn pair() do\n    1, 2\nend\n\nfn main() do\n    a, b, c = pair()\n    a\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("compilation should fail for destructuring arity mismatch"),
+        Err(err) => err,
+    };
+
+    match err {
+        CompileError::DestructuringArityMismatch { expected, found, .. } => {
+            assert_eq!(expected, 3);
+            assert_eq!(found, 2);
+        }
+        other => panic!("expected destructuring arity mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_function_return_arity_mismatch() {
+    let src = "fn pair(flag) do\n    if flag do\n        1, 2\n    else\n        1\n    end\nend\n\nfn main() do\n    0\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("compilation should fail for inconsistent return arity"),
+        Err(err) => err,
+    };
+
+    match err {
+        CompileError::ReturnArityMismatch { function, expected, found, .. } => {
+            assert_eq!(function, "pair");
+            assert_eq!(expected, 2);
+            assert_eq!(found, 1);
+        }
+        other => panic!("expected return arity mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_multi_return_main() {
+    let src = "fn main() do\n    1, 2\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("compilation should fail for multi-return main"),
+        Err(err) => err,
+    };
+
+    match err {
+        CompileError::InvalidMainReturnArity { mode, found, .. } => {
+            assert_eq!(mode, "runnable main function");
+            assert_eq!(found, 2);
+        }
+        other => panic!("expected invalid main return arity, got {other:?}"),
+    }
 }
 
 #[test]
@@ -6164,6 +6859,13 @@ fn llvm_jit_list_swap_works() {
 fn llvm_jit_list_delete_works() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    x = list_delete(xs, 1)\n    x + xs[1] + list_len(xs)\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 7);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_multi_return_destructuring_works() {
+    let src = "fn pair() do\n    20, 22\nend\n\nfn main() do\n    a, b = pair()\n    a + b\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 42);
 }
 
 #[cfg(feature = "llvm-backend")]

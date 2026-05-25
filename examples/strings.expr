@@ -35,3 +35,33 @@ fn main():
         print("integer!")
     if not string_is_integer("11T234"):
         print("not integer :(")
+
+    ok, value, err = string_parse_integer("-123")
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    ok, value, err = string_parse_integer("12x")
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    ok, value, err = string_parse_bigint("12345678901234567890")
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    ok, value, err = string_parse_bigint("-12")
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    ok, value, err = string_parse_bigint("12x")
+    if ok:
+        print(value)
+    else:
+        print(err)

@@ -23,6 +23,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::FunctionRef(name) => {
                 self.allocate_closure_for_function(name, vars, capture_slots, env_ptr, function)
             }
+            Ast::MultiValue(values) => {
+                self.compile_multi_value_ast(values, vars, capture_slots, env_ptr, function)
+            }
             Ast::ListLiteral(items) => {
                 self.compile_list_literal_ast(items, vars, capture_slots, env_ptr, function)
             }
@@ -50,11 +53,320 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::Assign { name, value, .. } => {
                 self.compile_assign_ast(name, value, vars, capture_slots, env_ptr, function)
             }
+            Ast::MultiAssign { names, value, .. } => {
+                self.compile_multi_assign_ast(names, value, vars, capture_slots, env_ptr, function)
+            }
             Ast::If { condition, then, else_, .. } => {
                 self.compile_if_ast(condition, then, else_, vars, capture_slots, env_ptr, function)
             }
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
         }
+    }
+
+    fn compile_multi_value_ast(
+        &self,
+        values: &[Ast],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let compiled = values
+            .iter()
+            .map(|value| self.compile_ast(value, vars, capture_slots, env_ptr, function))
+            .collect::<Vec<_>>();
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let data_bytes =
+            self.i64_type.const_int((compiled.len() as i64 * VALUE_SIZE) as u64, false);
+        let data_raw = self.build_boxed_call(alloc, &[data_bytes, align], "multi_data_alloc");
+        let header_size = self.i64_type.const_int(MULTI_HEADER_SIZE as u64, false);
+        let header_raw = self.build_boxed_call(alloc, &[header_size, align], "multi_header_alloc");
+        let header_ptr = self
+            .builder
+            .build_int_to_ptr(
+                header_raw,
+                self.context.ptr_type(Default::default()),
+                "multi_header_ptr",
+            )
+            .expect("failed to convert multi header ptr");
+        let len_ptr = self
+            .builder
+            .build_struct_gep(self.multi_header_type(), header_ptr, 0, "multi_len_ptr")
+            .expect("failed to build multi len gep");
+        self.builder
+            .build_store(len_ptr, self.i64_type.const_int(values.len() as u64, false))
+            .expect("failed to store multi len");
+        let data_ptr_ptr = self
+            .builder
+            .build_struct_gep(self.multi_header_type(), header_ptr, 1, "multi_data_ptr_ptr")
+            .expect("failed to build multi data ptr gep");
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                let data_ptr = self
+                    .builder
+                    .build_int_to_ptr(
+                        data_raw,
+                        self.context.ptr_type(Default::default()),
+                        "multi_data_ptr",
+                    )
+                    .expect("failed to convert multi data ptr");
+                self.builder
+                    .build_store(data_ptr_ptr, data_ptr)
+                    .expect("failed to store multi data ptr");
+            }
+            LlvmRuntimeMode::Wasm => {
+                self.builder
+                    .build_store(data_ptr_ptr, data_raw)
+                    .expect("failed to store wasm multi data ptr");
+            }
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => {
+                self.builder
+                    .build_store(data_ptr_ptr, data_raw)
+                    .expect("failed to store wasi multi data ptr");
+            }
+        }
+        for (index, value) in compiled.iter().enumerate() {
+            let slot_offset = self.i64_type.const_int((index as i64 * VALUE_SIZE) as u64, false);
+            let slot_tag_ptr = self.build_value_ptr_from_base(
+                data_raw,
+                slot_offset,
+                &format!("multi_value_{index}_tag"),
+            );
+            self.builder
+                .build_store(
+                    slot_tag_ptr,
+                    self.builder
+                        .build_int_truncate(
+                            value.tag,
+                            self.context.i8_type(),
+                            &format!("multi_value_{index}_tag_i8"),
+                        )
+                        .expect("failed to truncate multi tag"),
+                )
+                .expect("failed to store multi tag");
+            let payload_offset = self
+                .builder
+                .build_int_add(
+                    slot_offset,
+                    self.i64_type.const_int(VALUE_PAYLOAD_OFFSET as u64, false),
+                    &format!("multi_value_{index}_payload_offset"),
+                )
+                .expect("failed to compute multi payload offset");
+            let slot_payload_ptr = self.build_i64_ptr_from_base(
+                data_raw,
+                payload_offset,
+                &format!("multi_value_{index}_payload_ptr"),
+            );
+            self.builder
+                .build_store(slot_payload_ptr, value.payload)
+                .expect("failed to store multi payload");
+        }
+        CompiledValue { tag: self.i64_type.const_int(TAG_MULTI as u64, false), payload: header_raw }
+    }
+
+    fn compile_multi_assign_ast(
+        &self,
+        names: &[String],
+        value: &Ast,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let multi_value = self.compile_ast(value, vars, capture_slots, env_ptr, function);
+        let mut last = None;
+        for (index, name) in names.iter().enumerate() {
+            let unpacked = self.build_multi_value_load(multi_value, index, function);
+            let ptr = vars.get(name).unwrap_or_else(|| {
+                panic!("internal compiler error: assignment target '{name}' has no local slot")
+            });
+            self.builder
+                .build_store(
+                    *ptr,
+                    self.make_pair_value(
+                        unpacked.tag,
+                        unpacked.payload,
+                        &format!("multi_assign_{index}_pair"),
+                    ),
+                )
+                .expect("failed to store multi assignment value");
+            last = Some(unpacked);
+        }
+        last.expect("multi assignment must have at least one target")
+    }
+
+    fn build_multi_value_load(
+        &self,
+        multi_value: CompiledValue<'ctx>,
+        index: usize,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let trap_block = self.context.append_basic_block(function, "multi_load_trap");
+        let ok_block = self.context.append_basic_block(function, "multi_load_ok");
+        let payload =
+            self.expect_tag_payload(multi_value, TAG_MULTI, "multi_value", ok_block, trap_block);
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(ok_block);
+
+        let len = self.build_multi_len_load(payload, "multi_len");
+        let index_value = self.i64_type.const_int(index as u64, false);
+        let in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, index_value, len, "multi_in_bounds")
+            .expect("failed to compare multi bounds");
+        let bounds_ok = self.context.append_basic_block(function, "multi_bounds_ok");
+        let bounds_trap = self.context.append_basic_block(function, "multi_bounds_trap");
+        self.builder
+            .build_conditional_branch(in_bounds, bounds_ok, bounds_trap)
+            .expect("failed to branch on multi bounds");
+        self.builder.position_at_end(bounds_trap);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(bounds_ok);
+
+        let slot_offset = self
+            .builder
+            .build_int_mul(
+                index_value,
+                self.i64_type.const_int(VALUE_SIZE as u64, false),
+                "multi_slot_offset",
+            )
+            .expect("failed to compute multi slot offset");
+        let data_raw = self.build_multi_data_raw_load(payload, "multi_data_raw");
+        let tag_ptr = self.build_value_ptr_from_base(data_raw, slot_offset, "multi_tag_ptr");
+        let tag_i8 = self
+            .builder
+            .build_load(self.context.i8_type(), tag_ptr, "multi_tag_i8")
+            .expect("failed to load multi tag")
+            .into_int_value();
+        let tag = self
+            .builder
+            .build_int_z_extend(tag_i8, self.i64_type, "multi_tag")
+            .expect("failed to extend multi tag");
+        let payload_offset = self
+            .builder
+            .build_int_add(
+                slot_offset,
+                self.i64_type.const_int(VALUE_PAYLOAD_OFFSET as u64, false),
+                "multi_payload_offset",
+            )
+            .expect("failed to compute multi payload offset");
+        let payload_ptr =
+            self.build_i64_ptr_from_base(data_raw, payload_offset, "multi_payload_ptr");
+        let payload_value = self
+            .builder
+            .build_load(self.i64_type, payload_ptr, "multi_payload")
+            .expect("failed to load multi payload")
+            .into_int_value();
+        CompiledValue { tag, payload: payload_value }
+    }
+
+    fn multi_header_type(&self) -> inkwell::types::StructType<'ctx> {
+        let data_ptr_field = match self.runtime_mode {
+            LlvmRuntimeMode::Native => self.context.ptr_type(Default::default()).into(),
+            LlvmRuntimeMode::Wasm => self.i64_type.into(),
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => self.i64_type.into(),
+        };
+        self.context.struct_type(&[self.i64_type.into(), data_ptr_field], false)
+    }
+
+    fn build_multi_len_load(&self, payload: IntValue<'ctx>, label: &str) -> IntValue<'ctx> {
+        let header_ptr = self
+            .builder
+            .build_int_to_ptr(
+                payload,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_header_ptr"),
+            )
+            .expect("failed to convert multi header ptr");
+        let len_ptr = self
+            .builder
+            .build_struct_gep(self.multi_header_type(), header_ptr, 0, &format!("{label}_len_ptr"))
+            .expect("failed to build multi len gep");
+        self.builder
+            .build_load(self.i64_type, len_ptr, &format!("{label}_len"))
+            .expect("failed to load multi len")
+            .into_int_value()
+    }
+
+    fn build_multi_data_raw_load(&self, payload: IntValue<'ctx>, label: &str) -> IntValue<'ctx> {
+        let header_ptr = self
+            .builder
+            .build_int_to_ptr(
+                payload,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_header_ptr"),
+            )
+            .expect("failed to convert multi header ptr");
+        let data_ptr_ptr = self
+            .builder
+            .build_struct_gep(
+                self.multi_header_type(),
+                header_ptr,
+                1,
+                &format!("{label}_data_ptr_ptr"),
+            )
+            .expect("failed to build multi data ptr gep");
+        match self.runtime_mode {
+            LlvmRuntimeMode::Native => {
+                let ptr = self
+                    .builder
+                    .build_load(
+                        self.context.ptr_type(Default::default()),
+                        data_ptr_ptr,
+                        &format!("{label}_data_ptr"),
+                    )
+                    .expect("failed to load multi data ptr")
+                    .into_pointer_value();
+                self.builder
+                    .build_ptr_to_int(ptr, self.i64_type, &format!("{label}_data_raw"))
+                    .expect("failed to convert multi data ptr to int")
+            }
+            LlvmRuntimeMode::Wasm => self
+                .builder
+                .build_load(self.i64_type, data_ptr_ptr, &format!("{label}_data_raw"))
+                .expect("failed to load wasm multi data raw")
+                .into_int_value(),
+            #[cfg(feature = "wasi")]
+            LlvmRuntimeMode::WasiPreview1Command => self
+                .builder
+                .build_load(self.i64_type, data_ptr_ptr, &format!("{label}_data_raw"))
+                .expect("failed to load wasi multi data raw")
+                .into_int_value(),
+        }
+    }
+
+    fn build_value_ptr_from_base(
+        &self,
+        base_raw: IntValue<'ctx>,
+        offset: IntValue<'ctx>,
+        label: &str,
+    ) -> PointerValue<'ctx> {
+        let addr = self
+            .builder
+            .build_int_add(base_raw, offset, &format!("{label}_addr"))
+            .expect("failed to compute value ptr address");
+        self.builder
+            .build_int_to_ptr(addr, self.context.ptr_type(Default::default()), label)
+            .expect("failed to convert value ptr")
+    }
+
+    fn build_i64_ptr_from_base(
+        &self,
+        base_raw: IntValue<'ctx>,
+        offset: IntValue<'ctx>,
+        label: &str,
+    ) -> PointerValue<'ctx> {
+        let addr = self
+            .builder
+            .build_int_add(base_raw, offset, &format!("{label}_addr"))
+            .expect("failed to compute i64 ptr address");
+        self.builder
+            .build_int_to_ptr(addr, self.context.ptr_type(Default::default()), label)
+            .expect("failed to convert i64 ptr")
     }
 
     fn compile_list_literal_ast(

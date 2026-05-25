@@ -18,6 +18,7 @@ EXAMPLES_DIR = REPO_ROOT / "examples"
 MAX_NATIVE_BINARY_SIZE = 50 * 1024
 EXAMPLE_RUN_ARGS: dict[str, list[str]] = {
     "args": ["hello", "world"],
+    "calculator": ["*", "12345678901234567890", "12345678901234567890"],
 }
 
 

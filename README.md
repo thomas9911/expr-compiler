@@ -93,8 +93,12 @@ Current behavior:
     - `string_is_ascii(s)`
     - `string_all(s, predicate)`
     - `string_is_integer(s)`
+    - `string_parse_integer(s)`
+    - `string_parse_bigint(s)`
     - `string_repeat(s, n)`
     - `string_reverse(s)`
+  - `string_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
+  - `string_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
 - `print` can print string values
 - `string_concat(a, b)` concatenates two strings and returns a fresh string
 - `bytes_len(s)` returns the byte length as an `Int`
