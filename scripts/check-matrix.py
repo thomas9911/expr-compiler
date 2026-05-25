@@ -280,6 +280,20 @@ def normalize_output(text: str) -> str:
     return text.replace("\r\n", "\n")
 
 
+def is_compile_error(result: subprocess.CompletedProcess[str]) -> bool:
+    stderr = normalize_output(result.stderr)
+    markers = (
+        "parse error:",
+        "undefined variable:",
+        "undefined function:",
+        "callback `",
+        "supports at most",
+        "not implemented yet",
+        "toolchain error:",
+    )
+    return any(marker in stderr for marker in markers)
+
+
 def compare_to_baseline(
     result: subprocess.CompletedProcess[str],
     *,
@@ -560,8 +574,16 @@ def main() -> int:
                     proc = run_cranelift_emit_ir(
                         cranelift_compiler, example, cranelift_build_env
                     )
-                    ir_ok = proc.returncode == 0 and "function" in proc.stdout
-                    detail = "" if ir_ok else "emit-ir output missing function"
+                    if is_compile_error(baseline):
+                        ir_ok = proc.returncode != 0
+                        detail = (
+                            ""
+                            if ir_ok
+                            else "emit-ir unexpectedly succeeded for compile-error example"
+                        )
+                    else:
+                        ir_ok = proc.returncode == 0 and "function" in proc.stdout
+                        detail = "" if ir_ok else "emit-ir output missing function"
                     result = RunResult(
                         example=example.stem,
                         name=name,

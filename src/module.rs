@@ -1,4 +1,5 @@
-use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
+use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst};
+use crate::source::Span;
 use crate::value::{
     CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, STRING_CAP_OFFSET,
     STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
@@ -49,8 +50,8 @@ pub enum CompileError {
         "top-level expressions are not supported in source files; did you forget `fn` before a function definition?"
     )]
     TopLevelExpression,
-    #[error("parse error: {0}")]
-    Parse(String),
+    #[error("parse error: {message}")]
+    Parse { message: String, span: Option<Span> },
     #[error("llvm backend is not available in this build; enable the `llvm-backend` cargo feature")]
     LlvmBackendUnavailable,
     #[error(
@@ -62,21 +63,35 @@ pub enum CompileError {
     #[error("core wasm output currently supports only the llvm backend")]
     WasmRequiresLlvm,
     #[error("{mode} supports at most {max} argument(s), found {found}")]
-    InvalidMainArity { mode: &'static str, max: usize, found: usize },
+    InvalidMainArity { mode: &'static str, max: usize, found: usize, span: Option<Span> },
     #[error("{builtin} callback `{function}` must take exactly 1 argument")]
-    CallbackArity { builtin: String, function: String },
-    #[error("undefined function: {0}")]
-    UndefinedFunction(String),
-    #[error("undefined variable: {0}")]
-    UndefinedVariable(String),
+    CallbackArity { builtin: String, function: String, span: Option<Span> },
+    #[error("undefined function: {name}")]
+    UndefinedFunction { name: String, span: Option<Span> },
+    #[error("undefined variable: {name}")]
+    UndefinedVariable { name: String, span: Option<Span> },
     #[error("{0} is not implemented yet")]
     UnsupportedFeature(&'static str),
     #[error("toolchain error: {0}")]
     Toolchain(String),
 }
 
+impl CompileError {
+    pub fn span(&self) -> Option<&Span> {
+        match self {
+            Self::CallbackArity { span, .. }
+            | Self::Parse { span, .. }
+            | Self::InvalidMainArity { span, .. }
+            | Self::UndefinedFunction { span, .. }
+            | Self::UndefinedVariable { span, .. } => span.as_ref(),
+            _ => None,
+        }
+    }
+}
+
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
+    source: Option<String>,
     closure_metadata: HashMap<String, ClosureMetadata>,
     used_features: UsedFeatures,
 }
@@ -125,6 +140,7 @@ impl Module {
                     mode: "native executable main function",
                     max: 1,
                     found: main.inputs.len(),
+                    span: main.span.clone(),
                 });
             }
         }
@@ -159,6 +175,7 @@ impl Module {
     pub fn new() -> Self {
         Module {
             functions: vec![],
+            source: None,
             closure_metadata: HashMap::new(),
             used_features: UsedFeatures::default(),
         }
@@ -173,7 +190,9 @@ impl Module {
     }
 
     pub fn try_from_source(source: &str) -> Result<Self, CompileError> {
-        Self::try_from_functions(parse_source_functions(source)?)
+        let mut module = Self::try_from_functions(parse_source_functions(source)?)?;
+        module.source = Some(source.to_string());
+        Ok(module)
     }
 
     pub fn from_ast(ast: Ast) -> Self {
@@ -202,7 +221,12 @@ impl Module {
         }
         let functions = autoload_stdlib_functions(functions);
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
-        let module = Module { functions, closure_metadata, used_features: UsedFeatures::default() };
+        let module = Module {
+            functions,
+            source: None,
+            closure_metadata,
+            used_features: UsedFeatures::default(),
+        };
         let used_features = collect_used_features(&module.functions);
         Ok(Module { used_features, ..module })
     }
@@ -1224,7 +1248,12 @@ fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileEr
         match Ast::from_lexer(&mut lexer) {
             Ok(Ast::FunctionDef(func)) => functions.push(func),
             Ok(_) => return Err(CompileError::TopLevelExpression),
-            Err(err) => return Err(CompileError::Parse(err.to_string())),
+            Err(err) => {
+                return Err(CompileError::Parse {
+                    message: err.to_string(),
+                    span: Some(err.span.clone()),
+                });
+            }
         }
     }
 
@@ -1372,7 +1401,7 @@ fn collect_stdlib_references_from_ast(
     refs: &mut HashSet<String>,
 ) {
     match ast {
-        Ast::Expression(ExpressionAst { function, args }) => {
+        Ast::Expression(ExpressionAst { function, args, .. }) => {
             if !function.is_empty()
                 && !scope.contains(function)
                 && stdlib_function(function).is_some()
@@ -1384,12 +1413,12 @@ fn collect_stdlib_references_from_ast(
             }
         }
         Ast::Variable(name) | Ast::FunctionRef(name) => {
-            if !scope.contains(name) && stdlib_function(name).is_some() {
-                refs.insert(name.clone());
+            if !scope.contains(name.as_str()) && stdlib_function(name.as_ref()).is_some() {
+                refs.insert(name.to_string());
             }
         }
         Ast::Assign { value, .. } => collect_stdlib_references_from_ast(value, scope, refs),
-        Ast::If { condition, then, else_ } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_stdlib_references_from_ast(condition, scope, refs);
             let mut then_scope = scope.clone();
             collect_stdlib_references_from_block(then, &mut then_scope, refs);
@@ -1412,11 +1441,11 @@ fn collect_stdlib_references_from_ast(
                 collect_stdlib_references_from_ast(item, scope, refs);
             }
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
         }
-        Ast::IndexAssign { collection, index, value } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
             collect_stdlib_references_from_ast(value, scope, refs);
@@ -1445,7 +1474,7 @@ fn collect_used_features_from_block(block: &BlockAst, features: &mut UsedFeature
 
 fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
     match ast {
-        Ast::Expression(ExpressionAst { function, args }) => {
+        Ast::Expression(ExpressionAst { function, args, .. }) => {
             if matches!(
                 function.as_str(),
                 "bigint_from_int"
@@ -1487,12 +1516,12 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                 collect_used_features_from_ast(item, features);
             }
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             features.lists = true;
             collect_used_features_from_ast(collection, features);
             collect_used_features_from_ast(index, features);
         }
-        Ast::IndexAssign { collection, index, value } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             features.lists = true;
             features.list_mutation = true;
             collect_used_features_from_ast(collection, features);
@@ -1500,7 +1529,7 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             collect_used_features_from_ast(value, features);
         }
         Ast::Assign { value, .. } => collect_used_features_from_ast(value, features),
-        Ast::If { condition, then, else_ } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_used_features_from_ast(condition, features);
             collect_used_features_from_block(then, features);
             if let Some(else_block) = else_ {
@@ -1826,21 +1855,28 @@ fn validate_unary_callback_reference(
 ) -> Result<(), CompileError> {
     match ast {
         Ast::FunctionRef(name) => {
-            if !function_names.contains(name) {
-                return Err(CompileError::UndefinedFunction(name.clone()));
+            if !function_names.contains(name.as_str()) {
+                return Err(CompileError::UndefinedFunction {
+                    name: name.to_string(),
+                    span: name.span.clone(),
+                });
             }
-            if function_arities.get(name) != Some(&1usize) {
+            if function_arities.get(name.as_str()) != Some(&1usize) {
                 return Err(CompileError::CallbackArity {
                     builtin: builtin.to_string(),
-                    function: name.clone(),
+                    function: name.to_string(),
+                    span: name.span.clone(),
                 });
             }
         }
-        Ast::Variable(name) if !locals.contains(name) && function_names.contains(name) => {
-            if function_arities.get(name) != Some(&1usize) {
+        Ast::Variable(name)
+            if !locals.contains(name.as_str()) && function_names.contains(name.as_str()) =>
+        {
+            if function_arities.get(name.as_str()) != Some(&1usize) {
                 return Err(CompileError::CallbackArity {
                     builtin: builtin.to_string(),
-                    function: name.clone(),
+                    function: name.to_string(),
+                    span: name.span.clone(),
                 });
             }
         }
@@ -1864,10 +1900,10 @@ fn validate_ast_user_facing(
         Ast::ListLiteral(items) => {
             validate_ast_sequence(items, locals, function_names, function_arities)
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             validate_index_ast(collection, index, locals, function_names, function_arities)
         }
-        Ast::IndexAssign { collection, index, value } => validate_index_assign_ast(
+        Ast::IndexAssign { collection, index, value, .. } => validate_index_assign_ast(
             collection,
             index,
             value,
@@ -1875,20 +1911,23 @@ fn validate_ast_user_facing(
             function_names,
             function_arities,
         ),
-        Ast::Expression(ExpressionAst { function, args }) => validate_expression_user_facing(
-            function,
-            args,
-            locals,
-            function_names,
-            function_arities,
-        ),
+        Ast::Expression(ExpressionAst { function, args, function_span }) => {
+            validate_expression_user_facing(
+                function,
+                args,
+                function_span.clone(),
+                locals,
+                function_names,
+                function_arities,
+            )
+        }
         Ast::Block(block) => {
             validate_ast_sequence(&block.lines, locals, function_names, function_arities)
         }
         Ast::Assign { value, .. } => {
             validate_ast_user_facing(value, locals, function_names, function_arities)
         }
-        Ast::If { condition, then, else_ } => validate_if_ast_user_facing(
+        Ast::If { condition, then, else_, .. } => validate_if_ast_user_facing(
             condition,
             then,
             else_,
@@ -1900,25 +1939,25 @@ fn validate_ast_user_facing(
 }
 
 fn validate_function_reference(
-    name: &str,
+    name: &Ident,
     function_names: &HashSet<String>,
 ) -> Result<(), CompileError> {
-    if function_names.contains(name) {
+    if function_names.contains(name.as_str()) {
         Ok(())
     } else {
-        Err(CompileError::UndefinedFunction(name.to_string()))
+        Err(CompileError::UndefinedFunction { name: name.to_string(), span: name.span.clone() })
     }
 }
 
 fn validate_variable_reference(
-    name: &str,
+    name: &Ident,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
 ) -> Result<(), CompileError> {
-    if locals.contains(name) || function_names.contains(name) {
+    if locals.contains(name.as_str()) || function_names.contains(name.as_str()) {
         Ok(())
     } else {
-        Err(CompileError::UndefinedVariable(name.to_string()))
+        Err(CompileError::UndefinedVariable { name: name.to_string(), span: name.span.clone() })
     }
 }
 
@@ -1961,22 +2000,27 @@ fn validate_index_assign_ast(
 fn validate_expression_user_facing(
     function: &str,
     args: &[Ast],
+    function_span: Option<Span>,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
     function_arities: &HashMap<String, usize>,
 ) -> Result<(), CompileError> {
-    validate_callable_name(function, locals, function_names)?;
+    validate_callable_name(function, function_span.clone(), locals, function_names)?;
     validate_callback_argument(function, args, locals, function_names, function_arities)?;
     validate_ast_sequence(args, locals, function_names, function_arities)
 }
 
 fn validate_callable_name(
     function: &str,
+    function_span: Option<Span>,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
 ) -> Result<(), CompileError> {
     if !locals.contains(function) && !is_known_callable_name(function, function_names) {
-        return Err(CompileError::UndefinedFunction(function.to_string()));
+        return Err(CompileError::UndefinedFunction {
+            name: function.to_string(),
+            span: function_span,
+        });
     }
     Ok(())
 }
@@ -2031,11 +2075,11 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
             }
             Ok(())
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             validate_no_nested_function_defs(collection)?;
             validate_no_nested_function_defs(index)
         }
-        Ast::IndexAssign { collection, index, value } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             validate_no_nested_function_defs(collection)?;
             validate_no_nested_function_defs(index)?;
             validate_no_nested_function_defs(value)
@@ -2053,7 +2097,7 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
             Ok(())
         }
         Ast::Assign { value, .. } => validate_no_nested_function_defs(value),
-        Ast::If { condition, then, else_ } => {
+        Ast::If { condition, then, else_, .. } => {
             validate_no_nested_function_defs(condition)?;
             validate_no_nested_function_defs(&Ast::Block(then.clone()))?;
             if let Some(else_) = else_ {
@@ -2109,12 +2153,13 @@ impl LambdaLifter {
                 let name = self.fresh_name();
                 self.metadata.insert(name.clone(), ClosureMetadata { captures });
                 self.lifted.push(FunctionDefAst {
-                    name: name.clone(),
+                    name: name.to_string(),
                     inputs: inputs.clone(),
                     output: None,
                     block: BlockAst { lines: vec![(**body).clone()] },
+                    span: None,
                 });
-                *ast = Ast::FunctionRef(name);
+                *ast = Ast::FunctionRef(crate::parser::Ident::synthetic(name));
             }
             Ast::Block(block) => self.lift_block(block, scope_names),
             Ast::Expression(ExpressionAst { args, .. }) => {
@@ -2127,17 +2172,17 @@ impl LambdaLifter {
                     self.lift_ast(item, scope_names);
                 }
             }
-            Ast::Index { collection, index } => {
+            Ast::Index { collection, index, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
             }
-            Ast::IndexAssign { collection, index, value } => {
+            Ast::IndexAssign { collection, index, value, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
                 self.lift_ast(value, scope_names);
             }
             Ast::Assign { value, .. } => self.lift_ast(value, scope_names),
-            Ast::If { condition, then, else_ } => {
+            Ast::If { condition, then, else_, .. } => {
                 self.lift_ast(condition, scope_names);
                 self.lift_block(then, scope_names);
                 if let Some(else_block) = else_ {
@@ -2164,9 +2209,11 @@ fn collect_captures_into(
 ) {
     match ast {
         Ast::Variable(name) => {
-            if !local_names.contains(name) && scope_names.contains(name) && !captures.contains(name)
+            if !local_names.contains(&name.name)
+                && scope_names.contains(&name.name)
+                && !captures.contains(&name.name)
             {
-                captures.push(name.clone());
+                captures.push(name.to_string());
             }
         }
         Ast::Expression(ExpressionAst { args, .. }) => {
@@ -2179,16 +2226,16 @@ fn collect_captures_into(
                 collect_captures_into(item, local_names, scope_names, captures);
             }
         }
-        Ast::Index { collection, index } => {
+        Ast::Index { collection, index, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
             collect_captures_into(index, local_names, scope_names, captures);
         }
-        Ast::IndexAssign { collection, index, value } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
             collect_captures_into(index, local_names, scope_names, captures);
             collect_captures_into(value, local_names, scope_names, captures);
         }
-        Ast::If { condition, then, else_ } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_captures_into(condition, local_names, scope_names, captures);
             for line in &then.lines {
                 collect_captures_into(line, local_names, scope_names, captures);
@@ -2233,18 +2280,18 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             }
         }
         Ast::FunctionRef(_) => {}
-        Ast::Assign { name, value } => {
+        Ast::Assign { name, value, .. } => {
             if !names.contains(name) {
                 names.push(name.clone());
             }
             collect_var_names(value, names);
         }
-        Ast::IndexAssign { collection, index, value } => {
+        Ast::IndexAssign { collection, index, value, .. } => {
             collect_var_names(collection, names);
             collect_var_names(index, names);
             collect_var_names(value, names);
         }
-        Ast::If { condition, then, else_ } => {
+        Ast::If { condition, then, else_, .. } => {
             collect_var_names(condition, names);
             for line in &then.lines {
                 collect_var_names(line, names);
@@ -3381,14 +3428,17 @@ fn validate_unary_callback_ast(
 ) {
     match ast {
         Ast::FunctionRef(name) => {
-            if function_arities.get(name) != Some(&1usize) {
+            if function_arities.get(name.as_str()) != Some(&1usize) {
                 unreachable!(
                     "{builtin} callback arity should have been validated before codegen: {name}"
                 );
             }
         }
-        Ast::Variable(name) if !vars.contains_key(name) && function_ordinals.contains_key(name) => {
-            if function_arities.get(name) != Some(&1usize) {
+        Ast::Variable(name)
+            if !vars.contains_key(name.as_str())
+                && function_ordinals.contains_key(name.as_str()) =>
+        {
+            if function_arities.get(name.as_str()) != Some(&1usize) {
                 unreachable!(
                     "{builtin} callback variable arity should have been validated before codegen: {name}"
                 );
@@ -3454,7 +3504,8 @@ fn apply_function_value(
     let mut candidates: Vec<_> = function_ordinals
         .iter()
         .filter_map(|(name, &ordinal)| {
-            (function_arities.get(name) == Some(&args.len())).then_some((ordinal, name.as_str()))
+            (function_arities.get(name.as_str()) == Some(&args.len()))
+                .then_some((ordinal, name.as_str()))
         })
         .collect();
     candidates.sort_by_key(|(ordinal, _)| *ordinal);
@@ -3798,7 +3849,7 @@ fn compile_tail_ast(
     loop_block: Block,
 ) {
     match ast {
-        Ast::Expression(ExpressionAst { function, args })
+        Ast::Expression(ExpressionAst { function, args, .. })
             if function == current_function_name && !is_builtin_name(function) =>
         {
             let compiled_args: Vec<_> = args
@@ -3825,7 +3876,7 @@ fn compile_tail_ast(
             }
             builder.ins().jump(loop_block, &jump_args);
         }
-        Ast::If { condition, then, else_ } => {
+        Ast::If { condition, then, else_, .. } => {
             let cond_val = compile_ast(
                 builder,
                 condition,
@@ -3952,7 +4003,7 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::Index { collection, index } => compile_index_ast(
+        Ast::Index { collection, index, .. } => compile_index_ast(
             builder,
             collection,
             index,
@@ -3964,7 +4015,7 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::IndexAssign { collection, index, value } => compile_index_assign_ast(
+        Ast::IndexAssign { collection, index, value, .. } => compile_index_assign_ast(
             builder,
             collection,
             index,
@@ -3977,7 +4028,7 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::Expression(ExpressionAst { function, args }) => compile_expression_ast(
+        Ast::Expression(ExpressionAst { function, args, .. }) => compile_expression_ast(
             builder,
             function,
             args,
@@ -4010,7 +4061,7 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::Assign { name, value } => compile_assign_ast(
+        Ast::Assign { name, value, .. } => compile_assign_ast(
             builder,
             name,
             value,
@@ -4022,7 +4073,7 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
-        Ast::If { condition, then, else_ } => compile_if_ast(
+        Ast::If { condition, then, else_, .. } => compile_if_ast(
             builder,
             condition,
             then,
@@ -4836,6 +4887,22 @@ fn try_from_source_rejects_top_level_expressions() {
 
 #[cfg(test)]
 #[test]
+fn try_from_source_preserves_parse_error_span() {
+    let err = match Module::try_from_source("fn main()) do\n    1\nend") {
+        Ok(_) => panic!("invalid source should return a parse error"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::Parse {
+            message: "unexpected token \")\"".to_string(),
+            span: Some(Span { start: 9, end: 10 }),
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn try_compile_to_jit_rejects_undefined_functions() {
     let src = "fn main() do\n    missing_fn(1)\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -4843,7 +4910,13 @@ fn try_compile_to_jit_rejects_undefined_functions() {
         Ok(_) => panic!("undefined function should be rejected"),
         Err(err) => err,
     };
-    assert_eq!(err, CompileError::UndefinedFunction("missing_fn".to_string()));
+    assert_eq!(
+        err,
+        CompileError::UndefinedFunction {
+            name: "missing_fn".to_string(),
+            span: Some(Span { start: 17, end: 27 }),
+        }
+    );
 }
 
 #[cfg(test)]
@@ -4855,7 +4928,13 @@ fn try_compile_to_jit_rejects_undefined_variables() {
         Ok(_) => panic!("undefined variable should be rejected"),
         Err(err) => err,
     };
-    assert_eq!(err, CompileError::UndefinedVariable("missing_value".to_string()));
+    assert_eq!(
+        err,
+        CompileError::UndefinedVariable {
+            name: "missing_value".to_string(),
+            span: Some(Span { start: 17, end: 30 }),
+        }
+    );
 }
 
 #[cfg(test)]
@@ -4873,6 +4952,7 @@ fn try_compile_to_jit_rejects_non_unary_callbacks() {
         CompileError::CallbackArity {
             builtin: "list_map".to_string(),
             function: "__lambda_1".to_string(),
+            span: None,
         }
     );
 }
@@ -4894,6 +4974,7 @@ fn try_compile_to_executable_rejects_main_with_too_many_arguments() {
             mode: "native executable main function",
             max: 1,
             found: 2,
+            span: Some(Span { start: 0, end: 30 }),
         }
     );
 }
@@ -5806,7 +5887,7 @@ fn anonymous_functions_are_lifted_into_hidden_functions() {
     assert_eq!(module.functions[1].inputs, vec!["item".to_string()]);
 
     match &module.functions[0].block.lines[0] {
-        Ast::Expression(ExpressionAst { function, args }) => {
+        Ast::Expression(ExpressionAst { function, args, .. }) => {
             assert_eq!(function, "list_map");
             assert!(matches!(args[1], Ast::FunctionRef(_)));
         }
@@ -5828,11 +5909,15 @@ fn anonymous_functions_record_captures() {
 fn collect_captures_deduplicates_multiple_uses() {
     let ast = Ast::Block(BlockAst {
         lines: vec![
-            Ast::Variable("outer".to_string()),
-            Ast::Variable("outer".to_string()),
+            Ast::Variable(Ident::synthetic("outer".to_string())),
+            Ast::Variable(Ident::synthetic("outer".to_string())),
             Ast::Expression(ExpressionAst {
+                function_span: None,
                 function: "add".to_string(),
-                args: vec![Ast::Variable("outer".to_string()), Ast::Variable("outer".to_string())],
+                args: vec![
+                    Ast::Variable(Ident::synthetic("outer".to_string())),
+                    Ast::Variable(Ident::synthetic("outer".to_string())),
+                ],
             }),
         ],
     });
@@ -5846,13 +5931,15 @@ fn collect_captures_visits_index_and_index_assign() {
     let ast = Ast::Block(BlockAst {
         lines: vec![
             Ast::Index {
-                collection: Box::new(Ast::Variable("xs".to_string())),
-                index: Box::new(Ast::Variable("i".to_string())),
+                collection: Box::new(Ast::Variable(Ident::synthetic("xs".to_string()))),
+                index: Box::new(Ast::Variable(Ident::synthetic("i".to_string()))),
+                span: None,
             },
             Ast::IndexAssign {
-                collection: Box::new(Ast::Variable("ys".to_string())),
-                index: Box::new(Ast::Variable("j".to_string())),
-                value: Box::new(Ast::Variable("value".to_string())),
+                collection: Box::new(Ast::Variable(Ident::synthetic("ys".to_string()))),
+                index: Box::new(Ast::Variable(Ident::synthetic("j".to_string()))),
+                value: Box::new(Ast::Variable(Ident::synthetic("value".to_string()))),
+                span: None,
             },
         ],
     });
@@ -5874,12 +5961,18 @@ fn collect_captures_visits_if_else_and_assignment_values() {
         lines: vec![
             Ast::Assign {
                 name: "local".to_string(),
-                value: Box::new(Ast::Variable("assigned".to_string())),
+                value: Box::new(Ast::Variable(Ident::synthetic("assigned".to_string()))),
+                span: None,
             },
             Ast::If {
-                condition: Box::new(Ast::Variable("cond".to_string())),
-                then: BlockAst { lines: vec![Ast::Variable("then_value".to_string())] },
-                else_: Some(BlockAst { lines: vec![Ast::Variable("else_value".to_string())] }),
+                condition: Box::new(Ast::Variable(Ident::synthetic("cond".to_string()))),
+                then: BlockAst {
+                    lines: vec![Ast::Variable(Ident::synthetic("then_value".to_string()))],
+                },
+                else_: Some(BlockAst {
+                    lines: vec![Ast::Variable(Ident::synthetic("else_value".to_string()))],
+                }),
+                span: None,
             },
         ],
     });
@@ -5902,16 +5995,17 @@ fn collect_captures_respects_nested_lambda_inputs_and_locals() {
             lines: vec![
                 Ast::Assign {
                     name: "tmp".to_string(),
-                    value: Box::new(Ast::Variable("item".to_string())),
+                    value: Box::new(Ast::Variable(Ident::synthetic("item".to_string()))),
+                    span: None,
                 },
-                Ast::Variable("outer".to_string()),
-                Ast::Variable("tmp".to_string()),
+                Ast::Variable(Ident::synthetic("outer".to_string())),
+                Ast::Variable(Ident::synthetic("tmp".to_string())),
                 Ast::Lambda {
                     inputs: vec!["outer".to_string()],
                     body: Box::new(Ast::Block(BlockAst {
                         lines: vec![
-                            Ast::Variable("outer".to_string()),
-                            Ast::Variable("deep".to_string()),
+                            Ast::Variable(Ident::synthetic("outer".to_string())),
+                            Ast::Variable(Ident::synthetic("deep".to_string())),
                         ],
                     })),
                 },

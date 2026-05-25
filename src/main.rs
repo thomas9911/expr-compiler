@@ -1,8 +1,9 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
-use expr_compiler::module::{CodegenBackend, Module, llvm_backend_available};
+use expr_compiler::module::{CodegenBackend, CompileError, Module, llvm_backend_available};
 use expr_compiler::runtime::{
     build_argv_list_value, configure_runtime_arena, decode_int, reset_runtime_arena,
 };
+use expr_compiler::source::offset_to_line_col;
 use pico_args::Arguments;
 use std::path::{Path, PathBuf};
 
@@ -166,6 +167,38 @@ fn write_ir_or_stdout(ir: &str, output: Option<&Path>) {
     }
 }
 
+fn format_compile_error(path: &Path, source: &str, err: &CompileError) -> String {
+    if let Some(span) = err.span() {
+        let pos = offset_to_line_col(source, span.start);
+        let snippet = render_source_snippet(source, span);
+        format!("{}:{}:{}: {err}\n{snippet}", path.display(), pos.line, pos.column)
+    } else {
+        err.to_string()
+    }
+}
+
+fn render_source_snippet(source: &str, span: &expr_compiler::source::Span) -> String {
+    let line_start = source[..span.start.min(source.len())].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[span.start.min(source.len())..]
+        .find('\n')
+        .map(|i| span.start.min(source.len()) + i)
+        .unwrap_or(source.len());
+    let line_text = &source[line_start..line_end];
+
+    let start = span.start.min(line_end);
+    let end = span.end.min(line_end).max(start);
+    let start_col = offset_to_line_col(source, start).column;
+    let end_col = offset_to_line_col(source, end).column;
+    let underline_width = (end_col.saturating_sub(start_col)).max(1);
+
+    let line_no = offset_to_line_col(source, span.start.min(source.len())).line;
+    let gutter = line_no.to_string();
+    let underline =
+        format!("{}{}", " ".repeat(start_col.saturating_sub(1)), "^".repeat(underline_width));
+
+    format!("{gutter} | {line_text}\n{} | {underline}", " ".repeat(gutter.len()))
+}
+
 fn run_ir(ir: &str) -> Result<Option<i64>, String> {
     let functions =
         cranelift_reader::parse_functions(ir).map_err(|e| format!("error parsing IR: {e}"))?;
@@ -205,15 +238,15 @@ fn run_ir(ir: &str) -> Result<Option<i64>, String> {
     Ok(None)
 }
 
-fn maybe_handle_ir_modes(cli: &CliArgs, source: &str) -> Result<bool, String> {
+fn maybe_handle_ir_modes(cli: &CliArgs, input: &Path, source: &str) -> Result<bool, String> {
     if !cli.emit_ir && !cli.run_ir {
         return Ok(false);
     }
 
     let ir = Module::try_from_source(source)
-        .map_err(|err| err.to_string())?
+        .map_err(|err| format_compile_error(input, source, &err))?
         .try_compile_to_ir()
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format_compile_error(input, source, &err))?;
     if cli.emit_ir {
         write_ir_or_stdout(&ir, cli.output.as_deref());
     }
@@ -236,16 +269,19 @@ fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
     Ok((func.name.clone(), func.inputs.len()))
 }
 
-fn run_jit(cli: &CliArgs, source: &str) -> Result<i32, String> {
+fn run_jit(cli: &CliArgs, input: &Path, source: &str) -> Result<i32, String> {
     configure_runtime_arena(cli.arena_mb * 1024 * 1024);
     reset_runtime_arena();
-    let module = Module::try_from_source(source).map_err(|err| err.to_string())?;
+    let module =
+        Module::try_from_source(source).map_err(|err| format_compile_error(input, source, &err))?;
     let (func_name, func_arity) = select_jit_entry(&module)?;
     if func_arity > 1 {
         return Err("jit entry function supports at most one argument".to_string());
     }
 
-    let jit = module.try_compile_to_jit_with_backend(cli.backend).map_err(|err| err.to_string())?;
+    let jit = module
+        .try_compile_to_jit_with_backend(cli.backend)
+        .map_err(|err| format_compile_error(input, source, &err))?;
     let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(&func_name) {
         if func_arity == 1 {
             let (arg_tag, arg_payload) = build_argv_list_value(&cli.program_args);
@@ -274,7 +310,7 @@ fn compile_native_or_exit(cli: &CliArgs, input: &Path, source: &str) {
     Module::try_from_source(source)
         .and_then(|module| module.try_compile_to_executable_with_backend(&output, cli.backend))
         .unwrap_or_else(|err| {
-            eprintln!("{err}");
+            eprintln!("{}", format_compile_error(input, source, &err));
             std::process::exit(1);
         });
     println!("compiled to {}", output.display());
@@ -293,7 +329,7 @@ fn main() {
         print_cli_error_and_exit(&err);
     }
 
-    match maybe_handle_ir_modes(&cli, &source) {
+    match maybe_handle_ir_modes(&cli, input, &source) {
         Ok(true) => return,
         Ok(false) => {}
         Err(err) => {
@@ -303,7 +339,7 @@ fn main() {
     }
 
     if cli.run_jit {
-        match run_jit(&cli, &source) {
+        match run_jit(&cli, input, &source) {
             Ok(code) => std::process::exit(code),
             Err(err) => {
                 eprintln!("{err}");
@@ -474,8 +510,9 @@ mod tests {
     #[test]
     fn maybe_handle_ir_modes_returns_false_when_ir_modes_are_disabled() {
         let cli = parse_ok(&["examples/test.expr"]);
-        let handled = maybe_handle_ir_modes(&cli, "fn main() do\n    7\nend")
-            .expect("ir handling should not fail");
+        let handled =
+            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
+                .expect("ir handling should not fail");
         assert!(!handled);
     }
 
@@ -492,8 +529,9 @@ mod tests {
         let output_str = output.to_string_lossy().into_owned();
         let cli = parse_ok(&["examples/test.expr", "--emit-ir", "-o", &output_str]);
 
-        let handled = maybe_handle_ir_modes(&cli, "fn main() do\n    7\nend")
-            .expect("emit-ir handling should succeed");
+        let handled =
+            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
+                .expect("emit-ir handling should succeed");
         assert!(handled);
 
         let ir = std::fs::read_to_string(&output).expect("ir output should exist");
@@ -505,24 +543,26 @@ mod tests {
     #[test]
     fn maybe_handle_ir_modes_returns_false_when_run_jit_is_also_requested() {
         let cli = parse_ok(&["examples/test.expr", "--emit-ir", "--run-jit"]);
-        let handled = maybe_handle_ir_modes(&cli, "fn main() do\n    7\nend")
-            .expect("emit-ir handling should succeed");
+        let handled =
+            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
+                .expect("emit-ir handling should succeed");
         assert!(!handled);
     }
 
     #[test]
     fn maybe_handle_ir_modes_propagates_run_ir_errors() {
         let cli = parse_ok(&["examples/test.expr", "--run-ir"]);
-        let err = maybe_handle_ir_modes(&cli, "fn main() do\n    1 / 0\nend")
-            .expect_err("run-ir should propagate traps as errors");
+        let err =
+            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    1 / 0\nend")
+                .expect_err("run-ir should propagate traps as errors");
         assert!(!err.is_empty());
     }
 
     #[test]
     fn run_jit_executes_compiled_program() {
         let cli = parse_ok(&["examples/test.expr", "--run-jit"]);
-        let result =
-            run_jit(&cli, "fn main() do\n    1 + 2 * 3\nend").expect("run_jit should succeed");
+        let result = run_jit(&cli, Path::new("input.expr"), "fn main() do\n    1 + 2 * 3\nend")
+            .expect("run_jit should succeed");
         assert_eq!(result, 7);
     }
 
@@ -531,9 +571,36 @@ mod tests {
         let cli = parse_ok(&["examples/test.expr", "--run-jit", "--", "hello", "world"]);
         let result = run_jit(
             &cli,
+            Path::new("input.expr"),
             "fn main(args) do\n    list_len(args) + bytes_len(list_get(args, 0))\nend",
         )
         .expect("run_jit should succeed");
         assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn format_compile_error_includes_line_and_column_when_span_is_present() {
+        let source = "fn main() do\n    missing_value\nend";
+        let err = CompileError::UndefinedVariable {
+            name: "missing_value".to_string(),
+            span: Some(expr_compiler::source::Span { start: 17, end: 30 }),
+        };
+        assert_eq!(
+            format_compile_error(Path::new("input.expr"), source, &err),
+            "input.expr:2:5: undefined variable: missing_value\n2 |     missing_value\n  |     ^^^^^^^^^^^^^"
+        );
+    }
+
+    #[test]
+    fn format_compile_error_formats_parse_errors_with_line_and_column() {
+        let source = "fn main()) do\n    1\nend";
+        let err = CompileError::Parse {
+            message: "unexpected token \")\"".to_string(),
+            span: Some(expr_compiler::source::Span { start: 9, end: 10 }),
+        };
+        assert_eq!(
+            format_compile_error(Path::new("input.expr"), source, &err),
+            "input.expr:1:10: parse error: unexpected token \")\"\n1 | fn main()) do\n  |          ^"
+        );
     }
 }
