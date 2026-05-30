@@ -1149,48 +1149,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
     ) -> IntValue<'ctx> {
         let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let merge = self.context.append_basic_block(function, &format!("{label}_merge"));
-        let lhs_zero = self
-            .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                lhs_sign,
-                self.i64_type.const_zero(),
-                &format!("{label}_lhs_zero"),
-            )
-            .expect("failed bigint signed lhs_zero");
-        let lhs_zero_block =
-            self.context.append_basic_block(function, &format!("{label}_lhs_zero_block"));
-        let rhs_zero_check =
-            self.context.append_basic_block(function, &format!("{label}_rhs_zero_check"));
-        self.builder
-            .build_conditional_branch(lhs_zero, lhs_zero_block, rhs_zero_check)
-            .expect("failed bigint signed lhs_zero branch");
-
-        self.builder.position_at_end(lhs_zero_block);
-        self.builder.build_unconditional_branch(merge).expect("failed lhs_zero merge");
-        let lhs_zero_end = self.builder.get_insert_block().unwrap();
-
-        self.builder.position_at_end(rhs_zero_check);
-        let rhs_zero = self
-            .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                rhs_sign,
-                self.i64_type.const_zero(),
-                &format!("{label}_rhs_zero"),
-            )
-            .expect("failed bigint signed rhs_zero");
-        let rhs_zero_block =
-            self.context.append_basic_block(function, &format!("{label}_rhs_zero_block"));
         let same_sign_block =
             self.context.append_basic_block(function, &format!("{label}_same_sign"));
         self.builder
-            .build_conditional_branch(rhs_zero, rhs_zero_block, same_sign_block)
-            .expect("failed bigint signed rhs_zero branch");
-
-        self.builder.position_at_end(rhs_zero_block);
-        self.builder.build_unconditional_branch(merge).expect("failed rhs_zero merge");
-        let rhs_zero_end = self.builder.get_insert_block().unwrap();
+            .build_unconditional_branch(same_sign_block)
+            .expect("failed bigint signed entry branch");
 
         self.builder.position_at_end(same_sign_block);
         let signs_equal = self
@@ -1288,8 +1251,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_phi(self.i64_type, &format!("{label}_result_phi"))
             .expect("failed bigint signed result phi");
         result_phi.add_incoming(&[
-            (&rhs, lhs_zero_end),
-            (&lhs, rhs_zero_end),
             (&sum_ptr, add_end),
             (&zero_ptr, equal_end),
             (&lhs_diff, lhs_gt_end),

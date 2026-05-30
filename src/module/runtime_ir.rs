@@ -1259,26 +1259,8 @@ fn emit_bigint_addsub(
 ) -> Value {
     let merge = builder.create_block();
     builder.append_block_param(merge, types::I64);
-
-    let lhs_zero = builder.ins().icmp_imm(IntCC::Equal, lhs_sign, 0);
-    let lhs_zero_block = builder.create_block();
-    let rhs_zero_check = builder.create_block();
-    builder.ins().brif(lhs_zero, lhs_zero_block, &[], rhs_zero_check, &[]);
-
-    builder.switch_to_block(lhs_zero_block);
-    builder.seal_block(lhs_zero_block);
-    builder.ins().jump(merge, &[BlockArg::Value(rhs_ptr)]);
-
-    builder.switch_to_block(rhs_zero_check);
-    builder.seal_block(rhs_zero_check);
-    let rhs_zero = builder.ins().icmp_imm(IntCC::Equal, rhs_sign, 0);
-    let rhs_zero_block = builder.create_block();
     let same_sign_block = builder.create_block();
-    builder.ins().brif(rhs_zero, rhs_zero_block, &[], same_sign_block, &[]);
-
-    builder.switch_to_block(rhs_zero_block);
-    builder.seal_block(rhs_zero_block);
-    builder.ins().jump(merge, &[BlockArg::Value(lhs_ptr)]);
+    builder.ins().jump(same_sign_block, &[]);
 
     builder.switch_to_block(same_sign_block);
     builder.seal_block(same_sign_block);

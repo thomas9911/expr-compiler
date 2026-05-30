@@ -1,0 +1,46 @@
+fn main(args) do
+    if list_len(args) != 3 do
+        print("usage: <op> <lhs> <rhs>")
+        1
+    else
+        op = list_get(args, 0)
+        lhs_text = list_get(args, 1)
+        rhs_text = list_get(args, 2)
+
+        lhs_ok, lhs, lhs_err = string_try_parse_bigint(lhs_text)
+        if not lhs_ok do
+            print(string_concat("left operand error: ", lhs_err))
+            1
+        else
+            rhs_ok, rhs, rhs_err = string_try_parse_bigint(rhs_text)
+            if not rhs_ok do
+                print(string_concat("right operand error: ", rhs_err))
+                1
+            else
+                apply_and_print(op, lhs, rhs)
+            end
+        end
+    end
+end
+
+fn apply_and_print(op, lhs, rhs) do
+    if op == "+" do
+        print(lhs + rhs)
+        0
+    else if op == "-" do
+        print(lhs - rhs)
+        0
+    else if op == "*" do
+        print(lhs * rhs)
+        0
+    else if op == "/" do
+        print(lhs / rhs)
+        0
+    else if op == "%" do
+        print(lhs % rhs)
+        0
+    else
+        print("unknown operator")
+        1
+    end
+end

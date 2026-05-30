@@ -166,6 +166,7 @@ fn print_value_ref(value: &Value) {
             print_bigint_ref(header);
         }
         ValueTag::StringIter => runtime_trap("string iterators are not printable"),
+        ValueTag::Multi => runtime_trap("multi-value temporaries are not printable"),
     }
 }
 

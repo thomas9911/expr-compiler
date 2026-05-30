@@ -1,0 +1,7 @@
+fn bytes_try_get(s, index) do
+    if index < 0 or index >= bytes_len(s) do
+        false, 0, "index out of bounds"
+    else
+        true, bytes_get(s, index), ""
+    end
+end

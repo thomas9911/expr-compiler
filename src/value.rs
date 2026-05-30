@@ -4,6 +4,7 @@ pub const TAG_STRING: i64 = 3;
 pub const TAG_FUNCTION: i64 = 4;
 pub const TAG_BIGINT: i64 = 5;
 pub const TAG_STRING_ITER: i64 = 6;
+pub const TAG_MULTI: i64 = 7;
 
 pub const VALUE_SIZE: i64 = 16;
 pub const VALUE_PAYLOAD_OFFSET: i32 = 8;
@@ -21,6 +22,9 @@ pub const STRING_PTR_OFFSET: i32 = 16;
 pub const STRING_ITER_HEADER_SIZE: i64 = 16;
 pub const STRING_ITER_STRING_OFFSET: i32 = 0;
 pub const STRING_ITER_INDEX_OFFSET: i32 = 8;
+pub const MULTI_HEADER_SIZE: i64 = 16;
+pub const MULTI_LEN_OFFSET: i32 = 0;
+pub const MULTI_PTR_OFFSET: i32 = 8;
 pub const BIGINT_HEADER_SIZE: i64 = 32;
 pub const BIGINT_SIGN_OFFSET: i32 = 0;
 pub const BIGINT_LEN_OFFSET: i32 = 8;
@@ -37,6 +41,7 @@ pub enum ValueTag {
     Function = TAG_FUNCTION as u8,
     BigInt = TAG_BIGINT as u8,
     StringIter = TAG_STRING_ITER as u8,
+    Multi = TAG_MULTI as u8,
 }
 
 impl ValueTag {
@@ -48,6 +53,7 @@ impl ValueTag {
             TAG_FUNCTION => Some(Self::Function),
             TAG_BIGINT => Some(Self::BigInt),
             TAG_STRING_ITER => Some(Self::StringIter),
+            TAG_MULTI => Some(Self::Multi),
             _ => None,
         }
     }
@@ -86,6 +92,13 @@ pub struct StringIterHeader {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
+pub struct MultiHeader<T> {
+    pub len: usize,
+    pub ptr: *mut T,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
 pub struct BigIntHeader {
     pub sign: i64,
     pub len: usize,
@@ -101,4 +114,5 @@ fn verify_value() {
     assert_eq!(ValueTag::from_raw(TAG_FUNCTION as u8).unwrap(), ValueTag::Function);
     assert_eq!(ValueTag::from_raw(TAG_BIGINT as u8).unwrap(), ValueTag::BigInt);
     assert_eq!(ValueTag::from_raw(TAG_STRING_ITER as u8).unwrap(), ValueTag::StringIter);
+    assert_eq!(ValueTag::from_raw(TAG_MULTI as u8).unwrap(), ValueTag::Multi);
 }
