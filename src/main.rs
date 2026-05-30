@@ -1,13 +1,16 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
+use expr_compiler::analysis::{FunctionValueKindAnalysis, KindSet, ValueKind, ValueShape};
 use expr_compiler::module::{CodegenBackend, CompileError, Module, llvm_backend_available};
+use expr_compiler::parser::{Ast, BlockAst, FunctionDefAst, ParseLexer};
 use expr_compiler::runtime::{
     build_argv_list_value, configure_runtime_arena, decode_int, reset_runtime_arena,
 };
 use expr_compiler::source::offset_to_line_col;
+use expr_compiler::tokenizer::{Logos, Token};
 use pico_args::Arguments;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--backend <cranelift|llvm>] [--arena-mb <n>] [-- <arg>...]";
+const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--debug-types] [--backend <cranelift|llvm>] [--arena-mb <n>] [-- <arg>...]";
 
 #[derive(Debug)]
 struct CliArgs {
@@ -16,6 +19,7 @@ struct CliArgs {
     emit_ir: bool,
     run_ir: bool,
     run_jit: bool,
+    debug_types: bool,
     backend: CodegenBackend,
     arena_mb: usize,
     program_args: Vec<String>,
@@ -105,6 +109,7 @@ where
     let emit_ir = args.contains("--emit-ir");
     let run_ir = args.contains("--run-ir");
     let run_jit = args.contains("--run-jit");
+    let debug_types = args.contains("--debug-types");
     let backend = args
         .opt_value_from_str::<_, String>("--backend")
         .map_err(|e| format!("failed to parse --backend: {e}"))?
@@ -137,6 +142,7 @@ where
         emit_ir,
         run_ir,
         run_jit,
+        debug_types,
         backend,
         arena_mb,
         program_args,
@@ -165,6 +171,184 @@ fn write_ir_or_stdout(ir: &str, output: Option<&Path>) {
     } else {
         print!("{ir}");
     }
+}
+
+fn format_kind_set(kinds: KindSet) -> String {
+    if kinds.is_empty() {
+        return "unknown".to_string();
+    }
+
+    let mut names = vec![];
+    for (kind, label) in [
+        (ValueKind::Int, "int"),
+        (ValueKind::BigInt, "bigint"),
+        (ValueKind::String, "string"),
+        (ValueKind::List, "list"),
+        (ValueKind::Function, "function"),
+        (ValueKind::StringIter, "string_iter"),
+    ] {
+        if kinds.contains(kind) {
+            names.push(label);
+        }
+    }
+
+    if names.is_empty() { "unknown".to_string() } else { names.join(" | ") }
+}
+
+fn format_value_shape(shape: &ValueShape) -> String {
+    if shape.arity() == 1 {
+        return shape
+            .slot(0)
+            .map(format_kind_set)
+            .unwrap_or_else(|| "unknown".to_string());
+    }
+
+    let slots =
+        shape.slots().iter().copied().map(format_kind_set).collect::<Vec<_>>().join(", ");
+    format!("({slots})")
+}
+
+fn add_annotation(
+    annotations: &mut std::collections::BTreeMap<usize, Vec<String>>,
+    line: usize,
+    text: String,
+) {
+    annotations.entry(line).or_default().push(text);
+}
+
+fn collect_block_type_annotations(
+    source: &str,
+    block: &BlockAst,
+    analysis: &FunctionValueKindAnalysis,
+    annotations: &mut std::collections::BTreeMap<usize, Vec<String>>,
+) {
+    for line in &block.lines {
+        collect_ast_type_annotations(source, line, analysis, annotations);
+    }
+}
+
+fn collect_ast_type_annotations(
+    source: &str,
+    ast: &Ast,
+    analysis: &FunctionValueKindAnalysis,
+    annotations: &mut std::collections::BTreeMap<usize, Vec<String>>,
+) {
+    match ast {
+        Ast::Assign { name, span, .. } => {
+            if let (Some(span), Some(kinds)) = (span.as_ref(), analysis.variables.get(name)) {
+                add_annotation(
+                    annotations,
+                    offset_to_line_col(source, span.start).line,
+                    format!("{name}: {}", format_kind_set(*kinds)),
+                );
+            }
+        }
+        Ast::MultiAssign { names, span, .. } => {
+            if let Some(span) = span.as_ref() {
+                let vars = names
+                    .iter()
+                    .filter_map(|name| {
+                        analysis.variables.get(name).map(|kinds| format!("{name}: {}", format_kind_set(*kinds)))
+                    })
+                    .collect::<Vec<_>>();
+                if !vars.is_empty() {
+                    add_annotation(
+                        annotations,
+                        offset_to_line_col(source, span.start).line,
+                        vars.join(", "),
+                    );
+                }
+            }
+        }
+        Ast::If { then, else_, .. } => {
+            collect_block_type_annotations(source, then, analysis, annotations);
+            if let Some(else_block) = else_ {
+                collect_block_type_annotations(source, else_block, analysis, annotations);
+            }
+        }
+        Ast::Block(block) => collect_block_type_annotations(source, block, analysis, annotations),
+        Ast::IndexAssign { value, .. } => collect_ast_type_annotations(source, value, analysis, annotations),
+        _ => {}
+    }
+}
+
+fn format_function_annotation(function: &FunctionDefAst, analysis: &FunctionValueKindAnalysis) -> String {
+    let mut parts = vec![];
+    if !function.inputs.is_empty() {
+        let inputs = function
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let kinds = analysis.inputs.get(index).copied().unwrap_or_else(KindSet::empty);
+                format!("{name}: {}", format_kind_set(kinds))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("inputs [{inputs}]"));
+    }
+    parts.push(format!("returns {}", format_value_shape(&analysis.returns)));
+    parts.join("; ")
+}
+
+fn parse_user_functions_for_debug(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
+    let lex = Token::lexer(source);
+    let mut lexer = ParseLexer::new(lex);
+    let mut functions = vec![];
+    loop {
+        while lexer.peek() == Some(&Ok(Token::Newline)) {
+            lexer.next();
+        }
+        if lexer.peek().is_none() {
+            break;
+        }
+        match Ast::from_lexer(&mut lexer) {
+            Ok(Ast::FunctionDef(func)) => functions.push(func),
+            Ok(_) => return Err(CompileError::TopLevelExpression),
+            Err(err) => {
+                return Err(CompileError::Parse {
+                    message: err.to_string(),
+                    span: Some(err.span),
+                });
+            }
+        }
+    }
+    Ok(functions)
+}
+
+fn format_debug_types(
+    source: &str,
+    user_functions: &[FunctionDefAst],
+    module: &Module,
+) -> Result<String, CompileError> {
+    let analysis = module.analyze_value_kinds()?;
+    let mut annotations = std::collections::BTreeMap::<usize, Vec<String>>::new();
+    for function in user_functions {
+        let Some(function_analysis) = analysis.functions.get(&function.name) else { continue };
+        if let Some(span) = function.span.as_ref() {
+            add_annotation(
+                &mut annotations,
+                offset_to_line_col(source, span.start).line,
+                format_function_annotation(function, function_analysis),
+            );
+        }
+        collect_block_type_annotations(source, &function.block, function_analysis, &mut annotations);
+    }
+
+    let mut rendered = String::new();
+    for (index, line) in source.lines().enumerate() {
+        let line_no = index + 1;
+        rendered.push_str(line);
+        rendered.push('\n');
+        if let Some(items) = annotations.get(&line_no) {
+            for item in items {
+                rendered.push_str("#? ");
+                rendered.push_str(item);
+                rendered.push('\n');
+            }
+        }
+    }
+    Ok(rendered)
 }
 
 fn format_compile_error(path: &Path, source: &str, err: &CompileError) -> String {
@@ -260,6 +444,21 @@ fn maybe_handle_ir_modes(cli: &CliArgs, input: &Path, source: &str) -> Result<bo
     Ok(!cli.run_jit)
 }
 
+fn maybe_handle_debug_types(cli: &CliArgs, input: &Path, source: &str) -> Result<bool, String> {
+    if !cli.debug_types {
+        return Ok(false);
+    }
+
+    let module =
+        Module::try_from_source(source).map_err(|err| format_compile_error(input, source, &err))?;
+    let user_functions =
+        parse_user_functions_for_debug(source).map_err(|err| format_compile_error(input, source, &err))?;
+    let rendered = format_debug_types(source, &user_functions, &module)
+        .map_err(|err| format_compile_error(input, source, &err))?;
+    print!("{rendered}");
+    Ok(true)
+}
+
 fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
     if let Some(main) = module.functions.iter().find(|func| func.name == "main") {
         return Ok((main.name.clone(), main.inputs.len()));
@@ -325,6 +524,15 @@ fn main() {
     let input = Path::new(&cli.input);
     let source = read_source_or_exit(input);
 
+    match maybe_handle_debug_types(&cli, input, &source) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+
     if let Err(err) = validate_cli_runtime(&cli, llvm_backend_available(), cfg!(feature = "wasi")) {
         print_cli_error_and_exit(&err);
     }
@@ -365,6 +573,7 @@ mod tests {
         assert_eq!(cli.backend, CodegenBackend::Cranelift);
         assert_eq!(cli.arena_mb, 16);
         assert!(!cli.run_jit);
+        assert!(!cli.debug_types);
     }
 
     #[test]
@@ -378,6 +587,12 @@ mod tests {
     fn cli_collects_program_args_for_run_jit() {
         let cli = parse_ok(&["examples/test.expr", "--run-jit", "--", "hello", "world"]);
         assert_eq!(cli.program_args, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn cli_accepts_debug_types() {
+        let cli = parse_ok(&["examples/test.expr", "--debug-types"]);
+        assert!(cli.debug_types);
     }
 
     #[test]
@@ -517,6 +732,15 @@ mod tests {
     }
 
     #[test]
+    fn maybe_handle_debug_types_returns_false_when_disabled() {
+        let cli = parse_ok(&["examples/test.expr"]);
+        let handled =
+            maybe_handle_debug_types(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
+                .expect("debug-types handling should not fail");
+        assert!(!handled);
+    }
+
+    #[test]
     fn maybe_handle_ir_modes_writes_ir_file_and_returns_true() {
         let unique = format!(
             "expr-compiler-main-test-{}.clif",
@@ -556,6 +780,18 @@ mod tests {
             maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    1 / 0\nend")
                 .expect_err("run-ir should propagate traps as errors");
         assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn format_debug_types_includes_function_and_assignment_annotations() {
+        let source = "fn main() do\n    ok, value, err = string_try_parse_bigint(\"12\")\n    value\nend\n";
+        let module = Module::try_from_source(source).expect("source should parse");
+        let user_functions =
+            parse_user_functions_for_debug(source).expect("user functions should parse");
+        let rendered =
+            format_debug_types(source, &user_functions, &module).expect("debug types should render");
+        assert!(rendered.contains("#? returns bigint"));
+        assert!(rendered.contains("#? ok: int, value: bigint, err: string"));
     }
 
     #[test]
