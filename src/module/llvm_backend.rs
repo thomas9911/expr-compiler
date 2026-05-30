@@ -1,7 +1,8 @@
 use super::{
-    ClosureMetadata, CompileError, Module, function_arities, function_ordinals, is_builtin_name,
-    local_var_names,
+    ClosureMetadata, CompileError, Module, function_arities, function_ordinals,
+    infer_ast_value_shape, is_builtin_name, local_var_names, shape_is_exact_kind,
 };
+use crate::analysis::{FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis};
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
     BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, MULTI_HEADER_SIZE, STRING_HEADER_SIZE,
@@ -106,6 +107,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> Result<LlvmJitModule, Compi
         .map(|func| func.name.clone())
         .collect::<HashSet<_>>();
 
+    let value_kind_analysis = expr_module.analyze_value_kinds()?;
     let functions = {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
         compiler.bigint_enabled = expr_module.uses_bigint();
@@ -114,6 +116,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> Result<LlvmJitModule, Compi
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
+        compiler.value_kind_analysis = value_kind_analysis.clone();
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Jit);
         compiler.define_user_functions(&expr_module.functions);
@@ -143,6 +146,7 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Result<Vec<u
         CompileError::Toolchain(format!("failed to initialize LLVM native target: {e}"))
     })?;
 
+    let value_kind_analysis = expr_module.analyze_value_kinds()?;
     let (context, module, machine) = create_codegen_context(name, LlvmTargetKind::Host);
     {
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::Native);
@@ -152,6 +156,7 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Result<Vec<u
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
+        compiler.value_kind_analysis = value_kind_analysis;
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Executable);
         compiler.define_user_functions(&expr_module.functions);
@@ -171,6 +176,7 @@ pub(super) fn compile_to_wasm_assembly(
     name: &str,
 ) -> Result<Vec<u8>, CompileError> {
     Target::initialize_webassembly(&InitializationConfig::default());
+    let value_kind_analysis = expr_module.analyze_value_kinds()?;
     let needs_argv_list =
         expr_module.functions.iter().any(|func| func.name == "main" && func.inputs.len() == 1);
 
@@ -183,6 +189,7 @@ pub(super) fn compile_to_wasm_assembly(
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
+        compiler.value_kind_analysis = value_kind_analysis;
         compiler.declare_runtime_functions();
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Wasm);
         compiler.define_user_functions(&expr_module.functions);
@@ -203,6 +210,7 @@ pub(super) fn compile_to_wasm_preview1_command_assembly(
     name: &str,
 ) -> Result<Vec<u8>, CompileError> {
     Target::initialize_webassembly(&InitializationConfig::default());
+    let value_kind_analysis = expr_module.analyze_value_kinds()?;
     let needs_argv_list =
         expr_module.functions.iter().any(|func| func.name == "main" && func.inputs.len() == 1);
 
@@ -215,6 +223,7 @@ pub(super) fn compile_to_wasm_preview1_command_assembly(
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
+        compiler.value_kind_analysis = value_kind_analysis;
         compiler.declare_runtime_functions();
         compiler
             .declare_user_functions(&expr_module.functions, LlvmOutputMode::WasiPreview1Command);
@@ -276,6 +285,7 @@ struct LlvmCompiler<'ctx> {
     function_ordinals: HashMap<String, i64>,
     function_arities: HashMap<String, usize>,
     closure_metadata: HashMap<String, ClosureMetadata>,
+    value_kind_analysis: ModuleValueKindAnalysis,
 }
 
 #[derive(Clone, Copy)]
@@ -285,6 +295,13 @@ struct CompiledValue<'ctx> {
 }
 
 impl<'ctx> LlvmCompiler<'ctx> {
+    fn function_analysis(&self, current_function_name: &str) -> &FunctionValueKindAnalysis {
+        self.value_kind_analysis
+            .functions
+            .get(current_function_name)
+            .expect("missing value kind analysis for LLVM function")
+    }
+
     fn new(
         context: &'ctx Context,
         module: &'ctx LlvmModule<'ctx>,
@@ -303,6 +320,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             function_ordinals: HashMap::new(),
             function_arities: HashMap::new(),
             closure_metadata: HashMap::new(),
+            value_kind_analysis: ModuleValueKindAnalysis { functions: HashMap::new() },
         }
     }
 
@@ -1084,7 +1102,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 .build_load(self.i64_type, env_slot, "tail_env")
                 .expect("failed to load tail env")
                 .into_int_value();
-            let _ = self.compile_ast(line, vars, capture_slots, current_env, function);
+            let _ = self.compile_ast(
+                line,
+                vars,
+                capture_slots,
+                current_env,
+                function,
+                current_function_name,
+            );
         }
 
         let current_env = self
@@ -1123,7 +1148,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
             {
                 let compiled = args
                     .iter()
-                    .map(|arg| self.compile_ast(arg, vars, capture_slots, env_ptr, function))
+                    .map(|arg| {
+                        self.compile_ast(
+                            arg,
+                            vars,
+                            capture_slots,
+                            env_ptr,
+                            function,
+                            current_function_name,
+                        )
+                    })
                     .collect::<Vec<_>>();
                 for (index, value) in compiled.iter().enumerate() {
                     let ptr = vars.get(&current_function_inputs[index]).unwrap_or_else(|| {
@@ -1147,8 +1181,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     .expect("failed to branch to llvm tail loop");
             }
             Ast::If { condition, then, else_, .. } => {
-                let cond_value =
-                    self.compile_ast(condition, vars, capture_slots, env_ptr, function);
+                let cond_value = self.compile_ast(
+                    condition,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 let truth = self.build_internal_scalar_call(
                     self.require_func("__value_is_truthy"),
                     &[cond_value],
@@ -1215,7 +1255,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 current_function_inputs,
             ),
             _ => {
-                let value = self.compile_ast(ast, vars, capture_slots, env_ptr, function);
+                let value = self.compile_ast(
+                    ast,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 self.builder
                     .build_return(Some(&self.make_pair_value(
                         value.tag,
@@ -1334,8 +1381,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
-        let lhs = self.compile_ast(lhs_ast, vars, capture_slots, env_ptr, function);
+        let lhs = self.compile_ast(
+            lhs_ast,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
         let lhs_truth = self.build_internal_scalar_call(
             self.require_func("__value_is_truthy"),
             &[lhs],
@@ -1373,7 +1428,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let short_from = self.builder.get_insert_block().expect("missing logical short block");
 
         self.builder.position_at_end(rhs_block);
-        let rhs = self.compile_ast(rhs_ast, vars, capture_slots, env_ptr, function);
+        let rhs = self.compile_ast(
+            rhs_ast,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
         let rhs_truth = self.build_internal_scalar_call(
             self.require_func("__value_is_truthy"),
             &[rhs],
@@ -1406,8 +1468,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
-        let arg = self.compile_ast(arg_ast, vars, capture_slots, env_ptr, function);
+        let arg = self.compile_ast(
+            arg_ast,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
         let truth = self.build_internal_scalar_call(
             self.require_func("__value_is_truthy"),
             &[arg],
@@ -1422,6 +1492,177 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_int_z_extend(is_zero, self.i64_type, "not_payload")
             .expect("failed to extend logical not");
         CompiledValue { tag: self.i64_type.const_int(TAG_INT as u64, false), payload }
+    }
+
+    fn build_trap_if(&self, condition: IntValue<'ctx>) {
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let trap_block = self.context.append_basic_block(function, "trap_if_trap");
+        let ok_block = self.context.append_basic_block(function, "trap_if_ok");
+        self.builder
+            .build_conditional_branch(condition, trap_block, ok_block)
+            .expect("failed trap_if branch");
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(ok_block);
+    }
+
+    fn compile_exact_int_operator(
+        &self,
+        name: &str,
+        lhs: CompiledValue<'ctx>,
+        rhs: CompiledValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        let raw = match name {
+            "add" => {
+                let (raw, overflow) = self.build_overflow_intrinsic_call(
+                    "llvm.sadd.with.overflow.i64",
+                    lhs.payload,
+                    rhs.payload,
+                    "int_add",
+                );
+                self.build_trap_if(overflow);
+                raw
+            }
+            "subtract" => {
+                let (raw, overflow) = self.build_overflow_intrinsic_call(
+                    "llvm.ssub.with.overflow.i64",
+                    lhs.payload,
+                    rhs.payload,
+                    "int_sub",
+                );
+                self.build_trap_if(overflow);
+                raw
+            }
+            "multiply" => {
+                let (raw, overflow) = self.build_overflow_intrinsic_call(
+                    "llvm.smul.with.overflow.i64",
+                    lhs.payload,
+                    rhs.payload,
+                    "int_mul",
+                );
+                self.build_trap_if(overflow);
+                raw
+            }
+            "divide" | "modulo" => {
+                let safe = self.build_division_safe_check(lhs.payload, rhs.payload, "int_div");
+                let unsafe_block = self.context.append_basic_block(
+                    self.builder.get_insert_block().unwrap().get_parent().unwrap(),
+                    "int_div_trap",
+                );
+                let ok_block = self.context.append_basic_block(
+                    self.builder.get_insert_block().unwrap().get_parent().unwrap(),
+                    "int_div_ok",
+                );
+                self.builder
+                    .build_conditional_branch(safe, ok_block, unsafe_block)
+                    .expect("failed int div safe branch");
+                self.builder.position_at_end(unsafe_block);
+                self.build_trap_and_unreachable();
+                self.builder.position_at_end(ok_block);
+                if name == "divide" {
+                    self.builder
+                        .build_int_signed_div(lhs.payload, rhs.payload, "int_div")
+                        .expect("failed int div")
+                } else {
+                    self.builder
+                        .build_int_signed_rem(lhs.payload, rhs.payload, "int_rem")
+                        .expect("failed int rem")
+                }
+            }
+            "gt" | "lt" | "gte" | "lte" | "eq" | "ne" => {
+                let predicate = match name {
+                    "gt" => IntPredicate::SGT,
+                    "lt" => IntPredicate::SLT,
+                    "gte" => IntPredicate::SGE,
+                    "lte" => IntPredicate::SLE,
+                    "eq" => IntPredicate::EQ,
+                    "ne" => IntPredicate::NE,
+                    _ => unreachable!(),
+                };
+                let cmp = self
+                    .builder
+                    .build_int_compare(predicate, lhs.payload, rhs.payload, "int_cmp")
+                    .expect("failed int cmp");
+                let one = self.i64_type.const_int(1, false);
+                let zero = self.i64_type.const_zero();
+                self.builder
+                    .build_select(cmp, one, zero, "int_cmp_raw")
+                    .expect("failed int cmp select")
+                    .into_int_value()
+            }
+            _ => unreachable!("not an exact int operator: {name}"),
+        };
+        CompiledValue { tag: self.i64_type.const_int(TAG_INT as u64, false), payload: raw }
+    }
+
+    fn compile_exact_bigint_operator(
+        &self,
+        name: &str,
+        lhs: CompiledValue<'ctx>,
+        rhs: CompiledValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        match name {
+            "add" => {
+                self.build_internal_call(self.require_func("bigint_add"), &[lhs, rhs], "bigint_add")
+            }
+            "subtract" => self.build_internal_call(
+                self.require_func("bigint_subtract"),
+                &[lhs, rhs],
+                "bigint_subtract",
+            ),
+            "multiply" => self.build_internal_call(
+                self.require_func("bigint_multiply"),
+                &[lhs, rhs],
+                "bigint_multiply",
+            ),
+            "divide" => self.build_internal_call(
+                self.require_func("bigint_divide"),
+                &[lhs, rhs],
+                "bigint_divide",
+            ),
+            "modulo" => self.build_internal_call(
+                self.require_func("bigint_modulo"),
+                &[lhs, rhs],
+                "bigint_modulo",
+            ),
+            "gt" | "lt" | "gte" | "lte" | "eq" | "ne" => {
+                let compare = self.build_internal_call(
+                    self.require_func("bigint_compare"),
+                    &[lhs, rhs],
+                    "bigint_compare",
+                );
+                let predicate = match name {
+                    "gt" => IntPredicate::SGT,
+                    "lt" => IntPredicate::SLT,
+                    "gte" => IntPredicate::SGE,
+                    "lte" => IntPredicate::SLE,
+                    "eq" => IntPredicate::EQ,
+                    "ne" => IntPredicate::NE,
+                    _ => unreachable!(),
+                };
+                let cmp = self
+                    .builder
+                    .build_int_compare(
+                        predicate,
+                        compare.payload,
+                        self.i64_type.const_zero(),
+                        "bigint_cmp",
+                    )
+                    .expect("failed bigint cmp");
+                let raw = self
+                    .builder
+                    .build_select(
+                        cmp,
+                        self.i64_type.const_int(1, false),
+                        self.i64_type.const_zero(),
+                        "bigint_cmp_raw",
+                    )
+                    .expect("failed bigint cmp select")
+                    .into_int_value();
+                CompiledValue { tag: self.i64_type.const_int(TAG_INT as u64, false), payload: raw }
+            }
+            _ => unreachable!("not an exact bigint operator: {name}"),
+        }
     }
 
     fn require_func(&self, name: &str) -> FunctionValue<'ctx> {

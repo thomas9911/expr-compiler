@@ -1430,6 +1430,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
 
         self.builder.position_at_end(bounds_ok);
+        self.build_bytes_slice_known_string(string_raw, start, end, function)
+    }
+
+    pub(super) fn build_bytes_slice_known_string(
+        &self,
+        string_raw: IntValue<'ctx>,
+        start: IntValue<'ctx>,
+        end: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
         let slice_len = self
             .builder
             .build_int_sub(end, start, "bytes_slice_len")

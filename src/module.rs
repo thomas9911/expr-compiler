@@ -4,11 +4,11 @@ use crate::analysis::{
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst};
 use crate::source::Span;
 use crate::value::{
-    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, MULTI_HEADER_SIZE,
-    MULTI_LEN_OFFSET, MULTI_PTR_OFFSET, STRING_CAP_OFFSET, STRING_HEADER_SIZE,
-    STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET, STRING_ITER_STRING_OFFSET,
-    STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_MULTI, TAG_STRING,
-    TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, LIST_LEN_OFFSET,
+    LIST_PTR_OFFSET, MULTI_HEADER_SIZE, MULTI_LEN_OFFSET, MULTI_PTR_OFFSET, STRING_CAP_OFFSET,
+    STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
+    STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION,
+    TAG_INT, TAG_LIST, TAG_MULTI, TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
@@ -346,6 +346,9 @@ impl Module {
     }
 
     fn compile_to_cranelift_jit(self) -> CraneliftJitModule {
+        let value_kind_analysis = self
+            .analyze_value_kinds()
+            .expect("value kind analysis should succeed before Cranelift JIT codegen");
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -395,6 +398,7 @@ impl Module {
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
+                &value_kind_analysis,
             );
             if func_def.inputs.len() <= 1 {
                 let scalar_id = declare_jit_int_result_sig(
@@ -432,6 +436,7 @@ impl Module {
 
     pub fn try_compile_to_ir(self) -> Result<String, CompileError> {
         self.validate_user_facing_constructs()?;
+        let value_kind_analysis = self.analyze_value_kinds()?;
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -492,6 +497,7 @@ impl Module {
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
+                &value_kind_analysis,
             );
             out.push_str(&ir);
             out.push('\n');
@@ -535,6 +541,9 @@ impl Module {
     }
 
     fn compile_to_cranelift_object(self, name: &str) -> Vec<u8> {
+        let value_kind_analysis = self
+            .analyze_value_kinds()
+            .expect("value kind analysis should succeed before Cranelift object codegen");
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -579,6 +588,7 @@ impl Module {
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
+                &value_kind_analysis,
             );
         }
         cranelift_module.finish().emit().unwrap()
@@ -665,6 +675,7 @@ impl Module {
     }
 
     fn compile_to_cranelift_executable(self, output: &Path) -> Result<(), CompileError> {
+        let value_kind_analysis = self.analyze_value_kinds()?;
         let flags = settings::Flags::new(settings::builder());
         let isa = cranelift::native::builder()
             .expect("host machine supported")
@@ -730,6 +741,7 @@ impl Module {
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
+                &value_kind_analysis,
             );
             if func_def.name == "main" && func_def.inputs.len() <= 1 {
                 define_executable_main_int_result_wrapper(
@@ -1756,6 +1768,7 @@ fn define_function_body(
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> String {
     let mut sig = Signature::new(isa.default_call_conv());
     sig.returns.push(AbiParam::new(types::I64));
@@ -1836,6 +1849,11 @@ fn define_function_body(
             env_ptr,
             &func_def.name,
             loop_block,
+            value_kind_analysis
+                .functions
+                .get(&func_def.name)
+                .expect("missing value kind analysis for function"),
+            value_kind_analysis,
         );
 
         builder.seal_block(loop_block);
@@ -2972,6 +2990,10 @@ fn infer_ast_value_shape(
     }
 }
 
+fn shape_is_exact_kind(shape: &ValueShape, expected: KindSet) -> bool {
+    shape.arity() == 1 && shape.scalar_slot() == expected
+}
+
 fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> ValueShape {
     let scalar_arg = |index: usize| {
         arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any)
@@ -3394,6 +3416,8 @@ fn compile_logical_op(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let lhs = compile_ast(
         builder,
@@ -3405,6 +3429,8 @@ fn compile_logical_op(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let lhs_truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", lhs);
     let lhs_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, lhs_truth, 0);
@@ -3437,6 +3463,8 @@ fn compile_logical_op(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let rhs_truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", rhs);
     builder.ins().jump(merge_block, &[BlockArg::Value(rhs_truth)]);
@@ -3459,6 +3487,8 @@ fn compile_logical_not(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let arg = compile_ast(
         builder,
@@ -3470,6 +3500,8 @@ fn compile_logical_not(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let truth = call_unary_scalar(builder, func_refs, "__value_is_truthy", arg);
     let is_zero = builder.ins().icmp_imm(IntCC::Equal, truth, 0);
@@ -3552,6 +3584,99 @@ fn compile_bigint_builtin(
     let call = builder.ins().call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
     let results = builder.inst_results(call);
     CompiledValue { tag: results[0], payload: results[1] }
+}
+
+fn compile_exact_int_binary_op(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    lhs: CompiledValue,
+    rhs: CompiledValue,
+) -> CompiledValue {
+    let raw = match function {
+        "add" => {
+            let (sum, ovf) = builder.ins().sadd_overflow(lhs.payload, rhs.payload);
+            builder.ins().trapnz(ovf, TrapCode::INTEGER_OVERFLOW);
+            sum
+        }
+        "subtract" => {
+            let (diff, ovf) = builder.ins().ssub_overflow(lhs.payload, rhs.payload);
+            builder.ins().trapnz(ovf, TrapCode::INTEGER_OVERFLOW);
+            diff
+        }
+        "multiply" => {
+            let (prod, ovf) = builder.ins().smul_overflow(lhs.payload, rhs.payload);
+            builder.ins().trapnz(ovf, TrapCode::INTEGER_OVERFLOW);
+            prod
+        }
+        "divide" => {
+            builder.ins().trapz(rhs.payload, TrapCode::INTEGER_DIVISION_BY_ZERO);
+            let lhs_is_min = builder.ins().icmp_imm(IntCC::Equal, lhs.payload, i64::MIN);
+            let neg_one = builder.ins().iconst(types::I64, -1);
+            let rhs_is_neg_one = builder.ins().icmp(IntCC::Equal, rhs.payload, neg_one);
+            let overflow = builder.ins().band(lhs_is_min, rhs_is_neg_one);
+            builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
+            builder.ins().sdiv(lhs.payload, rhs.payload)
+        }
+        "modulo" => {
+            builder.ins().trapz(rhs.payload, TrapCode::INTEGER_DIVISION_BY_ZERO);
+            let lhs_is_min = builder.ins().icmp_imm(IntCC::Equal, lhs.payload, i64::MIN);
+            let neg_one = builder.ins().iconst(types::I64, -1);
+            let rhs_is_neg_one = builder.ins().icmp(IntCC::Equal, rhs.payload, neg_one);
+            let overflow = builder.ins().band(lhs_is_min, rhs_is_neg_one);
+            builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
+            builder.ins().srem(lhs.payload, rhs.payload)
+        }
+        _ => unreachable!("not an exact int binary op: {function}"),
+    };
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: raw }
+}
+
+fn compile_exact_int_compare_op(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    lhs: CompiledValue,
+    rhs: CompiledValue,
+) -> CompiledValue {
+    let cc = match function {
+        "gt" => IntCC::SignedGreaterThan,
+        "lt" => IntCC::SignedLessThan,
+        "gte" => IntCC::SignedGreaterThanOrEqual,
+        "lte" => IntCC::SignedLessThanOrEqual,
+        "eq" => IntCC::Equal,
+        "ne" => IntCC::NotEqual,
+        _ => unreachable!("not an exact int compare op: {function}"),
+    };
+    let cmp = builder.ins().icmp(cc, lhs.payload, rhs.payload);
+    let one = builder.ins().iconst(types::I64, 1);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let raw = builder.ins().select(cmp, one, zero);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: raw }
+}
+
+fn compile_exact_bigint_compare_op(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    function: &str,
+    lhs: CompiledValue,
+    rhs: CompiledValue,
+) -> CompiledValue {
+    let compare_ref = require_func(func_refs, "bigint_compare");
+    let call = builder.ins().call(compare_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
+    let cmp_raw = builder.inst_results(call)[1];
+    let cc = match function {
+        "gt" => IntCC::SignedGreaterThan,
+        "lt" => IntCC::SignedLessThan,
+        "gte" => IntCC::SignedGreaterThanOrEqual,
+        "lte" => IntCC::SignedLessThanOrEqual,
+        "eq" => IntCC::Equal,
+        "ne" => IntCC::NotEqual,
+        _ => unreachable!("not an exact bigint compare op: {function}"),
+    };
+    let cmp = builder.ins().icmp_imm(cc, cmp_raw, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let raw = builder.ins().select(cmp, one, zero);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: raw }
 }
 
 fn call_ternary(
@@ -3641,22 +3766,34 @@ fn compile_string_literal(
     CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING), payload: header_ptr }
 }
 
-fn compile_bytes_len(builder: &mut FunctionBuilder, value: CompiledValue) -> CompiledValue {
-    let is_string = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_STRING);
-    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+fn compile_bytes_len_known_string(
+    builder: &mut FunctionBuilder,
+    value: CompiledValue,
+    assume_string: bool,
+) -> CompiledValue {
+    if !assume_string {
+        let is_string = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_STRING);
+        builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
     let len = builder.ins().load(types::I64, MemFlags::new(), value.payload, STRING_LEN_OFFSET);
     CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: len }
 }
 
-fn compile_bytes_get(
+fn compile_bytes_get_known_types(
     builder: &mut FunctionBuilder,
     string_value: CompiledValue,
     index_value: CompiledValue,
+    assume_string: bool,
+    assume_int_index: bool,
 ) -> CompiledValue {
-    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let is_int = builder.ins().icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
-    builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    if !assume_string {
+        let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+        builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
+    if !assume_int_index {
+        let is_int = builder.ins().icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+        builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
 
     let len =
         builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
@@ -3673,19 +3810,28 @@ fn compile_bytes_get(
     CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: byte_i64 }
 }
 
-fn compile_bytes_slice(
+fn compile_bytes_slice_known_types(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
     string_value: CompiledValue,
     start_value: CompiledValue,
     end_value: CompiledValue,
+    assume_string: bool,
+    assume_int_start: bool,
+    assume_int_end: bool,
 ) -> CompiledValue {
-    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
-    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let start_is_int = builder.ins().icmp_imm(IntCC::Equal, start_value.tag, TAG_INT);
-    builder.ins().trapz(start_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
-    let end_is_int = builder.ins().icmp_imm(IntCC::Equal, end_value.tag, TAG_INT);
-    builder.ins().trapz(end_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    if !assume_string {
+        let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+        builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
+    if !assume_int_start {
+        let start_is_int = builder.ins().icmp_imm(IntCC::Equal, start_value.tag, TAG_INT);
+        builder.ins().trapz(start_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
+    if !assume_int_end {
+        let end_is_int = builder.ins().icmp_imm(IntCC::Equal, end_value.tag, TAG_INT);
+        builder.ins().trapz(end_is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
 
     let len =
         builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
@@ -3720,6 +3866,52 @@ fn compile_bytes_slice(
     builder.ins().store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
 
     CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING), payload: header_ptr }
+}
+
+fn compile_list_len_known_list(
+    builder: &mut FunctionBuilder,
+    list_value: CompiledValue,
+    assume_list: bool,
+) -> CompiledValue {
+    if !assume_list {
+        let is_list = builder.ins().icmp_imm(IntCC::Equal, list_value.tag, TAG_LIST);
+        builder.ins().trapz(is_list, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
+    let len = builder.ins().load(types::I64, MemFlags::new(), list_value.payload, LIST_LEN_OFFSET);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: len }
+}
+
+fn compile_list_get_known_types(
+    builder: &mut FunctionBuilder,
+    list_value: CompiledValue,
+    index_value: CompiledValue,
+    assume_list: bool,
+    assume_int_index: bool,
+) -> CompiledValue {
+    if !assume_list {
+        let is_list = builder.ins().icmp_imm(IntCC::Equal, list_value.tag, TAG_LIST);
+        builder.ins().trapz(is_list, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
+    if !assume_int_index {
+        let is_int = builder.ins().icmp_imm(IntCC::Equal, index_value.tag, TAG_INT);
+        builder.ins().trapz(is_int, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    }
+
+    let len = builder.ins().load(types::I64, MemFlags::new(), list_value.payload, LIST_LEN_OFFSET);
+    let non_neg = builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, index_value.payload, 0);
+    builder.ins().trapz(non_neg, TrapCode::HEAP_OUT_OF_BOUNDS);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index_value.payload, len);
+    builder.ins().trapz(in_bounds, TrapCode::HEAP_OUT_OF_BOUNDS);
+
+    let data_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), list_value.payload, LIST_PTR_OFFSET);
+    let slot_size = builder.ins().iconst(types::I64, VALUE_SIZE);
+    let slot_offset = builder.ins().imul(index_value.payload, slot_size);
+    let slot_addr = builder.ins().iadd(data_ptr, slot_offset);
+    let tag_i8 = builder.ins().load(types::I8, MemFlags::new(), slot_addr, 0);
+    let tag = builder.ins().uextend(types::I64, tag_i8);
+    let payload = builder.ins().load(types::I64, MemFlags::new(), slot_addr, VALUE_PAYLOAD_OFFSET);
+    CompiledValue { tag, payload }
 }
 
 fn compile_bytes_pop(builder: &mut FunctionBuilder, string_value: CompiledValue) -> CompiledValue {
@@ -4442,6 +4634,8 @@ fn compile_list_literal(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let list_new_ref = *func_refs
         .get("list_new")
@@ -4461,6 +4655,8 @@ fn compile_list_literal(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
         let _ = call_binary(builder, func_refs, "list_push", handle, value);
     }
@@ -4517,6 +4713,8 @@ fn compile_multi_value(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let compiled = values
         .iter()
@@ -4531,6 +4729,8 @@ fn compile_multi_value(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             )
         })
         .collect::<Vec<_>>();
@@ -4572,6 +4772,8 @@ fn compile_multi_assign_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let multi_value = compile_ast(
         builder,
@@ -4583,6 +4785,8 @@ fn compile_multi_assign_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let mut last = None;
     for (index, name) in names.iter().enumerate() {
@@ -4746,6 +4950,8 @@ fn compile_list_map(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     assert_eq!(args.len(), 2, "list_map expects 2 arguments");
     validate_unary_callback_ast(&args[1], vars, function_ordinals, function_arities, "list_map");
@@ -4759,6 +4965,8 @@ fn compile_list_map(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let callback = compile_ast(
         builder,
@@ -4770,6 +4978,8 @@ fn compile_list_map(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let output = create_empty_list(builder, func_refs);
     let len = call_unary(builder, func_refs, "list_len", input);
@@ -4820,6 +5030,8 @@ fn compile_list_filter(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     assert_eq!(args.len(), 2, "list_filter expects 2 arguments");
     validate_unary_callback_ast(&args[1], vars, function_ordinals, function_arities, "list_filter");
@@ -4833,6 +5045,8 @@ fn compile_list_filter(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let callback = compile_ast(
         builder,
@@ -4844,6 +5058,8 @@ fn compile_list_filter(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let output = create_empty_list(builder, func_refs);
     let len = call_unary(builder, func_refs, "list_len", input);
@@ -4911,6 +5127,8 @@ fn compile_list_range(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     assert_eq!(args.len(), 2, "list_range expects 2 arguments");
     let start_value = compile_ast(
@@ -4923,6 +5141,8 @@ fn compile_list_range(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let end_value = compile_ast(
         builder,
@@ -4934,6 +5154,8 @@ fn compile_list_range(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let start = expect_int_payload(builder, start_value);
     let end = expect_int_payload(builder, end_value);
@@ -4977,6 +5199,8 @@ fn compile_tail_block(
     env_ptr: Value,
     current_function_name: &str,
     loop_block: Block,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) {
     if block.lines.is_empty() {
         let zero = boxed_int_const(builder, 0);
@@ -4995,6 +5219,8 @@ fn compile_tail_block(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
     }
 
@@ -5010,6 +5236,8 @@ fn compile_tail_block(
         env_ptr,
         current_function_name,
         loop_block,
+        function_analysis,
+        value_kind_analysis,
     );
 }
 
@@ -5025,6 +5253,8 @@ fn compile_tail_ast(
     env_ptr: Value,
     current_function_name: &str,
     loop_block: Block,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) {
     match ast {
         Ast::Expression(ExpressionAst { function, args, .. })
@@ -5043,6 +5273,8 @@ fn compile_tail_ast(
                         closure_metadata,
                         capture_slots,
                         env_ptr,
+                        function_analysis,
+                        value_kind_analysis,
                     )
                 })
                 .collect();
@@ -5065,6 +5297,8 @@ fn compile_tail_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
             let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
@@ -5086,6 +5320,8 @@ fn compile_tail_ast(
                 env_ptr,
                 current_function_name,
                 loop_block,
+                function_analysis,
+                value_kind_analysis,
             );
             builder.seal_block(then_block);
 
@@ -5103,6 +5339,8 @@ fn compile_tail_ast(
                     env_ptr,
                     current_function_name,
                     loop_block,
+                    function_analysis,
+                    value_kind_analysis,
                 );
             } else {
                 let zero = boxed_int_const(builder, 0);
@@ -5122,6 +5360,8 @@ fn compile_tail_ast(
             env_ptr,
             current_function_name,
             loop_block,
+            function_analysis,
+            value_kind_analysis,
         ),
         _ => {
             let val = compile_ast(
@@ -5134,6 +5374,8 @@ fn compile_tail_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             builder.ins().return_(&[val.tag, val.payload]);
         }
@@ -5150,6 +5392,8 @@ fn compile_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     match ast {
         Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, *n),
@@ -5180,6 +5424,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::ListLiteral(items) => compile_list_literal(
             builder,
@@ -5191,6 +5437,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::Index { collection, index, .. } => compile_index_ast(
             builder,
@@ -5203,6 +5451,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::IndexAssign { collection, index, value, .. } => compile_index_assign_ast(
             builder,
@@ -5216,6 +5466,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::Expression(ExpressionAst { function, args, .. }) => compile_expression_ast(
             builder,
@@ -5228,6 +5480,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::Block(block) => compile_block_ast(
             builder,
@@ -5239,6 +5493,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::Variable(name) => resolve_named_value(
             builder,
@@ -5261,6 +5517,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::MultiAssign { names, value, .. } => compile_multi_assign_ast(
             builder,
@@ -5273,6 +5531,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::If { condition, then, else_, .. } => compile_if_ast(
             builder,
@@ -5286,6 +5546,8 @@ fn compile_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ),
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
@@ -5302,7 +5564,12 @@ fn compile_index_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
+    let collection_shape =
+        infer_ast_value_shape(collection, function_analysis, value_kind_analysis);
+    let index_shape = infer_ast_value_shape(index, function_analysis, value_kind_analysis);
     let collection_value = compile_ast(
         builder,
         collection,
@@ -5313,6 +5580,8 @@ fn compile_index_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let index_value = compile_ast(
         builder,
@@ -5324,8 +5593,16 @@ fn compile_index_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
-    call_binary(builder, func_refs, "list_get", collection_value, index_value)
+    if shape_is_exact_kind(&collection_shape, KindSet::list())
+        && shape_is_exact_kind(&index_shape, KindSet::int())
+    {
+        compile_list_get_known_types(builder, collection_value, index_value, true, true)
+    } else {
+        call_binary(builder, func_refs, "list_get", collection_value, index_value)
+    }
 }
 
 fn compile_index_assign_ast(
@@ -5340,6 +5617,8 @@ fn compile_index_assign_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let collection_value = compile_ast(
         builder,
@@ -5351,6 +5630,8 @@ fn compile_index_assign_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let index_value = compile_ast(
         builder,
@@ -5362,6 +5643,8 @@ fn compile_index_assign_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let value = compile_ast(
         builder,
@@ -5373,6 +5656,8 @@ fn compile_index_assign_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     call_ternary(builder, func_refs, "list_set", collection_value, index_value, value)
 }
@@ -5387,6 +5672,8 @@ fn compile_block_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let mut last = None;
     for line in &block.lines {
@@ -5400,6 +5687,8 @@ fn compile_block_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         ));
     }
     last.expect("empty block")
@@ -5416,6 +5705,8 @@ fn compile_assign_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let val = compile_ast(
         builder,
@@ -5427,6 +5718,8 @@ fn compile_assign_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let var = vars.get(name).unwrap_or_else(|| {
         panic!("internal compiler error: assignment target '{name}' has no local slot")
@@ -5448,6 +5741,8 @@ fn compile_if_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     let cond_val = compile_ast(
         builder,
@@ -5459,6 +5754,8 @@ fn compile_if_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     );
     let truth_value = call_unary_scalar(builder, func_refs, "__value_is_truthy", cond_val);
     let cond_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, truth_value, 0);
@@ -5484,6 +5781,8 @@ fn compile_if_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
         builder
             .ins()
@@ -5501,6 +5800,8 @@ fn compile_if_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
         builder
             .ins()
@@ -5527,6 +5828,8 @@ fn compile_if_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
         builder
             .ins()
@@ -5550,7 +5853,84 @@ fn compile_expression_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
+    if matches!(
+        function,
+        "add"
+            | "subtract"
+            | "multiply"
+            | "divide"
+            | "modulo"
+            | "gt"
+            | "lt"
+            | "gte"
+            | "lte"
+            | "eq"
+            | "ne"
+    ) && args.len() == 2
+    {
+        let lhs_shape = infer_ast_value_shape(&args[0], function_analysis, value_kind_analysis);
+        let rhs_shape = infer_ast_value_shape(&args[1], function_analysis, value_kind_analysis);
+        let lhs_exact_int = shape_is_exact_kind(&lhs_shape, KindSet::int());
+        let rhs_exact_int = shape_is_exact_kind(&rhs_shape, KindSet::int());
+        let lhs_exact_bigint = shape_is_exact_kind(&lhs_shape, KindSet::bigint());
+        let rhs_exact_bigint = shape_is_exact_kind(&rhs_shape, KindSet::bigint());
+        if (lhs_exact_int && rhs_exact_int) || (lhs_exact_bigint && rhs_exact_bigint) {
+            let lhs = compile_ast(
+                builder,
+                &args[0],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+                function_analysis,
+                value_kind_analysis,
+            );
+            let rhs = compile_ast(
+                builder,
+                &args[1],
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+                function_analysis,
+                value_kind_analysis,
+            );
+            return if lhs_exact_int && rhs_exact_int {
+                match function {
+                    "add" | "subtract" | "multiply" | "divide" | "modulo" => {
+                        compile_exact_int_binary_op(builder, function, lhs, rhs)
+                    }
+                    _ => compile_exact_int_compare_op(builder, function, lhs, rhs),
+                }
+            } else {
+                match function {
+                    "add" => compile_bigint_builtin(builder, func_refs, "bigint_add", &[lhs, rhs]),
+                    "subtract" => {
+                        compile_bigint_builtin(builder, func_refs, "bigint_subtract", &[lhs, rhs])
+                    }
+                    "multiply" => {
+                        compile_bigint_builtin(builder, func_refs, "bigint_multiply", &[lhs, rhs])
+                    }
+                    "divide" => {
+                        compile_bigint_builtin(builder, func_refs, "bigint_divide", &[lhs, rhs])
+                    }
+                    "modulo" => {
+                        compile_bigint_builtin(builder, func_refs, "bigint_modulo", &[lhs, rhs])
+                    }
+                    _ => compile_exact_bigint_compare_op(builder, func_refs, function, lhs, rhs),
+                }
+            };
+        }
+    }
     if function == "not" {
         assert_eq!(args.len(), 1, "not expects 1 argument");
         return compile_logical_not(
@@ -5563,6 +5943,8 @@ fn compile_expression_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
     }
     if function == "and" || function == "or" {
@@ -5579,6 +5961,8 @@ fn compile_expression_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
     }
     if function == "list_map" {
@@ -5592,6 +5976,8 @@ fn compile_expression_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
     }
     if function == "list_filter" {
@@ -5605,6 +5991,8 @@ fn compile_expression_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
     }
     if function == "list_range" {
@@ -5618,7 +6006,74 @@ fn compile_expression_ast(
             closure_metadata,
             capture_slots,
             env_ptr,
+            function_analysis,
+            value_kind_analysis,
         );
+    }
+    if function == "list_len" {
+        assert_eq!(args.len(), 1, "list_len expects 1 argument");
+        let shape = infer_ast_value_shape(&args[0], function_analysis, value_kind_analysis);
+        let value = compile_ast(
+            builder,
+            &args[0],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        );
+        if shape_is_exact_kind(&shape, KindSet::list()) {
+            return compile_list_len_known_list(builder, value, true);
+        }
+        return call_unary(builder, func_refs, "list_len", value);
+    }
+    if function == "list_get" {
+        assert_eq!(args.len(), 2, "list_get expects 2 arguments");
+        let collection_shape =
+            infer_ast_value_shape(&args[0], function_analysis, value_kind_analysis);
+        let index_shape = infer_ast_value_shape(&args[1], function_analysis, value_kind_analysis);
+        let collection_value = compile_ast(
+            builder,
+            &args[0],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        );
+        let index_value = compile_ast(
+            builder,
+            &args[1],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        );
+        if shape_is_exact_kind(&collection_shape, KindSet::list())
+            && shape_is_exact_kind(&index_shape, KindSet::int())
+        {
+            return compile_list_get_known_types(
+                builder,
+                collection_value,
+                index_value,
+                true,
+                true,
+            );
+        }
+        return call_binary(builder, func_refs, "list_get", collection_value, index_value);
     }
     if let Some(value) = compile_string_expression_ast(
         builder,
@@ -5631,6 +6086,8 @@ fn compile_expression_ast(
         closure_metadata,
         capture_slots,
         env_ptr,
+        function_analysis,
+        value_kind_analysis,
     ) {
         return value;
     }
@@ -5648,6 +6105,8 @@ fn compile_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             )
         })
         .collect();
@@ -5679,10 +6138,13 @@ fn compile_string_expression_ast(
     closure_metadata: &HashMap<String, ClosureMetadata>,
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> Option<CompiledValue> {
     match function {
         "bytes_len" => {
             assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
+            let shape = infer_ast_value_shape(&args[0], function_analysis, value_kind_analysis);
             let value = compile_ast(
                 builder,
                 &args[0],
@@ -5693,11 +6155,21 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
-            Some(compile_bytes_len(builder, value))
+            Some(compile_bytes_len_known_string(
+                builder,
+                value,
+                shape_is_exact_kind(&shape, KindSet::string()),
+            ))
         }
         "bytes_get" => {
             assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
+            let string_shape =
+                infer_ast_value_shape(&args[0], function_analysis, value_kind_analysis);
+            let index_shape =
+                infer_ast_value_shape(&args[1], function_analysis, value_kind_analysis);
             let string_value = compile_ast(
                 builder,
                 &args[0],
@@ -5708,6 +6180,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let index_value = compile_ast(
                 builder,
@@ -5719,8 +6193,16 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
-            Some(compile_bytes_get(builder, string_value, index_value))
+            Some(compile_bytes_get_known_types(
+                builder,
+                string_value,
+                index_value,
+                shape_is_exact_kind(&string_shape, KindSet::string()),
+                shape_is_exact_kind(&index_shape, KindSet::int()),
+            ))
         }
         "bytes_pop" => {
             assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
@@ -5734,6 +6216,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_bytes_pop(builder, string_value))
         }
@@ -5749,6 +6233,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let byte_value = compile_ast(
                 builder,
@@ -5760,6 +6246,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_bytes_push(builder, func_refs, string_value, byte_value))
         }
@@ -5775,6 +6263,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let index_value = compile_ast(
                 builder,
@@ -5786,6 +6276,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let byte_value = compile_ast(
                 builder,
@@ -5797,6 +6289,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_bytes_insert(builder, func_refs, string_value, index_value, byte_value))
         }
@@ -5812,6 +6306,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let index_value = compile_ast(
                 builder,
@@ -5823,6 +6319,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_bytes_remove(builder, string_value, index_value))
         }
@@ -5838,6 +6336,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let index_value = compile_ast(
                 builder,
@@ -5849,6 +6349,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let byte_value = compile_ast(
                 builder,
@@ -5860,11 +6362,18 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_bytes_set(builder, string_value, index_value, byte_value))
         }
         "bytes_slice" => {
             assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
+            let string_shape =
+                infer_ast_value_shape(&args[0], function_analysis, value_kind_analysis);
+            let start_shape =
+                infer_ast_value_shape(&args[1], function_analysis, value_kind_analysis);
+            let end_shape = infer_ast_value_shape(&args[2], function_analysis, value_kind_analysis);
             let string_value = compile_ast(
                 builder,
                 &args[0],
@@ -5875,6 +6384,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let start_value = compile_ast(
                 builder,
@@ -5886,6 +6397,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let end_value = compile_ast(
                 builder,
@@ -5897,8 +6410,19 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
-            Some(compile_bytes_slice(builder, func_refs, string_value, start_value, end_value))
+            Some(compile_bytes_slice_known_types(
+                builder,
+                func_refs,
+                string_value,
+                start_value,
+                end_value,
+                shape_is_exact_kind(&string_shape, KindSet::string()),
+                shape_is_exact_kind(&start_shape, KindSet::int()),
+                shape_is_exact_kind(&end_shape, KindSet::int()),
+            ))
         }
         "string_chars" => {
             assert_eq!(args.len(), 1, "string_chars expects 1 argument");
@@ -5912,6 +6436,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_string_chars(builder, func_refs, string_value))
         }
@@ -5927,6 +6453,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_string_iter_done(builder, iter_value))
         }
@@ -5942,6 +6470,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_string_iter_next(builder, iter_value))
         }
@@ -5957,6 +6487,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_string_copy(builder, func_refs, string_value))
         }
@@ -5972,6 +6504,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             let rhs = compile_ast(
                 builder,
@@ -5983,6 +6517,8 @@ fn compile_string_expression_ast(
                 closure_metadata,
                 capture_slots,
                 env_ptr,
+                function_analysis,
+                value_kind_analysis,
             );
             Some(compile_string_concat(builder, func_refs, lhs, rhs))
         }
@@ -6405,6 +6941,201 @@ fn ir_contains_overflow_trap_for_add() {
     let ir = Module::from_source(src).compile_to_ir();
     assert!(ir.contains("; fn main"));
     assert!(ir.contains("function"));
+}
+
+#[cfg(test)]
+fn extract_function_ir<'a>(ir: &'a str, name: &str) -> &'a str {
+    let marker = format!("; fn {name}\n");
+    let start = ir.find(&marker).expect("function marker should exist");
+    let rest = &ir[start..];
+    let next = rest.find("\n\n; fn ").unwrap_or(rest.len());
+    &rest[..next]
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+fn compile_llvm_wasm_assembly_for_test(src: &str) -> String {
+    String::from_utf8(
+        llvm_backend::compile_to_wasm_assembly(Module::from_source(src), "llvm_opt_test")
+            .expect("llvm wasm assembly should compile"),
+    )
+    .expect("llvm wasm assembly should be utf-8 text")
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+fn extract_llvm_wasm_symbol_asm<'a>(asm: &'a str, symbol: &str) -> &'a str {
+    let marker = format!("{symbol}:");
+    let start = asm.find(&marker).expect("llvm wasm symbol should exist");
+    let rest = &asm[start..];
+    let search = &rest[marker.len()..];
+    let mut next = rest.len();
+    for pattern in [
+        "\n.functype\t",
+        "\n.functype ",
+        "\n.section\t",
+        "\n.section ",
+        "\n.hidden\t",
+        "\n.hidden ",
+        "\n.globl\t",
+        "\n.globl ",
+    ] {
+        if let Some(pos) = search.find(pattern) {
+            next = next.min(marker.len() + pos);
+        }
+    }
+    &rest[..next]
+}
+
+#[test]
+fn ir_bytes_len_known_string_omits_bad_conversion_trap_in_main() {
+    let src = "fn main() do\n    bytes_len(\"abc\")\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(!main_ir.contains("bad_conversion_to_integer"));
+}
+
+#[test]
+fn ir_bytes_get_known_types_keep_bounds_trap_but_omit_type_traps_in_main() {
+    let src = "fn main() do\n    i = 1\n    bytes_get(\"abc\", i)\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(!main_ir.contains("bad_conversion_to_integer"));
+    assert!(main_ir.contains("heap_oob"));
+}
+
+#[test]
+fn ir_bytes_slice_known_types_keep_bounds_trap_but_omit_type_traps_in_main() {
+    let src = "fn main() do\n    end_index = 2\n    bytes_slice(\"abc\", 0, end_index)\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(!main_ir.contains("bad_conversion_to_integer"));
+    assert!(main_ir.contains("heap_oob"));
+}
+
+#[test]
+fn ir_list_len_known_list_omits_bad_conversion_trap_in_main() {
+    let src = "fn main() do\n    list_len([1, 2, 3])\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(!main_ir.contains("bad_conversion_to_integer"));
+}
+
+#[test]
+fn ir_list_get_known_types_keep_bounds_trap_but_omit_type_traps_in_main() {
+    let src = "fn main() do\n    i = 1\n    list_get([1, 2, 3], i)\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(!main_ir.contains("bad_conversion_to_integer"));
+    assert!(main_ir.contains("heap_oob"));
+}
+
+#[test]
+fn ir_index_known_types_keep_bounds_trap_but_omit_type_traps_in_main() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    i = 1\n    xs[i]\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(!main_ir.contains("bad_conversion_to_integer"));
+    assert!(main_ir.contains("heap_oob"));
+}
+
+#[test]
+fn ir_exact_int_add_is_lowered_directly_in_main() {
+    let src = "fn main() do\n    1 + 2\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(main_ir.contains("sadd_overflow"));
+}
+
+#[test]
+fn ir_exact_int_compare_is_lowered_directly_in_main() {
+    let src = "fn main() do\n    1 < 2\nend";
+    let ir = Module::from_source(src).compile_to_ir();
+    let main_ir = extract_function_ir(&ir, "main");
+    assert!(main_ir.contains("icmp"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_bytes_len_known_string_omits_type_trap_labels_in_main() {
+    let src = "fn main() do\n    bytes_len(\"abc\")\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("bytes_len_trap"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_bytes_get_known_types_keep_bounds_trap_but_omit_type_traps_in_main() {
+    let src = "fn main() do\n    i = 1\n    bytes_get(\"abc\", i)\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("bytes_get_string_trap"));
+    assert!(!main_asm.contains("bytes_get_idx_trap"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_bytes_slice_known_types_keep_bounds_trap_but_omit_type_traps_in_main() {
+    let src = "fn main() do\n    end_index = 2\n    bytes_slice(\"abc\", 0, end_index)\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("bytes_slice_string_trap"));
+    assert!(!main_asm.contains("bytes_slice_start_trap"));
+    assert!(!main_asm.contains("bytes_slice_end_trap"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_list_len_known_list_omits_runtime_call_in_main() {
+    let src = "fn main() do\n    list_len([1, 2, 3])\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("__rt_list_len"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_list_get_known_types_keep_bounds_trap_but_omit_runtime_call_in_main() {
+    let src = "fn main() do\n    i = 1\n    list_get([1, 2, 3], i)\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("__rt_list_get"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_index_known_types_keep_bounds_trap_but_omit_runtime_call_in_main() {
+    let src = "fn main() do\n    xs = [1, 2, 3]\n    i = 1\n    xs[i]\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("__rt_list_get"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_exact_int_add_omits_generic_operator_call_in_main() {
+    let src = "fn main() do\n    1 + 2\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("__op_add"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_exact_int_compare_omits_generic_operator_call_in_main() {
+    let src = "fn main() do\n    1 < 2\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("__op_lt"));
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_exact_bigint_add_uses_bigint_path_not_generic_operator_in_main() {
+    let src = "fn main() do\n    10000000000000000000n + 2n\nend";
+    let asm = compile_llvm_wasm_assembly_for_test(src);
+    let main_asm = extract_llvm_wasm_symbol_asm(&asm, "__expr_internal_main");
+    assert!(!main_asm.contains("__op_add"));
+    assert!(main_asm.contains("bigint_add"));
 }
 
 #[test]
