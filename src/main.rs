@@ -196,15 +196,19 @@ fn format_kind_set(kinds: KindSet) -> String {
 }
 
 fn format_value_shape(shape: &ValueShape) -> String {
-    if shape.arity() == 1 {
-        return shape
-            .slot(0)
-            .map(format_kind_set)
-            .unwrap_or_else(|| "unknown".to_string());
+    if let Some(items) = shape.list_items() {
+        return format!("list<{}>", format_kind_set(items));
     }
 
-    let slots =
-        shape.slots().iter().copied().map(format_kind_set).collect::<Vec<_>>().join(", ");
+    if shape.arity() == 1 {
+        return shape.slot(0).map(format_kind_set).unwrap_or_else(|| "unknown".to_string());
+    }
+
+    let slots = (0..shape.arity())
+        .filter_map(|index| shape.slot(index))
+        .map(format_kind_set)
+        .collect::<Vec<_>>()
+        .join(", ");
     format!("({slots})")
 }
 
@@ -235,11 +239,11 @@ fn collect_ast_type_annotations(
 ) {
     match ast {
         Ast::Assign { name, span, .. } => {
-            if let (Some(span), Some(kinds)) = (span.as_ref(), analysis.variables.get(name)) {
+            if let (Some(span), Some(shape)) = (span.as_ref(), analysis.variables.get(name)) {
                 add_annotation(
                     annotations,
                     offset_to_line_col(source, span.start).line,
-                    format!("{name}: {}", format_kind_set(*kinds)),
+                    format!("{name}: {}", format_value_shape(shape)),
                 );
             }
         }
@@ -248,7 +252,10 @@ fn collect_ast_type_annotations(
                 let vars = names
                     .iter()
                     .filter_map(|name| {
-                        analysis.variables.get(name).map(|kinds| format!("{name}: {}", format_kind_set(*kinds)))
+                        analysis
+                            .variables
+                            .get(name)
+                            .map(|shape| format!("{name}: {}", format_value_shape(shape)))
                     })
                     .collect::<Vec<_>>();
                 if !vars.is_empty() {
@@ -267,12 +274,17 @@ fn collect_ast_type_annotations(
             }
         }
         Ast::Block(block) => collect_block_type_annotations(source, block, analysis, annotations),
-        Ast::IndexAssign { value, .. } => collect_ast_type_annotations(source, value, analysis, annotations),
+        Ast::IndexAssign { value, .. } => {
+            collect_ast_type_annotations(source, value, analysis, annotations)
+        }
         _ => {}
     }
 }
 
-fn format_function_annotation(function: &FunctionDefAst, analysis: &FunctionValueKindAnalysis) -> String {
+fn format_function_annotation(
+    function: &FunctionDefAst,
+    analysis: &FunctionValueKindAnalysis,
+) -> String {
     let mut parts = vec![];
     if !function.inputs.is_empty() {
         let inputs = function
@@ -280,8 +292,12 @@ fn format_function_annotation(function: &FunctionDefAst, analysis: &FunctionValu
             .iter()
             .enumerate()
             .map(|(index, name)| {
-                let kinds = analysis.inputs.get(index).copied().unwrap_or_else(KindSet::empty);
-                format!("{name}: {}", format_kind_set(kinds))
+                let shape = analysis
+                    .inputs
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| ValueShape::scalar(KindSet::empty()));
+                format!("{name}: {}", format_value_shape(&shape))
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -306,10 +322,7 @@ fn parse_user_functions_for_debug(source: &str) -> Result<Vec<FunctionDefAst>, C
             Ok(Ast::FunctionDef(func)) => functions.push(func),
             Ok(_) => return Err(CompileError::TopLevelExpression),
             Err(err) => {
-                return Err(CompileError::Parse {
-                    message: err.to_string(),
-                    span: Some(err.span),
-                });
+                return Err(CompileError::Parse { message: err.to_string(), span: Some(err.span) });
             }
         }
     }
@@ -332,7 +345,12 @@ fn format_debug_types(
                 format_function_annotation(function, function_analysis),
             );
         }
-        collect_block_type_annotations(source, &function.block, function_analysis, &mut annotations);
+        collect_block_type_annotations(
+            source,
+            &function.block,
+            function_analysis,
+            &mut annotations,
+        );
     }
 
     let mut rendered = String::new();
@@ -451,8 +469,8 @@ fn maybe_handle_debug_types(cli: &CliArgs, input: &Path, source: &str) -> Result
 
     let module =
         Module::try_from_source(source).map_err(|err| format_compile_error(input, source, &err))?;
-    let user_functions =
-        parse_user_functions_for_debug(source).map_err(|err| format_compile_error(input, source, &err))?;
+    let user_functions = parse_user_functions_for_debug(source)
+        .map_err(|err| format_compile_error(input, source, &err))?;
     let rendered = format_debug_types(source, &user_functions, &module)
         .map_err(|err| format_compile_error(input, source, &err))?;
     print!("{rendered}");
@@ -784,14 +802,27 @@ mod tests {
 
     #[test]
     fn format_debug_types_includes_function_and_assignment_annotations() {
-        let source = "fn main() do\n    ok, value, err = string_try_parse_bigint(\"12\")\n    value\nend\n";
+        let source =
+            "fn main() do\n    ok, value, err = string_try_parse_bigint(\"12\")\n    value\nend\n";
         let module = Module::try_from_source(source).expect("source should parse");
         let user_functions =
             parse_user_functions_for_debug(source).expect("user functions should parse");
-        let rendered =
-            format_debug_types(source, &user_functions, &module).expect("debug types should render");
+        let rendered = format_debug_types(source, &user_functions, &module)
+            .expect("debug types should render");
         assert!(rendered.contains("#? returns bigint"));
         assert!(rendered.contains("#? ok: int, value: bigint, err: string"));
+    }
+
+    #[test]
+    fn format_debug_types_includes_list_item_kinds() {
+        let source = "fn main(args) do\n    xs = [1, \"a\"]\n    args\nend\n";
+        let module = Module::try_from_source(source).expect("source should parse");
+        let user_functions =
+            parse_user_functions_for_debug(source).expect("user functions should parse");
+        let rendered = format_debug_types(source, &user_functions, &module)
+            .expect("debug types should render");
+        assert!(rendered.contains("#? inputs [args: list<string>]; returns list<string>"));
+        assert!(rendered.contains("#? xs: list<int | string>"));
     }
 
     #[test]

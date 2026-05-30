@@ -1231,9 +1231,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
 #[cfg(all(test, feature = "wasi"))]
 mod tests {
     use super::*;
+    use std::sync::Once;
+
+    fn ensure_host_target_initialized() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            Target::initialize_native(&InitializationConfig::default())
+                .expect("failed to initialize native LLVM target for wasi tests");
+        });
+    }
 
     #[test]
     fn declare_wasi_preview1_import_supports_known_imports() {
+        ensure_host_target_initialized();
         let (context, module, _target_machine) =
             create_codegen_context("wasi_imports_test", LlvmTargetKind::Host);
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);
@@ -1263,6 +1273,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unsupported WASI Preview 1 import")]
     fn declare_wasi_preview1_import_rejects_unknown_imports() {
+        ensure_host_target_initialized();
         let (context, module, _target_machine) =
             create_codegen_context("wasi_imports_panic_test", LlvmTargetKind::Host);
         let mut compiler = LlvmCompiler::new(context, module, LlvmRuntimeMode::WasiPreview1Command);

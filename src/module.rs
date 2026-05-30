@@ -602,8 +602,8 @@ impl Module {
         output: &Path,
         backend: CodegenBackend,
     ) -> Result<(), CompileError> {
-        self.validate_user_facing_constructs()?;
         self.validate_native_main_arity()?;
+        self.validate_user_facing_constructs()?;
         if is_component_wasm_output(output) {
             match backend {
                 CodegenBackend::Llvm => {
@@ -2100,37 +2100,31 @@ fn validate_ast_user_facing(
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
         Ast::FunctionRef(name) => validate_function_reference(name, function_names),
-        Ast::MultiValue(values) => {
-            validate_ast_sequence(
-                values,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )
-        }
-        Ast::ListLiteral(items) => {
-            validate_ast_sequence(
-                items,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )
-        }
-        Ast::Index { collection, index, .. } => {
-            validate_index_ast(
-                collection,
-                index,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )
-        }
+        Ast::MultiValue(values) => validate_ast_sequence(
+            values,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
+        Ast::ListLiteral(items) => validate_ast_sequence(
+            items,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
+        Ast::Index { collection, index, .. } => validate_index_ast(
+            collection,
+            index,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
         Ast::IndexAssign { collection, index, value, .. } => validate_index_assign_ast(
             collection,
             index,
@@ -2153,36 +2147,30 @@ fn validate_ast_user_facing(
                 function_analysis,
             )
         }
-        Ast::Block(block) => {
-            validate_ast_sequence(
-                &block.lines,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )
-        }
-        Ast::Assign { value, .. } => {
-            validate_ast_user_facing(
-                value,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )
-        }
-        Ast::MultiAssign { value, .. } => {
-            validate_ast_user_facing(
-                value,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )
-        }
+        Ast::Block(block) => validate_ast_sequence(
+            &block.lines,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
+        Ast::Assign { value, .. } => validate_ast_user_facing(
+            value,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
+        Ast::MultiAssign { value, .. } => validate_ast_user_facing(
+            value,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
         Ast::If { condition, then, else_, .. } => validate_if_ast_user_facing(
             condition,
             then,
@@ -2542,7 +2530,32 @@ fn validate_index_ast(
         function_arities,
         value_kind_analysis,
         function_analysis,
-    )
+    )?;
+
+    let collection_kinds =
+        infer_ast_value_shape(collection, function_analysis, value_kind_analysis).scalar_slot();
+    let index_kinds =
+        infer_ast_value_shape(index, function_analysis, value_kind_analysis).scalar_slot();
+    let expected_collection = KindSet::string().union(KindSet::list());
+    if !collection_kinds.is_empty() && !kind_sets_intersect(collection_kinds, expected_collection) {
+        return Err(CompileError::InvalidArgumentType {
+            function: "index access".to_string(),
+            argument: 1,
+            expected: format_kind_set_for_error(expected_collection),
+            found: format_kind_set_for_error(collection_kinds),
+            span: span_of_ast(collection),
+        });
+    }
+    if !index_kinds.is_empty() && !kind_sets_intersect(index_kinds, KindSet::int()) {
+        return Err(CompileError::InvalidArgumentType {
+            function: "index access".to_string(),
+            argument: 2,
+            expected: "int".to_string(),
+            found: format_kind_set_for_error(index_kinds),
+            span: span_of_ast(index),
+        });
+    }
+    Ok(())
 }
 
 fn validate_index_assign_ast(
@@ -2578,7 +2591,47 @@ fn validate_index_assign_ast(
         function_arities,
         value_kind_analysis,
         function_analysis,
-    )
+    )?;
+
+    let collection_kinds =
+        infer_ast_value_shape(collection, function_analysis, value_kind_analysis).scalar_slot();
+    let index_kinds =
+        infer_ast_value_shape(index, function_analysis, value_kind_analysis).scalar_slot();
+    let value_kinds =
+        infer_ast_value_shape(value, function_analysis, value_kind_analysis).scalar_slot();
+    let expected_collection = KindSet::string().union(KindSet::list());
+    if !collection_kinds.is_empty() && !kind_sets_intersect(collection_kinds, expected_collection) {
+        return Err(CompileError::InvalidArgumentType {
+            function: "index assignment".to_string(),
+            argument: 1,
+            expected: format_kind_set_for_error(expected_collection),
+            found: format_kind_set_for_error(collection_kinds),
+            span: span_of_ast(collection),
+        });
+    }
+    if !index_kinds.is_empty() && !kind_sets_intersect(index_kinds, KindSet::int()) {
+        return Err(CompileError::InvalidArgumentType {
+            function: "index assignment".to_string(),
+            argument: 2,
+            expected: "int".to_string(),
+            found: format_kind_set_for_error(index_kinds),
+            span: span_of_ast(index),
+        });
+    }
+    if collection_kinds.contains(ValueKind::String)
+        && !collection_kinds.contains(ValueKind::List)
+        && !value_kinds.is_empty()
+        && !kind_sets_intersect(value_kinds, KindSet::int())
+    {
+        return Err(CompileError::InvalidArgumentType {
+            function: "index assignment".to_string(),
+            argument: 3,
+            expected: "int".to_string(),
+            found: format_kind_set_for_error(value_kinds),
+            span: span_of_ast(value),
+        });
+    }
+    Ok(())
 }
 
 fn validate_expression_user_facing(
@@ -2704,12 +2757,22 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
     const FUNCTION: BuiltinArgSpec = Spec { expected: KindSet::function() };
 
     match function {
-        "bytes_len" | "bytes_pop" | "string_copy" | "string_chars" | "string_first"
-        | "string_last" | "string_try_first" | "string_try_last" | "string_try_pop"
-        | "string_is_empty" | "string_is_not_empty" | "string_len" | "string_is_ascii"
-        | "string_is_integer" | "string_try_parse_integer" | "string_try_parse_bigint" => {
-            Some(&[STRING])
-        }
+        "bytes_len"
+        | "bytes_pop"
+        | "string_copy"
+        | "string_chars"
+        | "string_first"
+        | "string_last"
+        | "string_try_first"
+        | "string_try_last"
+        | "string_try_pop"
+        | "string_is_empty"
+        | "string_is_not_empty"
+        | "string_len"
+        | "string_is_ascii"
+        | "string_is_integer"
+        | "string_try_parse_integer"
+        | "string_try_parse_bigint" => Some(&[STRING]),
         "bytes_get" | "bytes_try_get" => Some(&[STRING, INT]),
         "bytes_slice" => Some(&[STRING, INT, INT]),
         "bytes_remove" => Some(&[STRING, INT]),
@@ -2728,7 +2791,8 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
         "list_map" | "list_filter" => Some(&[LIST, FUNCTION]),
         "list_range" => Some(&[INT, INT]),
         "bigint_from_int" => Some(&[INT]),
-        "bigint_compare" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
+        "add" | "subtract" | "multiply" | "divide" | "modulo" | "gt" | "lt" | "gte" | "lte"
+        | "bigint_compare" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
         | "bigint_divide" | "bigint_modulo" => Some(&[BIGINT_OR_INT, BIGINT_OR_INT]),
         _ => None,
     }
@@ -2766,7 +2830,8 @@ fn validate_expression_argument_types(
         let Some(arg) = args.get(index) else {
             break;
         };
-        let actual = infer_ast_value_shape(arg, function_analysis, value_kind_analysis).scalar_slot();
+        let actual =
+            infer_ast_value_shape(arg, function_analysis, value_kind_analysis).scalar_slot();
         if actual.is_empty() {
             continue;
         }
@@ -2806,15 +2871,27 @@ fn infer_ast_value_shape(
         Ast::Literal(LiteralAst::Integer(_)) => ValueShape::scalar(KindSet::int()),
         Ast::Literal(LiteralAst::BigInt(_)) => ValueShape::scalar(KindSet::bigint()),
         Ast::Literal(LiteralAst::String(_)) => ValueShape::scalar(KindSet::string()),
-        Ast::Variable(name) => ValueShape::scalar(
-            function_analysis.variables.get(name.as_str()).copied().unwrap_or_else(KindSet::empty),
-        ),
+        Ast::Variable(name) => function_analysis
+            .variables
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or_else(|| ValueShape::scalar(KindSet::empty())),
         Ast::FunctionRef(_) | Ast::Lambda { .. } => ValueShape::scalar(KindSet::function()),
-        Ast::ListLiteral(_) => ValueShape::scalar(KindSet::list()),
+        Ast::ListLiteral(items) => {
+            ValueShape::list(items.iter().fold(KindSet::empty(), |kinds, item| {
+                kinds.union(
+                    infer_ast_value_shape(item, function_analysis, value_kind_analysis)
+                        .scalar_slot(),
+                )
+            }))
+        }
         Ast::MultiValue(values) => ValueShape::from_slots(
             values
                 .iter()
-                .map(|value| infer_ast_value_shape(value, function_analysis, value_kind_analysis).scalar_slot())
+                .map(|value| {
+                    infer_ast_value_shape(value, function_analysis, value_kind_analysis)
+                        .scalar_slot()
+                })
                 .collect(),
         ),
         Ast::Expression(ExpressionAst { function, args, .. }) => {
@@ -2824,6 +2901,27 @@ fn infer_ast_value_shape(
                 .collect::<Vec<_>>();
             if let Some(function_info) = value_kind_analysis.functions.get(function) {
                 return function_info.returns.clone();
+            }
+            if function == "list_map" {
+                let items = args
+                    .get(1)
+                    .and_then(|callback| {
+                        infer_known_callback_return_shape(
+                            callback,
+                            function_analysis,
+                            value_kind_analysis,
+                        )
+                    })
+                    .map(|shape| shape.scalar_slot())
+                    .unwrap_or_else(KindSet::empty);
+                return ValueShape::list(items);
+            }
+            if function == "list_filter" {
+                return arg_shapes
+                    .first()
+                    .and_then(ValueShape::list_items)
+                    .map(ValueShape::list)
+                    .unwrap_or_else(|| ValueShape::list(KindSet::empty()));
             }
             infer_builtin_value_shape(function, &arg_shapes)
         }
@@ -2853,13 +2951,16 @@ fn infer_ast_value_shape(
             }
         }
         Ast::Index { collection, .. } => {
-            let collection_kinds =
-                infer_ast_value_shape(collection, function_analysis, value_kind_analysis).scalar_slot();
+            let collection_shape =
+                infer_ast_value_shape(collection, function_analysis, value_kind_analysis);
+            let collection_kinds = collection_shape.scalar_slot();
             let mut result = KindSet::empty();
             if collection_kinds.contains(ValueKind::String) {
                 result = result.union(KindSet::int());
             }
-            if collection_kinds.contains(ValueKind::List) {
+            if let Some(items) = collection_shape.list_items() {
+                result = result.union(items);
+            } else if collection_kinds.contains(ValueKind::List) {
                 result = result.union(KindSet::any());
             }
             ValueShape::scalar(result)
@@ -2872,7 +2973,9 @@ fn infer_ast_value_shape(
 }
 
 fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> ValueShape {
-    let scalar_arg = |index: usize| arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any);
+    let scalar_arg = |index: usize| {
+        arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any)
+    };
     match function {
         "add" | "subtract" | "multiply" | "divide" | "modulo" => {
             ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1)))
@@ -2880,11 +2983,26 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
             ValueShape::scalar(KindSet::int())
         }
-        "bytes_len" | "bytes_get" | "bytes_pop" | "string_iter_done" | "string_iter_next"
-        | "string_first" | "string_last" | "string_try_first" | "string_try_last"
-        | "bytes_try_get" | "string_try_pop" | "string_len" | "string_is_empty"
-        | "string_is_not_empty" | "string_starts_with" | "string_ends_with"
-        | "string_contains" | "string_is_ascii" | "string_all" | "string_any"
+        "bytes_len"
+        | "bytes_get"
+        | "bytes_pop"
+        | "string_iter_done"
+        | "string_iter_next"
+        | "string_first"
+        | "string_last"
+        | "string_try_first"
+        | "string_try_last"
+        | "bytes_try_get"
+        | "string_try_pop"
+        | "string_len"
+        | "string_is_empty"
+        | "string_is_not_empty"
+        | "string_starts_with"
+        | "string_ends_with"
+        | "string_contains"
+        | "string_is_ascii"
+        | "string_all"
+        | "string_any"
         | "string_is_integer" => ValueShape::scalar(KindSet::int()),
         "bigint_compare" => ValueShape::scalar(KindSet::int()),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
@@ -2893,13 +3011,20 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
             ValueShape::scalar(KindSet::string())
         }
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
-        "list_new" | "list_range" | "list_copy" | "list_map" | "list_filter" => {
-            ValueShape::scalar(KindSet::list())
-        }
+        "list_new" => ValueShape::list(KindSet::empty()),
+        "list_range" => ValueShape::list(KindSet::int()),
+        "list_copy" | "list_filter" => arg_shapes
+            .first()
+            .and_then(ValueShape::list_items)
+            .map(ValueShape::list)
+            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
+        "list_map" => ValueShape::list(KindSet::empty()),
         "list_len" | "list_push" | "list_insert" | "list_set" | "list_swap" => {
             ValueShape::scalar(KindSet::int())
         }
-        "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(KindSet::any()),
+        "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
+        ),
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
         }
@@ -2907,6 +3032,31 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
             ValueShape::from_slots(vec![KindSet::int(), KindSet::bigint(), KindSet::string()])
         }
         _ => ValueShape::scalar(KindSet::any()),
+    }
+}
+
+fn infer_known_callback_return_shape(
+    callback: &Ast,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> Option<ValueShape> {
+    match callback {
+        Ast::FunctionRef(name) => value_kind_analysis
+            .functions
+            .get(name.as_ref())
+            .map(|analysis| analysis.returns.clone()),
+        Ast::Variable(name) if !function_analysis.variables.contains_key(name.as_str()) => {
+            value_kind_analysis
+                .functions
+                .get(name.as_ref())
+                .map(|analysis| analysis.returns.clone())
+        }
+        Ast::Variable(name) => function_analysis
+            .function_bindings
+            .get(name.as_str())
+            .and_then(|binding| value_kind_analysis.functions.get(binding))
+            .map(|analysis| analysis.returns.clone()),
+        _ => None,
     }
 }
 
@@ -2921,6 +3071,24 @@ fn infer_numeric_result_kind(lhs: KindSet, rhs: KindSet) -> KindSet {
         (true, false) => KindSet::int(),
         (false, true) => KindSet::bigint(),
         (false, false) => KindSet::any(),
+    }
+}
+
+fn span_of_ast(ast: &Ast) -> Option<Span> {
+    match ast {
+        Ast::Variable(name) | Ast::FunctionRef(name) => name.span.clone(),
+        Ast::Expression(ExpressionAst { function_span, .. }) => function_span.clone(),
+        Ast::Index { span, .. }
+        | Ast::IndexAssign { span, .. }
+        | Ast::Assign { span, .. }
+        | Ast::MultiAssign { span, .. }
+        | Ast::If { span, .. } => span.clone(),
+        Ast::FunctionDef(func) => func.span.clone(),
+        Ast::Block(_)
+        | Ast::Lambda { .. }
+        | Ast::MultiValue(_)
+        | Ast::Literal(_)
+        | Ast::ListLiteral(_) => None,
     }
 }
 
@@ -6925,10 +7093,264 @@ fn try_compile_to_jit_rejects_invalid_bigint_builtin_argument_type() {
 }
 
 #[test]
+fn try_compile_to_jit_rejects_invalid_arithmetic_argument_type() {
+    let src = "fn main() do\n    \"a\" + 1\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "add");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "int | bigint");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_ordered_comparison_argument_type() {
+    let src = "fn main() do\n    1 < \"a\"\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "lt");
+            assert_eq!(argument, 2);
+            assert_eq!(expected, "int | bigint");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn try_compile_to_jit_allows_unknown_builtin_argument_types() {
     let src = "fn f(x) do\n    bytes_len(x)\nend\n\nfn main() do\n    0\nend";
     let module = Module::try_from_source(src).expect("source should parse");
     module.try_compile_to_jit().expect("unknown parameter type should stay runtime-checked");
+}
+
+#[test]
+fn try_compile_to_jit_allows_unknown_arithmetic_argument_types() {
+    let src = "fn f(x) do\n    x + 1\nend\n\nfn main() do\n    0\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    module.try_compile_to_jit().expect("unknown parameter type should stay runtime-checked");
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_index_collection_type() {
+    let src = "fn main() do\n    1[0]\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "index access");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string | list");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_index_type() {
+    let src = "fn main() do\n    xs = [1]\n    xs[\"0\"]\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "index access");
+            assert_eq!(argument, 2);
+            assert_eq!(expected, "int");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_index_assignment_value_type() {
+    let src = "fn main() do\n    s = \"abc\"\n    s[0] = list_new()\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "index assignment");
+            assert_eq!(argument, 3);
+            assert_eq!(expected, "int");
+            assert_eq!(found, "list");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_get() {
+    let src = "fn main() do\n    xs = [1]\n    bytes_len(list_get(xs, 0))\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_index() {
+    let src = "fn main() do\n    xs = [1]\n    bytes_len(xs[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map() {
+    let src = "fn double(x) do\n    x * 2\nend\n\nfn main() do\n    xs = [1]\n    ys = list_map(xs, double)\n    bytes_len(ys[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_filter() {
+    let src = "fn main() do\n    xs = [1, 2]\n    ys = list_filter(xs, fn item -> item > 1 end)\n    bytes_len(ys[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_function_alias() {
+    let src = "fn double(x) do\n    x * 2\nend\n\nfn main() do\n    f = double\n    xs = [1]\n    ys = list_map(xs, f)\n    bytes_len(ys[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_inline_lambda() {
+    let src = "fn main() do\n    xs = [1]\n    ys = list_map(xs, fn item -> item * 2 end)\n    bytes_len(ys[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_lambda_alias() {
+    let src = "fn main() do\n    f = fn item -> item * 2 end\n    xs = [1]\n    ys = list_map(xs, f)\n    bytes_len(ys[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_arithmetic_after_list_filter() {
+    let src = "fn main() do\n    xs = [\"a\", \"b\"]\n    ys = list_filter(xs, fn item -> string_is_not_empty(item) end)\n    ys[0] + 1\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "add");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "int | bigint");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

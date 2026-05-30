@@ -86,13 +86,19 @@ impl KindSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValueShape {
-    slots: Vec<KindSet>,
+pub enum ValueShape {
+    Scalar(KindSet),
+    Multi(Vec<KindSet>),
+    List { items: KindSet },
 }
 
 impl ValueShape {
     pub fn scalar(kinds: KindSet) -> Self {
-        Self { slots: vec![kinds] }
+        Self::Scalar(kinds)
+    }
+
+    pub fn list(items: KindSet) -> Self {
+        Self::List { items }
     }
 
     pub fn unknown_scalar() -> Self {
@@ -100,45 +106,66 @@ impl ValueShape {
     }
 
     pub fn unknown_with_arity(arity: usize) -> Self {
-        Self { slots: vec![KindSet::empty(); arity] }
+        if arity == 1 {
+            Self::scalar(KindSet::empty())
+        } else {
+            Self::Multi(vec![KindSet::empty(); arity])
+        }
     }
 
     pub fn from_slots(slots: Vec<KindSet>) -> Self {
-        Self { slots }
+        if slots.len() == 1 { Self::scalar(slots[0]) } else { Self::Multi(slots) }
     }
 
     pub fn arity(&self) -> usize {
-        self.slots.len()
+        match self {
+            Self::Scalar(_) | Self::List { .. } => 1,
+            Self::Multi(slots) => slots.len(),
+        }
     }
 
     pub fn slot(&self, index: usize) -> Option<KindSet> {
-        self.slots.get(index).copied()
-    }
-
-    pub fn slots(&self) -> &[KindSet] {
-        &self.slots
+        match self {
+            Self::Scalar(kinds) => (index == 0).then_some(*kinds),
+            Self::List { .. } => (index == 0).then_some(KindSet::list()),
+            Self::Multi(slots) => slots.get(index).copied(),
+        }
     }
 
     pub fn scalar_slot(&self) -> KindSet {
         if self.arity() == 1 { self.slot(0).unwrap_or(KindSet::empty()) } else { KindSet::empty() }
     }
 
+    pub fn list_items(&self) -> Option<KindSet> {
+        match self {
+            Self::List { items } => Some(*items),
+            _ => None,
+        }
+    }
+
     pub fn union(&self, other: &Self) -> Self {
-        assert_eq!(self.arity(), other.arity(), "cannot union shapes of different arity");
-        Self::from_slots(
-            self.slots
-                .iter()
-                .zip(other.slots.iter())
-                .map(|(lhs, rhs)| lhs.union(*rhs))
-                .collect(),
-        )
+        match (self, other) {
+            (Self::Scalar(lhs), Self::Scalar(rhs)) => Self::scalar(lhs.union(*rhs)),
+            (Self::List { items: lhs }, Self::List { items: rhs }) => Self::list(lhs.union(*rhs)),
+            (Self::Multi(lhs), Self::Multi(rhs)) => {
+                assert_eq!(lhs.len(), rhs.len(), "cannot union shapes of different arity");
+                Self::from_slots(
+                    lhs.iter().zip(rhs.iter()).map(|(lhs, rhs)| lhs.union(*rhs)).collect(),
+                )
+            }
+            _ if self.arity() == other.arity() && self.arity() == 1 => {
+                Self::scalar(self.scalar_slot().union(other.scalar_slot()))
+            }
+            _ => panic!("cannot union shapes of different arity"),
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionValueKindAnalysis {
-    pub inputs: Vec<KindSet>,
-    pub variables: HashMap<String, KindSet>,
+    pub inputs: Vec<ValueShape>,
+    pub variables: HashMap<String, ValueShape>,
+    pub function_bindings: HashMap<String, String>,
     pub returns: ValueShape,
 }
 
@@ -149,15 +176,16 @@ pub struct ModuleValueKindAnalysis {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FunctionKindSummary {
-    inputs: Vec<KindSet>,
+    inputs: Vec<ValueShape>,
     returns: ValueShape,
 }
 
 #[derive(Debug)]
 struct InferFunctionResult {
-    variables: HashMap<String, KindSet>,
+    variables: HashMap<String, ValueShape>,
+    function_bindings: HashMap<String, String>,
     returns: ValueShape,
-    calls: HashMap<String, Vec<KindSet>>,
+    calls: HashMap<String, Vec<ValueShape>>,
 }
 
 pub fn analyze_module_value_kinds(
@@ -175,7 +203,15 @@ pub fn analyze_module_value_kinds(
             (
                 name.clone(),
                 FunctionKindSummary {
-                    inputs: vec![KindSet::empty(); input_len],
+                    inputs: (0..input_len)
+                        .map(|index| {
+                            if name == "main" && index == 0 {
+                                ValueShape::list(KindSet::string())
+                            } else {
+                                ValueShape::scalar(KindSet::empty())
+                            }
+                        })
+                        .collect(),
                     returns: ValueShape::unknown_with_arity(*arity),
                 },
             )
@@ -184,17 +220,24 @@ pub fn analyze_module_value_kinds(
 
     for _ in 0..functions.len().max(1) {
         let mut changed = false;
-        let mut incoming = HashMap::<String, Vec<KindSet>>::new();
+        let mut incoming = HashMap::<String, Vec<ValueShape>>::new();
         for func in functions {
             let inferred = infer_function(func, &summaries);
             for (callee, args) in inferred.calls {
                 merge_input_kinds(&mut incoming, &callee, &args);
             }
-            let current = summaries.get(&func.name).cloned().unwrap_or_else(|| FunctionKindSummary {
-                inputs: vec![KindSet::empty(); func.inputs.len()],
-                returns: ValueShape::unknown_with_arity(inferred.returns.arity()),
-            });
-            let merged_returns = current.returns.union(&inferred.returns);
+            let current =
+                summaries.get(&func.name).cloned().unwrap_or_else(|| FunctionKindSummary {
+                    inputs: vec![ValueShape::scalar(KindSet::empty()); func.inputs.len()],
+                    returns: ValueShape::unknown_with_arity(inferred.returns.arity()),
+                });
+            let merged_returns = if current.returns.arity() == inferred.returns.arity() {
+                current.returns.union(&inferred.returns)
+            } else {
+                ValueShape::unknown_with_arity(
+                    current.returns.arity().max(inferred.returns.arity()),
+                )
+            };
             if merged_returns != current.returns {
                 summaries.insert(
                     func.name.clone(),
@@ -205,15 +248,18 @@ pub fn analyze_module_value_kinds(
         }
         for func in functions {
             if let Some(args) = incoming.get(&func.name) {
-                let current = summaries.get(&func.name).cloned().unwrap_or_else(|| FunctionKindSummary {
-                    inputs: vec![KindSet::empty(); func.inputs.len()],
-                    returns: ValueShape::unknown_with_arity(*function_return_arities.get(&func.name).unwrap_or(&1)),
-                });
+                let current =
+                    summaries.get(&func.name).cloned().unwrap_or_else(|| FunctionKindSummary {
+                        inputs: vec![ValueShape::scalar(KindSet::empty()); func.inputs.len()],
+                        returns: ValueShape::unknown_with_arity(
+                            *function_return_arities.get(&func.name).unwrap_or(&1),
+                        ),
+                    });
                 let merged_inputs = current
                     .inputs
                     .iter()
                     .zip(args.iter())
-                    .map(|(lhs, rhs)| lhs.union(*rhs))
+                    .map(|(lhs, rhs)| lhs.union(rhs))
                     .collect::<Vec<_>>();
                 if merged_inputs != current.inputs {
                     summaries.insert(
@@ -236,10 +282,15 @@ pub fn analyze_module_value_kinds(
             let inputs = summaries
                 .get(&func.name)
                 .map(|summary| summary.inputs.clone())
-                .unwrap_or_else(|| vec![KindSet::empty(); func.inputs.len()]);
+                .unwrap_or_else(|| vec![ValueShape::scalar(KindSet::empty()); func.inputs.len()]);
             (
                 func.name.clone(),
-                FunctionValueKindAnalysis { inputs, variables: inferred.variables, returns: inferred.returns },
+                FunctionValueKindAnalysis {
+                    inputs,
+                    variables: inferred.variables,
+                    function_bindings: inferred.function_bindings,
+                    returns: inferred.returns,
+                },
             )
         })
         .collect::<HashMap<_, _>>();
@@ -251,104 +302,143 @@ fn infer_function(
     function: &FunctionDefAst,
     summaries: &HashMap<String, FunctionKindSummary>,
 ) -> InferFunctionResult {
-    let summary_inputs = summaries.get(&function.name).map(|summary| summary.inputs.as_slice()).unwrap_or(&[]);
+    let summary_inputs =
+        summaries.get(&function.name).map(|summary| summary.inputs.as_slice()).unwrap_or(&[]);
     let mut env = function
         .inputs
         .iter()
         .enumerate()
         .map(|(index, name)| {
-            let kinds = summary_inputs
-                .get(index)
-                .copied()
-                .filter(|kinds| !kinds.is_empty())
-                .unwrap_or_else(|| if function.name == "main" { KindSet::any() } else { KindSet::empty() });
-            (name.clone(), kinds)
+            let default_shape = if function.name == "main" && index == 0 {
+                ValueShape::list(KindSet::string())
+            } else {
+                ValueShape::scalar(KindSet::empty())
+            };
+            let shape = summary_inputs.get(index).cloned().unwrap_or_else(|| default_shape.clone());
+            let shape = match shape {
+                ValueShape::Scalar(kinds)
+                    if kinds.is_empty() && function.name == "main" && index == 0 =>
+                {
+                    default_shape
+                }
+                other => other,
+            };
+            (name.clone(), shape)
         })
         .collect::<HashMap<_, _>>();
+    let mut function_bindings = HashMap::new();
     let mut calls = HashMap::new();
-    let returns = infer_block(&function.block, &mut env, summaries, &mut calls);
-    InferFunctionResult { variables: env, returns, calls }
+    let returns =
+        infer_block(&function.block, &mut env, &mut function_bindings, summaries, &mut calls);
+    InferFunctionResult { variables: env, function_bindings, returns, calls }
 }
 
 fn infer_block(
     block: &BlockAst,
-    env: &mut HashMap<String, KindSet>,
+    env: &mut HashMap<String, ValueShape>,
+    function_bindings: &mut HashMap<String, String>,
     summaries: &HashMap<String, FunctionKindSummary>,
-    calls: &mut HashMap<String, Vec<KindSet>>,
+    calls: &mut HashMap<String, Vec<ValueShape>>,
 ) -> ValueShape {
     let mut result = ValueShape::unknown_scalar();
     for line in &block.lines {
-        result = infer_ast(line, env, summaries, calls);
+        result = infer_ast(line, env, function_bindings, summaries, calls);
     }
     result
 }
 
 fn infer_ast(
     ast: &Ast,
-    env: &mut HashMap<String, KindSet>,
+    env: &mut HashMap<String, ValueShape>,
+    function_bindings: &mut HashMap<String, String>,
     summaries: &HashMap<String, FunctionKindSummary>,
-    calls: &mut HashMap<String, Vec<KindSet>>,
+    calls: &mut HashMap<String, Vec<ValueShape>>,
 ) -> ValueShape {
     match ast {
-        Ast::Block(block) => infer_block(block, env, summaries, calls),
+        Ast::Block(block) => infer_block(block, env, function_bindings, summaries, calls),
         Ast::FunctionDef(_) => ValueShape::unknown_scalar(),
         Ast::Lambda { .. } | Ast::FunctionRef(_) => ValueShape::scalar(KindSet::function()),
-        Ast::Expression(expr) => infer_expression(expr, env, summaries, calls),
-        Ast::MultiValue(values) => {
-            ValueShape::from_slots(
-                values.iter().map(|value| infer_ast(value, env, summaries, calls).scalar_slot()).collect(),
-            )
-        }
+        Ast::Expression(expr) => infer_expression(expr, env, function_bindings, summaries, calls),
+        Ast::MultiValue(values) => ValueShape::from_slots(
+            values
+                .iter()
+                .map(|value| {
+                    infer_ast(value, env, function_bindings, summaries, calls).scalar_slot()
+                })
+                .collect(),
+        ),
         Ast::Literal(lit) => infer_literal(lit),
         Ast::ListLiteral(values) => {
-            for value in values {
-                let _ = infer_ast(value, env, summaries, calls);
-            }
-            ValueShape::scalar(KindSet::list())
+            let items = values.iter().fold(KindSet::empty(), |items, value| {
+                items
+                    .union(infer_ast(value, env, function_bindings, summaries, calls).scalar_slot())
+            });
+            ValueShape::list(items)
         }
         Ast::Index { collection, index, .. } => {
-            let collection_kinds = infer_ast(collection, env, summaries, calls).scalar_slot();
-            let _ = infer_ast(index, env, summaries, calls);
-            ValueShape::scalar(index_result_kinds(collection_kinds))
+            let collection_shape = infer_ast(collection, env, function_bindings, summaries, calls);
+            let _ = infer_ast(index, env, function_bindings, summaries, calls);
+            ValueShape::scalar(index_result_kinds(&collection_shape))
         }
         Ast::IndexAssign { collection, index, value, .. } => {
-            let collection_kinds = infer_ast(collection, env, summaries, calls).scalar_slot();
-            let _ = infer_ast(index, env, summaries, calls);
-            let value_kinds = infer_ast(value, env, summaries, calls).scalar_slot();
-            if collection_kinds.contains(ValueKind::String) {
+            let collection_shape = infer_ast(collection, env, function_bindings, summaries, calls);
+            let _ = infer_ast(index, env, function_bindings, summaries, calls);
+            let value_shape = infer_ast(value, env, function_bindings, summaries, calls);
+            if collection_shape.scalar_slot().contains(ValueKind::String) {
                 ValueShape::scalar(KindSet::int())
-            } else if collection_kinds.contains(ValueKind::List) {
-                ValueShape::scalar(value_kinds)
+            } else if collection_shape.scalar_slot().contains(ValueKind::List) {
+                ValueShape::scalar(value_shape.scalar_slot())
             } else {
                 ValueShape::scalar(KindSet::any())
             }
         }
         Ast::Variable(name) => {
-            ValueShape::scalar(env.get(name.as_str()).copied().unwrap_or_else(KindSet::any))
+            if let Some(shape) = env.get(name.as_str()).cloned() {
+                shape
+            } else if summaries.contains_key(name.as_ref()) {
+                ValueShape::scalar(KindSet::function())
+            } else {
+                ValueShape::unknown_scalar()
+            }
         }
         Ast::Assign { name, value, .. } => {
-            let kinds = infer_ast(value, env, summaries, calls).scalar_slot();
-            env.insert(name.clone(), kinds);
-            ValueShape::scalar(kinds)
+            let shape = infer_ast(value, env, function_bindings, summaries, calls);
+            env.insert(name.clone(), shape.clone());
+            match infer_known_callback_name(value, env, function_bindings) {
+                Some(binding) => {
+                    function_bindings.insert(name.clone(), binding.to_string());
+                }
+                None => {
+                    function_bindings.remove(name);
+                }
+            }
+            shape
         }
         Ast::MultiAssign { names, value, .. } => {
-            let shape = infer_ast(value, env, summaries, calls);
+            let shape = infer_ast(value, env, function_bindings, summaries, calls);
             for (index, name) in names.iter().enumerate() {
-                env.insert(name.clone(), shape.slot(index).unwrap_or_else(KindSet::any));
+                env.insert(
+                    name.clone(),
+                    ValueShape::scalar(shape.slot(index).unwrap_or_else(KindSet::any)),
+                );
+                function_bindings.remove(name);
             }
             ValueShape::scalar(KindSet::any())
         }
         Ast::If { condition, then, else_, .. } => {
-            let _ = infer_ast(condition, env, summaries, calls);
+            let _ = infer_ast(condition, env, function_bindings, summaries, calls);
             let mut then_env = env.clone();
-            let then_shape = infer_block(then, &mut then_env, summaries, calls);
+            let mut then_bindings = function_bindings.clone();
+            let then_shape = infer_block(then, &mut then_env, &mut then_bindings, summaries, calls);
             let mut else_env = env.clone();
+            let mut else_bindings = function_bindings.clone();
             let else_shape = if let Some(else_block) = else_ {
-                infer_block(else_block, &mut else_env, summaries, calls)
+                infer_block(else_block, &mut else_env, &mut else_bindings, summaries, calls)
             } else {
                 ValueShape::unknown_scalar()
             };
             merge_envs(env, then_env, else_env);
+            merge_function_bindings(function_bindings, then_bindings, else_bindings);
             if then_shape.arity() == else_shape.arity() {
                 then_shape.union(&else_shape)
             } else {
@@ -360,29 +450,106 @@ fn infer_ast(
 
 fn infer_expression(
     expr: &ExpressionAst,
-    env: &mut HashMap<String, KindSet>,
+    env: &mut HashMap<String, ValueShape>,
+    function_bindings: &mut HashMap<String, String>,
     summaries: &HashMap<String, FunctionKindSummary>,
-    calls: &mut HashMap<String, Vec<KindSet>>,
+    calls: &mut HashMap<String, Vec<ValueShape>>,
 ) -> ValueShape {
     if expr.function.is_empty() {
         return expr
             .args
             .first()
-            .map(|arg| infer_ast(arg, env, summaries, calls))
+            .map(|arg| infer_ast(arg, env, function_bindings, summaries, calls))
             .unwrap_or_else(ValueShape::unknown_scalar);
     }
 
-    let arg_shapes =
-        expr.args.iter().map(|arg| infer_ast(arg, env, summaries, calls)).collect::<Vec<_>>();
-    if let Some(summary) = summaries.get(&expr.function) {
-        merge_input_kinds(
-            calls,
-            &expr.function,
-            &arg_shapes.iter().map(ValueShape::scalar_slot).collect::<Vec<_>>(),
+    let arg_shapes = expr
+        .args
+        .iter()
+        .map(|arg| infer_ast(arg, env, function_bindings, summaries, calls))
+        .collect::<Vec<_>>();
+    if matches!(expr.function.as_str(), "list_map" | "list_filter")
+        && let Some(callback_name) = expr
+            .args
+            .get(1)
+            .and_then(|callback| infer_known_callback_name(callback, env, function_bindings))
+    {
+        let callback_input = ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::empty),
         );
+        merge_input_kinds(calls, callback_name, &[callback_input]);
+    }
+    if let Some(summary) = summaries.get(&expr.function) {
+        merge_input_kinds(calls, &expr.function, &arg_shapes);
         return summary.returns.clone();
     }
+
+    if expr.function == "list_map" {
+        let items = expr
+            .args
+            .get(1)
+            .and_then(|callback| {
+                infer_known_callback_return_shape(callback, env, function_bindings, summaries)
+            })
+            .map(|shape| shape.scalar_slot())
+            .unwrap_or_else(KindSet::empty);
+        return ValueShape::list(items);
+    }
+
+    if expr.function == "list_filter" {
+        return arg_shapes
+            .first()
+            .and_then(ValueShape::list_items)
+            .map(ValueShape::list)
+            .unwrap_or_else(|| ValueShape::list(KindSet::empty()));
+    }
+
+    if matches!(expr.function.as_str(), "list_push" | "list_insert" | "list_set")
+        && let Some(Ast::Variable(name)) = expr.args.first()
+        && let Some(current) = env.get(name.as_str()).cloned()
+    {
+        let value_index = if expr.function == "list_push" { 1 } else { 2 };
+        let new_items = current.list_items().unwrap_or_else(KindSet::empty).union(
+            arg_shapes.get(value_index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty),
+        );
+        env.insert(name.name.clone(), ValueShape::list(new_items));
+    }
+
     builtin_shape(&expr.function, &arg_shapes)
+}
+
+fn infer_known_callback_return_shape(
+    callback: &Ast,
+    env: &HashMap<String, ValueShape>,
+    function_bindings: &HashMap<String, String>,
+    summaries: &HashMap<String, FunctionKindSummary>,
+) -> Option<ValueShape> {
+    match callback {
+        Ast::FunctionRef(name) => {
+            summaries.get(name.as_ref()).map(|summary| summary.returns.clone())
+        }
+        Ast::Variable(name) if !env.contains_key(name.as_str()) => {
+            summaries.get(name.as_ref()).map(|summary| summary.returns.clone())
+        }
+        Ast::Variable(name) => function_bindings
+            .get(name.as_str())
+            .and_then(|binding| summaries.get(binding))
+            .map(|summary| summary.returns.clone()),
+        _ => None,
+    }
+}
+
+fn infer_known_callback_name<'a>(
+    callback: &'a Ast,
+    env: &HashMap<String, ValueShape>,
+    function_bindings: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    match callback {
+        Ast::FunctionRef(name) => Some(name.as_ref()),
+        Ast::Variable(name) if !env.contains_key(name.as_str()) => Some(name.as_ref()),
+        Ast::Variable(name) => function_bindings.get(name.as_str()).map(|name| name.as_str()),
+        _ => None,
+    }
 }
 
 fn infer_literal(literal: &LiteralAst) -> ValueShape {
@@ -404,23 +571,45 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
             ValueShape::scalar(KindSet::int())
         }
         "print" | "list_print" => ValueShape::scalar(KindSet::int()),
-        "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
-        | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
+        "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
+        | "bigint_divide" | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
         "bigint_compare" => ValueShape::scalar(KindSet::int()),
         "string_concat" | "bytes_slice" | "string_copy" | "string_repeat" | "string_reverse" => {
             ValueShape::scalar(KindSet::string())
         }
-        "bytes_len" | "bytes_get" | "bytes_pop" | "string_iter_done" | "string_iter_next"
-        | "string_first" | "string_last" | "string_len" | "string_is_empty" | "string_is_not_empty"
-        | "string_starts_with" | "string_ends_with" | "string_contains" | "string_is_ascii"
-        | "string_all" | "string_any" | "string_is_integer" => ValueShape::scalar(KindSet::int()),
+        "bytes_len"
+        | "bytes_get"
+        | "bytes_pop"
+        | "string_iter_done"
+        | "string_iter_next"
+        | "string_first"
+        | "string_last"
+        | "string_len"
+        | "string_is_empty"
+        | "string_is_not_empty"
+        | "string_starts_with"
+        | "string_ends_with"
+        | "string_contains"
+        | "string_is_ascii"
+        | "string_all"
+        | "string_any"
+        | "string_is_integer" => ValueShape::scalar(KindSet::int()),
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
-        "list_new" | "list_range" | "list_copy" | "list_map" | "list_filter" => {
-            ValueShape::scalar(KindSet::list())
-        }
+        "list_new" => ValueShape::list(KindSet::empty()),
+        "list_range" => ValueShape::list(KindSet::int()),
+        "list_copy" | "list_filter" => args
+            .first()
+            .and_then(ValueShape::list_items)
+            .map(ValueShape::list)
+            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
+        "list_map" => ValueShape::list(KindSet::empty()),
         "list_len" => ValueShape::scalar(KindSet::int()),
-        "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(KindSet::any()),
-        "list_push" | "list_insert" | "list_set" | "list_swap" => ValueShape::scalar(KindSet::int()),
+        "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
+            args.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
+        ),
+        "list_push" | "list_insert" | "list_set" | "list_swap" => {
+            ValueShape::scalar(KindSet::int())
+        }
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
         }
@@ -452,55 +641,76 @@ fn numeric_result_kinds(lhs: KindSet, rhs: KindSet) -> KindSet {
     }
 }
 
-fn index_result_kinds(collection: KindSet) -> KindSet {
+fn index_result_kinds(collection: &ValueShape) -> KindSet {
     let mut result = KindSet::empty();
-    if collection.contains(ValueKind::String) {
+    let collection_kinds = collection.scalar_slot();
+    if collection_kinds.contains(ValueKind::String) {
         result = result.union(KindSet::int());
     }
-    if collection.contains(ValueKind::List) {
+    if let Some(items) = collection.list_items() {
+        result = result.union(items);
+    } else if collection_kinds.contains(ValueKind::List) {
         result = result.union(KindSet::any());
     }
     if result.is_empty() { KindSet::any() } else { result }
 }
 
 fn merge_envs(
-    env: &mut HashMap<String, KindSet>,
-    then_env: HashMap<String, KindSet>,
-    else_env: HashMap<String, KindSet>,
+    env: &mut HashMap<String, ValueShape>,
+    then_env: HashMap<String, ValueShape>,
+    else_env: HashMap<String, ValueShape>,
 ) {
-    let names = env
+    let names =
+        env.keys().chain(then_env.keys()).chain(else_env.keys()).cloned().collect::<HashSet<_>>();
+    for name in names {
+        let base = env.get(&name).cloned().unwrap_or_else(|| ValueShape::scalar(KindSet::empty()));
+        let then_value = then_env.get(&name).cloned().unwrap_or_else(|| base.clone());
+        let else_value = else_env.get(&name).cloned().unwrap_or(base);
+        env.insert(name, then_value.union(&else_value));
+    }
+}
+
+fn merge_function_bindings(
+    bindings: &mut HashMap<String, String>,
+    then_bindings: HashMap<String, String>,
+    else_bindings: HashMap<String, String>,
+) {
+    let names = bindings
         .keys()
-        .chain(then_env.keys())
-        .chain(else_env.keys())
+        .chain(then_bindings.keys())
+        .chain(else_bindings.keys())
         .cloned()
         .collect::<HashSet<_>>();
+    bindings.clear();
     for name in names {
-        let base = env.get(&name).copied().unwrap_or_else(KindSet::empty);
-        let then_value = then_env.get(&name).copied().unwrap_or(base);
-        let else_value = else_env.get(&name).copied().unwrap_or(base);
-        env.insert(name, then_value.union(else_value));
+        match (then_bindings.get(&name), else_bindings.get(&name)) {
+            (Some(lhs), Some(rhs)) if lhs == rhs => {
+                bindings.insert(name, lhs.clone());
+            }
+            _ => {}
+        }
     }
 }
 
 fn merge_input_kinds(
-    calls: &mut HashMap<String, Vec<KindSet>>,
+    calls: &mut HashMap<String, Vec<ValueShape>>,
     callee: &str,
-    args: &[KindSet],
+    args: &[ValueShape],
 ) {
     let entry = calls
         .entry(callee.to_string())
-        .or_insert_with(|| vec![KindSet::empty(); args.len()]);
+        .or_insert_with(|| vec![ValueShape::scalar(KindSet::empty()); args.len()]);
     if entry.len() < args.len() {
-        entry.resize(args.len(), KindSet::empty());
+        entry.resize(args.len(), ValueShape::scalar(KindSet::empty()));
     }
     for (slot, arg) in entry.iter_mut().zip(args.iter()) {
-        *slot = slot.union(*arg);
+        *slot = slot.union(arg);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{KindSet, ValueKind};
+    use super::{KindSet, ValueKind, ValueShape};
     use crate::module::Module;
 
     #[test]
@@ -509,9 +719,9 @@ mod tests {
         let module = Module::try_from_source(src).expect("source should parse");
         let analysis = module.analyze_value_kinds().expect("analysis should succeed");
         let main = analysis.functions.get("main").expect("main analysis missing");
-        assert_eq!(main.variables.get("ok").copied(), Some(KindSet::int()));
-        assert_eq!(main.variables.get("value").copied(), Some(KindSet::int()));
-        assert_eq!(main.variables.get("err").copied(), Some(KindSet::string()));
+        assert_eq!(main.variables.get("ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("err"), Some(&ValueShape::scalar(KindSet::string())));
         assert_eq!(main.returns.slot(0), Some(KindSet::int()));
     }
 
@@ -521,9 +731,9 @@ mod tests {
         let module = Module::try_from_source(src).expect("source should parse");
         let analysis = module.analyze_value_kinds().expect("analysis should succeed");
         let main = analysis.functions.get("main").expect("main analysis missing");
-        assert_eq!(main.variables.get("ok").copied(), Some(KindSet::int()));
-        assert_eq!(main.variables.get("value").copied(), Some(KindSet::bigint()));
-        assert_eq!(main.variables.get("err").copied(), Some(KindSet::string()));
+        assert_eq!(main.variables.get("ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(main.variables.get("err"), Some(&ValueShape::scalar(KindSet::string())));
     }
 
     #[test]
@@ -539,19 +749,98 @@ mod tests {
 
     #[test]
     fn analyze_value_kinds_tracks_calculator_bigint_variables() {
-        let src = std::fs::read_to_string("examples/calculator.expr").expect("calculator example should load");
+        let src = std::fs::read_to_string("examples/calculator.expr")
+            .expect("calculator example should load");
         let module = Module::try_from_source(&src).expect("source should parse");
         let analysis = module.analyze_value_kinds().expect("analysis should succeed");
         let main = analysis.functions.get("main").expect("main analysis missing");
-        assert_eq!(main.variables.get("lhs_ok").copied(), Some(KindSet::int()));
-        assert_eq!(main.variables.get("lhs").copied(), Some(KindSet::bigint()));
-        assert_eq!(main.variables.get("lhs_err").copied(), Some(KindSet::string()));
-        assert_eq!(main.variables.get("rhs_ok").copied(), Some(KindSet::int()));
-        assert_eq!(main.variables.get("rhs").copied(), Some(KindSet::bigint()));
-        assert_eq!(main.variables.get("rhs_err").copied(), Some(KindSet::string()));
+        assert_eq!(main.variables.get("lhs_ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(main.variables.get("lhs_err"), Some(&ValueShape::scalar(KindSet::string())));
+        assert_eq!(main.variables.get("rhs_ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(main.variables.get("rhs_err"), Some(&ValueShape::scalar(KindSet::string())));
         let apply = analysis.functions.get("apply_and_print").expect("apply_and_print missing");
-        assert_eq!(apply.variables.get("lhs").copied(), Some(KindSet::bigint()));
-        assert_eq!(apply.variables.get("rhs").copied(), Some(KindSet::bigint()));
+        assert_eq!(apply.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(apply.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::bigint())));
         assert!(apply.returns.slot(0).expect("return slot missing").contains(ValueKind::Int));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_list_literal_item_kinds() {
+        let src = "fn main() do\n    xs = [1, \"a\"]\n    xs\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(
+            main.variables.get("xs"),
+            Some(&ValueShape::list(KindSet::int().union(KindSet::string())))
+        );
+        assert_eq!(main.returns, ValueShape::list(KindSet::int().union(KindSet::string())));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_main_args_as_list_of_strings() {
+        let src = "fn main(args) do\n    args\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.inputs.get(0), Some(&ValueShape::list(KindSet::string())));
+        assert_eq!(main.variables.get("args"), Some(&ValueShape::list(KindSet::string())));
+        assert_eq!(main.returns, ValueShape::list(KindSet::string()));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_list_map_item_kinds_for_named_callbacks() {
+        let src = "fn double(x) do\n    x * 2\nend\n\nfn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, double)\n    ys\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("ys"), Some(&ValueShape::list(KindSet::int())));
+        assert_eq!(main.returns, ValueShape::list(KindSet::int()));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_list_filter_item_kinds() {
+        let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_filter(xs, fn item -> item > 1 end)\n    ys\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("ys"), Some(&ValueShape::list(KindSet::int())));
+        assert_eq!(main.returns, ValueShape::list(KindSet::int()));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_list_map_item_kinds_for_function_aliases() {
+        let src = "fn double(x) do\n    x * 2\nend\n\nfn main() do\n    f = double\n    xs = [1, 2, 3]\n    ys = list_map(xs, f)\n    ys\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("f"), Some(&ValueShape::scalar(KindSet::function())));
+        assert_eq!(main.function_bindings.get("f"), Some(&"double".to_string()));
+        assert_eq!(main.variables.get("ys"), Some(&ValueShape::list(KindSet::int())));
+        assert_eq!(main.returns, ValueShape::list(KindSet::int()));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_list_map_item_kinds_for_inline_lambdas() {
+        let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_map(xs, fn item -> item * 2 end)\n    ys\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("ys"), Some(&ValueShape::list(KindSet::int())));
+        assert_eq!(main.returns, ValueShape::list(KindSet::int()));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_list_map_item_kinds_for_lambda_aliases() {
+        let src = "fn main() do\n    f = fn item -> item * 2 end\n    xs = [1, 2, 3]\n    ys = list_map(xs, f)\n    ys\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("f"), Some(&ValueShape::scalar(KindSet::function())));
+        assert!(main.function_bindings.get("f").is_some());
+        assert_eq!(main.variables.get("ys"), Some(&ValueShape::list(KindSet::int())));
+        assert_eq!(main.returns, ValueShape::list(KindSet::int()));
     }
 }

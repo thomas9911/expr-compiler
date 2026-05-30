@@ -125,6 +125,13 @@ Current behavior:
 - `String == non-String` is false
 - `String != non-String` is true
 - `string_*` iteration validates UTF-8 and traps on invalid byte sequences
+- the compiler now also performs conservative compile-time kind checks for obvious builtin misuse and indexing misuse
+  - examples:
+    - `bytes_len(1)`
+    - `list_len("abc")`
+    - `1[0]`
+    - `xs["0"]`
+  - it only rejects when the inferred kinds are confident; unknown values still use runtime checks
 - UTF-8-aware indexing/slicing and string conversion helpers are not implemented yet
 
 Logical infix operators are also supported:
@@ -158,6 +165,23 @@ Current behavior:
 - `main` currently supports at most one argument in these runnable output modes
 - for JIT execution through the CLI, pass program arguments after `--`, for example:
   - `cargo run --release -q -- examples/args.expr --run-jit -- hello world`
+
+## Debugging inferred kinds
+
+You can print the original source annotated with inferred runtime value kinds:
+
+```text
+cargo run --release -q -- examples/strings.expr --debug-types
+```
+
+Current behavior:
+
+- prints the original source
+- adds `#?` annotation lines
+- shows function return kinds
+- shows function input kinds when present
+- shows assignment and destructuring variable kinds
+- this is based on conservative value-kind inference, not a full static type system
 
 ## Higher-order list functions
 
