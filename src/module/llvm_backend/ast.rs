@@ -1070,162 +1070,230 @@ impl<'ctx> LlvmCompiler<'ctx> {
         current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         let function_analysis = self.function_analysis(current_function_name);
+        if let Some(value) = self.compile_generic_runtime_expression_ast(name, compiled, function) {
+            return value;
+        }
+        if let Some(value) = self.compile_list_named_expression_ast(
+            name,
+            args,
+            compiled,
+            function,
+            function_analysis,
+        ) {
+            return value;
+        }
+        self.compile_fallback_named_expression_ast(
+            name,
+            compiled,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+        )
+    }
+
+    fn compile_generic_runtime_expression_ast(
+        &self,
+        name: &str,
+        compiled: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+    ) -> Option<CompiledValue<'ctx>> {
         match name {
-            "add" => self.build_internal_call(
+            "add" => Some(self.build_internal_call(
                 self.require_func("__op_add"),
                 &[compiled[0], compiled[1]],
                 "add",
-            ),
-            "subtract" => self.build_internal_call(
+            )),
+            "subtract" => Some(self.build_internal_call(
                 self.require_func("__op_subtract"),
                 &[compiled[0], compiled[1]],
                 "subtract",
-            ),
-            "multiply" => self.build_internal_call(
+            )),
+            "multiply" => Some(self.build_internal_call(
                 self.require_func("__op_multiply"),
                 &[compiled[0], compiled[1]],
                 "multiply",
-            ),
-            "divide" => self.build_internal_call(
+            )),
+            "divide" => Some(self.build_internal_call(
                 self.require_func("__op_divide"),
                 &[compiled[0], compiled[1]],
                 "divide",
-            ),
-            "modulo" => self.build_internal_call(
+            )),
+            "modulo" => Some(self.build_internal_call(
                 self.require_func("__op_modulo"),
                 &[compiled[0], compiled[1]],
                 "modulo",
-            ),
-            "gt" => self.build_internal_call(
+            )),
+            "gt" => Some(self.build_internal_call(
                 self.require_func("__op_gt"),
                 &[compiled[0], compiled[1]],
                 "gt",
-            ),
-            "lt" => self.build_internal_call(
+            )),
+            "lt" => Some(self.build_internal_call(
                 self.require_func("__op_lt"),
                 &[compiled[0], compiled[1]],
                 "lt",
-            ),
-            "gte" => self.build_internal_call(
+            )),
+            "gte" => Some(self.build_internal_call(
                 self.require_func("__op_gte"),
                 &[compiled[0], compiled[1]],
                 "gte",
-            ),
-            "lte" => self.build_internal_call(
+            )),
+            "lte" => Some(self.build_internal_call(
                 self.require_func("__op_lte"),
                 &[compiled[0], compiled[1]],
                 "lte",
-            ),
-            "eq" => self.build_internal_call(
+            )),
+            "eq" => Some(self.build_internal_call(
                 self.require_func("__op_eq"),
                 &[compiled[0], compiled[1]],
                 "eq",
-            ),
-            "ne" => self.build_internal_call(
+            )),
+            "ne" => Some(self.build_internal_call(
                 self.require_func("__op_ne"),
                 &[compiled[0], compiled[1]],
                 "ne",
-            ),
+            )),
             "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
             | "bigint_modulo" | "bigint_compare" => {
-                self.compile_bigint_builtin(name, &compiled, function)
+                Some(self.compile_bigint_builtin(name, compiled, function))
             }
             "print" => {
-                self.build_internal_call(self.require_func("__rt_print"), &compiled, "print")
+                Some(self.build_internal_call(self.require_func("__rt_print"), compiled, "print"))
             }
-            "list_new" => {
-                self.build_internal_call(self.require_func("__rt_list_new"), &compiled, "list_new")
-            }
-            "list_push" => self.build_internal_call(
-                self.require_func("__rt_list_push"),
-                &compiled,
-                "list_push",
-            ),
-            "list_insert" => self.build_internal_call(
-                self.require_func("__rt_list_insert"),
-                &compiled,
-                "list_insert",
-            ),
-            "list_len" => {
-                if shape_is_exact_kind(
-                    &infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis),
-                    KindSet::list(),
-                ) {
-                    self.int_value(self.build_list_len_load(compiled[0].payload, "list_len"))
-                } else {
-                    self.build_internal_call(
-                        self.require_func("__rt_list_len"),
-                        &compiled,
-                        "list_len",
-                    )
-                }
-            }
-            "list_get" => {
-                let list_shape =
-                    infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis);
-                let index_shape =
-                    infer_ast_value_shape(&args[1], function_analysis, &self.value_kind_analysis);
-                if shape_is_exact_kind(&list_shape, KindSet::list())
-                    && shape_is_exact_kind(&index_shape, KindSet::int())
-                {
-                    let idx = compiled[1].payload;
-                    let trap_block =
-                        self.context.append_basic_block(function, "list_get_bounds_trap");
-                    self.build_index_bounds_check(compiled[0].payload, idx, "list_get", trap_block);
-                    let result = self.build_list_value_load(compiled[0].payload, idx, "list_get");
-                    let ok_block =
-                        self.builder.get_insert_block().expect("missing list_get ok block");
-                    self.builder.position_at_end(trap_block);
-                    self.build_trap_and_unreachable();
-                    self.builder.position_at_end(ok_block);
-                    result
-                } else {
-                    self.build_internal_call(
-                        self.require_func("__rt_list_get"),
-                        &compiled,
-                        "list_get",
-                    )
-                }
-            }
-            "list_set" => {
-                self.build_internal_call(self.require_func("__rt_list_set"), &compiled, "list_set")
-            }
-            "list_swap" => self.build_internal_call(
-                self.require_func("__rt_list_swap"),
-                &compiled,
-                "list_swap",
-            ),
-            "list_pop" => {
-                self.build_internal_call(self.require_func("__rt_list_pop"), &compiled, "list_pop")
-            }
-            "list_delete" => self.build_internal_call(
-                self.require_func("__rt_list_delete"),
-                &compiled,
-                "list_delete",
-            ),
-            "list_copy" => self.build_internal_call(
-                self.require_func("__rt_list_copy"),
-                &compiled,
-                "list_copy",
-            ),
-            other => {
-                if vars.contains_key(other) || capture_slots.contains_key(other) {
-                    let callee =
-                        self.resolve_named_value(other, vars, capture_slots, env_ptr, function);
-                    return self.apply_function_value(callee, &compiled, function, other);
-                }
-                if self.function_ordinals.contains_key(other) {
-                    return self.build_user_call(
-                        self.require_func(other),
-                        self.i64_type.const_zero(),
-                        &compiled,
-                        other,
-                    );
-                }
-                let callee = self.require_func(other);
-                self.build_internal_call(callee, &compiled, other)
-            }
+            _ => None,
         }
+    }
+
+    fn compile_list_named_expression_ast(
+        &self,
+        name: &str,
+        args: &[Ast],
+        compiled: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+        function_analysis: &FunctionValueKindAnalysis,
+    ) -> Option<CompiledValue<'ctx>> {
+        match name {
+            "list_new" => Some(self.build_internal_call(
+                self.require_func("__rt_list_new"),
+                compiled,
+                "list_new",
+            )),
+            "list_push" => Some(self.build_internal_call(
+                self.require_func("__rt_list_push"),
+                compiled,
+                "list_push",
+            )),
+            "list_insert" => Some(self.build_internal_call(
+                self.require_func("__rt_list_insert"),
+                compiled,
+                "list_insert",
+            )),
+            "list_len" => {
+                Some(self.compile_list_len_named_expression_ast(args, compiled, function_analysis))
+            }
+            "list_get" => Some(self.compile_list_get_named_expression_ast(
+                args,
+                compiled,
+                function,
+                function_analysis,
+            )),
+            "list_set" => Some(self.build_internal_call(
+                self.require_func("__rt_list_set"),
+                compiled,
+                "list_set",
+            )),
+            "list_swap" => Some(self.build_internal_call(
+                self.require_func("__rt_list_swap"),
+                compiled,
+                "list_swap",
+            )),
+            "list_pop" => Some(self.build_internal_call(
+                self.require_func("__rt_list_pop"),
+                compiled,
+                "list_pop",
+            )),
+            "list_delete" => Some(self.build_internal_call(
+                self.require_func("__rt_list_delete"),
+                compiled,
+                "list_delete",
+            )),
+            "list_copy" => Some(self.build_internal_call(
+                self.require_func("__rt_list_copy"),
+                compiled,
+                "list_copy",
+            )),
+            _ => None,
+        }
+    }
+
+    fn compile_list_len_named_expression_ast(
+        &self,
+        args: &[Ast],
+        compiled: &[CompiledValue<'ctx>],
+        function_analysis: &FunctionValueKindAnalysis,
+    ) -> CompiledValue<'ctx> {
+        if shape_is_exact_kind(
+            &infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis),
+            KindSet::list(),
+        ) {
+            self.int_value(self.build_list_len_load(compiled[0].payload, "list_len"))
+        } else {
+            self.build_internal_call(self.require_func("__rt_list_len"), compiled, "list_len")
+        }
+    }
+
+    fn compile_list_get_named_expression_ast(
+        &self,
+        args: &[Ast],
+        compiled: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+        function_analysis: &FunctionValueKindAnalysis,
+    ) -> CompiledValue<'ctx> {
+        let list_shape =
+            infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis);
+        let index_shape =
+            infer_ast_value_shape(&args[1], function_analysis, &self.value_kind_analysis);
+        if shape_is_exact_kind(&list_shape, KindSet::list())
+            && shape_is_exact_kind(&index_shape, KindSet::int())
+        {
+            let idx = compiled[1].payload;
+            let trap_block = self.context.append_basic_block(function, "list_get_bounds_trap");
+            self.build_index_bounds_check(compiled[0].payload, idx, "list_get", trap_block);
+            let result = self.build_list_value_load(compiled[0].payload, idx, "list_get");
+            let ok_block = self.builder.get_insert_block().expect("missing list_get ok block");
+            self.builder.position_at_end(trap_block);
+            self.build_trap_and_unreachable();
+            self.builder.position_at_end(ok_block);
+            result
+        } else {
+            self.build_internal_call(self.require_func("__rt_list_get"), compiled, "list_get")
+        }
+    }
+
+    fn compile_fallback_named_expression_ast(
+        &self,
+        name: &str,
+        compiled: &[CompiledValue<'ctx>],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> CompiledValue<'ctx> {
+        if vars.contains_key(name) || capture_slots.contains_key(name) {
+            let callee = self.resolve_named_value(name, vars, capture_slots, env_ptr, function);
+            return self.apply_function_value(callee, compiled, function, name);
+        }
+        if self.function_ordinals.contains_key(name) {
+            return self.build_user_call(
+                self.require_func(name),
+                self.i64_type.const_zero(),
+                compiled,
+                name,
+            );
+        }
+        let callee = self.require_func(name);
+        self.build_internal_call(callee, compiled, name)
     }
 
     fn compile_block_ast(
@@ -1365,9 +1433,7 @@ mod tests {
     fn llvm_compile_if_ast_lowers_nested_if_expressions() {
         let src = "fn main() do\n    if 1 do\n        if 0 do\n            7\n        else\n            41\n        end\n    else\n        0\n    end\nend";
         let jit = Module::from_source(src).compile_to_jit_with_backend(CodegenBackend::Llvm);
-        let ptr = jit
-            .get_int_result_fn_ptr("main")
-            .expect("llvm int-result wrapper should exist");
+        let ptr = jit.get_int_result_fn_ptr("main").expect("llvm int-result wrapper should exist");
         let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
         assert_eq!(func(), 41);
     }
