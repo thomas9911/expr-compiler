@@ -1494,6 +1494,28 @@ impl<'ctx> LlvmCompiler<'ctx> {
         CompiledValue { tag: self.i64_type.const_int(TAG_INT as u64, false), payload }
     }
 
+    fn compile_is_tag_predicate(
+        &self,
+        value: CompiledValue<'ctx>,
+        expected_tag: i64,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let matches = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                value.tag,
+                self.i64_type.const_int(expected_tag as u64, false),
+                &format!("{label}_matches"),
+            )
+            .expect("failed to compare runtime tag");
+        let payload = self
+            .builder
+            .build_int_z_extend(matches, self.i64_type, &format!("{label}_payload"))
+            .expect("failed to extend runtime tag predicate");
+        CompiledValue { tag: self.i64_type.const_int(TAG_INT as u64, false), payload }
+    }
+
     fn build_trap_if(&self, condition: IntValue<'ctx>) {
         let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let trap_block = self.context.append_basic_block(function, "trap_if_trap");

@@ -1489,6 +1489,17 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
             source: include_str!("./stdlib/string_try_parse_bigint.expr"),
             stdlib_deps: &[],
         }),
+        "type_of" => Some(StdlibFunction {
+            source: include_str!("./stdlib/type_of.expr"),
+            stdlib_deps: &[
+                "is_int",
+                "is_bigint",
+                "is_string",
+                "is_list",
+                "is_function",
+                "is_string_iter",
+            ],
+        }),
         "string_try_first" => Some(StdlibFunction {
             source: include_str!("./stdlib/string_try_first.expr"),
             stdlib_deps: &["string_first"],
@@ -1995,6 +2006,12 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
         || matches!(
             name,
             "print"
+                | "is_int"
+                | "is_bigint"
+                | "is_string"
+                | "is_list"
+                | "is_function"
+                | "is_string_iter"
                 | "list_new"
                 | "list_push"
                 | "list_insert"
@@ -3005,6 +3022,9 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
             ValueShape::scalar(KindSet::int())
         }
+        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter" => {
+            ValueShape::scalar(KindSet::int())
+        }
         "bytes_len"
         | "bytes_get"
         | "bytes_pop"
@@ -3699,6 +3719,16 @@ fn boxed_int_const(builder: &mut FunctionBuilder, value: i64) -> CompiledValue {
         tag: builder.ins().iconst(types::I64, TAG_INT),
         payload: builder.ins().iconst(types::I64, value),
     }
+}
+
+fn compile_is_tag_predicate(
+    builder: &mut FunctionBuilder,
+    value: CompiledValue,
+    expected_tag: i64,
+) -> CompiledValue {
+    let matches = builder.ins().icmp_imm(IntCC::Equal, value.tag, expected_tag);
+    let payload = builder.ins().uextend(types::I64, matches);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload }
 }
 
 fn compile_bigint_literal(
@@ -4681,8 +4711,8 @@ fn load_multi_value_item(
     multi_value: CompiledValue,
     index: usize,
 ) -> CompiledValue {
-    let is_multi = builder.ins().icmp_imm(IntCC::Equal, multi_value.tag, TAG_MULTI);
-    builder.ins().trapz(is_multi, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let is_multi_tag = builder.ins().icmp_imm(IntCC::Equal, multi_value.tag, TAG_MULTI);
+    builder.ins().trapz(is_multi_tag, TrapCode::BAD_CONVERSION_TO_INTEGER);
     let len =
         builder.ins().load(types::I64, MemFlags::new(), multi_value.payload, MULTI_LEN_OFFSET);
     let index_value = builder.ins().iconst(types::I64, index as i64);
@@ -5856,6 +5886,35 @@ fn compile_expression_ast(
     function_analysis: &FunctionValueKindAnalysis,
     value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
+    if matches!(
+        function,
+        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter"
+    ) {
+        assert_eq!(args.len(), 1, "{function} expects 1 argument");
+        let value = compile_ast(
+            builder,
+            &args[0],
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        );
+        let expected_tag = match function {
+            "is_int" => TAG_INT,
+            "is_bigint" => TAG_BIGINT,
+            "is_string" => TAG_STRING,
+            "is_list" => TAG_LIST,
+            "is_function" => TAG_FUNCTION,
+            "is_string_iter" => TAG_STRING_ITER,
+            _ => unreachable!(),
+        };
+        return compile_is_tag_predicate(builder, value, expected_tag);
+    }
     if matches!(
         function,
         "add"
@@ -7335,6 +7394,35 @@ fn autoloaded_stdlib_functions_can_be_used_as_values() {
 }
 
 #[test]
+fn runtime_type_predicates_and_type_of_work() {
+    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
+    assert_cranelift_executable_output(src, "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n", 0);
+}
+
+#[test]
+fn infer_known_callback_return_shape_tracks_function_alias_callbacks() {
+    let src = "fn double(x) do\n    x * 2\nend\n\nfn main() do\n    f = double\n    xs = [1]\n    ys = list_map(xs, f)\n    ys\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+    let main_function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main function should exist");
+    let callback = match &main_function.block.lines[2] {
+        Ast::Assign { value, .. } => match &**value {
+            Ast::Expression(expr) if expr.function == "list_map" => &expr.args[1],
+            other => panic!("expected list_map assignment, found {other:?}"),
+        },
+        other => panic!("expected assignment, found {other:?}"),
+    };
+    let main_analysis = analysis.functions.get("main").expect("main analysis should exist");
+    let shape = infer_known_callback_return_shape(callback, main_analysis, &analysis)
+        .expect("known callback return shape should be inferred");
+    assert_eq!(shape, ValueShape::scalar(KindSet::int()));
+}
+
+#[test]
 fn jit_logical_and_or_short_circuit() {
     let src = "fn boom() do\n    1 / 0\nend\n\nfn main() do\n    print(0 and boom())\n    print(1 or boom())\n    print(1 and 2)\n    print(0 or 5)\n    print(not 0)\n    print(not 7)\n    print(not 1 == 0)\nend";
     assert_cranelift_executable_output(src, "0\n1\n1\n1\n1\n0\n1\n", 0);
@@ -7540,6 +7628,18 @@ fn llvm_jit_autoloaded_stdlib_string_helpers_work() {
 fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
     let src = "fn main() do\n    pred = string_is_empty\n    print(pred(\"\"))\n    print(pred(\"x\"))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n0\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_runtime_type_predicates_and_type_of_work() {
+    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        0,
+    );
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]

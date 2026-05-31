@@ -546,6 +546,30 @@ impl<'ctx> LlvmCompiler<'ctx> {
     ) -> CompiledValue<'ctx> {
         if matches!(
             name,
+            "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter"
+        ) {
+            assert_eq!(args.len(), 1, "{name} expects 1 argument");
+            let value = self.compile_ast(
+                &args[0],
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
+            let expected_tag = match name {
+                "is_int" => TAG_INT,
+                "is_bigint" => TAG_BIGINT,
+                "is_string" => TAG_STRING,
+                "is_list" => TAG_LIST,
+                "is_function" => TAG_FUNCTION,
+                "is_string_iter" => TAG_STRING_ITER,
+                _ => unreachable!(),
+            };
+            return self.compile_is_tag_predicate(value, expected_tag, name);
+        }
+        if matches!(
+            name,
             "add"
                 | "subtract"
                 | "multiply"
@@ -1330,5 +1354,21 @@ impl<'ctx> LlvmCompiler<'ctx> {
             tag: tag_phi.as_basic_value().into_int_value(),
             payload: payload_phi.as_basic_value().into_int_value(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+mod tests {
+    use crate::module::{CodegenBackend, Module};
+
+    #[test]
+    fn llvm_compile_if_ast_lowers_nested_if_expressions() {
+        let src = "fn main() do\n    if 1 do\n        if 0 do\n            7\n        else\n            41\n        end\n    else\n        0\n    end\nend";
+        let jit = Module::from_source(src).compile_to_jit_with_backend(CodegenBackend::Llvm);
+        let ptr = jit
+            .get_int_result_fn_ptr("main")
+            .expect("llvm int-result wrapper should exist");
+        let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+        assert_eq!(func(), 41);
     }
 }

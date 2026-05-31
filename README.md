@@ -99,8 +99,17 @@ Current behavior:
     - `string_is_integer(s)`
     - `string_try_parse_integer(s)`
     - `string_try_parse_bigint(s)`
+    - `type_of(value)`
     - `string_repeat(s, n)`
     - `string_reverse(s)`
+  - runtime type predicates are also available as builtins:
+    - `is_int(value)`
+    - `is_bigint(value)`
+    - `is_string(value)`
+    - `is_list(value)`
+    - `is_function(value)`
+    - `is_string_iter(value)`
+  - `type_of(value)` returns a debuggable stable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"function"`, or `"string_iter"`
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
   - `string_try_first(s)` returns `(ok, value, err)` where `value` is the first byte as an `Int`
