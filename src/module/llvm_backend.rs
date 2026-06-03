@@ -406,6 +406,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.define_pair_bigint_multiply("__rt_bigint_multiply", "llvm_rt_bigint_multiply");
             self.define_pair_bigint_divide("__rt_bigint_divide", "llvm_rt_bigint_divide");
             self.define_pair_bigint_modulo("__rt_bigint_modulo", "llvm_rt_bigint_modulo");
+            self.define_pair_bigint_bitand("__rt_bigint_bitand", "llvm_rt_bigint_bitand");
+            self.define_pair_bigint_bitor("__rt_bigint_bitor", "llvm_rt_bigint_bitor");
+            self.define_pair_bigint_bitxor("__rt_bigint_bitxor", "llvm_rt_bigint_bitxor");
+            self.define_pair_bigint_shl("__rt_bigint_shl", "llvm_rt_bigint_shl");
+            self.define_pair_bigint_shr("__rt_bigint_shr", "llvm_rt_bigint_shr");
         }
         self.define_runtime_operation(
             "__op_add",
@@ -437,11 +442,36 @@ impl<'ctx> LlvmCompiler<'ctx> {
             BinaryArithOp::Modulo,
             self.bigint_enabled.then_some("__rt_bigint_modulo"),
         );
-        self.define_runtime_operation("__op_bitand", "llvm_rt_bitand", BinaryArithOp::BitAnd, None);
-        self.define_runtime_operation("__op_bitor", "llvm_rt_bitor", BinaryArithOp::BitOr, None);
-        self.define_runtime_operation("__op_bitxor", "llvm_rt_bitxor", BinaryArithOp::BitXor, None);
-        self.define_runtime_operation("__op_shl", "llvm_rt_shl", BinaryArithOp::ShiftLeft, None);
-        self.define_runtime_operation("__op_shr", "llvm_rt_shr", BinaryArithOp::ShiftRight, None);
+        self.define_runtime_operation(
+            "__op_bitand",
+            "llvm_rt_bitand",
+            BinaryArithOp::BitAnd,
+            self.bigint_enabled.then_some("__rt_bigint_bitand"),
+        );
+        self.define_runtime_operation(
+            "__op_bitor",
+            "llvm_rt_bitor",
+            BinaryArithOp::BitOr,
+            self.bigint_enabled.then_some("__rt_bigint_bitor"),
+        );
+        self.define_runtime_operation(
+            "__op_bitxor",
+            "llvm_rt_bitxor",
+            BinaryArithOp::BitXor,
+            self.bigint_enabled.then_some("__rt_bigint_bitxor"),
+        );
+        self.define_runtime_operation(
+            "__op_shl",
+            "llvm_rt_shl",
+            BinaryArithOp::ShiftLeft,
+            self.bigint_enabled.then_some("__rt_bigint_shl"),
+        );
+        self.define_runtime_operation(
+            "__op_shr",
+            "llvm_rt_shr",
+            BinaryArithOp::ShiftRight,
+            self.bigint_enabled.then_some("__rt_bigint_shr"),
+        );
         self.define_runtime_compare(
             "__op_gt",
             "llvm_rt_gt",
@@ -1677,6 +1707,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         name: &str,
         lhs: CompiledValue<'ctx>,
         rhs: CompiledValue<'ctx>,
+        function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
         match name {
             "add" => {
@@ -1702,6 +1733,23 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 &[lhs, rhs],
                 "bigint_modulo",
             ),
+            "bitand" => self.build_internal_call(
+                self.require_func("bigint_bitand"),
+                &[lhs, rhs],
+                "bigint_bitand",
+            ),
+            "bitor" => self.build_internal_call(
+                self.require_func("bigint_bitor"),
+                &[lhs, rhs],
+                "bigint_bitor",
+            ),
+            "bitxor" => self.build_internal_call(
+                self.require_func("bigint_bitxor"),
+                &[lhs, rhs],
+                "bigint_bitxor",
+            ),
+            "shl" => self.compile_bigint_shift_builtin("bigint_shl", lhs, rhs, function),
+            "shr" => self.compile_bigint_shift_builtin("bigint_shr", lhs, rhs, function),
             "gt" | "lt" | "gte" | "lte" | "eq" | "ne" => {
                 let compare = self.build_internal_call(
                     self.require_func("bigint_compare"),
@@ -2077,97 +2125,125 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     "rhs_is_bigint",
                 )
                 .expect("failed rhs_is_bigint");
-            let both_bigint = self
-                .builder
-                .build_and(lhs_is_bigint, rhs_is_bigint, "both_bigint")
-                .expect("failed both_bigint");
-            let bigint_block = self.context.append_basic_block(function, "bigint");
-            let lhs_promote_check_block =
-                self.context.append_basic_block(function, "lhs_promote_check");
-            let lhs_promote_block = self.context.append_basic_block(function, "lhs_promote");
-            let rhs_maybe_promote_block =
-                self.context.append_basic_block(function, "rhs_maybe_promote");
-            let rhs_promote_block = self.context.append_basic_block(function, "rhs_promote");
-            self.builder
-                .build_conditional_branch(both_bigint, bigint_block, lhs_promote_check_block)
-                .expect("failed bigint branch");
+            if matches!(op, BinaryArithOp::ShiftLeft | BinaryArithOp::ShiftRight) {
+                let lhs_bigint_rhs_int = self
+                    .builder
+                    .build_and(lhs_is_bigint, rhs_is_int, "lhs_bigint_rhs_int")
+                    .expect("failed lhs_bigint_rhs_int");
+                let bigint_block = self.context.append_basic_block(function, "bigint_shift");
+                self.builder
+                    .build_conditional_branch(lhs_bigint_rhs_int, bigint_block, trap_block)
+                    .expect("failed bigint shift branch");
 
-            self.builder.position_at_end(bigint_block);
-            let result = self.build_internal_call(
-                self.require_func(bigint_name),
-                &[
-                    CompiledValue { tag: lhs_tag, payload: lhs_payload },
-                    CompiledValue { tag: rhs_tag, payload: rhs_payload },
-                ],
-                "bigint_op",
-            );
-            self.builder
-                .build_return(Some(&self.make_pair_value(
-                    result.tag,
-                    result.payload,
-                    "bigint_op_result",
-                )))
-                .expect("failed to return bigint op result");
+                self.builder.position_at_end(bigint_block);
+                let result = self.build_internal_call(
+                    self.require_func(bigint_name),
+                    &[
+                        CompiledValue { tag: lhs_tag, payload: lhs_payload },
+                        CompiledValue { tag: rhs_tag, payload: rhs_payload },
+                    ],
+                    "bigint_shift",
+                );
+                self.builder
+                    .build_return(Some(&self.make_pair_value(
+                        result.tag,
+                        result.payload,
+                        "bigint_shift_result",
+                    )))
+                    .expect("failed to return bigint shift result");
+            } else {
+                let both_bigint = self
+                    .builder
+                    .build_and(lhs_is_bigint, rhs_is_bigint, "both_bigint")
+                    .expect("failed both_bigint");
+                let bigint_block = self.context.append_basic_block(function, "bigint");
+                let lhs_promote_check_block =
+                    self.context.append_basic_block(function, "lhs_promote_check");
+                let lhs_promote_block = self.context.append_basic_block(function, "lhs_promote");
+                let rhs_maybe_promote_block =
+                    self.context.append_basic_block(function, "rhs_maybe_promote");
+                let rhs_promote_block = self.context.append_basic_block(function, "rhs_promote");
+                self.builder
+                    .build_conditional_branch(both_bigint, bigint_block, lhs_promote_check_block)
+                    .expect("failed bigint branch");
 
-            self.builder.position_at_end(lhs_promote_check_block);
-            let lhs_int_rhs_bigint = self
-                .builder
-                .build_and(lhs_is_int, rhs_is_bigint, "lhs_int_rhs_bigint")
-                .expect("failed lhs_int_rhs_bigint");
-            self.builder
-                .build_conditional_branch(
-                    lhs_int_rhs_bigint,
-                    lhs_promote_block,
-                    rhs_maybe_promote_block,
-                )
-                .expect("failed lhs promote branch");
+                self.builder.position_at_end(bigint_block);
+                let result = self.build_internal_call(
+                    self.require_func(bigint_name),
+                    &[
+                        CompiledValue { tag: lhs_tag, payload: lhs_payload },
+                        CompiledValue { tag: rhs_tag, payload: rhs_payload },
+                    ],
+                    "bigint_op",
+                );
+                self.builder
+                    .build_return(Some(&self.make_pair_value(
+                        result.tag,
+                        result.payload,
+                        "bigint_op_result",
+                    )))
+                    .expect("failed to return bigint op result");
 
-            self.builder.position_at_end(lhs_promote_block);
-            let lhs_big = self.build_internal_call(
-                self.require_func("__rt_bigint_from_int"),
-                &[CompiledValue { tag: lhs_tag, payload: lhs_payload }],
-                "lhs_promoted_bigint",
-            );
-            let result = self.build_internal_call(
-                self.require_func(bigint_name),
-                &[lhs_big, CompiledValue { tag: rhs_tag, payload: rhs_payload }],
-                "mixed_bigint_op_lhs",
-            );
-            self.builder
-                .build_return(Some(&self.make_pair_value(
-                    result.tag,
-                    result.payload,
-                    "mixed_bigint_op_lhs_result",
-                )))
-                .expect("failed to return mixed bigint lhs op result");
+                self.builder.position_at_end(lhs_promote_check_block);
+                let lhs_int_rhs_bigint = self
+                    .builder
+                    .build_and(lhs_is_int, rhs_is_bigint, "lhs_int_rhs_bigint")
+                    .expect("failed lhs_int_rhs_bigint");
+                self.builder
+                    .build_conditional_branch(
+                        lhs_int_rhs_bigint,
+                        lhs_promote_block,
+                        rhs_maybe_promote_block,
+                    )
+                    .expect("failed lhs promote branch");
 
-            self.builder.position_at_end(rhs_maybe_promote_block);
-            let rhs_int_lhs_bigint = self
-                .builder
-                .build_and(lhs_is_bigint, rhs_is_int, "rhs_int_lhs_bigint")
-                .expect("failed rhs_int_lhs_bigint");
-            self.builder
-                .build_conditional_branch(rhs_int_lhs_bigint, rhs_promote_block, trap_block)
-                .expect("failed rhs maybe promote branch");
+                self.builder.position_at_end(lhs_promote_block);
+                let lhs_big = self.build_internal_call(
+                    self.require_func("__rt_bigint_from_int"),
+                    &[CompiledValue { tag: lhs_tag, payload: lhs_payload }],
+                    "lhs_promoted_bigint",
+                );
+                let result = self.build_internal_call(
+                    self.require_func(bigint_name),
+                    &[lhs_big, CompiledValue { tag: rhs_tag, payload: rhs_payload }],
+                    "mixed_bigint_op_lhs",
+                );
+                self.builder
+                    .build_return(Some(&self.make_pair_value(
+                        result.tag,
+                        result.payload,
+                        "mixed_bigint_op_lhs_result",
+                    )))
+                    .expect("failed to return mixed bigint lhs op result");
 
-            self.builder.position_at_end(rhs_promote_block);
-            let rhs_big = self.build_internal_call(
-                self.require_func("__rt_bigint_from_int"),
-                &[CompiledValue { tag: rhs_tag, payload: rhs_payload }],
-                "rhs_promoted_bigint",
-            );
-            let result = self.build_internal_call(
-                self.require_func(bigint_name),
-                &[CompiledValue { tag: lhs_tag, payload: lhs_payload }, rhs_big],
-                "mixed_bigint_op_rhs",
-            );
-            self.builder
-                .build_return(Some(&self.make_pair_value(
-                    result.tag,
-                    result.payload,
-                    "mixed_bigint_op_rhs_result",
-                )))
-                .expect("failed to return mixed bigint rhs op result");
+                self.builder.position_at_end(rhs_maybe_promote_block);
+                let rhs_int_lhs_bigint = self
+                    .builder
+                    .build_and(lhs_is_bigint, rhs_is_int, "rhs_int_lhs_bigint")
+                    .expect("failed rhs_int_lhs_bigint");
+                self.builder
+                    .build_conditional_branch(rhs_int_lhs_bigint, rhs_promote_block, trap_block)
+                    .expect("failed rhs maybe promote branch");
+
+                self.builder.position_at_end(rhs_promote_block);
+                let rhs_big = self.build_internal_call(
+                    self.require_func("__rt_bigint_from_int"),
+                    &[CompiledValue { tag: rhs_tag, payload: rhs_payload }],
+                    "rhs_promoted_bigint",
+                );
+                let result = self.build_internal_call(
+                    self.require_func(bigint_name),
+                    &[CompiledValue { tag: lhs_tag, payload: lhs_payload }, rhs_big],
+                    "mixed_bigint_op_rhs",
+                );
+                self.builder
+                    .build_return(Some(&self.make_pair_value(
+                        result.tag,
+                        result.payload,
+                        "mixed_bigint_op_rhs_result",
+                    )))
+                    .expect("failed to return mixed bigint rhs op result");
+            }
         } else {
             self.build_trap_and_unreachable();
         }

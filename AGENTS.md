@@ -37,10 +37,21 @@ Guidance for coding agents working in this repository.
   - `bigint_multiply(a, b)`
   - `bigint_divide(a, b)`
   - `bigint_modulo(a, b)`
+  - `bigint_bitand(a, b)`
+  - `bigint_bitor(a, b)`
+  - `bigint_bitxor(a, b)`
+  - `bigint_shl(a, shift)`
+  - `bigint_shr(a, shift)`
   - `a + b`, `a - b`, `a * b`, `a / b`, and `a % b` when both sides are `BigInt`
+  - `a & b`, `a | b`, `a ^ b`, `a << b`, and `a >> b` when the operands are supported bigint bitwise forms
   - `a == b`, `a != b`, `a < b`, `a <= b`, `a > b`, and `a >= b` when both sides are `BigInt`
   - mixed `Int` / `BigInt` operator arithmetic and comparisons promote the `Int` operand
   - explicit `bigint_*` builtins also promote `Int` arguments to `BigInt`
+  - bigint bitwise support currently targets non-negative values first:
+    - `&`, `|`, and `^` accept `Int`, `BigInt`, or mixed `Int` / `BigInt` operands by promoting `Int`
+    - `<<` and `>>` accept a bigint-or-int left operand and an `Int` shift count
+    - negative bigint operands in bitwise operations trap at runtime
+    - negative shift counts or shift counts `>= 64` still trap
 - String values are supported:
   - `"hello"`
   - `print("hello")`

@@ -597,7 +597,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             let rhs_exact_int = shape_is_exact_kind(&rhs_shape, KindSet::int());
             let lhs_exact_bigint = shape_is_exact_kind(&lhs_shape, KindSet::bigint());
             let rhs_exact_bigint = shape_is_exact_kind(&rhs_shape, KindSet::bigint());
-            if (lhs_exact_int && rhs_exact_int) || (lhs_exact_bigint && rhs_exact_bigint) {
+            let exact_int_case = lhs_exact_int && rhs_exact_int;
+            let exact_bigint_case = lhs_exact_bigint && rhs_exact_bigint;
+            let exact_bigint_shift_case =
+                matches!(name, "shl" | "shr") && lhs_exact_bigint && rhs_exact_int;
+            if exact_int_case || exact_bigint_case || exact_bigint_shift_case {
                 let lhs = self.compile_ast(
                     &args[0],
                     vars,
@@ -614,10 +618,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     function,
                     current_function_name,
                 );
-                return if lhs_exact_int && rhs_exact_int {
+                return if exact_int_case {
                     self.compile_exact_int_operator(name, lhs, rhs)
                 } else {
-                    self.compile_exact_bigint_operator(name, lhs, rhs)
+                    self.compile_exact_bigint_operator(name, lhs, rhs, function)
                 };
             }
         }
@@ -1185,9 +1189,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "ne",
             )),
             "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
-            | "bigint_modulo" | "bigint_compare" => {
+            | "bigint_modulo" | "bigint_compare" | "bigint_bitand" | "bigint_bitor"
+            | "bigint_bitxor" => {
                 Some(self.compile_bigint_builtin(name, compiled, function))
             }
+            "bigint_shl" | "bigint_shr" => Some(
+                self.compile_bigint_shift_builtin(name, compiled[0], compiled[1], function),
+            ),
             "print" => {
                 Some(self.build_internal_call(self.require_func("__rt_print"), compiled, "print"))
             }

@@ -46,10 +46,16 @@ Current behavior:
 - `bigint_compare(a, b)` returns `-1`, `0`, or `1`
 - `bigint_add(a, b)`, `bigint_subtract(a, b)`, `bigint_multiply(a, b)`,
   `bigint_divide(a, b)`, and `bigint_modulo(a, b)` are available as builtins
+- `bigint_bitand(a, b)`, `bigint_bitor(a, b)`, `bigint_bitxor(a, b)`,
+  `bigint_shl(a, shift)`, and `bigint_shr(a, shift)` are also available
 - comparison operators also work for `BigInt` values when both operands are bigint:
   - `==`, `!=`, `<`, `<=`, `>`, `>=`
 - `+`, `-`, `*`, `/`, and `%` also work for `BigInt` values when both operands are bigint
+- `&`, `|`, `^`, `<<`, and `>>` also work for supported bigint bitwise forms
 - mixed `Int` / `BigInt` arithmetic and comparisons now promote the `Int` operand for operator use
+- mixed `Int` / `BigInt` bitwise `&`, `|`, and `^` also promote the `Int` operand
+- bigint `<<` and `>>` currently use a bigint-or-int left operand and an `Int` shift count
+- bigint bitwise support currently targets non-negative values first; negative bigint operands trap at runtime
 - plain `Int` / `Int` arithmetic keeps the existing semantics, including overflow traps
 - the explicit `bigint_*` builtins now accept `Int`, `BigInt`, or mixed `Int` / `BigInt` operands by promoting `Int` arguments to `BigInt`
 - bigint arithmetic is implemented in Cranelift IR and LLVM IR, not in Rust runtime helpers
