@@ -8,6 +8,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         match ast {
             Ast::Literal(LiteralAst::Integer(n)) => {
@@ -23,15 +24,31 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::FunctionRef(name) => {
                 self.allocate_closure_for_function(name, vars, capture_slots, env_ptr, function)
             }
-            Ast::MultiValue(values) => {
-                self.compile_multi_value_ast(values, vars, capture_slots, env_ptr, function)
-            }
-            Ast::ListLiteral(items) => {
-                self.compile_list_literal_ast(items, vars, capture_slots, env_ptr, function)
-            }
-            Ast::Index { collection, index, .. } => {
-                self.compile_index_ast(collection, index, vars, capture_slots, env_ptr, function)
-            }
+            Ast::MultiValue(values) => self.compile_multi_value_ast(
+                values,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
+            Ast::ListLiteral(items) => self.compile_list_literal_ast(
+                items,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
+            Ast::Index { collection, index, .. } => self.compile_index_ast(
+                collection,
+                index,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
             Ast::IndexAssign { collection, index, value, .. } => self.compile_index_assign_ast(
                 collection,
                 index,
@@ -40,25 +57,57 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 capture_slots,
                 env_ptr,
                 function,
+                current_function_name,
             ),
-            Ast::Expression(ExpressionAst { function: name, args, .. }) => {
-                self.compile_expression_ast(name, args, vars, capture_slots, env_ptr, function)
-            }
-            Ast::Block(block) => {
-                self.compile_block_ast(block, vars, capture_slots, env_ptr, function)
-            }
+            Ast::Expression(ExpressionAst { function: name, args, .. }) => self
+                .compile_expression_ast(
+                    name,
+                    args,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                ),
+            Ast::Block(block) => self.compile_block_ast(
+                block,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
             Ast::Variable(name) => {
                 self.resolve_named_value(name, vars, capture_slots, env_ptr, function)
             }
-            Ast::Assign { name, value, .. } => {
-                self.compile_assign_ast(name, value, vars, capture_slots, env_ptr, function)
-            }
-            Ast::MultiAssign { names, value, .. } => {
-                self.compile_multi_assign_ast(names, value, vars, capture_slots, env_ptr, function)
-            }
-            Ast::If { condition, then, else_, .. } => {
-                self.compile_if_ast(condition, then, else_, vars, capture_slots, env_ptr, function)
-            }
+            Ast::Assign { name, value, .. } => self.compile_assign_ast(
+                name,
+                value,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
+            Ast::MultiAssign { names, value, .. } => self.compile_multi_assign_ast(
+                names,
+                value,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
+            Ast::If { condition, then, else_, .. } => self.compile_if_ast(
+                condition,
+                then,
+                else_,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
         }
     }
@@ -70,10 +119,20 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         let compiled = values
             .iter()
-            .map(|value| self.compile_ast(value, vars, capture_slots, env_ptr, function))
+            .map(|value| {
+                self.compile_ast(
+                    value,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                )
+            })
             .collect::<Vec<_>>();
         let alloc = self.require_func("__alloc");
         let align = self.i64_type.const_int(8, false);
@@ -174,8 +233,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
-        let multi_value = self.compile_ast(value, vars, capture_slots, env_ptr, function);
+        let multi_value =
+            self.compile_ast(value, vars, capture_slots, env_ptr, function, current_function_name);
         let mut last = None;
         for (index, name) in names.iter().enumerate() {
             let unpacked = self.build_multi_value_load(multi_value, index, function);
@@ -376,10 +437,18 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         let list = self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_new");
         for item in items {
-            let value = self.compile_ast(item, vars, capture_slots, env_ptr, function);
+            let value = self.compile_ast(
+                item,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
             let _ = self.build_internal_call(
                 self.require_func("__rt_list_push"),
                 &[list, value],
@@ -397,14 +466,42 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
-        let collection = self.compile_ast(collection, vars, capture_slots, env_ptr, function);
-        let index = self.compile_ast(index, vars, capture_slots, env_ptr, function);
-        self.build_internal_call(
-            self.require_func("__rt_list_get"),
-            &[collection, index],
-            "list_get",
-        )
+        let function_analysis = self.function_analysis(current_function_name);
+        let collection_shape =
+            infer_ast_value_shape(collection, function_analysis, &self.value_kind_analysis);
+        let index_shape =
+            infer_ast_value_shape(index, function_analysis, &self.value_kind_analysis);
+        let collection = self.compile_ast(
+            collection,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
+        let index =
+            self.compile_ast(index, vars, capture_slots, env_ptr, function, current_function_name);
+        if shape_is_exact_kind(&collection_shape, KindSet::list())
+            && shape_is_exact_kind(&index_shape, KindSet::int())
+        {
+            let idx = index.payload;
+            let trap_block = self.context.append_basic_block(function, "list_get_bounds_trap");
+            self.build_index_bounds_check(collection.payload, idx, "list_get", trap_block);
+            let result = self.build_list_value_load(collection.payload, idx, "list_get");
+            let ok_block = self.builder.get_insert_block().expect("missing list_get ok block");
+            self.builder.position_at_end(trap_block);
+            self.build_trap_and_unreachable();
+            self.builder.position_at_end(ok_block);
+            result
+        } else {
+            self.build_internal_call(
+                self.require_func("__rt_list_get"),
+                &[collection, index],
+                "list_get",
+            )
+        }
     }
 
     fn compile_index_assign_ast(
@@ -416,10 +513,20 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
-        let collection = self.compile_ast(collection, vars, capture_slots, env_ptr, function);
-        let index = self.compile_ast(index, vars, capture_slots, env_ptr, function);
-        let value = self.compile_ast(value, vars, capture_slots, env_ptr, function);
+        let collection = self.compile_ast(
+            collection,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
+        let index =
+            self.compile_ast(index, vars, capture_slots, env_ptr, function, current_function_name);
+        let value =
+            self.compile_ast(value, vars, capture_slots, env_ptr, function, current_function_name);
         self.build_internal_call(
             self.require_func("__rt_list_set"),
             &[collection, index, value],
@@ -435,10 +542,90 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
+        if matches!(
+            name,
+            "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter"
+        ) {
+            assert_eq!(args.len(), 1, "{name} expects 1 argument");
+            let value = self.compile_ast(
+                &args[0],
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
+            let expected_tag = match name {
+                "is_int" => TAG_INT,
+                "is_bigint" => TAG_BIGINT,
+                "is_string" => TAG_STRING,
+                "is_list" => TAG_LIST,
+                "is_function" => TAG_FUNCTION,
+                "is_string_iter" => TAG_STRING_ITER,
+                _ => unreachable!(),
+            };
+            return self.compile_is_tag_predicate(value, expected_tag, name);
+        }
+        if matches!(
+            name,
+            "add"
+                | "subtract"
+                | "multiply"
+                | "divide"
+                | "modulo"
+                | "gt"
+                | "lt"
+                | "gte"
+                | "lte"
+                | "eq"
+                | "ne"
+        ) && args.len() == 2
+        {
+            let function_analysis = self.function_analysis(current_function_name);
+            let lhs_shape =
+                infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis);
+            let rhs_shape =
+                infer_ast_value_shape(&args[1], function_analysis, &self.value_kind_analysis);
+            let lhs_exact_int = shape_is_exact_kind(&lhs_shape, KindSet::int());
+            let rhs_exact_int = shape_is_exact_kind(&rhs_shape, KindSet::int());
+            let lhs_exact_bigint = shape_is_exact_kind(&lhs_shape, KindSet::bigint());
+            let rhs_exact_bigint = shape_is_exact_kind(&rhs_shape, KindSet::bigint());
+            if (lhs_exact_int && rhs_exact_int) || (lhs_exact_bigint && rhs_exact_bigint) {
+                let lhs = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let rhs = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                return if lhs_exact_int && rhs_exact_int {
+                    self.compile_exact_int_operator(name, lhs, rhs)
+                } else {
+                    self.compile_exact_bigint_operator(name, lhs, rhs)
+                };
+            }
+        }
         if name == "not" {
             assert_eq!(args.len(), 1, "{name} expects 1 argument");
-            return self.compile_logical_not(&args[0], vars, capture_slots, env_ptr, function);
+            return self.compile_logical_not(
+                &args[0],
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
         }
         if name == "and" || name == "or" {
             assert_eq!(args.len(), 2, "{name} expects 2 arguments");
@@ -450,31 +637,70 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 capture_slots,
                 env_ptr,
                 function,
+                current_function_name,
             );
         }
         if name == "list_map" {
-            return self.compile_list_map(args, vars, capture_slots, env_ptr, function);
+            return self.compile_list_map(
+                args,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
         }
         if name == "list_filter" {
-            return self.compile_list_filter(args, vars, capture_slots, env_ptr, function);
+            return self.compile_list_filter(
+                args,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
         }
         if name == "list_range" {
-            return self.compile_list_range(args, vars, capture_slots, env_ptr, function);
+            return self.compile_list_range(
+                args,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
         }
-        if let Some(value) =
-            self.compile_string_expression_ast(name, args, vars, capture_slots, env_ptr, function)
-        {
+        if let Some(value) = self.compile_string_expression_ast(
+            name,
+            args,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        ) {
             return value;
         }
 
         let compiled = args
             .iter()
-            .map(|arg| self.compile_ast(arg, vars, capture_slots, env_ptr, function))
+            .map(|arg| {
+                self.compile_ast(arg, vars, capture_slots, env_ptr, function, current_function_name)
+            })
             .collect::<Vec<_>>();
         if name.is_empty() {
             return compiled[0];
         }
-        self.compile_named_expression_ast(name, &compiled, vars, capture_slots, env_ptr, function)
+        self.compile_named_expression_ast(
+            name,
+            args,
+            &compiled,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        )
     }
 
     fn compile_string_expression_ast(
@@ -485,103 +711,347 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> Option<CompiledValue<'ctx>> {
         match name {
             "bytes_len" => {
                 assert_eq!(args.len(), 1, "bytes_len expects 1 argument");
-                let value = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let trap_block = self.context.append_basic_block(function, "bytes_len_trap");
-                let ok_block = self.context.append_basic_block(function, "bytes_len_ok");
-                let raw =
-                    self.expect_tag_payload(value, TAG_STRING, "bytes_len", ok_block, trap_block);
-                self.builder.position_at_end(trap_block);
-                self.build_trap_and_unreachable();
-                self.builder.position_at_end(ok_block);
-                let len = self.build_string_len_load(raw, "bytes_len");
+                let function_analysis = self.function_analysis(current_function_name);
+                let value_shape =
+                    infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis);
+                let value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let len = if shape_is_exact_kind(&value_shape, KindSet::string()) {
+                    self.build_string_len_load(value.payload, "bytes_len")
+                } else {
+                    let trap_block = self.context.append_basic_block(function, "bytes_len_trap");
+                    let ok_block = self.context.append_basic_block(function, "bytes_len_ok");
+                    let raw = self.expect_tag_payload(
+                        value,
+                        TAG_STRING,
+                        "bytes_len",
+                        ok_block,
+                        trap_block,
+                    );
+                    self.builder.position_at_end(trap_block);
+                    self.build_trap_and_unreachable();
+                    self.builder.position_at_end(ok_block);
+                    self.build_string_len_load(raw, "bytes_len")
+                };
                 Some(self.int_value(len))
             }
             "bytes_get" => {
                 assert_eq!(args.len(), 2, "bytes_get expects 2 arguments");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let index_value =
-                    self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
-                Some(self.build_bytes_get(string_value, index_value, function))
+                let function_analysis = self.function_analysis(current_function_name);
+                let string_shape =
+                    infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis);
+                let index_shape =
+                    infer_ast_value_shape(&args[1], function_analysis, &self.value_kind_analysis);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let index_value = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                if shape_is_exact_kind(&string_shape, KindSet::string())
+                    && shape_is_exact_kind(&index_shape, KindSet::int())
+                {
+                    let idx = index_value.payload;
+                    let trap_block =
+                        self.context.append_basic_block(function, "bytes_get_bounds_trap");
+                    let ok_block = self.context.append_basic_block(function, "bytes_get_ok");
+                    let non_neg = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::SGE,
+                            idx,
+                            self.i64_type.const_zero(),
+                            "bytes_get_non_neg",
+                        )
+                        .expect("failed bytes_get non-neg compare");
+                    let len = self.build_string_len_load(string_value.payload, "bytes_get");
+                    let in_bounds = self
+                        .builder
+                        .build_int_compare(IntPredicate::ULT, idx, len, "bytes_get_in_bounds")
+                        .expect("failed bytes_get in-bounds compare");
+                    let ok = self
+                        .builder
+                        .build_and(non_neg, in_bounds, "bytes_get_ok_cond")
+                        .expect("failed bytes_get ok cond");
+                    self.builder
+                        .build_conditional_branch(ok, ok_block, trap_block)
+                        .expect("failed bytes_get branch");
+                    self.builder.position_at_end(trap_block);
+                    self.build_trap_and_unreachable();
+                    self.builder.position_at_end(ok_block);
+                    let data_ptr = self.build_string_ptr_load(string_value.payload, "bytes_get");
+                    let base = self
+                        .builder
+                        .build_ptr_to_int(data_ptr, self.i64_type, "bytes_get_base")
+                        .expect("failed bytes_get ptr-to-int");
+                    let addr = self
+                        .builder
+                        .build_int_add(base, idx, "bytes_get_addr")
+                        .expect("failed bytes_get addr");
+                    let ptr = self
+                        .builder
+                        .build_int_to_ptr(
+                            addr,
+                            self.context.ptr_type(Default::default()),
+                            "bytes_get_ptr",
+                        )
+                        .expect("failed bytes_get ptr");
+                    let byte = self
+                        .builder
+                        .build_load(self.context.i8_type(), ptr, "bytes_get_byte")
+                        .expect("failed bytes_get load")
+                        .into_int_value();
+                    let raw = self
+                        .builder
+                        .build_int_z_extend(byte, self.i64_type, "bytes_get_i64")
+                        .expect("failed bytes_get zext");
+                    Some(self.int_value(raw))
+                } else {
+                    Some(self.build_bytes_get(string_value, index_value, function))
+                }
             }
             "bytes_pop" => {
                 assert_eq!(args.len(), 1, "bytes_pop expects 1 argument");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_bytes_pop(string_value, function))
             }
             "bytes_push" => {
                 assert_eq!(args.len(), 2, "bytes_push expects 2 arguments");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let byte_value = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let byte_value = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_bytes_push(string_value, byte_value, function))
             }
             "bytes_insert" => {
                 assert_eq!(args.len(), 3, "bytes_insert expects 3 arguments");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let index_value =
-                    self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
-                let byte_value = self.compile_ast(&args[2], vars, capture_slots, env_ptr, function);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let index_value = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let byte_value = self.compile_ast(
+                    &args[2],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_bytes_insert(string_value, index_value, byte_value, function))
             }
             "bytes_remove" => {
                 assert_eq!(args.len(), 2, "bytes_remove expects 2 arguments");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let index_value =
-                    self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let index_value = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_bytes_remove(string_value, index_value, function))
             }
             "bytes_set" => {
                 assert_eq!(args.len(), 3, "bytes_set expects 3 arguments");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let index_value =
-                    self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
-                let byte_value = self.compile_ast(&args[2], vars, capture_slots, env_ptr, function);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let index_value = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let byte_value = self.compile_ast(
+                    &args[2],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_bytes_set(string_value, index_value, byte_value, function))
             }
             "bytes_slice" => {
                 assert_eq!(args.len(), 3, "bytes_slice expects 3 arguments");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let start_value =
-                    self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
-                let end_value = self.compile_ast(&args[2], vars, capture_slots, env_ptr, function);
-                Some(self.build_bytes_slice(string_value, start_value, end_value, function))
+                let function_analysis = self.function_analysis(current_function_name);
+                let string_shape =
+                    infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis);
+                let start_shape =
+                    infer_ast_value_shape(&args[1], function_analysis, &self.value_kind_analysis);
+                let end_shape =
+                    infer_ast_value_shape(&args[2], function_analysis, &self.value_kind_analysis);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let start_value = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let end_value = self.compile_ast(
+                    &args[2],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                if shape_is_exact_kind(&string_shape, KindSet::string())
+                    && shape_is_exact_kind(&start_shape, KindSet::int())
+                    && shape_is_exact_kind(&end_shape, KindSet::int())
+                {
+                    Some(self.build_bytes_slice_known_string(
+                        string_value.payload,
+                        start_value.payload,
+                        end_value.payload,
+                        function,
+                    ))
+                } else {
+                    Some(self.build_bytes_slice(string_value, start_value, end_value, function))
+                }
             }
             "string_chars" => {
                 assert_eq!(args.len(), 1, "string_chars expects 1 argument");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_string_chars(string_value, function))
             }
             "string_iter_done" => {
                 assert_eq!(args.len(), 1, "string_iter_done expects 1 argument");
-                let iter_value = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                let iter_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_string_iter_done(iter_value, function))
             }
             "string_iter_next" => {
                 assert_eq!(args.len(), 1, "string_iter_next expects 1 argument");
-                let iter_value = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                let iter_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_string_iter_next(iter_value, function))
             }
             "string_copy" => {
                 assert_eq!(args.len(), 1, "string_copy expects 1 argument");
-                let string_value =
-                    self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
+                let string_value = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_string_copy(string_value, function))
             }
             "string_concat" => {
                 assert_eq!(args.len(), 2, "string_concat expects 2 arguments");
-                let lhs = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-                let rhs = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+                let lhs = self.compile_ast(
+                    &args[0],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
+                let rhs = self.compile_ast(
+                    &args[1],
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
                 Some(self.build_string_concat(lhs, rhs, function))
             }
             _ => None,
@@ -591,133 +1061,239 @@ impl<'ctx> LlvmCompiler<'ctx> {
     fn compile_named_expression_ast(
         &self,
         name: &str,
+        args: &[Ast],
+        compiled: &[CompiledValue<'ctx>],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+    ) -> CompiledValue<'ctx> {
+        let function_analysis = self.function_analysis(current_function_name);
+        if let Some(value) = self.compile_generic_runtime_expression_ast(name, compiled, function) {
+            return value;
+        }
+        if let Some(value) = self.compile_list_named_expression_ast(
+            name,
+            args,
+            compiled,
+            function,
+            function_analysis,
+        ) {
+            return value;
+        }
+        self.compile_fallback_named_expression_ast(
+            name,
+            compiled,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+        )
+    }
+
+    fn compile_generic_runtime_expression_ast(
+        &self,
+        name: &str,
+        compiled: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+    ) -> Option<CompiledValue<'ctx>> {
+        match name {
+            "add" => Some(self.build_internal_call(
+                self.require_func("__op_add"),
+                &[compiled[0], compiled[1]],
+                "add",
+            )),
+            "subtract" => Some(self.build_internal_call(
+                self.require_func("__op_subtract"),
+                &[compiled[0], compiled[1]],
+                "subtract",
+            )),
+            "multiply" => Some(self.build_internal_call(
+                self.require_func("__op_multiply"),
+                &[compiled[0], compiled[1]],
+                "multiply",
+            )),
+            "divide" => Some(self.build_internal_call(
+                self.require_func("__op_divide"),
+                &[compiled[0], compiled[1]],
+                "divide",
+            )),
+            "modulo" => Some(self.build_internal_call(
+                self.require_func("__op_modulo"),
+                &[compiled[0], compiled[1]],
+                "modulo",
+            )),
+            "gt" => Some(self.build_internal_call(
+                self.require_func("__op_gt"),
+                &[compiled[0], compiled[1]],
+                "gt",
+            )),
+            "lt" => Some(self.build_internal_call(
+                self.require_func("__op_lt"),
+                &[compiled[0], compiled[1]],
+                "lt",
+            )),
+            "gte" => Some(self.build_internal_call(
+                self.require_func("__op_gte"),
+                &[compiled[0], compiled[1]],
+                "gte",
+            )),
+            "lte" => Some(self.build_internal_call(
+                self.require_func("__op_lte"),
+                &[compiled[0], compiled[1]],
+                "lte",
+            )),
+            "eq" => Some(self.build_internal_call(
+                self.require_func("__op_eq"),
+                &[compiled[0], compiled[1]],
+                "eq",
+            )),
+            "ne" => Some(self.build_internal_call(
+                self.require_func("__op_ne"),
+                &[compiled[0], compiled[1]],
+                "ne",
+            )),
+            "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
+            | "bigint_modulo" | "bigint_compare" => {
+                Some(self.compile_bigint_builtin(name, compiled, function))
+            }
+            "print" => {
+                Some(self.build_internal_call(self.require_func("__rt_print"), compiled, "print"))
+            }
+            _ => None,
+        }
+    }
+
+    fn compile_list_named_expression_ast(
+        &self,
+        name: &str,
+        args: &[Ast],
+        compiled: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+        function_analysis: &FunctionValueKindAnalysis,
+    ) -> Option<CompiledValue<'ctx>> {
+        match name {
+            "list_new" => Some(self.build_internal_call(
+                self.require_func("__rt_list_new"),
+                compiled,
+                "list_new",
+            )),
+            "list_push" => Some(self.build_internal_call(
+                self.require_func("__rt_list_push"),
+                compiled,
+                "list_push",
+            )),
+            "list_insert" => Some(self.build_internal_call(
+                self.require_func("__rt_list_insert"),
+                compiled,
+                "list_insert",
+            )),
+            "list_len" => {
+                Some(self.compile_list_len_named_expression_ast(args, compiled, function_analysis))
+            }
+            "list_get" => Some(self.compile_list_get_named_expression_ast(
+                args,
+                compiled,
+                function,
+                function_analysis,
+            )),
+            "list_set" => Some(self.build_internal_call(
+                self.require_func("__rt_list_set"),
+                compiled,
+                "list_set",
+            )),
+            "list_swap" => Some(self.build_internal_call(
+                self.require_func("__rt_list_swap"),
+                compiled,
+                "list_swap",
+            )),
+            "list_pop" => Some(self.build_internal_call(
+                self.require_func("__rt_list_pop"),
+                compiled,
+                "list_pop",
+            )),
+            "list_delete" => Some(self.build_internal_call(
+                self.require_func("__rt_list_delete"),
+                compiled,
+                "list_delete",
+            )),
+            "list_copy" => Some(self.build_internal_call(
+                self.require_func("__rt_list_copy"),
+                compiled,
+                "list_copy",
+            )),
+            _ => None,
+        }
+    }
+
+    fn compile_list_len_named_expression_ast(
+        &self,
+        args: &[Ast],
+        compiled: &[CompiledValue<'ctx>],
+        function_analysis: &FunctionValueKindAnalysis,
+    ) -> CompiledValue<'ctx> {
+        if shape_is_exact_kind(
+            &infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis),
+            KindSet::list(),
+        ) {
+            self.int_value(self.build_list_len_load(compiled[0].payload, "list_len"))
+        } else {
+            self.build_internal_call(self.require_func("__rt_list_len"), compiled, "list_len")
+        }
+    }
+
+    fn compile_list_get_named_expression_ast(
+        &self,
+        args: &[Ast],
+        compiled: &[CompiledValue<'ctx>],
+        function: FunctionValue<'ctx>,
+        function_analysis: &FunctionValueKindAnalysis,
+    ) -> CompiledValue<'ctx> {
+        let list_shape =
+            infer_ast_value_shape(&args[0], function_analysis, &self.value_kind_analysis);
+        let index_shape =
+            infer_ast_value_shape(&args[1], function_analysis, &self.value_kind_analysis);
+        if shape_is_exact_kind(&list_shape, KindSet::list())
+            && shape_is_exact_kind(&index_shape, KindSet::int())
+        {
+            let idx = compiled[1].payload;
+            let trap_block = self.context.append_basic_block(function, "list_get_bounds_trap");
+            self.build_index_bounds_check(compiled[0].payload, idx, "list_get", trap_block);
+            let result = self.build_list_value_load(compiled[0].payload, idx, "list_get");
+            let ok_block = self.builder.get_insert_block().expect("missing list_get ok block");
+            self.builder.position_at_end(trap_block);
+            self.build_trap_and_unreachable();
+            self.builder.position_at_end(ok_block);
+            result
+        } else {
+            self.build_internal_call(self.require_func("__rt_list_get"), compiled, "list_get")
+        }
+    }
+
+    fn compile_fallback_named_expression_ast(
+        &self,
+        name: &str,
         compiled: &[CompiledValue<'ctx>],
         vars: &HashMap<String, PointerValue<'ctx>>,
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
     ) -> CompiledValue<'ctx> {
-        match name {
-            "add" => self.build_internal_call(
-                self.require_func("__op_add"),
-                &[compiled[0], compiled[1]],
-                "add",
-            ),
-            "subtract" => self.build_internal_call(
-                self.require_func("__op_subtract"),
-                &[compiled[0], compiled[1]],
-                "subtract",
-            ),
-            "multiply" => self.build_internal_call(
-                self.require_func("__op_multiply"),
-                &[compiled[0], compiled[1]],
-                "multiply",
-            ),
-            "divide" => self.build_internal_call(
-                self.require_func("__op_divide"),
-                &[compiled[0], compiled[1]],
-                "divide",
-            ),
-            "modulo" => self.build_internal_call(
-                self.require_func("__op_modulo"),
-                &[compiled[0], compiled[1]],
-                "modulo",
-            ),
-            "gt" => self.build_internal_call(
-                self.require_func("__op_gt"),
-                &[compiled[0], compiled[1]],
-                "gt",
-            ),
-            "lt" => self.build_internal_call(
-                self.require_func("__op_lt"),
-                &[compiled[0], compiled[1]],
-                "lt",
-            ),
-            "gte" => self.build_internal_call(
-                self.require_func("__op_gte"),
-                &[compiled[0], compiled[1]],
-                "gte",
-            ),
-            "lte" => self.build_internal_call(
-                self.require_func("__op_lte"),
-                &[compiled[0], compiled[1]],
-                "lte",
-            ),
-            "eq" => self.build_internal_call(
-                self.require_func("__op_eq"),
-                &[compiled[0], compiled[1]],
-                "eq",
-            ),
-            "ne" => self.build_internal_call(
-                self.require_func("__op_ne"),
-                &[compiled[0], compiled[1]],
-                "ne",
-            ),
-            "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
-            | "bigint_modulo" | "bigint_compare" => {
-                self.compile_bigint_builtin(name, &compiled, function)
-            }
-            "print" => {
-                self.build_internal_call(self.require_func("__rt_print"), &compiled, "print")
-            }
-            "list_new" => {
-                self.build_internal_call(self.require_func("__rt_list_new"), &compiled, "list_new")
-            }
-            "list_push" => self.build_internal_call(
-                self.require_func("__rt_list_push"),
-                &compiled,
-                "list_push",
-            ),
-            "list_insert" => self.build_internal_call(
-                self.require_func("__rt_list_insert"),
-                &compiled,
-                "list_insert",
-            ),
-            "list_len" => {
-                self.build_internal_call(self.require_func("__rt_list_len"), &compiled, "list_len")
-            }
-            "list_get" => {
-                self.build_internal_call(self.require_func("__rt_list_get"), &compiled, "list_get")
-            }
-            "list_set" => {
-                self.build_internal_call(self.require_func("__rt_list_set"), &compiled, "list_set")
-            }
-            "list_swap" => self.build_internal_call(
-                self.require_func("__rt_list_swap"),
-                &compiled,
-                "list_swap",
-            ),
-            "list_pop" => {
-                self.build_internal_call(self.require_func("__rt_list_pop"), &compiled, "list_pop")
-            }
-            "list_delete" => self.build_internal_call(
-                self.require_func("__rt_list_delete"),
-                &compiled,
-                "list_delete",
-            ),
-            "list_copy" => self.build_internal_call(
-                self.require_func("__rt_list_copy"),
-                &compiled,
-                "list_copy",
-            ),
-            other => {
-                if vars.contains_key(other) || capture_slots.contains_key(other) {
-                    let callee =
-                        self.resolve_named_value(other, vars, capture_slots, env_ptr, function);
-                    return self.apply_function_value(callee, &compiled, function, other);
-                }
-                if self.function_ordinals.contains_key(other) {
-                    return self.build_user_call(
-                        self.require_func(other),
-                        self.i64_type.const_zero(),
-                        &compiled,
-                        other,
-                    );
-                }
-                let callee = self.require_func(other);
-                self.build_internal_call(callee, &compiled, other)
-            }
+        if vars.contains_key(name) || capture_slots.contains_key(name) {
+            let callee = self.resolve_named_value(name, vars, capture_slots, env_ptr, function);
+            return self.apply_function_value(callee, compiled, function, name);
         }
+        if self.function_ordinals.contains_key(name) {
+            return self.build_user_call(
+                self.require_func(name),
+                self.i64_type.const_zero(),
+                compiled,
+                name,
+            );
+        }
+        let callee = self.require_func(name);
+        self.build_internal_call(callee, compiled, name)
     }
 
     fn compile_block_ast(
@@ -727,10 +1303,18 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         let mut last = None;
         for line in &block.lines {
-            last = Some(self.compile_ast(line, vars, capture_slots, env_ptr, function));
+            last = Some(self.compile_ast(
+                line,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ));
         }
         last.expect("empty block")
     }
@@ -743,8 +1327,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
-        let value = self.compile_ast(value, vars, capture_slots, env_ptr, function);
+        let value =
+            self.compile_ast(value, vars, capture_slots, env_ptr, function, current_function_name);
         let ptr = vars.get(name).unwrap_or_else(|| {
             panic!("internal compiler error: assignment target '{name}' has no llvm local slot")
         });
@@ -763,8 +1349,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
-        let cond_value = self.compile_ast(condition, vars, capture_slots, env_ptr, function);
+        let cond_value = self.compile_ast(
+            condition,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
         let truth = self.build_internal_scalar_call(
             self.require_func("__value_is_truthy"),
             &[cond_value],
@@ -785,7 +1379,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.position_at_end(then_block);
         let mut then_value = self.int_value(self.i64_type.const_zero());
         for line in &then.lines {
-            then_value = self.compile_ast(line, vars, capture_slots, env_ptr, function);
+            then_value = self.compile_ast(
+                line,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
         }
         self.builder.build_unconditional_branch(merge_block).expect("failed to branch from then");
         let then_end = self.builder.get_insert_block().expect("then block should exist");
@@ -794,7 +1395,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let mut else_value = self.int_value(self.i64_type.const_zero());
         if let Some(else_block_ast) = else_ {
             for line in &else_block_ast.lines {
-                else_value = self.compile_ast(line, vars, capture_slots, env_ptr, function);
+                else_value = self.compile_ast(
+                    line,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                );
             }
         }
         self.builder.build_unconditional_branch(merge_block).expect("failed to branch from else");
@@ -814,5 +1422,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
             tag: tag_phi.as_basic_value().into_int_value(),
             payload: payload_phi.as_basic_value().into_int_value(),
         }
+    }
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+mod tests {
+    use crate::module::{CodegenBackend, Module};
+
+    #[test]
+    fn llvm_compile_if_ast_lowers_nested_if_expressions() {
+        let src = "fn main() do\n    if 1 do\n        if 0 do\n            7\n        else\n            41\n        end\n    else\n        0\n    end\nend";
+        let jit = Module::from_source(src).compile_to_jit_with_backend(CodegenBackend::Llvm);
+        let ptr = jit.get_int_result_fn_ptr("main").expect("llvm int-result wrapper should exist");
+        let func = unsafe { std::mem::transmute::<*const u8, extern "C" fn() -> i64>(ptr) };
+        assert_eq!(func(), 41);
     }
 }

@@ -99,8 +99,17 @@ Current behavior:
     - `string_is_integer(s)`
     - `string_try_parse_integer(s)`
     - `string_try_parse_bigint(s)`
+    - `type_of(value)`
     - `string_repeat(s, n)`
     - `string_reverse(s)`
+  - runtime type predicates are also available as builtins:
+    - `is_int(value)`
+    - `is_bigint(value)`
+    - `is_string(value)`
+    - `is_list(value)`
+    - `is_function(value)`
+    - `is_string_iter(value)`
+  - `type_of(value)` returns a debuggable stable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"function"`, or `"string_iter"`
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
   - `string_try_first(s)` returns `(ok, value, err)` where `value` is the first byte as an `Int`
@@ -125,6 +134,13 @@ Current behavior:
 - `String == non-String` is false
 - `String != non-String` is true
 - `string_*` iteration validates UTF-8 and traps on invalid byte sequences
+- the compiler now also performs conservative compile-time kind checks for obvious builtin misuse and indexing misuse
+  - examples:
+    - `bytes_len(1)`
+    - `list_len("abc")`
+    - `1[0]`
+    - `xs["0"]`
+  - it only rejects when the inferred kinds are confident; unknown values still use runtime checks
 - UTF-8-aware indexing/slicing and string conversion helpers are not implemented yet
 
 Logical infix operators are also supported:
@@ -158,6 +174,23 @@ Current behavior:
 - `main` currently supports at most one argument in these runnable output modes
 - for JIT execution through the CLI, pass program arguments after `--`, for example:
   - `cargo run --release -q -- examples/args.expr --run-jit -- hello world`
+
+## Debugging inferred kinds
+
+You can print the original source annotated with inferred runtime value kinds:
+
+```text
+cargo run --release -q -- examples/strings.expr --debug-types
+```
+
+Current behavior:
+
+- prints the original source
+- adds `#?` annotation lines
+- shows function return kinds
+- shows function input kinds when present
+- shows assignment and destructuring variable kinds
+- this is based on conservative value-kind inference, not a full static type system
 
 ## Higher-order list functions
 

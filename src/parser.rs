@@ -1936,3 +1936,19 @@ fn parse_multi_assign_statement() {
 
     assert_eq!(ast, expected);
 }
+
+#[test]
+fn expression_from_lexer_wraps_non_call_expressions() {
+    let text = "1";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let expr = ExpressionAst::from_lexer(&mut lexer).unwrap();
+    assert_eq!(
+        expr,
+        ExpressionAst {
+            function_span: None,
+            function: String::new(),
+            args: vec![Ast::Literal(LiteralAst::Integer(1))],
+        }
+    );
+}

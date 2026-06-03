@@ -36,11 +36,26 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         assert_eq!(args.len(), 2, "list_map expects 2 arguments");
         self.validate_unary_callback_ast(&args[1], vars, "list_map");
-        let input = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-        let callback = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+        let input = self.compile_ast(
+            &args[0],
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
+        let callback = self.compile_ast(
+            &args[1],
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
         let output =
             self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_map_new");
         let len =
@@ -109,11 +124,26 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         assert_eq!(args.len(), 2, "list_filter expects 2 arguments");
         self.validate_unary_callback_ast(&args[1], vars, "list_filter");
-        let input = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-        let callback = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+        let input = self.compile_ast(
+            &args[0],
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
+        let callback = self.compile_ast(
+            &args[1],
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
         let output =
             self.build_internal_call(self.require_func("__rt_list_new"), &[], "list_filter_new");
         let len = self.build_internal_call(
@@ -217,10 +247,25 @@ impl<'ctx> LlvmCompiler<'ctx> {
         capture_slots: &HashMap<String, usize>,
         env_ptr: IntValue<'ctx>,
         function: FunctionValue<'ctx>,
+        current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         assert_eq!(args.len(), 2, "list_range expects 2 arguments");
-        let start_value = self.compile_ast(&args[0], vars, capture_slots, env_ptr, function);
-        let end_value = self.compile_ast(&args[1], vars, capture_slots, env_ptr, function);
+        let start_value = self.compile_ast(
+            &args[0],
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
+        let end_value = self.compile_ast(
+            &args[1],
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
         let start = self.build_internal_scalar_call(
             self.require_func("__value_to_i64"),
             &[start_value],

@@ -74,6 +74,13 @@ Guidance for coding agents working in this repository.
   - `string_is_integer(s)`
   - `string_try_parse_integer(s)`
   - `string_try_parse_bigint(s)`
+  - `type_of(value)`
+  - `is_int(value)`
+  - `is_bigint(value)`
+  - `is_string(value)`
+  - `is_list(value)`
+  - `is_function(value)`
+  - `is_string_iter(value)`
   - `string_repeat(s, n)`
   - `string_reverse(s)`
   - `"a" == "a"`
@@ -97,6 +104,10 @@ Guidance for coding agents working in this repository.
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is a boolean alias, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
   - `string_try_first(s)`, `string_try_last(s)`, `bytes_try_get(s, index)`, and `string_try_pop(s)` also return `(ok, value, err)` instead of trapping on empty strings or out-of-bounds access
+  - `type_of(value)` returns a stable debuggable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"function"`, or `"string_iter"`
+  - `is_int(value)`, `is_bigint(value)`, `is_string(value)`, `is_list(value)`, `is_function(value)`, and `is_string_iter(value)` return normalized integer booleans based on the runtime tag
+  - the compiler now performs conservative compile-time kind checks for obvious builtin and indexing misuse
+  - it rejects only when the inferred kinds are confident; unknown values still rely on runtime checks
   - UTF-8 iterator operations validate encoding and trap on invalid byte sequences
   - string equality compares byte contents
   - `String == non-String` is false
@@ -136,6 +147,8 @@ Guidance for coding agents working in this repository.
   - `cargo test -q`
 - Run one example with JIT:
   - `cargo run --release -q -- examples/<name>.expr --run-jit`
+- Print inferred runtime kinds for an example:
+  - `cargo run --release -q -- examples/<name>.expr --debug-types`
 - Build native executable from source file:
   - `cargo run --release -q -- examples/<name>.expr`
 
