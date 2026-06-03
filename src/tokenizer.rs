@@ -105,6 +105,16 @@ pub enum Token {
     Divide,
     #[token("%")]
     Modulo,
+    #[token("<<")]
+    ShiftLeft,
+    #[token(">>")]
+    ShiftRight,
+    #[token("&")]
+    BitAnd,
+    #[token("|")]
+    BitOr,
+    #[token("^")]
+    BitXor,
     #[token(">=")]
     GreaterThanOrEqual,
     #[token("<=")]
@@ -394,6 +404,29 @@ fn tokenize_comparison_operators() {
 
     let result: Result<Vec<_>, _> = Token::lexer("a != b").collect();
     assert_eq!(result.unwrap(), vec![Symbol("a".to_string()), NotEqual, Symbol("b".to_string())]);
+}
+
+#[test]
+fn tokenize_bitwise_operators() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("a << b >> c & d | e ^ f").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Symbol("a".to_string()),
+            ShiftLeft,
+            Symbol("b".to_string()),
+            ShiftRight,
+            Symbol("c".to_string()),
+            BitAnd,
+            Symbol("d".to_string()),
+            BitOr,
+            Symbol("e".to_string()),
+            BitXor,
+            Symbol("f".to_string()),
+        ]
+    );
 }
 
 #[test]

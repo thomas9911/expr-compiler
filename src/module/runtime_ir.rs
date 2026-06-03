@@ -136,6 +136,11 @@ fn build_builtin_map(
     builtins.insert("__op_multiply".to_string(), runtime.op_multiply);
     builtins.insert("__op_divide".to_string(), runtime.op_divide);
     builtins.insert("__op_modulo".to_string(), runtime.op_modulo);
+    builtins.insert("__op_bitand".to_string(), runtime.op_bitand);
+    builtins.insert("__op_bitor".to_string(), runtime.op_bitor);
+    builtins.insert("__op_bitxor".to_string(), runtime.op_bitxor);
+    builtins.insert("__op_shl".to_string(), runtime.op_shl);
+    builtins.insert("__op_shr".to_string(), runtime.op_shr);
     builtins.insert("__op_gt".to_string(), runtime.op_gt);
     builtins.insert("__op_lt".to_string(), runtime.op_lt);
     builtins.insert("__op_gte".to_string(), runtime.op_gte);
@@ -179,6 +184,11 @@ struct RuntimeBuiltins {
     op_multiply: FuncId,
     op_divide: FuncId,
     op_modulo: FuncId,
+    op_bitand: FuncId,
+    op_bitor: FuncId,
+    op_bitxor: FuncId,
+    op_shl: FuncId,
+    op_shr: FuncId,
     op_gt: FuncId,
     op_lt: FuncId,
     op_gte: FuncId,
@@ -309,6 +319,36 @@ fn declare_runtime_function_ids(
         module,
         isa,
         "__rt_modulo",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_bitand = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_bitand",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_bitor = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_bitor",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_bitxor = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_bitxor",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_shl = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_shl",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_shr = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_shr",
         &[types::I64, types::I64, types::I64, types::I64],
     );
     let op_gt = declare_local_pair_builtin(
@@ -473,6 +513,11 @@ fn declare_runtime_function_ids(
             op_multiply,
             op_divide,
             op_modulo,
+            op_bitand,
+            op_bitor,
+            op_bitxor,
+            op_shl,
+            op_shr,
             op_gt,
             op_lt,
             op_gte,
@@ -568,6 +613,61 @@ fn define_runtime_operations(
         ids.builtins.bigint_from_int,
         ids.builtins.bigint_modulo,
         "modulo",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_bitand,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        None,
+        None,
+        "bitand",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_bitor,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        None,
+        None,
+        "bitor",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_bitxor,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        None,
+        None,
+        "bitxor",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_shl,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        None,
+        None,
+        "shl",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_shr,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        None,
+        None,
+        "shr",
     );
     if bigint_enabled {
         define_rt_bigint_from_int(
@@ -1949,6 +2049,16 @@ fn define_rt_binary_op(
                     let overflow = b.ins().band(lhs_is_min, rhs_is_neg_one);
                     b.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
                     b.ins().srem(lhs, rhs)
+                }
+                "bitand" => b.ins().band(lhs, rhs),
+                "bitor" => b.ins().bor(lhs, rhs),
+                "bitxor" => b.ins().bxor(lhs, rhs),
+                "shl" | "shr" => {
+                    let rhs_non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs, 0);
+                    let rhs_lt_width = b.ins().icmp_imm(IntCC::SignedLessThan, rhs, 64);
+                    let rhs_in_range = b.ins().band(rhs_non_neg, rhs_lt_width);
+                    b.ins().trapz(rhs_in_range, TrapCode::BAD_CONVERSION_TO_INTEGER);
+                    if op == "shl" { b.ins().ishl(lhs, rhs) } else { b.ins().sshr(lhs, rhs) }
                 }
                 _ => unreachable!(),
             };

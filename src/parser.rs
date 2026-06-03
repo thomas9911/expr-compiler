@@ -560,8 +560,12 @@ fn infix_precedence(token: &Token) -> Option<u8> {
         | Token::LessThanOrEqual
         | Token::EqualEqual
         | Token::NotEqual => Some(2),
-        Token::Add | Token::Subtract => Some(3),
-        Token::Multiply | Token::Divide | Token::Modulo => Some(4),
+        Token::BitOr => Some(3),
+        Token::BitXor => Some(4),
+        Token::BitAnd => Some(5),
+        Token::ShiftLeft | Token::ShiftRight => Some(6),
+        Token::Add | Token::Subtract => Some(7),
+        Token::Multiply | Token::Divide | Token::Modulo => Some(8),
         _ => None,
     }
 }
@@ -575,6 +579,11 @@ fn infix_name(token: &Token) -> &'static str {
         Token::Multiply => "multiply",
         Token::Divide => "divide",
         Token::Modulo => "modulo",
+        Token::BitAnd => "bitand",
+        Token::BitOr => "bitor",
+        Token::BitXor => "bitxor",
+        Token::ShiftLeft => "shl",
+        Token::ShiftRight => "shr",
         Token::GreaterThan => "gt",
         Token::LessThan => "lt",
         Token::GreaterThanOrEqual => "gte",
@@ -1840,6 +1849,63 @@ fn parse_not_operator_precedence() {
                         })],
                     }),
                     Literal(LiteralAst::Integer(2)),
+                ],
+            })],
+        },
+        span: None,
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_bitwise_operator_precedence() {
+    use Ast::*;
+
+    let text = "fn main() do\n    1 + 2 << 3 ^ 4 & 5 | 6\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = FunctionDef(FunctionDefAst {
+        name: "main".to_string(),
+        inputs: vec![],
+        output: None,
+        block: BlockAst {
+            lines: vec![Expression(ExpressionAst {
+                function_span: None,
+                function: "bitor".to_string(),
+                args: vec![
+                    Expression(ExpressionAst {
+                        function_span: None,
+                        function: "bitxor".to_string(),
+                        args: vec![
+                            Expression(ExpressionAst {
+                                function_span: None,
+                                function: "shl".to_string(),
+                                args: vec![
+                                    Expression(ExpressionAst {
+                                        function_span: None,
+                                        function: "add".to_string(),
+                                        args: vec![
+                                            Literal(LiteralAst::Integer(1)),
+                                            Literal(LiteralAst::Integer(2)),
+                                        ],
+                                    }),
+                                    Literal(LiteralAst::Integer(3)),
+                                ],
+                            }),
+                            Expression(ExpressionAst {
+                                function_span: None,
+                                function: "bitand".to_string(),
+                                args: vec![
+                                    Literal(LiteralAst::Integer(4)),
+                                    Literal(LiteralAst::Integer(5)),
+                                ],
+                            }),
+                        ],
+                    }),
+                    Literal(LiteralAst::Integer(6)),
                 ],
             })],
         },

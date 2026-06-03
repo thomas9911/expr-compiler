@@ -437,6 +437,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             BinaryArithOp::Modulo,
             self.bigint_enabled.then_some("__rt_bigint_modulo"),
         );
+        self.define_runtime_operation("__op_bitand", "llvm_rt_bitand", BinaryArithOp::BitAnd, None);
+        self.define_runtime_operation("__op_bitor", "llvm_rt_bitor", BinaryArithOp::BitOr, None);
+        self.define_runtime_operation("__op_bitxor", "llvm_rt_bitxor", BinaryArithOp::BitXor, None);
+        self.define_runtime_operation("__op_shl", "llvm_rt_shl", BinaryArithOp::ShiftLeft, None);
+        self.define_runtime_operation("__op_shr", "llvm_rt_shr", BinaryArithOp::ShiftRight, None);
         self.define_runtime_compare(
             "__op_gt",
             "llvm_rt_gt",
@@ -1591,6 +1596,56 @@ impl<'ctx> LlvmCompiler<'ctx> {
                         .expect("failed int rem")
                 }
             }
+            "bitand" => self
+                .builder
+                .build_and(lhs.payload, rhs.payload, "int_bitand")
+                .expect("failed int bitand"),
+            "bitor" => self
+                .builder
+                .build_or(lhs.payload, rhs.payload, "int_bitor")
+                .expect("failed int bitor"),
+            "bitxor" => self
+                .builder
+                .build_xor(lhs.payload, rhs.payload, "int_bitxor")
+                .expect("failed int bitxor"),
+            "shl" | "shr" => {
+                let non_neg = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        rhs.payload,
+                        self.i64_type.const_zero(),
+                        "shift_non_neg",
+                    )
+                    .expect("failed shift non-neg");
+                let lt_width = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SLT,
+                        rhs.payload,
+                        self.i64_type.const_int(64, false),
+                        "shift_lt_width",
+                    )
+                    .expect("failed shift lt width");
+                let in_range = self
+                    .builder
+                    .build_and(non_neg, lt_width, "shift_in_range")
+                    .expect("failed shift in range");
+                let invalid = self
+                    .builder
+                    .build_not(in_range, "shift_invalid")
+                    .expect("failed shift invalid");
+                self.build_trap_if(invalid);
+                if name == "shl" {
+                    self.builder
+                        .build_left_shift(lhs.payload, rhs.payload, "int_shl")
+                        .expect("failed int shl")
+                } else {
+                    self.builder
+                        .build_right_shift(lhs.payload, rhs.payload, true, "int_shr")
+                        .expect("failed int shr")
+                }
+            }
             "gt" | "lt" | "gte" | "lte" | "eq" | "ne" => {
                 let predicate = match name {
                     "gt" => IntPredicate::SGT,
@@ -1847,7 +1902,6 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         let entry = self.context.append_basic_block(function, "entry");
         let int_block = self.context.append_basic_block(function, "int");
-        let int_ok_block = self.context.append_basic_block(function, "int_ok");
         let trap_block = self.context.append_basic_block(function, "trap");
         let non_int_block = self.context.append_basic_block(function, "non_int");
         self.builder.position_at_end(entry);
@@ -1885,6 +1939,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let rhs_raw = rhs_payload;
         let raw = match op {
             BinaryArithOp::Add => {
+                let int_ok_block = self.context.append_basic_block(function, "int_ok");
                 let (value, overflow) = self.build_overflow_intrinsic_call(
                     "llvm.sadd.with.overflow.i64",
                     lhs_raw,
@@ -1898,6 +1953,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 value
             }
             BinaryArithOp::Subtract => {
+                let int_ok_block = self.context.append_basic_block(function, "int_ok");
                 let (value, overflow) = self.build_overflow_intrinsic_call(
                     "llvm.ssub.with.overflow.i64",
                     lhs_raw,
@@ -1911,6 +1967,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 value
             }
             BinaryArithOp::Multiply => {
+                let int_ok_block = self.context.append_basic_block(function, "int_ok");
                 let (value, overflow) = self.build_overflow_intrinsic_call(
                     "llvm.smul.with.overflow.i64",
                     lhs_raw,
@@ -1924,6 +1981,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 value
             }
             BinaryArithOp::Divide => {
+                let int_ok_block = self.context.append_basic_block(function, "int_ok");
                 let div_ok = self.build_division_safe_check(lhs_raw, rhs_raw, "div");
                 self.builder
                     .build_conditional_branch(div_ok, int_ok_block, trap_block)
@@ -1934,6 +1992,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     .expect("failed to divide")
             }
             BinaryArithOp::Modulo => {
+                let int_ok_block = self.context.append_basic_block(function, "int_ok");
                 let rem_ok = self.build_division_safe_check(lhs_raw, rhs_raw, "rem");
                 self.builder
                     .build_conditional_branch(rem_ok, int_ok_block, trap_block)
@@ -1942,6 +2001,51 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.builder
                     .build_int_signed_rem(lhs_raw, rhs_raw, "rem")
                     .expect("failed to modulo")
+            }
+            BinaryArithOp::BitAnd => {
+                self.builder.build_and(lhs_raw, rhs_raw, "bitand").expect("failed bitand")
+            }
+            BinaryArithOp::BitOr => {
+                self.builder.build_or(lhs_raw, rhs_raw, "bitor").expect("failed bitor")
+            }
+            BinaryArithOp::BitXor => {
+                self.builder.build_xor(lhs_raw, rhs_raw, "bitxor").expect("failed bitxor")
+            }
+            BinaryArithOp::ShiftLeft | BinaryArithOp::ShiftRight => {
+                let int_ok_block = self.context.append_basic_block(function, "int_ok");
+                let rhs_non_neg = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGE,
+                        rhs_raw,
+                        self.i64_type.const_zero(),
+                        "shift_non_neg",
+                    )
+                    .expect("failed shift non-neg");
+                let rhs_lt_width = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SLT,
+                        rhs_raw,
+                        self.i64_type.const_int(64, false),
+                        "shift_lt_width",
+                    )
+                    .expect("failed shift lt width");
+                let rhs_in_range = self
+                    .builder
+                    .build_and(rhs_non_neg, rhs_lt_width, "shift_in_range")
+                    .expect("failed shift in range");
+                self.builder
+                    .build_conditional_branch(rhs_in_range, int_ok_block, trap_block)
+                    .expect("failed to build shift branch");
+                self.builder.position_at_end(int_ok_block);
+                if matches!(op, BinaryArithOp::ShiftLeft) {
+                    self.builder.build_left_shift(lhs_raw, rhs_raw, "shl").expect("failed shl")
+                } else {
+                    self.builder
+                        .build_right_shift(lhs_raw, rhs_raw, true, "shr")
+                        .expect("failed shr")
+                }
             }
         };
 
@@ -2816,6 +2920,11 @@ enum BinaryArithOp {
     Multiply,
     Divide,
     Modulo,
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
 }
 
 fn internal_symbol_name(name: &str) -> String {

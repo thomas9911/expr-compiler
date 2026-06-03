@@ -581,6 +581,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 | "lte"
                 | "eq"
                 | "ne"
+                | "bitand"
+                | "bitor"
+                | "bitxor"
+                | "shl"
+                | "shr"
         ) && args.len() == 2
         {
             let function_analysis = self.function_analysis(current_function_name);
@@ -1123,6 +1128,31 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.require_func("__op_modulo"),
                 &[compiled[0], compiled[1]],
                 "modulo",
+            )),
+            "bitand" => Some(self.build_internal_call(
+                self.require_func("__op_bitand"),
+                &[compiled[0], compiled[1]],
+                "bitand",
+            )),
+            "bitor" => Some(self.build_internal_call(
+                self.require_func("__op_bitor"),
+                &[compiled[0], compiled[1]],
+                "bitor",
+            )),
+            "bitxor" => Some(self.build_internal_call(
+                self.require_func("__op_bitxor"),
+                &[compiled[0], compiled[1]],
+                "bitxor",
+            )),
+            "shl" => Some(self.build_internal_call(
+                self.require_func("__op_shl"),
+                &[compiled[0], compiled[1]],
+                "shl",
+            )),
+            "shr" => Some(self.build_internal_call(
+                self.require_func("__op_shr"),
+                &[compiled[0], compiled[1]],
+                "shr",
             )),
             "gt" => Some(self.build_internal_call(
                 self.require_func("__op_gt"),
