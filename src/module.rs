@@ -1702,6 +1702,11 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                     | "bigint_multiply"
                     | "bigint_divide"
                     | "bigint_modulo"
+                    | "bigint_bitand"
+                    | "bigint_bitor"
+                    | "bigint_bitxor"
+                    | "bigint_shl"
+                    | "bigint_shr"
             ) {
                 features.bigint = true;
             }
@@ -2032,6 +2037,11 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "bigint_multiply"
                 | "bigint_divide"
                 | "bigint_modulo"
+                | "bigint_bitand"
+                | "bigint_bitor"
+                | "bigint_bitxor"
+                | "bigint_shl"
+                | "bigint_shr"
                 | "bytes_len"
                 | "bytes_get"
                 | "bytes_pop"
@@ -2055,6 +2065,11 @@ fn is_operator_name(name: &str) -> bool {
             | "*"
             | "/"
             | "%"
+            | "&"
+            | "|"
+            | "^"
+            | "<<"
+            | ">>"
             | "=="
             | "!="
             | "<"
@@ -2069,6 +2084,11 @@ fn is_operator_name(name: &str) -> bool {
             | "multiply"
             | "divide"
             | "modulo"
+            | "bitand"
+            | "bitor"
+            | "bitxor"
+            | "shl"
+            | "shr"
             | "eq"
             | "ne"
             | "lt"
@@ -2967,7 +2987,11 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
         "bigint_from_int" => Some(&[INT]),
         "add" | "subtract" | "multiply" | "divide" | "modulo" | "gt" | "lt" | "gte" | "lte"
         | "bigint_compare" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
-        | "bigint_divide" | "bigint_modulo" => Some(&[BIGINT_OR_INT, BIGINT_OR_INT]),
+        | "bigint_divide" | "bigint_modulo" | "bigint_bitand" | "bigint_bitor"
+        | "bigint_bitxor" => Some(&[BIGINT_OR_INT, BIGINT_OR_INT]),
+        "bigint_shl" | "bigint_shr" => Some(&[BIGINT_OR_INT, INT]),
+        "bitand" | "bitor" | "bitxor" => Some(&[BIGINT_OR_INT, BIGINT_OR_INT]),
+        "shl" | "shr" => Some(&[BIGINT_OR_INT, INT]),
         _ => None,
     }
 }
@@ -3158,6 +3182,10 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         "add" | "subtract" | "multiply" | "divide" | "modulo" => {
             ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1)))
         }
+        "bitand" | "bitor" | "bitxor" => {
+            ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1)))
+        }
+        "shl" | "shr" => ValueShape::scalar(scalar_arg(0)),
         "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
             ValueShape::scalar(KindSet::int())
         }
@@ -3186,6 +3214,10 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         | "string_any"
         | "string_is_integer" => ValueShape::scalar(KindSet::int()),
         "bigint_compare" => ValueShape::scalar(KindSet::int()),
+        "bigint_bitand" | "bigint_bitor" | "bigint_bitxor" => {
+            ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1)))
+        }
+        "bigint_shl" | "bigint_shr" => ValueShape::scalar(scalar_arg(0)),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
         | "bigint_divide" | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
         "string_concat" | "bytes_slice" | "string_copy" | "string_repeat" | "string_reverse" => {
@@ -3745,6 +3777,20 @@ fn compile_bigint_builtin(
     CompiledValue { tag: results[0], payload: results[1] }
 }
 
+fn compile_bigint_shift_builtin(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    name: &str,
+    lhs: CompiledValue,
+    rhs: CompiledValue,
+) -> CompiledValue {
+    let lhs = promote_value_to_bigint(builder, func_refs, lhs);
+    let func_ref = require_func(func_refs, name);
+    let call = builder.ins().call(func_ref, &[lhs.tag, lhs.payload, rhs.tag, rhs.payload]);
+    let results = builder.inst_results(call);
+    CompiledValue { tag: results[0], payload: results[1] }
+}
+
 fn compile_exact_int_binary_op(
     builder: &mut FunctionBuilder,
     function: &str,
@@ -3784,6 +3830,21 @@ fn compile_exact_int_binary_op(
             let overflow = builder.ins().band(lhs_is_min, rhs_is_neg_one);
             builder.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
             builder.ins().srem(lhs.payload, rhs.payload)
+        }
+        "bitand" => builder.ins().band(lhs.payload, rhs.payload),
+        "bitor" => builder.ins().bor(lhs.payload, rhs.payload),
+        "bitxor" => builder.ins().bxor(lhs.payload, rhs.payload),
+        "shl" | "shr" => {
+            let rhs_non_neg =
+                builder.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs.payload, 0);
+            let rhs_lt_width = builder.ins().icmp_imm(IntCC::SignedLessThan, rhs.payload, 64);
+            let rhs_in_range = builder.ins().band(rhs_non_neg, rhs_lt_width);
+            builder.ins().trapz(rhs_in_range, TrapCode::BAD_CONVERSION_TO_INTEGER);
+            if function == "shl" {
+                builder.ins().ishl(lhs.payload, rhs.payload)
+            } else {
+                builder.ins().sshr(lhs.payload, rhs.payload)
+            }
         }
         _ => unreachable!("not an exact int binary op: {function}"),
     };
@@ -6232,6 +6293,11 @@ fn compile_exact_numeric_expression_ast(
             | "lte"
             | "eq"
             | "ne"
+            | "bitand"
+            | "bitor"
+            | "bitxor"
+            | "shl"
+            | "shr"
     ) || args.len() != 2
     {
         return None;
@@ -6242,7 +6308,11 @@ fn compile_exact_numeric_expression_ast(
     let rhs_exact_int = shape_is_exact_kind(&rhs_shape, KindSet::int());
     let lhs_exact_bigint = shape_is_exact_kind(&lhs_shape, KindSet::bigint());
     let rhs_exact_bigint = shape_is_exact_kind(&rhs_shape, KindSet::bigint());
-    if !(lhs_exact_int && rhs_exact_int || lhs_exact_bigint && rhs_exact_bigint) {
+    let exact_int_case = lhs_exact_int && rhs_exact_int;
+    let exact_bigint_case = lhs_exact_bigint && rhs_exact_bigint;
+    let exact_bigint_shift_case =
+        matches!(function, "shl" | "shr") && lhs_exact_bigint && rhs_exact_int;
+    if !(exact_int_case || exact_bigint_case || exact_bigint_shift_case) {
         return None;
     }
     let lhs = compile_ast(
@@ -6271,11 +6341,10 @@ fn compile_exact_numeric_expression_ast(
         function_analysis,
         value_kind_analysis,
     );
-    Some(if lhs_exact_int && rhs_exact_int {
+    Some(if exact_int_case {
         match function {
-            "add" | "subtract" | "multiply" | "divide" | "modulo" => {
-                compile_exact_int_binary_op(builder, function, lhs, rhs)
-            }
+            "add" | "subtract" | "multiply" | "divide" | "modulo" | "bitand" | "bitor"
+            | "bitxor" | "shl" | "shr" => compile_exact_int_binary_op(builder, function, lhs, rhs),
             _ => compile_exact_int_compare_op(builder, function, lhs, rhs),
         }
     } else {
@@ -6289,6 +6358,11 @@ fn compile_exact_numeric_expression_ast(
             }
             "divide" => compile_bigint_builtin(builder, func_refs, "bigint_divide", &[lhs, rhs]),
             "modulo" => compile_bigint_builtin(builder, func_refs, "bigint_modulo", &[lhs, rhs]),
+            "bitand" => compile_bigint_builtin(builder, func_refs, "bigint_bitand", &[lhs, rhs]),
+            "bitor" => compile_bigint_builtin(builder, func_refs, "bigint_bitor", &[lhs, rhs]),
+            "bitxor" => compile_bigint_builtin(builder, func_refs, "bigint_bitxor", &[lhs, rhs]),
+            "shl" => compile_bigint_shift_builtin(builder, func_refs, "bigint_shl", lhs, rhs),
+            "shr" => compile_bigint_shift_builtin(builder, func_refs, "bigint_shr", lhs, rhs),
             _ => compile_exact_bigint_compare_op(builder, func_refs, function, lhs, rhs),
         }
     })
@@ -6833,6 +6907,11 @@ fn compile_named_expression_ast(
         "multiply" => call_binary(builder, func_refs, "__op_multiply", compiled[0], compiled[1]),
         "divide" => call_binary(builder, func_refs, "__op_divide", compiled[0], compiled[1]),
         "modulo" => call_binary(builder, func_refs, "__op_modulo", compiled[0], compiled[1]),
+        "bitand" => call_binary(builder, func_refs, "__op_bitand", compiled[0], compiled[1]),
+        "bitor" => call_binary(builder, func_refs, "__op_bitor", compiled[0], compiled[1]),
+        "bitxor" => call_binary(builder, func_refs, "__op_bitxor", compiled[0], compiled[1]),
+        "shl" => call_binary(builder, func_refs, "__op_shl", compiled[0], compiled[1]),
+        "shr" => call_binary(builder, func_refs, "__op_shr", compiled[0], compiled[1]),
         "gt" => call_binary(builder, func_refs, "__op_gt", compiled[0], compiled[1]),
         "lt" => call_binary(builder, func_refs, "__op_lt", compiled[0], compiled[1]),
         "gte" => call_binary(builder, func_refs, "__op_gte", compiled[0], compiled[1]),
@@ -6840,8 +6919,12 @@ fn compile_named_expression_ast(
         "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
         "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
         "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
-        | "bigint_modulo" | "bigint_compare" => {
+        | "bigint_modulo" | "bigint_compare" | "bigint_bitand" | "bigint_bitor"
+        | "bigint_bitxor" => {
             compile_bigint_builtin(builder, func_refs, function, &compiled)
+        }
+        "bigint_shl" | "bigint_shr" => {
+            compile_bigint_shift_builtin(builder, func_refs, function, compiled[0], compiled[1])
         }
         name => {
             if vars.contains_key(name) || capture_slots.contains_key(name) {
@@ -8837,6 +8920,25 @@ fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_lambda_alias
 }
 
 #[test]
+fn try_compile_to_jit_rejects_invalid_bitwise_argument_type() {
+    let src = "fn main() do\n    \"a\" & 1\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bitand");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "int | bigint");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_arithmetic_after_list_filter() {
     let src = "fn main() do\n    xs = [\"a\", \"b\"]\n    ys = list_filter(xs, fn item -> string_is_not_empty(item) end)\n    ys[0] + 1\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -9133,6 +9235,18 @@ fn jit_nested_closures_work() {
 }
 
 #[test]
+fn jit_bitwise_operators_work() {
+    let src = "fn main() do\n    (6 & 3) + (4 | 1) + (7 ^ 3) + (1 << 4) + ((0 - 8) >> 1)\nend";
+    assert_cranelift_jit_result(src, 23);
+}
+
+#[test]
+fn bigint_bitwise_operators_work() {
+    let src = "fn main() do\n    print(6n & 3n)\n    print(4n | 1n)\n    print(7n ^ 3n)\n    print(1n << 4)\n    print(32n >> 2)\nend";
+    assert_cranelift_executable_output(src, "2\n5\n4\n16\n8\n", 0);
+}
+
+#[test]
 fn jit_self_tail_recursion_works() {
     let src = "fn sum(n, acc) do\n    if n == 0 do\n        acc\n    else\n        sum(n - 1, acc + n)\n    end\nend\n\nfn main() do\n    sum(10000, 0)\nend";
     assert_cranelift_jit_result(src, 50005000);
@@ -9212,6 +9326,20 @@ fn llvm_jit_function_value_calls_support_closures() {
 fn llvm_jit_nested_closures_work() {
     let src = "fn main() do\n    a = 2\n    xs = [1, 2, 3]\n    ys = list_map(xs, fn x ->\n        inner = fn y -> y + a end\n        inner(x)\n    end)\n    ys[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 5);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_jit_bitwise_operators_work() {
+    let src = "fn main() do\n    (6 & 3) + (4 | 1) + (7 ^ 3) + (1 << 4) + ((0 - 8) >> 1)\nend";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 23);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_bigint_bitwise_operators_work() {
+    let src = "fn main() do\n    print(6n & 3n)\n    print(4n | 1n)\n    print(7n ^ 3n)\n    print(1n << 4)\n    print(32n >> 2)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "2\n5\n4\n16\n8\n", 0);
 }
 
 #[cfg(feature = "llvm-backend")]

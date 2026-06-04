@@ -1,0 +1,17 @@
+fn main() do
+    print("bigint bitwise")
+
+    print(6n & 3n)
+    print(4n | 1n)
+    print(7n ^ 3n)
+    print(1n << 4)
+    print(32n >> 2)
+
+    print("mixed int/bigint")
+
+    print(6n & 3)
+    print(4 | 1n)
+    print(7n ^ 3)
+    print(1 << 5)
+    print(64n >> 3)
+end

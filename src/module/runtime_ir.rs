@@ -136,6 +136,11 @@ fn build_builtin_map(
     builtins.insert("__op_multiply".to_string(), runtime.op_multiply);
     builtins.insert("__op_divide".to_string(), runtime.op_divide);
     builtins.insert("__op_modulo".to_string(), runtime.op_modulo);
+    builtins.insert("__op_bitand".to_string(), runtime.op_bitand);
+    builtins.insert("__op_bitor".to_string(), runtime.op_bitor);
+    builtins.insert("__op_bitxor".to_string(), runtime.op_bitxor);
+    builtins.insert("__op_shl".to_string(), runtime.op_shl);
+    builtins.insert("__op_shr".to_string(), runtime.op_shr);
     builtins.insert("__op_gt".to_string(), runtime.op_gt);
     builtins.insert("__op_lt".to_string(), runtime.op_lt);
     builtins.insert("__op_gte".to_string(), runtime.op_gte);
@@ -150,6 +155,11 @@ fn build_builtin_map(
         builtins.insert("bigint_multiply".to_string(), runtime.bigint_multiply.unwrap());
         builtins.insert("bigint_divide".to_string(), runtime.bigint_divide.unwrap());
         builtins.insert("bigint_modulo".to_string(), runtime.bigint_modulo.unwrap());
+        builtins.insert("bigint_bitand".to_string(), runtime.bigint_bitand.unwrap());
+        builtins.insert("bigint_bitor".to_string(), runtime.bigint_bitor.unwrap());
+        builtins.insert("bigint_bitxor".to_string(), runtime.bigint_bitxor.unwrap());
+        builtins.insert("bigint_shl".to_string(), runtime.bigint_shl.unwrap());
+        builtins.insert("bigint_shr".to_string(), runtime.bigint_shr.unwrap());
     }
     if list_enabled {
         builtins.insert("list_new".to_string(), runtime.list_new.unwrap());
@@ -179,6 +189,11 @@ struct RuntimeBuiltins {
     op_multiply: FuncId,
     op_divide: FuncId,
     op_modulo: FuncId,
+    op_bitand: FuncId,
+    op_bitor: FuncId,
+    op_bitxor: FuncId,
+    op_shl: FuncId,
+    op_shr: FuncId,
     op_gt: FuncId,
     op_lt: FuncId,
     op_gte: FuncId,
@@ -192,6 +207,11 @@ struct RuntimeBuiltins {
     bigint_multiply: Option<FuncId>,
     bigint_divide: Option<FuncId>,
     bigint_modulo: Option<FuncId>,
+    bigint_bitand: Option<FuncId>,
+    bigint_bitor: Option<FuncId>,
+    bigint_bitxor: Option<FuncId>,
+    bigint_shl: Option<FuncId>,
+    bigint_shr: Option<FuncId>,
     list_new: Option<FuncId>,
     list_push: Option<FuncId>,
     list_insert: Option<FuncId>,
@@ -311,6 +331,36 @@ fn declare_runtime_function_ids(
         "__rt_modulo",
         &[types::I64, types::I64, types::I64, types::I64],
     );
+    let op_bitand = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_bitand",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_bitor = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_bitor",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_bitxor = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_bitxor",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_shl = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_shl",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
+    let op_shr = declare_local_pair_builtin(
+        module,
+        isa,
+        "__rt_shr",
+        &[types::I64, types::I64, types::I64, types::I64],
+    );
     let op_gt = declare_local_pair_builtin(
         module,
         isa,
@@ -398,6 +448,46 @@ fn declare_runtime_function_ids(
             &[types::I64, types::I64, types::I64, types::I64],
         )
     });
+    let bigint_bitand = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_bitand",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_bitor = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_bitor",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_bitxor = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_bitxor",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_shl = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_shl",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let bigint_shr = bigint_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_bigint_shr",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
     let list_new =
         list_enabled.then(|| declare_local_pair_builtin(module, isa, "__rt_list_new", &[]));
     let list_push = list_enabled.then(|| {
@@ -473,6 +563,11 @@ fn declare_runtime_function_ids(
             op_multiply,
             op_divide,
             op_modulo,
+            op_bitand,
+            op_bitor,
+            op_bitxor,
+            op_shl,
+            op_shr,
             op_gt,
             op_lt,
             op_gte,
@@ -486,6 +581,11 @@ fn declare_runtime_function_ids(
             bigint_multiply,
             bigint_divide,
             bigint_modulo,
+            bigint_bitand,
+            bigint_bitor,
+            bigint_bitxor,
+            bigint_shl,
+            bigint_shr,
             list_new,
             list_push,
             list_insert,
@@ -569,6 +669,61 @@ fn define_runtime_operations(
         ids.builtins.bigint_modulo,
         "modulo",
     );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_bitand,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_bitand,
+        "bitand",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_bitor,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_bitor,
+        "bitor",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_bitxor,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_bitxor,
+        "bitxor",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_shl,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_shl,
+        "shl",
+    );
+    define_rt_binary_op(
+        module,
+        isa,
+        flags,
+        ids.builtins.op_shr,
+        ids.builtins.value_to_i64,
+        ids.builtins.value_int,
+        ids.builtins.bigint_from_int,
+        ids.builtins.bigint_shr,
+        "shr",
+    );
     if bigint_enabled {
         define_rt_bigint_from_int(
             module,
@@ -601,6 +756,11 @@ fn define_runtime_operations(
         );
         define_rt_bigint_divide(module, isa, flags, ids.builtins.bigint_divide.unwrap(), ids.alloc);
         define_rt_bigint_modulo(module, isa, flags, ids.builtins.bigint_modulo.unwrap(), ids.alloc);
+        define_rt_bigint_bitand(module, isa, flags, ids.builtins.bigint_bitand.unwrap(), ids.alloc);
+        define_rt_bigint_bitor(module, isa, flags, ids.builtins.bigint_bitor.unwrap(), ids.alloc);
+        define_rt_bigint_bitxor(module, isa, flags, ids.builtins.bigint_bitxor.unwrap(), ids.alloc);
+        define_rt_bigint_shl(module, isa, flags, ids.builtins.bigint_shl.unwrap(), ids.alloc);
+        define_rt_bigint_shr(module, isa, flags, ids.builtins.bigint_shr.unwrap(), ids.alloc);
     }
     define_rt_compare_op(
         module,
@@ -1395,6 +1555,317 @@ fn bigint_one(builder: &mut FunctionBuilder, alloc_ref: FuncRef) -> Value {
     ptr
 }
 
+fn bigint_trap_if_negative(builder: &mut FunctionBuilder, header_ptr: Value) {
+    let sign = bigint_load_sign(builder, header_ptr);
+    let negative = builder.ins().icmp_imm(IntCC::SignedLessThan, sign, 0);
+    builder.ins().trapnz(negative, TrapCode::BAD_CONVERSION_TO_INTEGER);
+}
+
+fn bigint_bitwise_abs(
+    builder: &mut FunctionBuilder,
+    alloc_ref: FuncRef,
+    lhs: Value,
+    rhs: Value,
+    op: &str,
+) -> Value {
+    let lhs_len = bigint_load_len(builder, lhs);
+    let rhs_len = bigint_load_len(builder, rhs);
+    let cap = if op == "bitand" {
+        let lhs_le_rhs = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, lhs_len, rhs_len);
+        builder.ins().select(lhs_le_rhs, lhs_len, rhs_len)
+    } else {
+        let lhs_ge_rhs = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, lhs_len, rhs_len);
+        builder.ins().select(lhs_ge_rhs, lhs_len, rhs_len)
+    };
+    let result = bigint_alloc(builder, alloc_ref, cap);
+    let one = builder.ins().iconst(types::I64, 1);
+    let zero = builder.ins().iconst(types::I64, 0);
+    bigint_store_sign(builder, result, one);
+    bigint_store_len(builder, result, cap);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, cap);
+    builder.ins().brif(more, body_block, &[], done_block, &[]);
+
+    builder.switch_to_block(body_block);
+    builder.seal_block(body_block);
+    let lhs_limb = if op == "bitand" {
+        bigint_load_limb(builder, lhs, idx)
+    } else {
+        let lhs_in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, lhs_len);
+        let lhs_have = builder.create_block();
+        let lhs_zero = builder.create_block();
+        let lhs_merge = builder.create_block();
+        builder.append_block_param(lhs_merge, types::I64);
+        builder.ins().brif(lhs_in_bounds, lhs_have, &[], lhs_zero, &[]);
+        builder.switch_to_block(lhs_have);
+        builder.seal_block(lhs_have);
+        let limb = bigint_load_limb(builder, lhs, idx);
+        builder.ins().jump(lhs_merge, &[BlockArg::Value(limb)]);
+        builder.switch_to_block(lhs_zero);
+        builder.seal_block(lhs_zero);
+        builder.ins().jump(lhs_merge, &[BlockArg::Value(zero)]);
+        builder.switch_to_block(lhs_merge);
+        builder.seal_block(lhs_merge);
+        builder.block_params(lhs_merge)[0]
+    };
+    let rhs_limb = if op == "bitand" {
+        bigint_load_limb(builder, rhs, idx)
+    } else {
+        let rhs_in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, idx, rhs_len);
+        let rhs_have = builder.create_block();
+        let rhs_zero = builder.create_block();
+        let rhs_merge = builder.create_block();
+        builder.append_block_param(rhs_merge, types::I64);
+        builder.ins().brif(rhs_in_bounds, rhs_have, &[], rhs_zero, &[]);
+        builder.switch_to_block(rhs_have);
+        builder.seal_block(rhs_have);
+        let limb = bigint_load_limb(builder, rhs, idx);
+        builder.ins().jump(rhs_merge, &[BlockArg::Value(limb)]);
+        builder.switch_to_block(rhs_zero);
+        builder.seal_block(rhs_zero);
+        builder.ins().jump(rhs_merge, &[BlockArg::Value(zero)]);
+        builder.switch_to_block(rhs_merge);
+        builder.seal_block(rhs_merge);
+        builder.block_params(rhs_merge)[0]
+    };
+    let out_limb = match op {
+        "bitand" => builder.ins().band(lhs_limb, rhs_limb),
+        "bitor" => builder.ins().bor(lhs_limb, rhs_limb),
+        "bitxor" => builder.ins().bxor(lhs_limb, rhs_limb),
+        _ => unreachable!(),
+    };
+    bigint_store_limb(builder, result, idx, out_limb);
+    let next = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    builder.seal_block(loop_block);
+    bigint_normalize(builder, result);
+    result
+}
+
+fn bigint_shift_left(builder: &mut FunctionBuilder, alloc_ref: FuncRef, lhs: Value, shift: Value) -> Value {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let lhs_sign = bigint_load_sign(builder, lhs);
+    let lhs_is_zero = builder.ins().icmp(IntCC::Equal, lhs_sign, zero);
+    let zero_block = builder.create_block();
+    let work_block = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    builder.ins().brif(lhs_is_zero, zero_block, &[], work_block, &[]);
+
+    builder.switch_to_block(zero_block);
+    let zero_ptr = bigint_zero(builder, alloc_ref);
+    builder.ins().jump(merge, &[BlockArg::Value(zero_ptr)]);
+    builder.seal_block(zero_block);
+
+    builder.switch_to_block(work_block);
+    builder.seal_block(work_block);
+    let lhs_len = bigint_load_len(builder, lhs);
+    let limb_shift = builder.ins().ushr_imm(shift, 5);
+    let bit_shift = builder.ins().band_imm(shift, 31);
+    let bit_non_zero = builder.ins().icmp_imm(IntCC::NotEqual, bit_shift, 0);
+    let carry_block = builder.create_block();
+    let no_carry_block = builder.create_block();
+    let extra_merge = builder.create_block();
+    builder.append_block_param(extra_merge, types::I64);
+    builder.ins().brif(bit_non_zero, carry_block, &[], no_carry_block, &[]);
+
+    builder.switch_to_block(carry_block);
+    builder.seal_block(carry_block);
+    builder.ins().jump(extra_merge, &[BlockArg::Value(one)]);
+
+    builder.switch_to_block(no_carry_block);
+    builder.seal_block(no_carry_block);
+    builder.ins().jump(extra_merge, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(extra_merge);
+    builder.seal_block(extra_merge);
+    let extra = builder.block_params(extra_merge)[0];
+    let lhs_plus_limb = builder.ins().iadd(lhs_len, limb_shift);
+    let cap = builder.ins().iadd(lhs_plus_limb, extra);
+    let result = bigint_alloc(builder, alloc_ref, cap);
+    bigint_store_sign(builder, result, one);
+    bigint_store_len(builder, result, cap);
+
+    let init_loop = builder.create_block();
+    let init_body = builder.create_block();
+    let init_done = builder.create_block();
+    builder.append_block_param(init_loop, types::I64);
+    builder.ins().jump(init_loop, &[BlockArg::Value(zero)]);
+    builder.switch_to_block(init_loop);
+    let init_idx = builder.block_params(init_loop)[0];
+    let init_more = builder.ins().icmp(IntCC::UnsignedLessThan, init_idx, cap);
+    builder.ins().brif(init_more, init_body, &[], init_done, &[]);
+    builder.switch_to_block(init_body);
+    builder.seal_block(init_body);
+    bigint_store_limb(builder, result, init_idx, zero);
+    let init_next = builder.ins().iadd_imm(init_idx, 1);
+    builder.ins().jump(init_loop, &[BlockArg::Value(init_next)]);
+    builder.switch_to_block(init_done);
+    builder.seal_block(init_done);
+    builder.seal_block(init_loop);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, lhs_len);
+    builder.ins().brif(more, body_block, &[], done_block, &[]);
+    builder.switch_to_block(body_block);
+    builder.seal_block(body_block);
+    let limb = bigint_load_limb(builder, lhs, idx);
+    let dst_idx = builder.ins().iadd(idx, limb_shift);
+    let low = builder.ins().ishl(limb, bit_shift);
+    let mask = builder.ins().iconst(types::I64, 0xffff_ffff);
+    let low32 = builder.ins().band(low, mask);
+    let existing_low = bigint_load_limb(builder, result, dst_idx);
+    let new_low = builder.ins().iadd(existing_low, low32);
+    bigint_store_limb(builder, result, dst_idx, new_low);
+    let has_carry = builder.ins().icmp_imm(IntCC::NotEqual, bit_shift, 0);
+    let carry_body = builder.create_block();
+    let carry_done = builder.create_block();
+    builder.ins().brif(has_carry, carry_body, &[], carry_done, &[]);
+    builder.switch_to_block(carry_body);
+    builder.seal_block(carry_body);
+    let high = builder.ins().ushr_imm(low, 32);
+    let next_idx = builder.ins().iadd_imm(dst_idx, 1);
+    let existing_high = bigint_load_limb(builder, result, next_idx);
+    let new_high = builder.ins().iadd(existing_high, high);
+    bigint_store_limb(builder, result, next_idx, new_high);
+    builder.ins().jump(carry_done, &[]);
+    builder.switch_to_block(carry_done);
+    builder.seal_block(carry_done);
+    let next = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    builder.seal_block(loop_block);
+    bigint_normalize(builder, result);
+    builder.ins().jump(merge, &[BlockArg::Value(result)]);
+
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    builder.block_params(merge)[0]
+}
+
+fn bigint_shift_right(builder: &mut FunctionBuilder, alloc_ref: FuncRef, lhs: Value, shift: Value) -> Value {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let lhs_sign = bigint_load_sign(builder, lhs);
+    let lhs_is_zero = builder.ins().icmp(IntCC::Equal, lhs_sign, zero);
+    let zero_block = builder.create_block();
+    let work_block = builder.create_block();
+    let merge = builder.create_block();
+    builder.append_block_param(merge, types::I64);
+    builder.ins().brif(lhs_is_zero, zero_block, &[], work_block, &[]);
+
+    builder.switch_to_block(zero_block);
+    let zero_ptr = bigint_zero(builder, alloc_ref);
+    builder.ins().jump(merge, &[BlockArg::Value(zero_ptr)]);
+
+    builder.switch_to_block(work_block);
+    builder.seal_block(work_block);
+    let lhs_len = bigint_load_len(builder, lhs);
+    let limb_shift = builder.ins().ushr_imm(shift, 5);
+    let enough = builder.ins().icmp(IntCC::UnsignedLessThan, limb_shift, lhs_len);
+    let non_zero_block = builder.create_block();
+    builder.ins().brif(enough, non_zero_block, &[], zero_block, &[]);
+    builder.seal_block(zero_block);
+
+    builder.switch_to_block(non_zero_block);
+    builder.seal_block(non_zero_block);
+    let result_len = builder.ins().isub(lhs_len, limb_shift);
+    let bit_shift = builder.ins().band_imm(shift, 31);
+    let result = bigint_alloc(builder, alloc_ref, result_len);
+    let one = builder.ins().iconst(types::I64, 1);
+    bigint_store_sign(builder, result, one);
+    bigint_store_len(builder, result, result_len);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, result_len);
+    builder.ins().brif(more, body_block, &[], done_block, &[]);
+    builder.switch_to_block(body_block);
+    builder.seal_block(body_block);
+    let src_idx = builder.ins().iadd(idx, limb_shift);
+    let limb = bigint_load_limb(builder, lhs, src_idx);
+    let has_bit_shift = builder.ins().icmp_imm(IntCC::NotEqual, bit_shift, 0);
+    let shift_body = builder.create_block();
+    let shift_none = builder.create_block();
+    let out_merge = builder.create_block();
+    builder.append_block_param(out_merge, types::I64);
+    builder.ins().brif(has_bit_shift, shift_body, &[], shift_none, &[]);
+
+    builder.switch_to_block(shift_none);
+    builder.seal_block(shift_none);
+    builder.ins().jump(out_merge, &[BlockArg::Value(limb)]);
+
+    builder.switch_to_block(shift_body);
+    builder.seal_block(shift_body);
+    let low = builder.ins().ushr(limb, bit_shift);
+    let next_src = builder.ins().iadd_imm(src_idx, 1);
+    let next_in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, next_src, lhs_len);
+    let next_have = builder.create_block();
+    let next_zero = builder.create_block();
+    let next_merge = builder.create_block();
+    builder.append_block_param(next_merge, types::I64);
+    builder.ins().brif(next_in_bounds, next_have, &[], next_zero, &[]);
+
+    builder.switch_to_block(next_have);
+    builder.seal_block(next_have);
+    let next_limb = bigint_load_limb(builder, lhs, next_src);
+    let thirty_two = builder.ins().iconst(types::I64, 32);
+    let inv_shift = builder.ins().isub(thirty_two, bit_shift);
+    let high = builder.ins().ishl(next_limb, inv_shift);
+    let mask = builder.ins().iconst(types::I64, 0xffff_ffff);
+    let high_masked = builder.ins().band(high, mask);
+    let merged = builder.ins().bor(low, high_masked);
+    builder.ins().jump(next_merge, &[BlockArg::Value(merged)]);
+
+    builder.switch_to_block(next_zero);
+    builder.seal_block(next_zero);
+    builder.ins().jump(next_merge, &[BlockArg::Value(low)]);
+
+    builder.switch_to_block(next_merge);
+    builder.seal_block(next_merge);
+    let merged_limb = builder.block_params(next_merge)[0];
+    builder.ins().jump(out_merge, &[BlockArg::Value(merged_limb)]);
+
+    builder.switch_to_block(out_merge);
+    builder.seal_block(out_merge);
+    let out_limb = builder.block_params(out_merge)[0];
+    bigint_store_limb(builder, result, idx, out_limb);
+    let next = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    builder.seal_block(loop_block);
+    bigint_normalize(builder, result);
+    builder.ins().jump(merge, &[BlockArg::Value(result)]);
+
+    builder.switch_to_block(merge);
+    builder.seal_block(merge);
+    builder.block_params(merge)[0]
+}
+
 fn bigint_mul_abs(
     builder: &mut FunctionBuilder,
     alloc_ref: FuncRef,
@@ -1950,6 +2421,16 @@ fn define_rt_binary_op(
                     b.ins().trapnz(overflow, TrapCode::INTEGER_OVERFLOW);
                     b.ins().srem(lhs, rhs)
                 }
+                "bitand" => b.ins().band(lhs, rhs),
+                "bitor" => b.ins().bor(lhs, rhs),
+                "bitxor" => b.ins().bxor(lhs, rhs),
+                "shl" | "shr" => {
+                    let rhs_non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, rhs, 0);
+                    let rhs_lt_width = b.ins().icmp_imm(IntCC::SignedLessThan, rhs, 64);
+                    let rhs_in_range = b.ins().band(rhs_non_neg, rhs_lt_width);
+                    b.ins().trapz(rhs_in_range, TrapCode::BAD_CONVERSION_TO_INTEGER);
+                    if op == "shl" { b.ins().ishl(lhs, rhs) } else { b.ins().sshr(lhs, rhs) }
+                }
                 _ => unreachable!(),
             };
             let out = b.ins().call(make_int, &[raw]);
@@ -1964,66 +2445,82 @@ fn define_rt_binary_op(
             {
                 let lhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[0], TAG_BIGINT);
                 let rhs_is_bigint = b.ins().icmp_imm(IntCC::Equal, p[2], TAG_BIGINT);
-                let both_bigint = b.ins().band(lhs_is_bigint, rhs_is_bigint);
-                let bigint_block = b.create_block();
-                let lhs_promote_check_block = b.create_block();
-                let lhs_promote_block = b.create_block();
-                let rhs_promote_check_block = b.create_block();
-                let rhs_promote_block = b.create_block();
                 let trap_block = b.create_block();
-                b.ins().brif(both_bigint, bigint_block, &[], lhs_promote_check_block, &[]);
+                if matches!(op, "shl" | "shr") {
+                    let lhs_bigint_rhs_int = b.ins().band(lhs_is_bigint, rhs_is_int);
+                    let bigint_block = b.create_block();
+                    b.ins().brif(lhs_bigint_rhs_int, bigint_block, &[], trap_block, &[]);
 
-                b.switch_to_block(bigint_block);
-                b.seal_block(bigint_block);
-                let out = b.ins().call(bigint_ref, &[p[0], p[1], p[2], p[3]]);
-                let result_tag = b.inst_results(out)[0];
-                let result_payload = b.inst_results(out)[1];
-                b.ins().jump(
-                    merge_block,
-                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
-                );
+                    b.switch_to_block(bigint_block);
+                    b.seal_block(bigint_block);
+                    let out = b.ins().call(bigint_ref, &[p[0], p[1], p[2], p[3]]);
+                    let result_tag = b.inst_results(out)[0];
+                    let result_payload = b.inst_results(out)[1];
+                    b.ins().jump(
+                        merge_block,
+                        &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                    );
+                } else {
+                    let both_bigint = b.ins().band(lhs_is_bigint, rhs_is_bigint);
+                    let bigint_block = b.create_block();
+                    let lhs_promote_check_block = b.create_block();
+                    let lhs_promote_block = b.create_block();
+                    let rhs_promote_check_block = b.create_block();
+                    let rhs_promote_block = b.create_block();
+                    b.ins().brif(both_bigint, bigint_block, &[], lhs_promote_check_block, &[]);
 
-                b.switch_to_block(lhs_promote_check_block);
-                b.seal_block(lhs_promote_check_block);
-                let lhs_int_rhs_bigint = b.ins().band(lhs_is_int, rhs_is_bigint);
-                b.ins().brif(
-                    lhs_int_rhs_bigint,
-                    lhs_promote_block,
-                    &[],
-                    rhs_promote_check_block,
-                    &[],
-                );
+                    b.switch_to_block(bigint_block);
+                    b.seal_block(bigint_block);
+                    let out = b.ins().call(bigint_ref, &[p[0], p[1], p[2], p[3]]);
+                    let result_tag = b.inst_results(out)[0];
+                    let result_payload = b.inst_results(out)[1];
+                    b.ins().jump(
+                        merge_block,
+                        &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                    );
 
-                b.switch_to_block(lhs_promote_block);
-                b.seal_block(lhs_promote_block);
-                let lhs_big = b.ins().call(bigint_from_int_ref, &[p[0], p[1]]);
-                let lhs_big_tag = b.inst_results(lhs_big)[0];
-                let lhs_big_payload = b.inst_results(lhs_big)[1];
-                let out = b.ins().call(bigint_ref, &[lhs_big_tag, lhs_big_payload, p[2], p[3]]);
-                let result_tag = b.inst_results(out)[0];
-                let result_payload = b.inst_results(out)[1];
-                b.ins().jump(
-                    merge_block,
-                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
-                );
+                    b.switch_to_block(lhs_promote_check_block);
+                    b.seal_block(lhs_promote_check_block);
+                    let lhs_int_rhs_bigint = b.ins().band(lhs_is_int, rhs_is_bigint);
+                    b.ins().brif(
+                        lhs_int_rhs_bigint,
+                        lhs_promote_block,
+                        &[],
+                        rhs_promote_check_block,
+                        &[],
+                    );
 
-                b.switch_to_block(rhs_promote_check_block);
-                b.seal_block(rhs_promote_check_block);
-                let rhs_int_lhs_bigint = b.ins().band(lhs_is_bigint, rhs_is_int);
-                b.ins().brif(rhs_int_lhs_bigint, rhs_promote_block, &[], trap_block, &[]);
+                    b.switch_to_block(lhs_promote_block);
+                    b.seal_block(lhs_promote_block);
+                    let lhs_big = b.ins().call(bigint_from_int_ref, &[p[0], p[1]]);
+                    let lhs_big_tag = b.inst_results(lhs_big)[0];
+                    let lhs_big_payload = b.inst_results(lhs_big)[1];
+                    let out = b.ins().call(bigint_ref, &[lhs_big_tag, lhs_big_payload, p[2], p[3]]);
+                    let result_tag = b.inst_results(out)[0];
+                    let result_payload = b.inst_results(out)[1];
+                    b.ins().jump(
+                        merge_block,
+                        &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                    );
 
-                b.switch_to_block(rhs_promote_block);
-                b.seal_block(rhs_promote_block);
-                let rhs_big = b.ins().call(bigint_from_int_ref, &[p[2], p[3]]);
-                let rhs_big_tag = b.inst_results(rhs_big)[0];
-                let rhs_big_payload = b.inst_results(rhs_big)[1];
-                let out = b.ins().call(bigint_ref, &[p[0], p[1], rhs_big_tag, rhs_big_payload]);
-                let result_tag = b.inst_results(out)[0];
-                let result_payload = b.inst_results(out)[1];
-                b.ins().jump(
-                    merge_block,
-                    &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
-                );
+                    b.switch_to_block(rhs_promote_check_block);
+                    b.seal_block(rhs_promote_check_block);
+                    let rhs_int_lhs_bigint = b.ins().band(lhs_is_bigint, rhs_is_int);
+                    b.ins().brif(rhs_int_lhs_bigint, rhs_promote_block, &[], trap_block, &[]);
+
+                    b.switch_to_block(rhs_promote_block);
+                    b.seal_block(rhs_promote_block);
+                    let rhs_big = b.ins().call(bigint_from_int_ref, &[p[2], p[3]]);
+                    let rhs_big_tag = b.inst_results(rhs_big)[0];
+                    let rhs_big_payload = b.inst_results(rhs_big)[1];
+                    let out = b.ins().call(bigint_ref, &[p[0], p[1], rhs_big_tag, rhs_big_payload]);
+                    let result_tag = b.inst_results(out)[0];
+                    let result_payload = b.inst_results(out)[1];
+                    b.ins().jump(
+                        merge_block,
+                        &[BlockArg::Value(result_tag), BlockArg::Value(result_payload)],
+                    );
+                }
 
                 b.switch_to_block(trap_block);
                 b.seal_block(trap_block);
@@ -2504,6 +3001,143 @@ fn define_rt_bigint_modulo(
             b.switch_to_block(done_block);
             b.seal_block(done_block);
             let result_ptr = b.block_params(done_block)[0];
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_bitand(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            bigint_trap_if_negative(b, lhs_ptr);
+            bigint_trap_if_negative(b, rhs_ptr);
+            let result_ptr = bigint_bitwise_abs(b, alloc_ref, lhs_ptr, rhs_ptr, "bitand");
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_bitor(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            bigint_trap_if_negative(b, lhs_ptr);
+            bigint_trap_if_negative(b, rhs_ptr);
+            let result_ptr = bigint_bitwise_abs(b, alloc_ref, lhs_ptr, rhs_ptr, "bitor");
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_bitxor(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let rhs_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_BIGINT);
+            bigint_trap_if_negative(b, lhs_ptr);
+            bigint_trap_if_negative(b, rhs_ptr);
+            let result_ptr = bigint_bitwise_abs(b, alloc_ref, lhs_ptr, rhs_ptr, "bitxor");
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_shl(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let shift = pair_payload_for_tag(b, p[2], p[3], TAG_INT);
+            let non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, shift, 0);
+            b.ins().trapz(non_neg, TrapCode::BAD_CONVERSION_TO_INTEGER);
+            bigint_trap_if_negative(b, lhs_ptr);
+            let result_ptr = bigint_shift_left(b, alloc_ref, lhs_ptr, shift);
+            let tag = b.ins().iconst(types::I64, TAG_BIGINT);
+            b.ins().return_(&[tag, result_ptr]);
+        },
+    );
+}
+
+fn define_rt_bigint_shr(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let lhs_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_BIGINT);
+            let shift = pair_payload_for_tag(b, p[2], p[3], TAG_INT);
+            let non_neg = b.ins().icmp_imm(IntCC::SignedGreaterThanOrEqual, shift, 0);
+            b.ins().trapz(non_neg, TrapCode::BAD_CONVERSION_TO_INTEGER);
+            bigint_trap_if_negative(b, lhs_ptr);
+            let result_ptr = bigint_shift_right(b, alloc_ref, lhs_ptr, shift);
             let tag = b.ins().iconst(types::I64, TAG_BIGINT);
             b.ins().return_(&[tag, result_ptr]);
         },
