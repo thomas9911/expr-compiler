@@ -6,8 +6,8 @@ use crate::analysis::{FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysi
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
     BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, MULTI_HEADER_SIZE, STRING_HEADER_SIZE,
-    STRING_ITER_HEADER_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_MULTI, TAG_STRING,
-    TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    STRING_ITER_HEADER_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_MAP, TAG_MULTI,
+    TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 mod ast;
 mod bigint;
 mod lists;
+mod maps;
 mod strings;
 mod values;
 mod wasi;
@@ -113,6 +114,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> Result<LlvmJitModule, Compi
         compiler.bigint_enabled = expr_module.uses_bigint();
         compiler.list_enabled = expr_module.uses_lists();
         compiler.list_mutation_enabled = expr_module.uses_list_mutation();
+        compiler.map_enabled = expr_module.uses_maps();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -153,6 +155,7 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Result<Vec<u
         compiler.bigint_enabled = expr_module.uses_bigint();
         compiler.list_enabled = expr_module.uses_lists();
         compiler.list_mutation_enabled = expr_module.uses_list_mutation();
+        compiler.map_enabled = expr_module.uses_maps();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -186,6 +189,7 @@ pub(super) fn compile_to_wasm_assembly(
         compiler.bigint_enabled = expr_module.uses_bigint();
         compiler.list_enabled = expr_module.uses_lists() || needs_argv_list;
         compiler.list_mutation_enabled = expr_module.uses_list_mutation();
+        compiler.map_enabled = expr_module.uses_maps();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -220,6 +224,7 @@ pub(super) fn compile_to_wasm_preview1_command_assembly(
         compiler.bigint_enabled = expr_module.uses_bigint();
         compiler.list_enabled = expr_module.uses_lists() || needs_argv_list;
         compiler.list_mutation_enabled = expr_module.uses_list_mutation();
+        compiler.map_enabled = expr_module.uses_maps();
         compiler.function_ordinals = function_ordinals(&expr_module.functions);
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
@@ -281,6 +286,7 @@ struct LlvmCompiler<'ctx> {
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
     functions: HashMap<String, FunctionValue<'ctx>>,
     function_ordinals: HashMap<String, i64>,
     function_arities: HashMap<String, usize>,
@@ -316,6 +322,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             bigint_enabled: false,
             list_enabled: false,
             list_mutation_enabled: false,
+            map_enabled: false,
             functions: HashMap::new(),
             function_ordinals: HashMap::new(),
             function_arities: HashMap::new(),
@@ -544,6 +551,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.define_pair_list_pop("__rt_list_pop", "llvm_rt_list_pop");
             self.define_pair_list_delete("__rt_list_delete", "llvm_rt_list_delete");
             self.define_pair_list_copy("__rt_list_copy", "llvm_rt_list_copy");
+        }
+        if self.map_enabled {
+            self.define_pair_map_new("__rt_map_new", "llvm_rt_map_new");
+            self.define_pair_map_set("__rt_map_set", "llvm_rt_map_set");
+            self.define_pair_map_len("__rt_map_len", "llvm_rt_map_len");
+            self.define_pair_map_get("__rt_map_get", "llvm_rt_map_get");
+            self.define_pair_map_has("__rt_map_has", "llvm_rt_map_has");
+            self.define_pair_map_delete("__rt_map_delete", "llvm_rt_map_delete");
+            self.define_pair_map_keys("__rt_map_keys", "llvm_rt_map_keys");
         }
     }
 

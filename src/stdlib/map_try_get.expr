@@ -1,0 +1,7 @@
+fn map_try_get(map, key) do
+    if map_has(map, key) do
+        true, map_get(map, key), ""
+    else
+        false, 0, "missing key"
+    end
+end

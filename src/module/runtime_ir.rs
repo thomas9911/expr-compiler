@@ -14,8 +14,11 @@ use std::collections::HashMap;
 use crate::value::{
     BIGINT_CAP_OFFSET, BIGINT_HEADER_SIZE, BIGINT_LEN_OFFSET, BIGINT_LIMB_SIZE, BIGINT_PTR_OFFSET,
     BIGINT_SIGN_OFFSET, LIST_CAP_OFFSET, LIST_HEADER_SIZE, LIST_LEN_OFFSET, LIST_PTR_OFFSET,
-    STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_INT, TAG_LIST, TAG_STRING,
-    VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    MAP_CAP_OFFSET, MAP_ENTRY_HASH_OFFSET, MAP_ENTRY_KEY_OFFSET, MAP_ENTRY_OCCUPIED,
+    MAP_ENTRY_SIZE, MAP_ENTRY_STATE_OFFSET, MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+    MAP_ENTRY_VALUE_TAG_OFFSET, MAP_HEADER_SIZE, MAP_LEN_OFFSET, MAP_PTR_OFFSET, STRING_LEN_OFFSET,
+    STRING_PTR_OFFSET, TAG_BIGINT, TAG_INT, TAG_LIST, TAG_MAP, TAG_STRING, VALUE_PAYLOAD_OFFSET,
+    VALUE_SIZE,
 };
 
 const ARENA_BYTES: i64 = 16 * 1024 * 1024;
@@ -28,6 +31,7 @@ pub(super) fn setup_builtins(
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
 ) -> HashMap<String, FuncId> {
     let oom_host_id = declare_host_builtin(module, isa, "__expr_runtime_oom_host", &[]);
     let runtime = define_runtime_ir(
@@ -38,6 +42,7 @@ pub(super) fn setup_builtins(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     );
     let print_host_id = declare_host_builtin(module, isa, "__expr_print_host", &[types::I64]);
     let list_print_host_id =
@@ -62,6 +67,7 @@ pub(super) fn setup_builtins(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     )
 }
 
@@ -72,6 +78,7 @@ pub(super) fn setup_builtins_jit(
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
     print_host_addr: i64,
     list_print_host_addr: i64,
     arena_base_addr: i64,
@@ -87,6 +94,7 @@ pub(super) fn setup_builtins_jit(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     );
     let print_host_id = declare_local_builtin(module, isa, "__rt_print_host_scalar", &[types::I64]);
     let list_print_host_id =
@@ -113,6 +121,7 @@ pub(super) fn setup_builtins_jit(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     )
 }
 
@@ -123,6 +132,7 @@ fn build_builtin_map(
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
 ) -> HashMap<String, FuncId> {
     let mut builtins = HashMap::new();
     builtins.insert("print".to_string(), print_id);
@@ -175,6 +185,15 @@ fn build_builtin_map(
         builtins.insert("list_delete".to_string(), runtime.list_delete.unwrap());
         builtins.insert("list_copy".to_string(), runtime.list_copy.unwrap());
     }
+    if map_enabled {
+        builtins.insert("map_new".to_string(), runtime.map_new.unwrap());
+        builtins.insert("map_set".to_string(), runtime.map_set.unwrap());
+        builtins.insert("map_len".to_string(), runtime.map_len.unwrap());
+        builtins.insert("map_get".to_string(), runtime.map_get.unwrap());
+        builtins.insert("map_has".to_string(), runtime.map_has.unwrap());
+        builtins.insert("map_delete".to_string(), runtime.map_delete.unwrap());
+        builtins.insert("map_keys".to_string(), runtime.map_keys.unwrap());
+    }
     builtins
 }
 
@@ -222,6 +241,13 @@ struct RuntimeBuiltins {
     list_pop: Option<FuncId>,
     list_delete: Option<FuncId>,
     list_copy: Option<FuncId>,
+    map_new: Option<FuncId>,
+    map_set: Option<FuncId>,
+    map_len: Option<FuncId>,
+    map_get: Option<FuncId>,
+    map_has: Option<FuncId>,
+    map_delete: Option<FuncId>,
+    map_keys: Option<FuncId>,
 }
 
 struct RuntimeData {
@@ -291,6 +317,7 @@ fn declare_runtime_function_ids(
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
 ) -> RuntimeFunctionIds {
     let alloc = declare_local_builtin(module, isa, "__rt_alloc", &[types::I64, types::I64]);
     let oom = declare_local_builtin(module, isa, "__rt_runtime_oom_host", &[]);
@@ -547,6 +574,45 @@ fn declare_runtime_function_ids(
     let list_copy = list_mutation_enabled.then(|| {
         declare_local_pair_builtin(module, isa, "__rt_list_copy", &[types::I64, types::I64])
     });
+    let map_new = map_enabled.then(|| declare_local_pair_builtin(module, isa, "__rt_map_new", &[]));
+    let map_set = map_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_map_set",
+            &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let map_len = map_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_map_len", &[types::I64, types::I64])
+    });
+    let map_get = map_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_map_get",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let map_has = map_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_map_has",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let map_delete = map_enabled.then(|| {
+        declare_local_pair_builtin(
+            module,
+            isa,
+            "__rt_map_delete",
+            &[types::I64, types::I64, types::I64, types::I64],
+        )
+    });
+    let map_keys = map_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_map_keys", &[types::I64, types::I64])
+    });
 
     RuntimeFunctionIds {
         alloc,
@@ -596,6 +662,13 @@ fn declare_runtime_function_ids(
             list_pop,
             list_delete,
             list_copy,
+            map_new,
+            map_set,
+            map_len,
+            map_get,
+            map_has,
+            map_delete,
+            map_keys,
         },
     }
 }
@@ -608,6 +681,7 @@ fn define_runtime_operations(
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
 ) {
     define_rt_memcpy(module, isa, flags, ids.memcpy);
     define_rt_box_value(module, isa, flags, ids.builtins.box_value, ids.alloc);
@@ -904,6 +978,34 @@ fn define_runtime_operations(
             ids.memcpy,
         );
     }
+    if map_enabled {
+        define_rt_map_new(module, isa, flags, ids.builtins.map_new.unwrap(), ids.alloc);
+        define_rt_map_set(module, isa, flags, ids.builtins.map_set.unwrap(), ids.alloc, ids.memcpy);
+        define_rt_map_len(
+            module,
+            isa,
+            flags,
+            ids.builtins.map_len.unwrap(),
+            ids.builtins.value_int,
+        );
+        define_rt_map_get(module, isa, flags, ids.builtins.map_get.unwrap());
+        define_rt_map_has(
+            module,
+            isa,
+            flags,
+            ids.builtins.map_has.unwrap(),
+            ids.builtins.value_int,
+        );
+        define_rt_map_delete(module, isa, flags, ids.builtins.map_delete.unwrap());
+        define_rt_map_keys(
+            module,
+            isa,
+            flags,
+            ids.builtins.map_keys.unwrap(),
+            ids.builtins.list_new.expect("internal compiler error: map_keys requires list_new"),
+            ids.builtins.list_push.expect("internal compiler error: map_keys requires list_push"),
+        );
+    }
 }
 
 fn define_runtime_ir(
@@ -914,6 +1016,7 @@ fn define_runtime_ir(
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
 ) -> RuntimeBuiltins {
     let data = init_runtime_data(module);
     let ids = declare_runtime_function_ids(
@@ -922,6 +1025,7 @@ fn define_runtime_ir(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     );
     define_rt_host_oom_import_wrapper(module, isa, flags, ids.oom, oom_host_id);
     define_rt_alloc(module, isa, flags, ids.alloc, ids.oom, &data);
@@ -933,6 +1037,7 @@ fn define_runtime_ir(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     );
     ids.builtins
 }
@@ -1043,6 +1148,24 @@ fn string_eq_bytes(builder: &mut FunctionBuilder, lhs_ptr: Value, rhs_ptr: Value
     builder.seal_block(loop_block);
     builder.seal_block(body_block);
     builder.block_params(done_block)[0]
+}
+
+fn map_load_len(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder.ins().load(types::I64, MemFlags::new(), header_ptr, MAP_LEN_OFFSET)
+}
+
+fn map_load_cap(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder.ins().load(types::I64, MemFlags::new(), header_ptr, MAP_CAP_OFFSET)
+}
+
+fn map_load_ptr(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    builder.ins().load(types::I64, MemFlags::new(), header_ptr, MAP_PTR_OFFSET)
+}
+
+fn map_entry_ptr(builder: &mut FunctionBuilder, entries_ptr: Value, index: Value) -> Value {
+    let entry_size = builder.ins().iconst(types::I64, MAP_ENTRY_SIZE);
+    let off = builder.ins().imul(index, entry_size);
+    builder.ins().iadd(entries_ptr, off)
 }
 
 fn bigint_load_sign(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
@@ -1653,7 +1776,12 @@ fn bigint_bitwise_abs(
     result
 }
 
-fn bigint_shift_left(builder: &mut FunctionBuilder, alloc_ref: FuncRef, lhs: Value, shift: Value) -> Value {
+fn bigint_shift_left(
+    builder: &mut FunctionBuilder,
+    alloc_ref: FuncRef,
+    lhs: Value,
+    shift: Value,
+) -> Value {
     let zero = builder.ins().iconst(types::I64, 0);
     let one = builder.ins().iconst(types::I64, 1);
     let lhs_sign = bigint_load_sign(builder, lhs);
@@ -1762,7 +1890,12 @@ fn bigint_shift_left(builder: &mut FunctionBuilder, alloc_ref: FuncRef, lhs: Val
     builder.block_params(merge)[0]
 }
 
-fn bigint_shift_right(builder: &mut FunctionBuilder, alloc_ref: FuncRef, lhs: Value, shift: Value) -> Value {
+fn bigint_shift_right(
+    builder: &mut FunctionBuilder,
+    alloc_ref: FuncRef,
+    lhs: Value,
+    shift: Value,
+) -> Value {
     let zero = builder.ins().iconst(types::I64, 0);
     let lhs_sign = bigint_load_sign(builder, lhs);
     let lhs_is_zero = builder.ins().icmp(IntCC::Equal, lhs_sign, zero);
@@ -2027,6 +2160,7 @@ fn define_runtime_ir_jit(
     bigint_enabled: bool,
     list_enabled: bool,
     list_mutation_enabled: bool,
+    map_enabled: bool,
 ) -> RuntimeBuiltins {
     let ids = declare_runtime_function_ids(
         module,
@@ -2034,6 +2168,7 @@ fn define_runtime_ir_jit(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     );
     define_rt_host_oom_shim(module, isa, flags, ids.oom, oom_host_addr);
     define_rt_alloc_from_addrs(
@@ -2053,6 +2188,7 @@ fn define_runtime_ir_jit(
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,
+        map_enabled,
     );
     ids.builtins
 }
@@ -3302,6 +3438,324 @@ fn define_rt_compare_op(
     );
 }
 
+fn define_rt_map_new(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    alloc_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(module, isa, flags, id, &[], |b, _p, func| {
+        let alloc = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+        let cap = b.ins().iconst(types::I64, 64);
+        let entry_size = b.ins().iconst(types::I64, MAP_ENTRY_SIZE);
+        let data_bytes = b.ins().imul(cap, entry_size);
+        let align = b.ins().iconst(types::I64, 8);
+        let data_call = b.ins().call(alloc, &[data_bytes, align]);
+        let entries_ptr = b.inst_results(data_call)[0];
+
+        let header_size = b.ins().iconst(types::I64, MAP_HEADER_SIZE);
+        let header_call = b.ins().call(alloc, &[header_size, align]);
+        let header_ptr = b.inst_results(header_call)[0];
+        b.ins().store(MemFlags::new(), entries_ptr, header_ptr, MAP_PTR_OFFSET);
+        let zero = b.ins().iconst(types::I64, 0);
+        b.ins().store(MemFlags::new(), zero, header_ptr, MAP_LEN_OFFSET);
+        b.ins().store(MemFlags::new(), cap, header_ptr, MAP_CAP_OFFSET);
+
+        let loop_block = b.create_block();
+        let body_block = b.create_block();
+        let done_block = b.create_block();
+        b.append_block_param(loop_block, types::I64);
+        b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+        b.switch_to_block(loop_block);
+        let idx = b.block_params(loop_block)[0];
+        let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, cap);
+        b.ins().brif(more, body_block, &[], done_block, &[]);
+
+        b.switch_to_block(body_block);
+        let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
+        b.ins().store(MemFlags::new(), zero, entry_ptr, MAP_ENTRY_STATE_OFFSET);
+        let next = b.ins().iadd_imm(idx, 1);
+        b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+        b.seal_block(body_block);
+
+        b.switch_to_block(done_block);
+        let tag = b.ins().iconst(types::I64, TAG_MAP);
+        b.ins().return_(&[tag, header_ptr]);
+        b.seal_block(done_block);
+        b.seal_block(loop_block);
+    });
+}
+
+fn define_rt_map_len(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    int_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(module, isa, flags, id, &[types::I64, types::I64], |b, p, func| {
+        let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
+        let len = map_load_len(b, header_ptr);
+        let make_int = unsafe { (&mut *module_ptr).declare_func_in_func(int_id, func) };
+        let out = b.ins().call(make_int, &[len]);
+        let result_tag = b.inst_results(out)[0];
+        let result_payload = b.inst_results(out)[1];
+        b.ins().return_(&[result_tag, result_payload]);
+    });
+}
+
+fn define_rt_map_has(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    int_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, func| {
+            let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
+            let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
+            let entries_ptr = map_load_ptr(b, header_ptr);
+            let len = map_load_len(b, header_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+            let one = b.ins().iconst(types::I64, 1);
+
+            let loop_block = b.create_block();
+            let body_block = b.create_block();
+            let found_block = b.create_block();
+            let done_block = b.create_block();
+            b.append_block_param(loop_block, types::I64);
+            b.append_block_param(done_block, types::I64);
+            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(loop_block);
+            let idx = b.block_params(loop_block)[0];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            b.ins().brif(more, body_block, &[], done_block, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(body_block);
+            let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
+            let state =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
+            let skip_block = b.create_block();
+            let cmp_block = b.create_block();
+            b.ins().brif(occupied, cmp_block, &[], skip_block, &[]);
+            b.seal_block(body_block);
+
+            b.switch_to_block(cmp_block);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let equal = string_eq_bytes(b, stored_key, key_ptr);
+            b.ins().brif(equal, found_block, &[], skip_block, &[]);
+            b.seal_block(cmp_block);
+
+            b.switch_to_block(found_block);
+            b.ins().jump(done_block, &[BlockArg::Value(one)]);
+            b.seal_block(found_block);
+
+            b.switch_to_block(skip_block);
+            let next = b.ins().iadd_imm(idx, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+            b.seal_block(skip_block);
+
+            b.switch_to_block(done_block);
+            let raw = b.block_params(done_block)[0];
+            let make_int = unsafe { (&mut *module_ptr).declare_func_in_func(int_id, func) };
+            let out = b.ins().call(make_int, &[raw]);
+            let result_tag = b.inst_results(out)[0];
+            let result_payload = b.inst_results(out)[1];
+            b.ins().return_(&[result_tag, result_payload]);
+            b.seal_block(done_block);
+            b.seal_block(loop_block);
+        },
+    );
+}
+
+fn define_rt_map_get(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+) {
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, _func| {
+            let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
+            let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
+            let entries_ptr = map_load_ptr(b, header_ptr);
+            let len = map_load_len(b, header_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+
+            let loop_block = b.create_block();
+            let body_block = b.create_block();
+            let found_block = b.create_block();
+            let trap_block = b.create_block();
+            b.append_block_param(loop_block, types::I64);
+            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(loop_block);
+            let idx = b.block_params(loop_block)[0];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            b.ins().brif(more, body_block, &[], trap_block, &[]);
+
+            b.switch_to_block(body_block);
+            let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
+            let state =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
+            let skip_block = b.create_block();
+            let cmp_block = b.create_block();
+            b.ins().brif(occupied, cmp_block, &[], skip_block, &[]);
+            b.seal_block(body_block);
+
+            b.switch_to_block(cmp_block);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let equal = string_eq_bytes(b, stored_key, key_ptr);
+            b.ins().brif(equal, found_block, &[], skip_block, &[]);
+            b.seal_block(cmp_block);
+
+            b.switch_to_block(found_block);
+            let tag =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+            let payload = b.ins().load(
+                types::I64,
+                MemFlags::new(),
+                entry_ptr,
+                MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            );
+            b.ins().return_(&[tag, payload]);
+            b.seal_block(found_block);
+
+            b.switch_to_block(skip_block);
+            let next = b.ins().iadd_imm(idx, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+            b.seal_block(skip_block);
+
+            b.switch_to_block(trap_block);
+            let one = b.ins().iconst(types::I64, 1);
+            b.ins().trapnz(one, TrapCode::HEAP_OUT_OF_BOUNDS);
+            b.ins().return_(&[zero, zero]);
+            b.seal_block(trap_block);
+            b.seal_block(loop_block);
+        },
+    );
+}
+
+fn define_rt_map_set(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    _alloc_id: FuncId,
+    _memcpy_id: FuncId,
+) {
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64],
+        |b, p, _func| {
+            let map_tag = p[0];
+            let map_payload = p[1];
+            let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
+            let value_tag = p[4];
+            let value_payload = p[5];
+            let header_ptr = pair_payload_for_tag(b, map_tag, map_payload, TAG_MAP);
+            let entries_ptr = map_load_ptr(b, header_ptr);
+            let len = map_load_len(b, header_ptr);
+            let cap = map_load_cap(b, header_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+
+            let loop_block = b.create_block();
+            let body_block = b.create_block();
+            let insert_block = b.create_block();
+            let done_block = b.create_block();
+            let full_block = b.create_block();
+            b.append_block_param(loop_block, types::I64);
+            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(loop_block);
+            let idx = b.block_params(loop_block)[0];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            b.ins().brif(more, body_block, &[], insert_block, &[]);
+
+            b.switch_to_block(body_block);
+            let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let equal = string_eq_bytes(b, stored_key, key_ptr);
+            let next_block = b.create_block();
+            let update_block = b.create_block();
+            b.ins().brif(equal, update_block, &[], next_block, &[]);
+            b.seal_block(body_block);
+
+            b.switch_to_block(update_block);
+            b.ins().store(MemFlags::new(), value_tag, entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+            b.ins().store(
+                MemFlags::new(),
+                value_payload,
+                entry_ptr,
+                MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            );
+            b.ins().return_(&[map_tag, map_payload]);
+            b.seal_block(update_block);
+
+            b.switch_to_block(next_block);
+            let next = b.ins().iadd_imm(idx, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+            b.seal_block(next_block);
+
+            b.switch_to_block(insert_block);
+            let has_room = b.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+            b.ins().brif(has_room, done_block, &[], full_block, &[]);
+            b.seal_block(insert_block);
+
+            b.switch_to_block(done_block);
+            let entry_ptr = map_entry_ptr(b, entries_ptr, len);
+            let zero_hash = b.ins().iconst(types::I64, 0);
+            let occupied = b.ins().iconst(types::I64, MAP_ENTRY_OCCUPIED);
+            b.ins().store(MemFlags::new(), zero_hash, entry_ptr, MAP_ENTRY_HASH_OFFSET);
+            b.ins().store(MemFlags::new(), key_ptr, entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            b.ins().store(MemFlags::new(), value_tag, entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+            b.ins().store(
+                MemFlags::new(),
+                value_payload,
+                entry_ptr,
+                MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            );
+            b.ins().store(MemFlags::new(), occupied, entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let new_len = b.ins().iadd_imm(len, 1);
+            b.ins().store(MemFlags::new(), new_len, header_ptr, MAP_LEN_OFFSET);
+            b.ins().return_(&[map_tag, map_payload]);
+            b.seal_block(done_block);
+
+            b.switch_to_block(full_block);
+            let one = b.ins().iconst(types::I64, 1);
+            b.ins().trapnz(one, TrapCode::HEAP_OUT_OF_BOUNDS);
+            b.ins().return_(&[zero, zero]);
+            b.seal_block(full_block);
+            b.seal_block(loop_block);
+        },
+    );
+}
+
 fn define_rt_list_new(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
@@ -3536,6 +3990,171 @@ fn define_rt_list_delete(
             b.seal_block(loop_block);
         },
     );
+}
+
+fn define_rt_map_delete(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+) {
+    define_runtime_pair_fn(
+        module,
+        isa,
+        flags,
+        id,
+        &[types::I64, types::I64, types::I64, types::I64],
+        |b, p, _func| {
+            let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
+            let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
+            let entries_ptr = map_load_ptr(b, header_ptr);
+            let len = map_load_len(b, header_ptr);
+            let zero = b.ins().iconst(types::I64, 0);
+
+            let loop_block = b.create_block();
+            let body_block = b.create_block();
+            let found_block = b.create_block();
+            let trap_block = b.create_block();
+            b.append_block_param(loop_block, types::I64);
+            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(loop_block);
+            let idx = b.block_params(loop_block)[0];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            b.ins().brif(more, body_block, &[], trap_block, &[]);
+
+            b.switch_to_block(body_block);
+            let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
+            let state =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
+            let skip_block = b.create_block();
+            let cmp_block = b.create_block();
+            b.ins().brif(occupied, cmp_block, &[], skip_block, &[]);
+            b.seal_block(body_block);
+
+            b.switch_to_block(cmp_block);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let equal = string_eq_bytes(b, stored_key, key_ptr);
+            b.ins().brif(equal, found_block, &[], skip_block, &[]);
+            b.seal_block(cmp_block);
+
+            b.switch_to_block(found_block);
+            let removed_tag =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+            let removed_payload = b.ins().load(
+                types::I64,
+                MemFlags::new(),
+                entry_ptr,
+                MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            );
+            let shift_loop = b.create_block();
+            let shift_body = b.create_block();
+            let done_block = b.create_block();
+            let start = b.ins().iadd_imm(idx, 1);
+            b.append_block_param(shift_loop, types::I64);
+            b.ins().jump(shift_loop, &[BlockArg::Value(start)]);
+            b.seal_block(found_block);
+
+            b.switch_to_block(shift_loop);
+            let cur = b.block_params(shift_loop)[0];
+            let shift_more = b.ins().icmp(IntCC::UnsignedLessThan, cur, len);
+            b.ins().brif(shift_more, shift_body, &[], done_block, &[]);
+
+            b.switch_to_block(shift_body);
+            let src_ptr = map_entry_ptr(b, entries_ptr, cur);
+            let dst_index = b.ins().iadd_imm(cur, -1);
+            let dst_ptr = map_entry_ptr(b, entries_ptr, dst_index);
+            let moved_hash =
+                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_HASH_OFFSET);
+            let moved_key =
+                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_KEY_OFFSET);
+            let moved_tag =
+                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+            let moved_payload =
+                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_VALUE_PAYLOAD_OFFSET);
+            let moved_state =
+                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_STATE_OFFSET);
+            b.ins().store(MemFlags::new(), moved_hash, dst_ptr, MAP_ENTRY_HASH_OFFSET);
+            b.ins().store(MemFlags::new(), moved_key, dst_ptr, MAP_ENTRY_KEY_OFFSET);
+            b.ins().store(MemFlags::new(), moved_tag, dst_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+            b.ins().store(MemFlags::new(), moved_payload, dst_ptr, MAP_ENTRY_VALUE_PAYLOAD_OFFSET);
+            b.ins().store(MemFlags::new(), moved_state, dst_ptr, MAP_ENTRY_STATE_OFFSET);
+            let next = b.ins().iadd_imm(cur, 1);
+            b.ins().jump(shift_loop, &[BlockArg::Value(next)]);
+            b.seal_block(shift_body);
+
+            b.switch_to_block(done_block);
+            let new_len = b.ins().iadd_imm(len, -1);
+            b.ins().store(MemFlags::new(), new_len, header_ptr, MAP_LEN_OFFSET);
+            let last_ptr = map_entry_ptr(b, entries_ptr, new_len);
+            b.ins().store(MemFlags::new(), zero, last_ptr, MAP_ENTRY_STATE_OFFSET);
+            b.ins().return_(&[removed_tag, removed_payload]);
+            b.seal_block(done_block);
+            b.seal_block(shift_loop);
+
+            b.switch_to_block(skip_block);
+            let next = b.ins().iadd_imm(idx, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+            b.seal_block(skip_block);
+
+            b.switch_to_block(trap_block);
+            let one = b.ins().iconst(types::I64, 1);
+            b.ins().trapnz(one, TrapCode::HEAP_OUT_OF_BOUNDS);
+            b.ins().return_(&[zero, zero]);
+            b.seal_block(trap_block);
+            b.seal_block(loop_block);
+        },
+    );
+}
+
+fn define_rt_map_keys(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    list_new_id: FuncId,
+    list_push_id: FuncId,
+) {
+    let module_ptr: *mut _ = module;
+    define_runtime_pair_fn(module, isa, flags, id, &[types::I64, types::I64], |b, p, func| {
+        let list_new_ref = unsafe { (&mut *module_ptr).declare_func_in_func(list_new_id, func) };
+        let list_push_ref = unsafe { (&mut *module_ptr).declare_func_in_func(list_push_id, func) };
+        let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
+        let entries_ptr = map_load_ptr(b, header_ptr);
+        let len = map_load_len(b, header_ptr);
+
+        let create_call = b.ins().call(list_new_ref, &[]);
+        let list_tag = b.inst_results(create_call)[0];
+        let list_payload = b.inst_results(create_call)[1];
+        let zero = b.ins().iconst(types::I64, 0);
+        let string_tag = b.ins().iconst(types::I64, TAG_STRING);
+
+        let loop_block = b.create_block();
+        let body_block = b.create_block();
+        let done_block = b.create_block();
+        b.append_block_param(loop_block, types::I64);
+        b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+
+        b.switch_to_block(loop_block);
+        let idx = b.block_params(loop_block)[0];
+        let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+        b.ins().brif(more, body_block, &[], done_block, &[]);
+
+        b.switch_to_block(body_block);
+        let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
+        let key_ptr = b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+        let _push = b.ins().call(list_push_ref, &[list_tag, list_payload, string_tag, key_ptr]);
+        let next = b.ins().iadd_imm(idx, 1);
+        b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+        b.seal_block(body_block);
+
+        b.switch_to_block(done_block);
+        b.ins().return_(&[list_tag, list_payload]);
+        b.seal_block(done_block);
+        b.seal_block(loop_block);
+    });
 }
 
 fn define_runtime_scalar_fn(

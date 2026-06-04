@@ -7,6 +7,7 @@ pub enum ValueKind {
     BigInt,
     String,
     List,
+    Map,
     Function,
     StringIter,
 }
@@ -19,12 +20,14 @@ impl KindSet {
     const BIGINT_BIT: u8 = 1 << 1;
     const STRING_BIT: u8 = 1 << 2;
     const LIST_BIT: u8 = 1 << 3;
-    const FUNCTION_BIT: u8 = 1 << 4;
-    const STRING_ITER_BIT: u8 = 1 << 5;
+    const MAP_BIT: u8 = 1 << 4;
+    const FUNCTION_BIT: u8 = 1 << 5;
+    const STRING_ITER_BIT: u8 = 1 << 6;
     const ALL_BITS: u8 = Self::INT_BIT
         | Self::BIGINT_BIT
         | Self::STRING_BIT
         | Self::LIST_BIT
+        | Self::MAP_BIT
         | Self::FUNCTION_BIT
         | Self::STRING_ITER_BIT;
 
@@ -52,6 +55,10 @@ impl KindSet {
         Self(Self::LIST_BIT)
     }
 
+    pub const fn map() -> Self {
+        Self(Self::MAP_BIT)
+    }
+
     pub const fn function() -> Self {
         Self(Self::FUNCTION_BIT)
     }
@@ -70,6 +77,7 @@ impl KindSet {
             ValueKind::BigInt => Self::BIGINT_BIT,
             ValueKind::String => Self::STRING_BIT,
             ValueKind::List => Self::LIST_BIT,
+            ValueKind::Map => Self::MAP_BIT,
             ValueKind::Function => Self::FUNCTION_BIT,
             ValueKind::StringIter => Self::STRING_ITER_BIT,
         };
@@ -570,6 +578,8 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
         "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
             ValueShape::scalar(KindSet::int())
         }
+        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_map" | "is_function"
+        | "is_string_iter" => ValueShape::scalar(KindSet::int()),
         "print" | "list_print" => ValueShape::scalar(KindSet::int()),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
         | "bigint_divide" | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
@@ -596,6 +606,7 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
         | "string_is_integer" => ValueShape::scalar(KindSet::int()),
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
         "list_new" => ValueShape::list(KindSet::empty()),
+        "map_new" => ValueShape::scalar(KindSet::map()),
         "list_range" => ValueShape::list(KindSet::int()),
         "list_copy" | "list_filter" => args
             .first()
@@ -604,12 +615,16 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
             .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
         "list_map" => ValueShape::list(KindSet::empty()),
         "list_len" => ValueShape::scalar(KindSet::int()),
+        "map_len" | "map_has" => ValueShape::scalar(KindSet::int()),
         "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
             args.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
         ),
+        "map_get" | "map_delete" => ValueShape::unknown_scalar(),
+        "map_keys" => ValueShape::list(KindSet::string()),
         "list_push" | "list_insert" | "list_set" | "list_swap" => {
             ValueShape::scalar(KindSet::int())
         }
+        "map_set" => ValueShape::scalar(KindSet::map()),
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
         }
@@ -758,12 +773,19 @@ mod tests {
         assert_eq!(main.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
         assert_eq!(main.variables.get("lhs_err"), Some(&ValueShape::scalar(KindSet::string())));
         assert_eq!(main.variables.get("rhs_ok"), Some(&ValueShape::scalar(KindSet::int())));
-        assert_eq!(main.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(
+            main.variables.get("rhs"),
+            Some(&ValueShape::scalar(KindSet::bigint().union(KindSet::int())))
+        );
         assert_eq!(main.variables.get("rhs_err"), Some(&ValueShape::scalar(KindSet::string())));
         let apply = analysis.functions.get("apply_and_print").expect("apply_and_print missing");
         assert_eq!(apply.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
         assert_eq!(apply.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::bigint())));
         assert!(apply.returns.slot(0).expect("return slot missing").contains(ValueKind::Int));
+        let apply_shift =
+            analysis.functions.get("apply_and_print_shift").expect("apply_and_print_shift missing");
+        assert_eq!(apply_shift.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(apply_shift.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::int())));
     }
 
     #[test]

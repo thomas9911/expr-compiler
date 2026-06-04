@@ -1,0 +1,42 @@
+fn main() do
+    m = map_new()
+
+    map_set(m, "name", "expr-compiler")
+    map_set(m, "year", 2026)
+    map_set(m, "year", 2027)
+
+    print(type_of(m))
+    print(map_len(m))
+    print(map_has(m, "name"))
+    print(map_has(m, "missing"))
+    print(map_get(m, "name"))
+    print(map_get(m, "year"))
+
+    ok1, value1, err1 = map_try_get(m, "year")
+    print(ok1)
+    print(value1)
+    print(err1 == "")
+
+    ok2, value2, err2 = map_try_get(m, "missing")
+    print(ok2)
+    print(value2)
+    print(err2 == "missing key")
+
+    keys = map_keys(m)
+    print(list_len(keys))
+    print(keys[0])
+    print(keys[1])
+
+    print(map_delete(m, "name"))
+    print(map_len(m))
+
+    ok3, value3, err3 = map_try_delete(m, "missing")
+    print(ok3)
+    print(value3)
+    print(err3 == "missing key")
+
+    remaining = map_keys(m)
+    print(list_len(remaining))
+    # probably gives different results each run
+    print(remaining[0])
+end

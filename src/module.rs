@@ -8,7 +8,8 @@ use crate::value::{
     LIST_PTR_OFFSET, MULTI_HEADER_SIZE, MULTI_LEN_OFFSET, MULTI_PTR_OFFSET, STRING_CAP_OFFSET,
     STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
     STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION,
-    TAG_INT, TAG_LIST, TAG_MULTI, TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    TAG_INT, TAG_LIST, TAG_MAP, TAG_MULTI, TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET,
+    VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
@@ -155,6 +156,7 @@ struct UsedFeatures {
     bigint: bool,
     lists: bool,
     list_mutation: bool,
+    maps: bool,
 }
 
 impl Module {
@@ -310,6 +312,11 @@ impl Module {
         self.used_features.list_mutation
     }
 
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_maps(&self) -> bool {
+        self.used_features.maps
+    }
+
     pub fn compile_to_jit(self) -> JitArtifact {
         self.try_compile_to_jit().unwrap_or_else(|err| panic!("{err}"))
     }
@@ -366,6 +373,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
             crate::runtime::__expr_print_host as usize as i64,
             crate::runtime::__expr_list_print_host as usize as i64,
             arena_base_addr,
@@ -454,6 +462,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
         );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
@@ -561,6 +570,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
         );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
@@ -693,6 +703,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
         );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
@@ -1496,9 +1507,18 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
                 "is_bigint",
                 "is_string",
                 "is_list",
+                "is_map",
                 "is_function",
                 "is_string_iter",
             ],
+        }),
+        "map_try_get" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_try_get.expr"),
+            stdlib_deps: &[],
+        }),
+        "map_try_delete" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_try_delete.expr"),
+            stdlib_deps: &["map_try_get"],
         }),
         "string_try_first" => Some(StdlibFunction {
             source: include_str!("./stdlib/string_try_first.expr"),
@@ -1720,6 +1740,19 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                     | "list_map"
                     | "list_filter"
             ) {
+                features.lists = true;
+            }
+            if matches!(
+                function.as_str(),
+                "map_new"
+                    | "map_set"
+                    | "map_len"
+                    | "map_get"
+                    | "map_has"
+                    | "map_delete"
+                    | "map_keys"
+            ) {
+                features.maps = true;
                 features.lists = true;
             }
             if matches!(
@@ -2015,6 +2048,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "is_bigint"
                 | "is_string"
                 | "is_list"
+                | "is_map"
                 | "is_function"
                 | "is_string_iter"
                 | "list_new"
@@ -2027,6 +2061,13 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "list_pop"
                 | "list_delete"
                 | "list_copy"
+                | "map_new"
+                | "map_set"
+                | "map_len"
+                | "map_get"
+                | "map_has"
+                | "map_delete"
+                | "map_keys"
                 | "list_range"
                 | "list_map"
                 | "list_filter"
@@ -2948,6 +2989,7 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
     const BIGINT_OR_INT: BuiltinArgSpec =
         Spec { expected: KindSet::bigint().union(KindSet::int()) };
     const LIST: BuiltinArgSpec = Spec { expected: KindSet::list() };
+    const MAP: BuiltinArgSpec = Spec { expected: KindSet::map() };
     const FUNCTION: BuiltinArgSpec = Spec { expected: KindSet::function() };
 
     match function {
@@ -2984,6 +3026,9 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
         "list_swap" => Some(&[LIST, INT, INT]),
         "list_map" | "list_filter" => Some(&[LIST, FUNCTION]),
         "list_range" => Some(&[INT, INT]),
+        "map_len" | "map_keys" => Some(&[MAP]),
+        "map_has" | "map_get" | "map_delete" => Some(&[MAP, STRING]),
+        "map_set" => Some(&[MAP, STRING]),
         "bigint_from_int" => Some(&[INT]),
         "add" | "subtract" | "multiply" | "divide" | "modulo" | "gt" | "lt" | "gte" | "lte"
         | "bigint_compare" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
@@ -3003,6 +3048,7 @@ fn format_kind_set_for_error(kinds: KindSet) -> String {
         (ValueKind::BigInt, "bigint"),
         (ValueKind::String, "string"),
         (ValueKind::List, "list"),
+        (ValueKind::Map, "map"),
         (ValueKind::Function, "function"),
         (ValueKind::StringIter, "string_iter"),
     ] {
@@ -3053,6 +3099,7 @@ fn kind_sets_intersect(lhs: KindSet, rhs: KindSet) -> bool {
         ValueKind::BigInt,
         ValueKind::String,
         ValueKind::List,
+        ValueKind::Map,
         ValueKind::Function,
         ValueKind::StringIter,
     ]
@@ -3189,9 +3236,8 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
             ValueShape::scalar(KindSet::int())
         }
-        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter" => {
-            ValueShape::scalar(KindSet::int())
-        }
+        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_map" | "is_function"
+        | "is_string_iter" => ValueShape::scalar(KindSet::int()),
         "bytes_len"
         | "bytes_get"
         | "bytes_pop"
@@ -3225,6 +3271,7 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         }
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
         "list_new" => ValueShape::list(KindSet::empty()),
+        "map_new" => ValueShape::scalar(KindSet::map()),
         "list_range" => ValueShape::list(KindSet::int()),
         "list_copy" | "list_filter" => arg_shapes
             .first()
@@ -3235,9 +3282,13 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         "list_len" | "list_push" | "list_insert" | "list_set" | "list_swap" => {
             ValueShape::scalar(KindSet::int())
         }
+        "map_len" | "map_has" => ValueShape::scalar(KindSet::int()),
+        "map_set" => ValueShape::scalar(KindSet::map()),
         "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
             arg_shapes.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
         ),
+        "map_get" | "map_delete" => ValueShape::scalar(KindSet::any()),
+        "map_keys" => ValueShape::list(KindSet::string()),
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
         }
@@ -6236,7 +6287,13 @@ fn compile_type_predicate_expression_ast(
 ) -> Option<CompiledValue> {
     if !matches!(
         function,
-        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter"
+        "is_int"
+            | "is_bigint"
+            | "is_string"
+            | "is_list"
+            | "is_map"
+            | "is_function"
+            | "is_string_iter"
     ) {
         return None;
     }
@@ -6259,6 +6316,7 @@ fn compile_type_predicate_expression_ast(
         "is_bigint" => TAG_BIGINT,
         "is_string" => TAG_STRING,
         "is_list" => TAG_LIST,
+        "is_map" => TAG_MAP,
         "is_function" => TAG_FUNCTION,
         "is_string_iter" => TAG_STRING_ITER,
         _ => unreachable!(),
@@ -6918,11 +6976,22 @@ fn compile_named_expression_ast(
         "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
         "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
         "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
+        "map_new" => {
+            let func_ref = require_func(func_refs, "map_new");
+            let call = builder.ins().call(func_ref, &[]);
+            let results = builder.inst_results(call);
+            CompiledValue { tag: results[0], payload: results[1] }
+        }
+        "map_len" | "map_keys" => call_unary(builder, func_refs, function, compiled[0]),
+        "map_has" | "map_get" | "map_delete" => {
+            call_binary(builder, func_refs, function, compiled[0], compiled[1])
+        }
+        "map_set" => {
+            call_ternary(builder, func_refs, "map_set", compiled[0], compiled[1], compiled[2])
+        }
         "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
         | "bigint_modulo" | "bigint_compare" | "bigint_bitand" | "bigint_bitor"
-        | "bigint_bitxor" => {
-            compile_bigint_builtin(builder, func_refs, function, &compiled)
-        }
+        | "bigint_bitxor" => compile_bigint_builtin(builder, func_refs, function, &compiled),
         "bigint_shl" | "bigint_shr" => {
             compile_bigint_shift_builtin(builder, func_refs, function, compiled[0], compiled[1])
         }
@@ -7708,8 +7777,32 @@ fn autoloaded_stdlib_functions_can_be_used_as_values() {
 
 #[test]
 fn runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
-    assert_cranelift_executable_output(src, "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n", 0);
+    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
+    assert_cranelift_executable_output(src, "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n", 0);
+}
+
+#[test]
+fn maps_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
+    assert_cranelift_executable_output(src, "2\n1\n0\n11\n32\n", 0);
+}
+
+#[test]
+fn map_try_get_works() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"answer\", 42)\n    ok1, value1, err1 = map_try_get(m, \"answer\")\n    print(ok1)\n    print(value1)\n    print(err1 == \"\")\n    ok2, value2, err2 = map_try_get(m, \"missing\")\n    print(ok2)\n    print(value2)\n    print(err2 == \"missing key\")\nend";
+    assert_cranelift_executable_output(src, "1\n42\n1\n0\n0\n1\n", 0);
+}
+
+#[test]
+fn map_delete_and_try_delete_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    print(map_delete(m, \"a\"))\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_get(m, \"b\"))\n    ok, value, err = map_try_delete(m, \"missing\")\n    print(ok)\n    print(value)\n    print(err == \"missing key\")\nend";
+    assert_cranelift_executable_output(src, "10\n1\n0\n32\n0\n0\n1\n", 0);
+}
+
+#[test]
+fn map_keys_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    keys = map_keys(m)\n    print(list_len(keys))\n    print(keys[0])\n    print(keys[1])\nend";
+    assert_cranelift_executable_output(src, "2\na\nb\n", 0);
 }
 
 #[test]
@@ -8362,13 +8455,41 @@ fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
+    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
         0,
     );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_maps_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "2\n1\n0\n11\n32\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_try_get_works() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"answer\", 42)\n    ok1, value1, err1 = map_try_get(m, \"answer\")\n    print(ok1)\n    print(value1)\n    print(err1 == \"\")\n    ok2, value2, err2 = map_try_get(m, \"missing\")\n    print(ok2)\n    print(value2)\n    print(err2 == \"missing key\")\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n42\n1\n0\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_delete_and_try_delete_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    print(map_delete(m, \"a\"))\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_get(m, \"b\"))\n    ok, value, err = map_try_delete(m, \"missing\")\n    print(ok)\n    print(value)\n    print(err == \"missing key\")\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "10\n1\n0\n32\n0\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_keys_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    keys = map_keys(m)\n    print(list_len(keys))\n    print(keys[0])\n    print(keys[1])\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "2\na\nb\n", 0);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -8671,6 +8792,101 @@ fn try_compile_to_jit_rejects_invalid_bigint_builtin_argument_type() {
             assert_eq!(function, "bigint_from_int");
             assert_eq!(argument, 1);
             assert_eq!(expected, "int");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_builtin_argument_type() {
+    let src = "fn main() do\n    map_len(\"abc\")\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "map");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_key_argument_type() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, 1, 2)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_set");
+            assert_eq!(argument, 2);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_get_map_argument_type() {
+    let src = "fn main() do\n    map_get(list_new(), \"a\")\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_get");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "map");
+            assert_eq!(found, "list");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_delete_key_argument_type() {
+    let src = "fn main() do\n    m = map_new()\n    map_delete(m, 1)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_delete");
+            assert_eq!(argument, 2);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_keys_argument_type() {
+    let src = "fn main() do\n    map_keys(\"abc\")\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_keys");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "map");
             assert_eq!(found, "string");
         }
         other => panic!("unexpected error: {other:?}"),

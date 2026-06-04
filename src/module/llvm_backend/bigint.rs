@@ -1418,7 +1418,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let cap = if op == "bitand" {
             let lhs_le_rhs = self
                 .builder
-                .build_int_compare(IntPredicate::ULE, lhs_len, rhs_len, &format!("{label}_lhs_le_rhs"))
+                .build_int_compare(
+                    IntPredicate::ULE,
+                    lhs_len,
+                    rhs_len,
+                    &format!("{label}_lhs_le_rhs"),
+                )
                 .expect("failed bigint bitand len compare");
             self.builder
                 .build_select(lhs_le_rhs, lhs_len, rhs_len, &format!("{label}_cap"))
@@ -1427,7 +1432,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         } else {
             let lhs_ge_rhs = self
                 .builder
-                .build_int_compare(IntPredicate::UGE, lhs_len, rhs_len, &format!("{label}_lhs_ge_rhs"))
+                .build_int_compare(
+                    IntPredicate::UGE,
+                    lhs_len,
+                    rhs_len,
+                    &format!("{label}_lhs_ge_rhs"),
+                )
                 .expect("failed bigint bitor/xor len compare");
             self.builder
                 .build_select(lhs_ge_rhs, lhs_len, rhs_len, &format!("{label}_cap"))
@@ -1435,7 +1445,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 .into_int_value()
         };
         let result = self.build_bigint_alloc(cap, &format!("{label}_alloc"));
-        self.build_bigint_sign_store(result, self.i64_type.const_int(1, false), &format!("{label}_sign"));
+        self.build_bigint_sign_store(
+            result,
+            self.i64_type.const_int(1, false),
+            &format!("{label}_sign"),
+        );
         self.build_bigint_len_store(result, cap, &format!("{label}_len"));
 
         let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
@@ -1473,9 +1487,18 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.build_bigint_optional_limb_load(rhs, rhs_len, idx, &format!("{label}_rhs_opt"))
         };
         let out_limb = match op {
-            "bitand" => self.builder.build_and(lhs_limb, rhs_limb, &format!("{label}_and")).expect("failed bigint and"),
-            "bitor" => self.builder.build_or(lhs_limb, rhs_limb, &format!("{label}_or")).expect("failed bigint or"),
-            "bitxor" => self.builder.build_xor(lhs_limb, rhs_limb, &format!("{label}_xor")).expect("failed bigint xor"),
+            "bitand" => self
+                .builder
+                .build_and(lhs_limb, rhs_limb, &format!("{label}_and"))
+                .expect("failed bigint and"),
+            "bitor" => self
+                .builder
+                .build_or(lhs_limb, rhs_limb, &format!("{label}_or"))
+                .expect("failed bigint or"),
+            "bitxor" => self
+                .builder
+                .build_xor(lhs_limb, rhs_limb, &format!("{label}_xor"))
+                .expect("failed bigint xor"),
             _ => unreachable!(),
         };
         self.build_bigint_limb_store(result, idx, out_limb, &format!("{label}_store"));
@@ -1545,12 +1568,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let lhs_sign = self.build_bigint_sign_load(lhs, &format!("{label}_lhs_sign"));
         let lhs_is_zero = self
             .builder
-            .build_int_compare(IntPredicate::EQ, lhs_sign, self.i64_type.const_zero(), &format!("{label}_lhs_zero"))
+            .build_int_compare(
+                IntPredicate::EQ,
+                lhs_sign,
+                self.i64_type.const_zero(),
+                &format!("{label}_lhs_zero"),
+            )
             .expect("failed bigint shl zero compare");
         let zero_block = self.context.append_basic_block(function, &format!("{label}_zero"));
         let work_block = self.context.append_basic_block(function, &format!("{label}_work"));
         let merge_block = self.context.append_basic_block(function, &format!("{label}_merge"));
-        self.builder.build_conditional_branch(lhs_is_zero, zero_block, work_block).expect("failed bigint shl zero branch");
+        self.builder
+            .build_conditional_branch(lhs_is_zero, zero_block, work_block)
+            .expect("failed bigint shl zero branch");
 
         self.builder.position_at_end(zero_block);
         let zero_ptr = self.build_bigint_zero(&format!("{label}_zero"));
@@ -1561,7 +1591,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let lhs_len = self.build_bigint_len_load(lhs, &format!("{label}_lhs_len"));
         let limb_shift = self
             .builder
-            .build_right_shift(shift, self.i64_type.const_int(5, false), false, &format!("{label}_limb_shift"))
+            .build_right_shift(
+                shift,
+                self.i64_type.const_int(5, false),
+                false,
+                &format!("{label}_limb_shift"),
+            )
             .expect("failed bigint shl limb shift");
         let bit_shift = self
             .builder
@@ -1569,7 +1604,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed bigint shl bit shift");
         let bit_non_zero = self
             .builder
-            .build_int_compare(IntPredicate::NE, bit_shift, self.i64_type.const_zero(), &format!("{label}_bit_non_zero"))
+            .build_int_compare(
+                IntPredicate::NE,
+                bit_shift,
+                self.i64_type.const_zero(),
+                &format!("{label}_bit_non_zero"),
+            )
             .expect("failed bigint shl bit non-zero");
         let extra = self
             .builder
@@ -1592,7 +1632,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )
             .expect("failed bigint shl cap");
         let result = self.build_bigint_alloc(cap, &format!("{label}_alloc"));
-        self.build_bigint_sign_store(result, self.i64_type.const_int(1, false), &format!("{label}_sign"));
+        self.build_bigint_sign_store(
+            result,
+            self.i64_type.const_int(1, false),
+            &format!("{label}_sign"),
+        );
         self.build_bigint_len_store(result, cap, &format!("{label}_len"));
 
         let init_loop = self.context.append_basic_block(function, &format!("{label}_init_loop"));
@@ -1602,16 +1646,38 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let init_entry = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(init_loop);
-        let init_phi = self.builder.build_phi(self.i64_type, &format!("{label}_init_phi")).expect("failed bigint shl init phi");
+        let init_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_init_phi"))
+            .expect("failed bigint shl init phi");
         init_phi.add_incoming(&[(&self.i64_type.const_zero(), init_entry)]);
         let init_idx = init_phi.as_basic_value().into_int_value();
-        let init_more = self.builder.build_int_compare(IntPredicate::ULT, init_idx, cap, &format!("{label}_init_more")).expect("failed bigint shl init more");
-        self.builder.build_conditional_branch(init_more, init_body, init_done).expect("failed bigint shl init branch");
+        let init_more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, init_idx, cap, &format!("{label}_init_more"))
+            .expect("failed bigint shl init more");
+        self.builder
+            .build_conditional_branch(init_more, init_body, init_done)
+            .expect("failed bigint shl init branch");
 
         self.builder.position_at_end(init_body);
-        self.build_bigint_limb_store(result, init_idx, self.i64_type.const_zero(), &format!("{label}_init_store"));
-        let init_next = self.builder.build_int_add(init_idx, self.i64_type.const_int(1, false), &format!("{label}_init_next")).expect("failed bigint shl init next");
-        self.builder.build_unconditional_branch(init_loop).expect("failed bigint shl init continue");
+        self.build_bigint_limb_store(
+            result,
+            init_idx,
+            self.i64_type.const_zero(),
+            &format!("{label}_init_store"),
+        );
+        let init_next = self
+            .builder
+            .build_int_add(
+                init_idx,
+                self.i64_type.const_int(1, false),
+                &format!("{label}_init_next"),
+            )
+            .expect("failed bigint shl init next");
+        self.builder
+            .build_unconditional_branch(init_loop)
+            .expect("failed bigint shl init continue");
         let init_body_end = self.builder.get_insert_block().unwrap();
         init_phi.add_incoming(&[(&init_next, init_body_end)]);
 
@@ -1623,36 +1689,89 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(loop_block);
-        let idx_phi = self.builder.build_phi(self.i64_type, &format!("{label}_idx")).expect("failed bigint shl idx phi");
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_idx"))
+            .expect("failed bigint shl idx phi");
         idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_end)]);
         let idx = idx_phi.as_basic_value().into_int_value();
-        let more = self.builder.build_int_compare(IntPredicate::ULT, idx, lhs_len, &format!("{label}_more")).expect("failed bigint shl more");
-        self.builder.build_conditional_branch(more, body_block, done_block).expect("failed bigint shl branch");
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, lhs_len, &format!("{label}_more"))
+            .expect("failed bigint shl more");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed bigint shl branch");
 
         self.builder.position_at_end(body_block);
         let limb = self.build_bigint_limb_load(lhs, idx, &format!("{label}_limb"));
-        let dst_idx = self.builder.build_int_add(idx, limb_shift, &format!("{label}_dst_idx")).expect("failed bigint shl dst idx");
-        let low = self.builder.build_left_shift(limb, bit_shift, &format!("{label}_low")).expect("failed bigint shl low");
-        let low32 = self.builder.build_and(low, self.i64_type.const_int(0xffff_ffff, false), &format!("{label}_low32")).expect("failed bigint shl low32");
-        let existing_low = self.build_bigint_limb_load(result, dst_idx, &format!("{label}_existing_low"));
-        let new_low = self.builder.build_int_add(existing_low, low32, &format!("{label}_new_low")).expect("failed bigint shl new low");
+        let dst_idx = self
+            .builder
+            .build_int_add(idx, limb_shift, &format!("{label}_dst_idx"))
+            .expect("failed bigint shl dst idx");
+        let low = self
+            .builder
+            .build_left_shift(limb, bit_shift, &format!("{label}_low"))
+            .expect("failed bigint shl low");
+        let low32 = self
+            .builder
+            .build_and(low, self.i64_type.const_int(0xffff_ffff, false), &format!("{label}_low32"))
+            .expect("failed bigint shl low32");
+        let existing_low =
+            self.build_bigint_limb_load(result, dst_idx, &format!("{label}_existing_low"));
+        let new_low = self
+            .builder
+            .build_int_add(existing_low, low32, &format!("{label}_new_low"))
+            .expect("failed bigint shl new low");
         self.build_bigint_limb_store(result, dst_idx, new_low, &format!("{label}_store_low"));
-        let has_carry = self.builder.build_int_compare(IntPredicate::NE, bit_shift, self.i64_type.const_zero(), &format!("{label}_has_carry")).expect("failed bigint shl has_carry");
+        let has_carry = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                bit_shift,
+                self.i64_type.const_zero(),
+                &format!("{label}_has_carry"),
+            )
+            .expect("failed bigint shl has_carry");
         let carry_block = self.context.append_basic_block(function, &format!("{label}_carry"));
         let carry_done = self.context.append_basic_block(function, &format!("{label}_carry_done"));
-        self.builder.build_conditional_branch(has_carry, carry_block, carry_done).expect("failed bigint shl carry branch");
+        self.builder
+            .build_conditional_branch(has_carry, carry_block, carry_done)
+            .expect("failed bigint shl carry branch");
 
         self.builder.position_at_end(carry_block);
-        let high = self.builder.build_right_shift(low, self.i64_type.const_int(32, false), false, &format!("{label}_high")).expect("failed bigint shl high");
-        let next_idx = self.builder.build_int_add(dst_idx, self.i64_type.const_int(1, false), &format!("{label}_next_idx")).expect("failed bigint shl next_idx");
-        let existing_high = self.build_bigint_limb_load(result, next_idx, &format!("{label}_existing_high"));
-        let new_high = self.builder.build_int_add(existing_high, high, &format!("{label}_new_high")).expect("failed bigint shl new high");
+        let high = self
+            .builder
+            .build_right_shift(
+                low,
+                self.i64_type.const_int(32, false),
+                false,
+                &format!("{label}_high"),
+            )
+            .expect("failed bigint shl high");
+        let next_idx = self
+            .builder
+            .build_int_add(dst_idx, self.i64_type.const_int(1, false), &format!("{label}_next_idx"))
+            .expect("failed bigint shl next_idx");
+        let existing_high =
+            self.build_bigint_limb_load(result, next_idx, &format!("{label}_existing_high"));
+        let new_high = self
+            .builder
+            .build_int_add(existing_high, high, &format!("{label}_new_high"))
+            .expect("failed bigint shl new high");
         self.build_bigint_limb_store(result, next_idx, new_high, &format!("{label}_store_high"));
-        self.builder.build_unconditional_branch(carry_done).expect("failed bigint shl carry done jump");
+        self.builder
+            .build_unconditional_branch(carry_done)
+            .expect("failed bigint shl carry done jump");
 
         self.builder.position_at_end(carry_done);
-        let next = self.builder.build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next")).expect("failed bigint shl next");
-        self.builder.build_unconditional_branch(loop_block).expect("failed bigint shl loop continue");
+        let next = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next"))
+            .expect("failed bigint shl next");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed bigint shl loop continue");
         let body_end = self.builder.get_insert_block().unwrap();
         idx_phi.add_incoming(&[(&next, body_end)]);
 
@@ -1662,7 +1781,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let work_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge_block);
-        let phi = self.builder.build_phi(self.i64_type, &format!("{label}_result_phi")).expect("failed bigint shl result phi");
+        let phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_result_phi"))
+            .expect("failed bigint shl result phi");
         phi.add_incoming(&[(&zero_ptr, zero_end), (&result, work_end)]);
         phi.as_basic_value().into_int_value()
     }
@@ -1677,12 +1799,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let lhs_sign = self.build_bigint_sign_load(lhs, &format!("{label}_lhs_sign"));
         let lhs_is_zero = self
             .builder
-            .build_int_compare(IntPredicate::EQ, lhs_sign, self.i64_type.const_zero(), &format!("{label}_lhs_zero"))
+            .build_int_compare(
+                IntPredicate::EQ,
+                lhs_sign,
+                self.i64_type.const_zero(),
+                &format!("{label}_lhs_zero"),
+            )
             .expect("failed bigint shr zero compare");
         let zero_block = self.context.append_basic_block(function, &format!("{label}_zero"));
         let work_block = self.context.append_basic_block(function, &format!("{label}_work"));
         let merge_block = self.context.append_basic_block(function, &format!("{label}_merge"));
-        self.builder.build_conditional_branch(lhs_is_zero, zero_block, work_block).expect("failed bigint shr zero branch");
+        self.builder
+            .build_conditional_branch(lhs_is_zero, zero_block, work_block)
+            .expect("failed bigint shr zero branch");
 
         self.builder.position_at_end(zero_block);
         let zero_ptr = self.build_bigint_zero(&format!("{label}_zero"));
@@ -1693,14 +1822,22 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let lhs_len = self.build_bigint_len_load(lhs, &format!("{label}_lhs_len"));
         let limb_shift = self
             .builder
-            .build_right_shift(shift, self.i64_type.const_int(5, false), false, &format!("{label}_limb_shift"))
+            .build_right_shift(
+                shift,
+                self.i64_type.const_int(5, false),
+                false,
+                &format!("{label}_limb_shift"),
+            )
             .expect("failed bigint shr limb shift");
         let enough = self
             .builder
             .build_int_compare(IntPredicate::ULT, limb_shift, lhs_len, &format!("{label}_enough"))
             .expect("failed bigint shr enough");
-        let non_zero_block = self.context.append_basic_block(function, &format!("{label}_non_zero"));
-        self.builder.build_conditional_branch(enough, non_zero_block, zero_block).expect("failed bigint shr enough branch");
+        let non_zero_block =
+            self.context.append_basic_block(function, &format!("{label}_non_zero"));
+        self.builder
+            .build_conditional_branch(enough, non_zero_block, zero_block)
+            .expect("failed bigint shr enough branch");
 
         self.builder.position_at_end(non_zero_block);
         let result_len = self
@@ -1712,7 +1849,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_and(shift, self.i64_type.const_int(31, false), &format!("{label}_bit_shift"))
             .expect("failed bigint shr bit shift");
         let result = self.build_bigint_alloc(result_len, &format!("{label}_alloc"));
-        self.build_bigint_sign_store(result, self.i64_type.const_int(1, false), &format!("{label}_sign"));
+        self.build_bigint_sign_store(
+            result,
+            self.i64_type.const_int(1, false),
+            &format!("{label}_sign"),
+        );
         self.build_bigint_len_store(result, result_len, &format!("{label}_len"));
 
         let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
@@ -1722,63 +1863,138 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let entry_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(loop_block);
-        let idx_phi = self.builder.build_phi(self.i64_type, &format!("{label}_idx")).expect("failed bigint shr idx phi");
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_idx"))
+            .expect("failed bigint shr idx phi");
         idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_end)]);
         let idx = idx_phi.as_basic_value().into_int_value();
-        let more = self.builder.build_int_compare(IntPredicate::ULT, idx, result_len, &format!("{label}_more")).expect("failed bigint shr more");
-        self.builder.build_conditional_branch(more, body_block, done_block).expect("failed bigint shr branch");
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, result_len, &format!("{label}_more"))
+            .expect("failed bigint shr more");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed bigint shr branch");
 
         self.builder.position_at_end(body_block);
-        let src_idx = self.builder.build_int_add(idx, limb_shift, &format!("{label}_src_idx")).expect("failed bigint shr src idx");
+        let src_idx = self
+            .builder
+            .build_int_add(idx, limb_shift, &format!("{label}_src_idx"))
+            .expect("failed bigint shr src idx");
         let limb = self.build_bigint_limb_load(lhs, src_idx, &format!("{label}_limb"));
-        let has_bit_shift = self.builder.build_int_compare(IntPredicate::NE, bit_shift, self.i64_type.const_zero(), &format!("{label}_has_bit_shift")).expect("failed bigint shr has_bit_shift");
+        let has_bit_shift = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                bit_shift,
+                self.i64_type.const_zero(),
+                &format!("{label}_has_bit_shift"),
+            )
+            .expect("failed bigint shr has_bit_shift");
         let shift_block = self.context.append_basic_block(function, &format!("{label}_shift"));
-        let no_shift_block = self.context.append_basic_block(function, &format!("{label}_no_shift"));
+        let no_shift_block =
+            self.context.append_basic_block(function, &format!("{label}_no_shift"));
         let merge_limb = self.context.append_basic_block(function, &format!("{label}_merge_limb"));
-        self.builder.build_conditional_branch(has_bit_shift, shift_block, no_shift_block).expect("failed bigint shr shift branch");
+        self.builder
+            .build_conditional_branch(has_bit_shift, shift_block, no_shift_block)
+            .expect("failed bigint shr shift branch");
 
         self.builder.position_at_end(no_shift_block);
-        self.builder.build_unconditional_branch(merge_limb).expect("failed bigint shr no_shift merge");
+        self.builder
+            .build_unconditional_branch(merge_limb)
+            .expect("failed bigint shr no_shift merge");
         let no_shift_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(shift_block);
-        let low = self.builder.build_right_shift(limb, bit_shift, false, &format!("{label}_low")).expect("failed bigint shr low");
-        let next_src = self.builder.build_int_add(src_idx, self.i64_type.const_int(1, false), &format!("{label}_next_src")).expect("failed bigint shr next_src");
-        let next_in_bounds = self.builder.build_int_compare(IntPredicate::ULT, next_src, lhs_len, &format!("{label}_next_in_bounds")).expect("failed bigint shr next_in_bounds");
+        let low = self
+            .builder
+            .build_right_shift(limb, bit_shift, false, &format!("{label}_low"))
+            .expect("failed bigint shr low");
+        let next_src = self
+            .builder
+            .build_int_add(src_idx, self.i64_type.const_int(1, false), &format!("{label}_next_src"))
+            .expect("failed bigint shr next_src");
+        let next_in_bounds = self
+            .builder
+            .build_int_compare(
+                IntPredicate::ULT,
+                next_src,
+                lhs_len,
+                &format!("{label}_next_in_bounds"),
+            )
+            .expect("failed bigint shr next_in_bounds");
         let have_next = self.context.append_basic_block(function, &format!("{label}_have_next"));
         let no_next = self.context.append_basic_block(function, &format!("{label}_no_next"));
         let next_merge = self.context.append_basic_block(function, &format!("{label}_next_merge"));
-        self.builder.build_conditional_branch(next_in_bounds, have_next, no_next).expect("failed bigint shr next branch");
+        self.builder
+            .build_conditional_branch(next_in_bounds, have_next, no_next)
+            .expect("failed bigint shr next branch");
 
         self.builder.position_at_end(have_next);
         let next_limb = self.build_bigint_limb_load(lhs, next_src, &format!("{label}_next_limb"));
-        let inv_shift = self.builder.build_int_sub(self.i64_type.const_int(32, false), bit_shift, &format!("{label}_inv_shift")).expect("failed bigint shr inv_shift");
-        let high = self.builder.build_left_shift(next_limb, inv_shift, &format!("{label}_high")).expect("failed bigint shr high");
+        let inv_shift = self
+            .builder
+            .build_int_sub(
+                self.i64_type.const_int(32, false),
+                bit_shift,
+                &format!("{label}_inv_shift"),
+            )
+            .expect("failed bigint shr inv_shift");
+        let high = self
+            .builder
+            .build_left_shift(next_limb, inv_shift, &format!("{label}_high"))
+            .expect("failed bigint shr high");
         let merged = self
             .builder
-            .build_or(low, self.builder.build_and(high, self.i64_type.const_int(0xffff_ffff, false), &format!("{label}_high_masked")).expect("failed bigint shr high masked"), &format!("{label}_merged"))
+            .build_or(
+                low,
+                self.builder
+                    .build_and(
+                        high,
+                        self.i64_type.const_int(0xffff_ffff, false),
+                        &format!("{label}_high_masked"),
+                    )
+                    .expect("failed bigint shr high masked"),
+                &format!("{label}_merged"),
+            )
             .expect("failed bigint shr merged");
-        self.builder.build_unconditional_branch(next_merge).expect("failed bigint shr have_next merge");
+        self.builder
+            .build_unconditional_branch(next_merge)
+            .expect("failed bigint shr have_next merge");
         let have_next_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(no_next);
-        self.builder.build_unconditional_branch(next_merge).expect("failed bigint shr no_next merge");
+        self.builder
+            .build_unconditional_branch(next_merge)
+            .expect("failed bigint shr no_next merge");
         let no_next_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(next_merge);
-        let next_phi = self.builder.build_phi(self.i64_type, &format!("{label}_next_phi")).expect("failed bigint shr next phi");
+        let next_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_next_phi"))
+            .expect("failed bigint shr next phi");
         next_phi.add_incoming(&[(&merged, have_next_end), (&low, no_next_end)]);
         let shifted = next_phi.as_basic_value().into_int_value();
         self.builder.build_unconditional_branch(merge_limb).expect("failed bigint shr shift merge");
         let shift_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge_limb);
-        let limb_phi = self.builder.build_phi(self.i64_type, &format!("{label}_limb_phi")).expect("failed bigint shr limb phi");
+        let limb_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_limb_phi"))
+            .expect("failed bigint shr limb phi");
         limb_phi.add_incoming(&[(&limb, no_shift_end), (&shifted, shift_end)]);
         let out_limb = limb_phi.as_basic_value().into_int_value();
         self.build_bigint_limb_store(result, idx, out_limb, &format!("{label}_store"));
-        let next = self.builder.build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next")).expect("failed bigint shr next");
-        self.builder.build_unconditional_branch(loop_block).expect("failed bigint shr loop continue");
+        let next = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next"))
+            .expect("failed bigint shr next");
+        self.builder
+            .build_unconditional_branch(loop_block)
+            .expect("failed bigint shr loop continue");
         let body_end = self.builder.get_insert_block().unwrap();
         idx_phi.add_incoming(&[(&next, body_end)]);
 
@@ -1788,7 +2004,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let work_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(merge_block);
-        let phi = self.builder.build_phi(self.i64_type, &format!("{label}_result_phi")).expect("failed bigint shr result phi");
+        let phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_result_phi"))
+            .expect("failed bigint shr result phi");
         phi.add_incoming(&[(&zero_ptr, zero_end), (&result, work_end)]);
         phi.as_basic_value().into_int_value()
     }
@@ -2671,10 +2890,12 @@ impl<'ctx> LlvmCompiler<'ctx> {
             payload: function.get_nth_param(3).unwrap().into_int_value(),
         };
         let lhs_ok = self.context.append_basic_block(function, "lhs_ok");
-        let lhs_ptr = self.expect_tag_payload(lhs, TAG_BIGINT, "bigint_bit_lhs", lhs_ok, trap_block);
+        let lhs_ptr =
+            self.expect_tag_payload(lhs, TAG_BIGINT, "bigint_bit_lhs", lhs_ok, trap_block);
         self.builder.position_at_end(lhs_ok);
         let rhs_ok = self.context.append_basic_block(function, "rhs_ok");
-        let rhs_ptr = self.expect_tag_payload(rhs, TAG_BIGINT, "bigint_bit_rhs", rhs_ok, trap_block);
+        let rhs_ptr =
+            self.expect_tag_payload(rhs, TAG_BIGINT, "bigint_bit_rhs", rhs_ok, trap_block);
         self.builder.position_at_end(rhs_ok);
         self.build_bigint_trap_if_negative(lhs_ptr, "bigint_bit_lhs");
         self.build_bigint_trap_if_negative(rhs_ptr, "bigint_bit_rhs");
@@ -2713,7 +2934,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Some(Linkage::Private),
         );
         self.functions.insert(name.to_string(), function);
-        self.functions.insert(if left { "bigint_shl".to_string() } else { "bigint_shr".to_string() }, function);
+        self.functions.insert(
+            if left { "bigint_shl".to_string() } else { "bigint_shr".to_string() },
+            function,
+        );
         let entry = self.context.append_basic_block(function, "entry");
         let trap_block = self.context.append_basic_block(function, "trap");
         self.builder.position_at_end(entry);
@@ -2726,14 +2950,24 @@ impl<'ctx> LlvmCompiler<'ctx> {
             payload: function.get_nth_param(3).unwrap().into_int_value(),
         };
         let lhs_ok = self.context.append_basic_block(function, "lhs_ok");
-        let lhs_ptr = self.expect_tag_payload(lhs, TAG_BIGINT, "bigint_shift_lhs", lhs_ok, trap_block);
+        let lhs_ptr =
+            self.expect_tag_payload(lhs, TAG_BIGINT, "bigint_shift_lhs", lhs_ok, trap_block);
         self.builder.position_at_end(lhs_ok);
         let shift = self.expect_tag_int(rhs, "bigint_shift_rhs", trap_block);
         let non_neg = self
             .builder
-            .build_int_compare(IntPredicate::SGE, shift, self.i64_type.const_zero(), "bigint_shift_non_neg")
+            .build_int_compare(
+                IntPredicate::SGE,
+                shift,
+                self.i64_type.const_zero(),
+                "bigint_shift_non_neg",
+            )
             .expect("failed bigint shift non-neg");
-        self.build_trap_if(self.builder.build_not(non_neg, "bigint_shift_invalid").expect("failed bigint shift invalid"));
+        self.build_trap_if(
+            self.builder
+                .build_not(non_neg, "bigint_shift_invalid")
+                .expect("failed bigint shift invalid"),
+        );
         self.build_bigint_trap_if_negative(lhs_ptr, "bigint_shift_lhs");
         let result_ptr = if left {
             self.build_bigint_shift_left(lhs_ptr, shift, "bigint_shl")

@@ -546,7 +546,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
     ) -> CompiledValue<'ctx> {
         if matches!(
             name,
-            "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter"
+            "is_int"
+                | "is_bigint"
+                | "is_string"
+                | "is_list"
+                | "is_map"
+                | "is_function"
+                | "is_string_iter"
         ) {
             assert_eq!(args.len(), 1, "{name} expects 1 argument");
             let value = self.compile_ast(
@@ -562,6 +568,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "is_bigint" => TAG_BIGINT,
                 "is_string" => TAG_STRING,
                 "is_list" => TAG_LIST,
+                "is_map" => TAG_MAP,
                 "is_function" => TAG_FUNCTION,
                 "is_string_iter" => TAG_STRING_ITER,
                 _ => unreachable!(),
@@ -1091,6 +1098,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         ) {
             return value;
         }
+        if let Some(value) = self.compile_map_named_expression_ast(name, compiled) {
+            return value;
+        }
         self.compile_fallback_named_expression_ast(
             name,
             compiled,
@@ -1190,12 +1200,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )),
             "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
             | "bigint_modulo" | "bigint_compare" | "bigint_bitand" | "bigint_bitor"
-            | "bigint_bitxor" => {
-                Some(self.compile_bigint_builtin(name, compiled, function))
+            | "bigint_bitxor" => Some(self.compile_bigint_builtin(name, compiled, function)),
+            "bigint_shl" | "bigint_shr" => {
+                Some(self.compile_bigint_shift_builtin(name, compiled[0], compiled[1], function))
             }
-            "bigint_shl" | "bigint_shr" => Some(
-                self.compile_bigint_shift_builtin(name, compiled[0], compiled[1], function),
-            ),
             "print" => {
                 Some(self.build_internal_call(self.require_func("__rt_print"), compiled, "print"))
             }
@@ -1260,6 +1268,51 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.require_func("__rt_list_copy"),
                 compiled,
                 "list_copy",
+            )),
+            _ => None,
+        }
+    }
+
+    fn compile_map_named_expression_ast(
+        &self,
+        name: &str,
+        compiled: &[CompiledValue<'ctx>],
+    ) -> Option<CompiledValue<'ctx>> {
+        match name {
+            "map_new" => Some(self.build_internal_call(
+                self.require_func("__rt_map_new"),
+                compiled,
+                "map_new",
+            )),
+            "map_len" => Some(self.build_internal_call(
+                self.require_func("__rt_map_len"),
+                compiled,
+                "map_len",
+            )),
+            "map_has" => Some(self.build_internal_call(
+                self.require_func("__rt_map_has"),
+                compiled,
+                "map_has",
+            )),
+            "map_get" => Some(self.build_internal_call(
+                self.require_func("__rt_map_get"),
+                compiled,
+                "map_get",
+            )),
+            "map_delete" => Some(self.build_internal_call(
+                self.require_func("__rt_map_delete"),
+                compiled,
+                "map_delete",
+            )),
+            "map_keys" => Some(self.build_internal_call(
+                self.require_func("__rt_map_keys"),
+                compiled,
+                "map_keys",
+            )),
+            "map_set" => Some(self.build_internal_call(
+                self.require_func("__rt_map_set"),
+                compiled,
+                "map_set",
             )),
             _ => None,
         }
