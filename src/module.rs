@@ -7805,6 +7805,42 @@ fn map_keys_work() {
     assert_cranelift_executable_output(src, "2\na\nb\n", 0);
 }
 
+#[cfg(test)]
+fn test_map_bucket_index(key: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3u64);
+    }
+    hash % 64
+}
+
+#[cfg(test)]
+fn test_find_colliding_map_keys() -> (String, String) {
+    let mut buckets = std::collections::HashMap::<u64, String>::new();
+    for idx in 0..512 {
+        let key = format!("k{idx}");
+        let bucket = test_map_bucket_index(&key);
+        if let Some(existing) = buckets.get(&bucket) {
+            if existing != &key {
+                return (existing.clone(), key);
+            }
+        } else {
+            buckets.insert(bucket, key);
+        }
+    }
+    panic!("failed to find colliding test map keys")
+}
+
+#[test]
+fn map_delete_preserves_probe_chain_and_reuses_tombstone() {
+    let (key1, key2) = test_find_colliding_map_keys();
+    let src = format!(
+        "fn main() do\n    m = map_new()\n    map_set(m, \"{key1}\", 10)\n    map_set(m, \"{key2}\", 32)\n    print(map_delete(m, \"{key1}\"))\n    print(map_has(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    map_set(m, \"{key1}\", 11)\n    print(map_get(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    print(map_len(m))\nend"
+    );
+    assert_cranelift_executable_output(&src, "10\n0\n32\n11\n32\n2\n", 0);
+}
+
 #[test]
 fn infer_known_callback_return_shape_tracks_function_alias_callbacks() {
     let src = "fn double(x) do\n    x * 2\nend\n\nfn main() do\n    f = double\n    xs = [1]\n    ys = list_map(xs, f)\n    ys\nend";
@@ -8490,6 +8526,16 @@ fn llvm_map_delete_and_try_delete_work() {
 fn llvm_map_keys_work() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    keys = map_keys(m)\n    print(list_len(keys))\n    print(keys[0])\n    print(keys[1])\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "2\na\nb\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_delete_preserves_probe_chain_and_reuses_tombstone() {
+    let (key1, key2) = test_find_colliding_map_keys();
+    let src = format!(
+        "fn main() do\n    m = map_new()\n    map_set(m, \"{key1}\", 10)\n    map_set(m, \"{key2}\", 32)\n    print(map_delete(m, \"{key1}\"))\n    print(map_has(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    map_set(m, \"{key1}\", 11)\n    print(map_get(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    print(map_len(m))\nend"
+    );
+    assert_backend_executable_output(&src, CodegenBackend::Llvm, "10\n0\n32\n11\n32\n2\n", 0);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]

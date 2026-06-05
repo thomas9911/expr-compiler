@@ -1,8 +1,9 @@
 use super::{CompiledValue, LlvmCompiler};
 use crate::value::{
-    MAP_CAP_OFFSET, MAP_ENTRY_KEY_OFFSET, MAP_ENTRY_OCCUPIED, MAP_ENTRY_SIZE,
-    MAP_ENTRY_STATE_OFFSET, MAP_ENTRY_VALUE_PAYLOAD_OFFSET, MAP_ENTRY_VALUE_TAG_OFFSET,
-    MAP_HEADER_SIZE, MAP_LEN_OFFSET, MAP_PTR_OFFSET, TAG_INT, TAG_MAP, TAG_STRING,
+    MAP_CAP_OFFSET, MAP_ENTRY_HASH_OFFSET, MAP_ENTRY_KEY_OFFSET, MAP_ENTRY_OCCUPIED,
+    MAP_ENTRY_SIZE, MAP_ENTRY_STATE_OFFSET, MAP_ENTRY_TOMBSTONE, MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+    MAP_ENTRY_VALUE_TAG_OFFSET, MAP_HEADER_SIZE, MAP_LEN_OFFSET, MAP_PTR_OFFSET, TAG_INT, TAG_MAP,
+    TAG_STRING,
 };
 use inkwell::IntPredicate;
 use inkwell::module::Linkage;
@@ -183,6 +184,116 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.build_store(ptr, value).expect("failed map field store");
     }
 
+    fn build_map_next_index(
+        &self,
+        idx: inkwell::values::IntValue<'ctx>,
+        cap: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) -> inkwell::values::IntValue<'ctx> {
+        let next = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next"))
+            .expect("failed map next index");
+        let in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, next, cap, &format!("{label}_in_bounds"))
+            .expect("failed map next bounds");
+        self.builder
+            .build_select(in_bounds, next, self.i64_type.const_zero(), &format!("{label}_wrapped"))
+            .expect("failed map next select")
+            .into_int_value()
+    }
+
+    fn build_string_hash_bytes(
+        &self,
+        header_ptr: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) -> inkwell::values::IntValue<'ctx> {
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let len = self.build_string_len_load(header_ptr, &format!("{label}_len"));
+        let data_ptr = self.build_string_ptr_load(header_ptr, &format!("{label}_data"));
+        let data_base = self
+            .builder
+            .build_ptr_to_int(data_ptr, self.i64_type, &format!("{label}_base"))
+            .expect("failed string hash base");
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
+        let offset_basis = self.i64_type.const_int(0xcbf29ce484222325u64, false);
+        let prime = self.i64_type.const_int(0x100000001b3u64, false);
+        self.builder.build_unconditional_branch(loop_block).expect("failed string hash loop jump");
+        let entry_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(loop_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_idx"))
+            .expect("failed string hash idx phi");
+        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_end)]);
+        let hash_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_hash"))
+            .expect("failed string hash phi");
+        hash_phi.add_incoming(&[(&offset_basis, entry_end)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let hash = hash_phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, len, &format!("{label}_more"))
+            .expect("failed string hash more");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed string hash branch");
+        let loop_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(body_block);
+        let byte_addr = self
+            .builder
+            .build_int_add(data_base, idx, &format!("{label}_byte_addr"))
+            .expect("failed string hash addr");
+        let byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                byte_addr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_byte_ptr"),
+            )
+            .expect("failed string hash ptr");
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), byte_ptr, &format!("{label}_byte"))
+            .expect("failed string hash byte")
+            .into_int_value();
+        let byte64 = self
+            .builder
+            .build_int_z_extend(byte, self.i64_type, &format!("{label}_byte64"))
+            .expect("failed string hash extend");
+        let xored = self
+            .builder
+            .build_xor(hash, byte64, &format!("{label}_xored"))
+            .expect("failed string hash xor");
+        let next_hash = self
+            .builder
+            .build_int_mul(xored, prime, &format!("{label}_next_hash"))
+            .expect("failed string hash mul");
+        let next_idx = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next_idx"))
+            .expect("failed string hash next idx");
+        self.builder.build_unconditional_branch(loop_block).expect("failed string hash loop");
+        let body_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next_idx, body_end)]);
+        hash_phi.add_incoming(&[(&next_hash, body_end)]);
+
+        self.builder.position_at_end(done_block);
+        let result_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_result"))
+            .expect("failed string hash result phi");
+        result_phi.add_incoming(&[(&hash, loop_end)]);
+        result_phi.as_basic_value().into_int_value()
+    }
+
     pub(super) fn define_pair_map_new(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
@@ -299,6 +410,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.functions.insert(name.to_string(), function);
         let entry = self.context.append_basic_block(function, "entry");
         let ok_block = self.context.append_basic_block(function, "ok");
+        let key_ok_block = self.context.append_basic_block(function, "key_ok");
         let trap_block = self.context.append_basic_block(function, "trap");
         let loop_block = self.context.append_basic_block(function, "loop");
         let body_block = self.context.append_basic_block(function, "body");
@@ -317,17 +429,31 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.expect_tag_payload(map, TAG_MAP, "map_has_map", ok_block, trap_block);
         self.builder.position_at_end(ok_block);
         let key_ptr =
-            self.expect_tag_payload(key, TAG_STRING, "map_has_key", loop_block, trap_block);
+            self.expect_tag_payload(key, TAG_STRING, "map_has_key", key_ok_block, trap_block);
+        self.builder.position_at_end(key_ok_block);
+        let cap = self.build_map_cap_load(map_payload, "map_has");
+        let hash = self.build_string_hash_bytes(key_ptr, "map_has_hash");
+        let start_idx = self
+            .builder
+            .build_int_unsigned_rem(hash, cap, "map_has_start_idx")
+            .expect("failed map has start idx");
+        let hash_done = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(loop_block).expect("failed map has hash jump");
 
         self.builder.position_at_end(loop_block);
         let idx_phi =
-            self.builder.build_phi(self.i64_type, "map_has_idx").expect("failed map has phi");
-        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), ok_block)]);
+            self.builder.build_phi(self.i64_type, "map_has_idx").expect("failed map has idx phi");
+        let probes_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_has_probes")
+            .expect("failed map has probes phi");
+        idx_phi.add_incoming(&[(&start_idx, hash_done)]);
+        probes_phi.add_incoming(&[(&self.i64_type.const_zero(), hash_done)]);
         let idx = idx_phi.as_basic_value().into_int_value();
-        let len = self.build_map_len_load(map_payload, "map_has");
+        let probes = probes_phi.as_basic_value().into_int_value();
         let more = self
             .builder
-            .build_int_compare(IntPredicate::ULT, idx, len, "map_has_more")
+            .build_int_compare(IntPredicate::ULT, probes, cap, "map_has_more")
             .expect("failed map has more");
         self.builder
             .build_conditional_branch(more, body_block, done_block)
@@ -338,6 +464,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let entry_ptr = self.build_map_entry_ptr(entries_ptr, idx, "map_has");
         let state =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_STATE_OFFSET, "map_has_state");
+        let empty = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, state, self.i64_type.const_zero(), "map_has_empty")
+            .expect("failed map has empty");
+        let cmp_block = self.context.append_basic_block(function, "map_has_cmp");
+        let next_block = self.context.append_basic_block(function, "map_has_next");
+        self.builder
+            .build_conditional_branch(empty, done_block, cmp_block)
+            .expect("failed map has empty branch");
+
+        self.builder.position_at_end(cmp_block);
         let occupied = self
             .builder
             .build_int_compare(
@@ -347,28 +484,37 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "map_has_occupied",
             )
             .expect("failed map has occupied");
-        let cmp_block = self.context.append_basic_block(function, "map_has_cmp");
-        let next_block = self.context.append_basic_block(function, "map_has_next");
+        let maybe_match_block = self.context.append_basic_block(function, "map_has_maybe_match");
         self.builder
-            .build_conditional_branch(occupied, cmp_block, next_block)
+            .build_conditional_branch(occupied, maybe_match_block, next_block)
             .expect("failed map has occupied branch");
 
-        self.builder.position_at_end(cmp_block);
+        self.builder.position_at_end(maybe_match_block);
+        let stored_hash =
+            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_HASH_OFFSET, "map_has_hash");
+        let hash_equal = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, stored_hash, hash, "map_has_hash_equal")
+            .expect("failed map has hash equal");
         let stored_key =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_has_key");
-        let equal = self.build_string_eq_bytes(stored_key, key_ptr, "map_has_equal");
-        let equal_bool = self
+        let key_equal = self.build_string_eq_bytes(stored_key, key_ptr, "map_has_equal");
+        let key_equal_bool = self
             .builder
             .build_int_compare(
                 IntPredicate::NE,
-                equal,
+                key_equal,
                 self.i64_type.const_zero(),
-                "map_has_equal_bool",
+                "map_has_key_equal_bool",
             )
-            .expect("failed map has equal bool");
+            .expect("failed map has key equal bool");
+        let both = self
+            .builder
+            .build_and(hash_equal, key_equal_bool, "map_has_both")
+            .expect("failed map has both");
         self.builder
-            .build_conditional_branch(equal_bool, found_block, next_block)
-            .expect("failed map has equal branch");
+            .build_conditional_branch(both, found_block, next_block)
+            .expect("failed map has both branch");
 
         self.builder.position_at_end(found_block);
         self.builder
@@ -380,12 +526,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed map has found return");
 
         self.builder.position_at_end(next_block);
-        let next = self
+        let next_idx = self.build_map_next_index(idx, cap, "map_has");
+        let next_probes = self
             .builder
-            .build_int_add(idx, self.i64_type.const_int(1, false), "map_has_next_idx")
-            .expect("failed map has next");
+            .build_int_add(probes, self.i64_type.const_int(1, false), "map_has_next_probes")
+            .expect("failed map has next probes");
         self.builder.build_unconditional_branch(loop_block).expect("failed map has loop");
-        idx_phi.add_incoming(&[(&next, next_block)]);
+        idx_phi.add_incoming(&[(&next_idx, next_block)]);
+        probes_phi.add_incoming(&[(&next_probes, next_block)]);
 
         self.builder.position_at_end(done_block);
         self.builder
@@ -416,6 +564,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.functions.insert(name.to_string(), function);
         let entry = self.context.append_basic_block(function, "entry");
         let ok_block = self.context.append_basic_block(function, "ok");
+        let key_ok_block = self.context.append_basic_block(function, "key_ok");
         let trap_block = self.context.append_basic_block(function, "trap");
         let loop_block = self.context.append_basic_block(function, "loop");
         let body_block = self.context.append_basic_block(function, "body");
@@ -433,17 +582,31 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.expect_tag_payload(map, TAG_MAP, "map_get_map", ok_block, trap_block);
         self.builder.position_at_end(ok_block);
         let key_ptr =
-            self.expect_tag_payload(key, TAG_STRING, "map_get_key", loop_block, trap_block);
+            self.expect_tag_payload(key, TAG_STRING, "map_get_key", key_ok_block, trap_block);
+        self.builder.position_at_end(key_ok_block);
+        let cap = self.build_map_cap_load(map_payload, "map_get");
+        let hash = self.build_string_hash_bytes(key_ptr, "map_get_hash");
+        let start_idx = self
+            .builder
+            .build_int_unsigned_rem(hash, cap, "map_get_start_idx")
+            .expect("failed map get start idx");
+        let hash_done = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(loop_block).expect("failed map get hash jump");
 
         self.builder.position_at_end(loop_block);
         let idx_phi =
-            self.builder.build_phi(self.i64_type, "map_get_idx").expect("failed map get phi");
-        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), ok_block)]);
+            self.builder.build_phi(self.i64_type, "map_get_idx").expect("failed map get idx phi");
+        let probes_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_get_probes")
+            .expect("failed map get probes phi");
+        idx_phi.add_incoming(&[(&start_idx, hash_done)]);
+        probes_phi.add_incoming(&[(&self.i64_type.const_zero(), hash_done)]);
         let idx = idx_phi.as_basic_value().into_int_value();
-        let len = self.build_map_len_load(map_payload, "map_get");
+        let probes = probes_phi.as_basic_value().into_int_value();
         let more = self
             .builder
-            .build_int_compare(IntPredicate::ULT, idx, len, "map_get_more")
+            .build_int_compare(IntPredicate::ULT, probes, cap, "map_get_more")
             .expect("failed map get more");
         self.builder
             .build_conditional_branch(more, body_block, trap_block)
@@ -454,6 +617,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let entry_ptr = self.build_map_entry_ptr(entries_ptr, idx, "map_get");
         let state =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_STATE_OFFSET, "map_get_state");
+        let empty = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, state, self.i64_type.const_zero(), "map_get_empty")
+            .expect("failed map get empty");
+        let cmp_block = self.context.append_basic_block(function, "map_get_cmp");
+        let next_block = self.context.append_basic_block(function, "map_get_next");
+        self.builder
+            .build_conditional_branch(empty, trap_block, cmp_block)
+            .expect("failed map get empty branch");
+
+        self.builder.position_at_end(cmp_block);
         let occupied = self
             .builder
             .build_int_compare(
@@ -463,28 +637,37 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "map_get_occupied",
             )
             .expect("failed map get occupied");
-        let cmp_block = self.context.append_basic_block(function, "map_get_cmp");
-        let next_block = self.context.append_basic_block(function, "map_get_next");
+        let maybe_match_block = self.context.append_basic_block(function, "map_get_maybe_match");
         self.builder
-            .build_conditional_branch(occupied, cmp_block, next_block)
+            .build_conditional_branch(occupied, maybe_match_block, next_block)
             .expect("failed map get occupied branch");
 
-        self.builder.position_at_end(cmp_block);
+        self.builder.position_at_end(maybe_match_block);
+        let stored_hash =
+            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_HASH_OFFSET, "map_get_hash");
+        let hash_equal = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, stored_hash, hash, "map_get_hash_equal")
+            .expect("failed map get hash equal");
         let stored_key =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_get_key");
-        let equal = self.build_string_eq_bytes(stored_key, key_ptr, "map_get_equal");
-        let equal_bool = self
+        let key_equal = self.build_string_eq_bytes(stored_key, key_ptr, "map_get_equal");
+        let key_equal_bool = self
             .builder
             .build_int_compare(
                 IntPredicate::NE,
-                equal,
+                key_equal,
                 self.i64_type.const_zero(),
-                "map_get_equal_bool",
+                "map_get_key_equal_bool",
             )
-            .expect("failed map get equal bool");
+            .expect("failed map get key equal bool");
+        let both = self
+            .builder
+            .build_and(hash_equal, key_equal_bool, "map_get_both")
+            .expect("failed map get both");
         self.builder
-            .build_conditional_branch(equal_bool, found_block, next_block)
-            .expect("failed map get equal branch");
+            .build_conditional_branch(both, found_block, next_block)
+            .expect("failed map get both branch");
 
         self.builder.position_at_end(found_block);
         let value_tag = self.build_map_entry_field_load(
@@ -502,12 +685,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed map get return");
 
         self.builder.position_at_end(next_block);
-        let next = self
+        let next = self.build_map_next_index(idx, cap, "map_get");
+        let next_probes = self
             .builder
-            .build_int_add(idx, self.i64_type.const_int(1, false), "map_get_next_idx")
-            .expect("failed map get next");
+            .build_int_add(probes, self.i64_type.const_int(1, false), "map_get_next_probes")
+            .expect("failed map get next probes");
         self.builder.build_unconditional_branch(loop_block).expect("failed map get loop");
         idx_phi.add_incoming(&[(&next, next_block)]);
+        probes_phi.add_incoming(&[(&next_probes, next_block)]);
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();
@@ -532,11 +717,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.functions.insert(name.to_string(), function);
         let entry = self.context.append_basic_block(function, "entry");
         let ok_block = self.context.append_basic_block(function, "ok");
+        let key_ok_block = self.context.append_basic_block(function, "key_ok");
         let trap_block = self.context.append_basic_block(function, "trap");
         let loop_block = self.context.append_basic_block(function, "loop");
         let body_block = self.context.append_basic_block(function, "body");
         let insert_block = self.context.append_basic_block(function, "insert");
-        let full_block = self.context.append_basic_block(function, "full");
         self.builder.position_at_end(entry);
         let map = CompiledValue {
             tag: function.get_first_param().unwrap().into_int_value(),
@@ -554,25 +739,80 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.expect_tag_payload(map, TAG_MAP, "map_set_map", ok_block, trap_block);
         self.builder.position_at_end(ok_block);
         let key_ptr =
-            self.expect_tag_payload(key, TAG_STRING, "map_set_key", loop_block, trap_block);
+            self.expect_tag_payload(key, TAG_STRING, "map_set_key", key_ok_block, trap_block);
+        self.builder.position_at_end(key_ok_block);
+        let cap = self.build_map_cap_load(map_payload, "map_set");
+        let hash = self.build_string_hash_bytes(key_ptr, "map_set_hash");
+        let start_idx = self
+            .builder
+            .build_int_unsigned_rem(hash, cap, "map_set_start_idx")
+            .expect("failed map set start idx");
+        let no_tombstone = self.i64_type.const_all_ones();
+        let hash_done = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(loop_block).expect("failed map set hash jump");
 
         self.builder.position_at_end(loop_block);
         let idx_phi =
-            self.builder.build_phi(self.i64_type, "map_set_idx").expect("failed map set phi");
-        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), ok_block)]);
+            self.builder.build_phi(self.i64_type, "map_set_idx").expect("failed map set idx phi");
+        let probes_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_set_probes")
+            .expect("failed map set probes phi");
+        let first_tombstone_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_set_first_tombstone")
+            .expect("failed map set tombstone phi");
+        idx_phi.add_incoming(&[(&start_idx, hash_done)]);
+        probes_phi.add_incoming(&[(&self.i64_type.const_zero(), hash_done)]);
+        first_tombstone_phi.add_incoming(&[(&no_tombstone, hash_done)]);
         let idx = idx_phi.as_basic_value().into_int_value();
-        let len = self.build_map_len_load(map_payload, "map_set");
+        let probes = probes_phi.as_basic_value().into_int_value();
+        let first_tombstone = first_tombstone_phi.as_basic_value().into_int_value();
         let more = self
             .builder
-            .build_int_compare(IntPredicate::ULT, idx, len, "map_set_more")
+            .build_int_compare(IntPredicate::ULT, probes, cap, "map_set_more")
             .expect("failed map set more");
         self.builder
-            .build_conditional_branch(more, body_block, insert_block)
-            .expect("failed map set branch");
+            .build_conditional_branch(more, body_block, trap_block)
+            .expect("failed map set loop branch");
 
         self.builder.position_at_end(body_block);
         let entries_ptr = self.build_map_ptr_load(map_payload, "map_set");
         let entry_ptr = self.build_map_entry_ptr(entries_ptr, idx, "map_set");
+        let state =
+            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_STATE_OFFSET, "map_set_state");
+        let empty = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, state, self.i64_type.const_zero(), "map_set_empty")
+            .expect("failed map set empty");
+        let cmp_block = self.context.append_basic_block(function, "map_set_cmp");
+        self.builder
+            .build_conditional_branch(empty, insert_block, cmp_block)
+            .expect("failed map set empty branch");
+
+        self.builder.position_at_end(cmp_block);
+        let occupied = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                state,
+                self.i64_type.const_int(MAP_ENTRY_OCCUPIED as u64, false),
+                "map_set_occupied",
+            )
+            .expect("failed map set occupied");
+        let maybe_match_block = self.context.append_basic_block(function, "map_set_maybe_match");
+        let tombstone_block = self.context.append_basic_block(function, "map_set_tombstone");
+        self.builder
+            .build_conditional_branch(occupied, maybe_match_block, tombstone_block)
+            .expect("failed map set occupied branch");
+
+        self.builder.position_at_end(maybe_match_block);
+        let stored_hash =
+            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_HASH_OFFSET, "map_set_hash");
+        let hash_equal = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, stored_hash, hash, "map_set_hash_equal")
+            .expect("failed map set hash equal");
         let stored_key =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_set_key");
         let equal = self.build_string_eq_bytes(stored_key, key_ptr, "map_set_equal");
@@ -585,11 +825,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "map_set_equal_bool",
             )
             .expect("failed map set equal bool");
+        let both = self
+            .builder
+            .build_and(hash_equal, equal_bool, "map_set_both")
+            .expect("failed map set both");
         let update_block = self.context.append_basic_block(function, "map_set_update");
         let next_block = self.context.append_basic_block(function, "map_set_next");
         self.builder
-            .build_conditional_branch(equal_bool, update_block, next_block)
-            .expect("failed map set equal branch");
+            .build_conditional_branch(both, update_block, next_block)
+            .expect("failed map set match branch");
+        let maybe_match_end = self.builder.get_insert_block().unwrap();
 
         self.builder.position_at_end(update_block);
         self.build_map_entry_field_store(
@@ -608,27 +853,93 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_return(Some(&self.make_pair_value(map.tag, map.payload, "map_set_result")))
             .expect("failed map set update return");
 
-        self.builder.position_at_end(next_block);
-        let next = self
+        self.builder.position_at_end(tombstone_block);
+        let is_tombstone = self
             .builder
-            .build_int_add(idx, self.i64_type.const_int(1, false), "map_set_next_idx")
-            .expect("failed map set next");
+            .build_int_compare(
+                IntPredicate::EQ,
+                state,
+                self.i64_type.const_int(MAP_ENTRY_TOMBSTONE as u64, false),
+                "map_set_is_tombstone",
+            )
+            .expect("failed map set tombstone");
+        let need_tombstone = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                first_tombstone,
+                no_tombstone,
+                "map_set_need_tombstone",
+            )
+            .expect("failed map set need tombstone");
+        let record_tombstone = self
+            .builder
+            .build_and(is_tombstone, need_tombstone, "map_set_record_tombstone")
+            .expect("failed map set record tombstone");
+        let next_tombstone = self
+            .builder
+            .build_select(record_tombstone, idx, first_tombstone, "map_set_next_tombstone")
+            .expect("failed map set next tombstone")
+            .into_int_value();
+        self.builder.build_unconditional_branch(next_block).expect("failed map set tombstone jump");
+        let tombstone_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(next_block);
+        let carried_tombstone_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_set_carried_tombstone")
+            .expect("failed map set carried tombstone phi");
+        carried_tombstone_phi.add_incoming(&[(&first_tombstone, maybe_match_end)]);
+        carried_tombstone_phi.add_incoming(&[(&next_tombstone, tombstone_end)]);
+        let carried_tombstone = carried_tombstone_phi.as_basic_value().into_int_value();
+        let next = self.build_map_next_index(idx, cap, "map_set");
+        let next_probes = self
+            .builder
+            .build_int_add(probes, self.i64_type.const_int(1, false), "map_set_next_probes")
+            .expect("failed map set next probes");
         self.builder.build_unconditional_branch(loop_block).expect("failed map set loop");
-        idx_phi.add_incoming(&[(&next, next_block)]);
+        let next_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next, next_end)]);
+        probes_phi.add_incoming(&[(&next_probes, next_end)]);
+        first_tombstone_phi.add_incoming(&[(&carried_tombstone, next_end)]);
 
         self.builder.position_at_end(insert_block);
-        let cap = self.build_map_cap_load(map_payload, "map_set");
+        let use_tombstone = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                first_tombstone,
+                no_tombstone,
+                "map_set_use_tombstone",
+            )
+            .expect("failed map set use tombstone");
+        let len = self.build_map_len_load(map_payload, "map_set_insert");
         let has_room = self
             .builder
             .build_int_compare(IntPredicate::ULT, len, cap, "map_set_has_room")
             .expect("failed map set has room");
+        let allow_insert = self
+            .builder
+            .build_or(use_tombstone, has_room, "map_set_allow_insert")
+            .expect("failed map set allow insert");
+        let do_insert_block = self.context.append_basic_block(function, "map_set_do_insert");
         self.builder
-            .build_conditional_branch(has_room, full_block, trap_block)
+            .build_conditional_branch(allow_insert, do_insert_block, trap_block)
             .expect("failed map set insert branch");
 
-        self.builder.position_at_end(full_block);
-        let entries_ptr = self.build_map_ptr_load(map_payload, "map_set_insert");
-        let entry_ptr = self.build_map_entry_ptr(entries_ptr, len, "map_set_insert");
+        self.builder.position_at_end(do_insert_block);
+        let insert_idx = self
+            .builder
+            .build_select(use_tombstone, first_tombstone, idx, "map_set_insert_idx")
+            .expect("failed map set insert idx")
+            .into_int_value();
+        let entry_ptr = self.build_map_entry_ptr(entries_ptr, insert_idx, "map_set_insert");
+        self.build_map_entry_field_store(
+            entry_ptr,
+            MAP_ENTRY_HASH_OFFSET,
+            hash,
+            "map_set_insert_hash",
+        );
         self.build_map_entry_field_store(
             entry_ptr,
             MAP_ENTRY_KEY_OFFSET,
@@ -687,6 +998,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.functions.insert(name.to_string(), function);
         let entry = self.context.append_basic_block(function, "entry");
         let ok_block = self.context.append_basic_block(function, "ok");
+        let key_ok_block = self.context.append_basic_block(function, "key_ok");
         let trap_block = self.context.append_basic_block(function, "trap");
         let loop_block = self.context.append_basic_block(function, "loop");
         let body_block = self.context.append_basic_block(function, "body");
@@ -704,17 +1016,33 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.expect_tag_payload(map, TAG_MAP, "map_delete_map", ok_block, trap_block);
         self.builder.position_at_end(ok_block);
         let key_ptr =
-            self.expect_tag_payload(key, TAG_STRING, "map_delete_key", loop_block, trap_block);
+            self.expect_tag_payload(key, TAG_STRING, "map_delete_key", key_ok_block, trap_block);
+        self.builder.position_at_end(key_ok_block);
+        let cap = self.build_map_cap_load(map_payload, "map_delete");
+        let hash = self.build_string_hash_bytes(key_ptr, "map_delete_hash");
+        let start_idx = self
+            .builder
+            .build_int_unsigned_rem(hash, cap, "map_delete_start_idx")
+            .expect("failed map delete start idx");
+        let hash_done = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(loop_block).expect("failed map delete hash jump");
 
         self.builder.position_at_end(loop_block);
-        let idx_phi =
-            self.builder.build_phi(self.i64_type, "map_delete_idx").expect("failed map delete phi");
-        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), ok_block)]);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_delete_idx")
+            .expect("failed map delete idx phi");
+        let probes_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_delete_probes")
+            .expect("failed map delete probes phi");
+        idx_phi.add_incoming(&[(&start_idx, hash_done)]);
+        probes_phi.add_incoming(&[(&self.i64_type.const_zero(), hash_done)]);
         let idx = idx_phi.as_basic_value().into_int_value();
-        let len = self.build_map_len_load(map_payload, "map_delete");
+        let probes = probes_phi.as_basic_value().into_int_value();
         let more = self
             .builder
-            .build_int_compare(IntPredicate::ULT, idx, len, "map_delete_more")
+            .build_int_compare(IntPredicate::ULT, probes, cap, "map_delete_more")
             .expect("failed map delete more");
         self.builder
             .build_conditional_branch(more, body_block, trap_block)
@@ -725,6 +1053,21 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let entry_ptr = self.build_map_entry_ptr(entries_ptr, idx, "map_delete");
         let state =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_STATE_OFFSET, "map_delete_state");
+        let empty = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                state,
+                self.i64_type.const_zero(),
+                "map_delete_empty",
+            )
+            .expect("failed map delete empty");
+        let cmp_block = self.context.append_basic_block(function, "map_delete_cmp");
+        self.builder
+            .build_conditional_branch(empty, trap_block, cmp_block)
+            .expect("failed map delete empty branch");
+
+        self.builder.position_at_end(cmp_block);
         let occupied = self
             .builder
             .build_int_compare(
@@ -734,13 +1077,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "map_delete_occupied",
             )
             .expect("failed map delete occupied");
-        let cmp_block = self.context.append_basic_block(function, "map_delete_cmp");
+        let maybe_match_block = self.context.append_basic_block(function, "map_delete_maybe_match");
         let next_block = self.context.append_basic_block(function, "map_delete_next");
         self.builder
-            .build_conditional_branch(occupied, cmp_block, next_block)
+            .build_conditional_branch(occupied, maybe_match_block, next_block)
             .expect("failed map delete occupied branch");
 
-        self.builder.position_at_end(cmp_block);
+        self.builder.position_at_end(maybe_match_block);
+        let stored_hash =
+            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_HASH_OFFSET, "map_delete_hash");
+        let hash_equal = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, stored_hash, hash, "map_delete_hash_equal")
+            .expect("failed map delete hash equal");
         let stored_key =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_delete_key");
         let equal = self.build_string_eq_bytes(stored_key, key_ptr, "map_delete_equal");
@@ -753,9 +1102,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "map_delete_equal_bool",
             )
             .expect("failed map delete equal bool");
+        let both = self
+            .builder
+            .build_and(hash_equal, equal_bool, "map_delete_both")
+            .expect("failed map delete both");
         self.builder
-            .build_conditional_branch(equal_bool, found_block, next_block)
-            .expect("failed map delete equal branch");
+            .build_conditional_branch(both, found_block, next_block)
+            .expect("failed map delete match branch");
 
         self.builder.position_at_end(found_block);
         let removed_tag = self.build_map_entry_field_load(
@@ -768,102 +1121,18 @@ impl<'ctx> LlvmCompiler<'ctx> {
             MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
             "map_delete_removed_payload",
         );
-        let shift_loop = self.context.append_basic_block(function, "map_delete_shift_loop");
-        let shift_body = self.context.append_basic_block(function, "map_delete_shift_body");
-        let done_block = self.context.append_basic_block(function, "map_delete_done");
-        let start = self
-            .builder
-            .build_int_add(idx, self.i64_type.const_int(1, false), "map_delete_shift_start")
-            .expect("failed map delete shift start");
-        self.builder.build_unconditional_branch(shift_loop).expect("failed map delete shift jump");
-        let found_end = self.builder.get_insert_block().unwrap();
-
-        self.builder.position_at_end(shift_loop);
-        let cur_phi = self
-            .builder
-            .build_phi(self.i64_type, "map_delete_shift_idx")
-            .expect("failed map delete shift phi");
-        cur_phi.add_incoming(&[(&start, found_end)]);
-        let cur = cur_phi.as_basic_value().into_int_value();
-        let shift_more = self
-            .builder
-            .build_int_compare(IntPredicate::ULT, cur, len, "map_delete_shift_more")
-            .expect("failed map delete shift more");
-        self.builder
-            .build_conditional_branch(shift_more, shift_body, done_block)
-            .expect("failed map delete shift branch");
-
-        self.builder.position_at_end(shift_body);
-        let src_ptr = self.build_map_entry_ptr(entries_ptr, cur, "map_delete_shift_src");
-        let dst_index = self
-            .builder
-            .build_int_sub(cur, self.i64_type.const_int(1, false), "map_delete_shift_dst_index")
-            .expect("failed map delete shift dst index");
-        let dst_ptr = self.build_map_entry_ptr(entries_ptr, dst_index, "map_delete_shift_dst");
-        let moved_hash = self.build_map_entry_field_load(src_ptr, 0, "map_delete_shift_hash");
-        let moved_key =
-            self.build_map_entry_field_load(src_ptr, MAP_ENTRY_KEY_OFFSET, "map_delete_shift_key");
-        let moved_tag = self.build_map_entry_field_load(
-            src_ptr,
-            MAP_ENTRY_VALUE_TAG_OFFSET,
-            "map_delete_shift_tag",
-        );
-        let moved_payload = self.build_map_entry_field_load(
-            src_ptr,
-            MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
-            "map_delete_shift_payload",
-        );
-        let moved_state = self.build_map_entry_field_load(
-            src_ptr,
+        self.build_map_entry_field_store(
+            entry_ptr,
             MAP_ENTRY_STATE_OFFSET,
-            "map_delete_shift_state",
+            self.i64_type.const_int(MAP_ENTRY_TOMBSTONE as u64, false),
+            "map_delete_tombstone",
         );
-        self.build_map_entry_field_store(dst_ptr, 0, moved_hash, "map_delete_shift_store_hash");
-        self.build_map_entry_field_store(
-            dst_ptr,
-            MAP_ENTRY_KEY_OFFSET,
-            moved_key,
-            "map_delete_shift_store_key",
-        );
-        self.build_map_entry_field_store(
-            dst_ptr,
-            MAP_ENTRY_VALUE_TAG_OFFSET,
-            moved_tag,
-            "map_delete_shift_store_tag",
-        );
-        self.build_map_entry_field_store(
-            dst_ptr,
-            MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
-            moved_payload,
-            "map_delete_shift_store_payload",
-        );
-        self.build_map_entry_field_store(
-            dst_ptr,
-            MAP_ENTRY_STATE_OFFSET,
-            moved_state,
-            "map_delete_shift_store_state",
-        );
-        let next = self
-            .builder
-            .build_int_add(cur, self.i64_type.const_int(1, false), "map_delete_shift_next")
-            .expect("failed map delete shift next");
-        self.builder.build_unconditional_branch(shift_loop).expect("failed map delete shift loop");
-        let shift_body_end = self.builder.get_insert_block().unwrap();
-        cur_phi.add_incoming(&[(&next, shift_body_end)]);
-
-        self.builder.position_at_end(done_block);
+        let len = self.build_map_len_load(map_payload, "map_delete_len");
         let new_len = self
             .builder
             .build_int_sub(len, self.i64_type.const_int(1, false), "map_delete_new_len")
             .expect("failed map delete new len");
         self.build_map_len_store(map_payload, new_len, "map_delete");
-        let last_ptr = self.build_map_entry_ptr(entries_ptr, new_len, "map_delete_last");
-        self.build_map_entry_field_store(
-            last_ptr,
-            MAP_ENTRY_STATE_OFFSET,
-            self.i64_type.const_zero(),
-            "map_delete_last_state",
-        );
         self.builder
             .build_return(Some(&self.make_pair_value(
                 removed_tag,
@@ -873,13 +1142,15 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed map delete return");
 
         self.builder.position_at_end(next_block);
-        let next = self
+        let next = self.build_map_next_index(idx, cap, "map_delete");
+        let next_probes = self
             .builder
-            .build_int_add(idx, self.i64_type.const_int(1, false), "map_delete_next_idx")
-            .expect("failed map delete next");
+            .build_int_add(probes, self.i64_type.const_int(1, false), "map_delete_next_probes")
+            .expect("failed map delete next probes");
         self.builder.build_unconditional_branch(loop_block).expect("failed map delete loop");
         let next_end = self.builder.get_insert_block().unwrap();
         idx_phi.add_incoming(&[(&next, next_end)]);
+        probes_phi.add_incoming(&[(&next_probes, next_end)]);
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();
@@ -911,7 +1182,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let list_tag = list.tag;
         let list_payload = list.payload;
         let entries_ptr = self.build_map_ptr_load(map_payload, "map_keys");
-        let len = self.build_map_len_load(map_payload, "map_keys");
+        let cap = self.build_map_cap_load(map_payload, "map_keys");
         self.builder.build_unconditional_branch(loop_block).expect("failed map keys loop jump");
         let ok_end = self.builder.get_insert_block().unwrap();
 
@@ -922,7 +1193,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let idx = idx_phi.as_basic_value().into_int_value();
         let more = self
             .builder
-            .build_int_compare(IntPredicate::ULT, idx, len, "map_keys_more")
+            .build_int_compare(IntPredicate::ULT, idx, cap, "map_keys_more")
             .expect("failed map keys more");
         self.builder
             .build_conditional_branch(more, body_block, done_block)
@@ -930,6 +1201,24 @@ impl<'ctx> LlvmCompiler<'ctx> {
 
         self.builder.position_at_end(body_block);
         let entry_ptr = self.build_map_entry_ptr(entries_ptr, idx, "map_keys");
+        let state =
+            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_STATE_OFFSET, "map_keys_state");
+        let occupied = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                state,
+                self.i64_type.const_int(MAP_ENTRY_OCCUPIED as u64, false),
+                "map_keys_occupied",
+            )
+            .expect("failed map keys occupied");
+        let push_block = self.context.append_basic_block(function, "map_keys_push");
+        let next_block = self.context.append_basic_block(function, "map_keys_next");
+        self.builder
+            .build_conditional_branch(occupied, push_block, next_block)
+            .expect("failed map keys occupied branch");
+
+        self.builder.position_at_end(push_block);
         let key_ptr =
             self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_keys_key");
         let string_value = CompiledValue {
@@ -941,13 +1230,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
             &[CompiledValue { tag: list_tag, payload: list_payload }, string_value],
             "map_keys_push",
         );
+        self.builder.build_unconditional_branch(next_block).expect("failed map keys push jump");
+
+        self.builder.position_at_end(next_block);
         let next = self
             .builder
             .build_int_add(idx, self.i64_type.const_int(1, false), "map_keys_next")
             .expect("failed map keys next");
         self.builder.build_unconditional_branch(loop_block).expect("failed map keys loop");
-        let body_end = self.builder.get_insert_block().unwrap();
-        idx_phi.add_incoming(&[(&next, body_end)]);
+        let next_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next, next_end)]);
 
         self.builder.position_at_end(done_block);
         self.builder

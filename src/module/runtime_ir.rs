@@ -15,7 +15,7 @@ use crate::value::{
     BIGINT_CAP_OFFSET, BIGINT_HEADER_SIZE, BIGINT_LEN_OFFSET, BIGINT_LIMB_SIZE, BIGINT_PTR_OFFSET,
     BIGINT_SIGN_OFFSET, LIST_CAP_OFFSET, LIST_HEADER_SIZE, LIST_LEN_OFFSET, LIST_PTR_OFFSET,
     MAP_CAP_OFFSET, MAP_ENTRY_HASH_OFFSET, MAP_ENTRY_KEY_OFFSET, MAP_ENTRY_OCCUPIED,
-    MAP_ENTRY_SIZE, MAP_ENTRY_STATE_OFFSET, MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+    MAP_ENTRY_SIZE, MAP_ENTRY_STATE_OFFSET, MAP_ENTRY_TOMBSTONE, MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
     MAP_ENTRY_VALUE_TAG_OFFSET, MAP_HEADER_SIZE, MAP_LEN_OFFSET, MAP_PTR_OFFSET, STRING_LEN_OFFSET,
     STRING_PTR_OFFSET, TAG_BIGINT, TAG_INT, TAG_LIST, TAG_MAP, TAG_STRING, VALUE_PAYLOAD_OFFSET,
     VALUE_SIZE,
@@ -1166,6 +1166,50 @@ fn map_entry_ptr(builder: &mut FunctionBuilder, entries_ptr: Value, index: Value
     let entry_size = builder.ins().iconst(types::I64, MAP_ENTRY_SIZE);
     let off = builder.ins().imul(index, entry_size);
     builder.ins().iadd(entries_ptr, off)
+}
+
+fn map_next_index(builder: &mut FunctionBuilder, idx: Value, cap: Value) -> Value {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let next = builder.ins().iadd_imm(idx, 1);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, next, cap);
+    builder.ins().select(in_bounds, next, zero)
+}
+
+fn string_hash_bytes(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
+    let len = string_load_len(builder, header_ptr);
+    let data = string_load_ptr(builder, header_ptr);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let offset_basis = builder.ins().iconst(types::I64, 0xcbf29ce484222325u64 as i64);
+    let prime = builder.ins().iconst(types::I64, 0x100000001b3u64 as i64);
+
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.append_block_param(loop_block, types::I64);
+    builder.append_block_param(done_block, types::I64);
+    builder.ins().jump(loop_block, &[BlockArg::Value(zero), BlockArg::Value(offset_basis)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let hash = builder.block_params(loop_block)[1];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+    builder.ins().brif(more, body_block, &[], done_block, &[BlockArg::Value(hash)]);
+
+    builder.switch_to_block(body_block);
+    let byte_ptr = builder.ins().iadd(data, idx);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), byte_ptr, 0);
+    let byte64 = builder.ins().uextend(types::I64, byte);
+    let xored = builder.ins().bxor(hash, byte64);
+    let next_hash = builder.ins().imul(xored, prime);
+    let next_idx = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next_idx), BlockArg::Value(next_hash)]);
+    builder.seal_block(body_block);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    builder.seal_block(loop_block);
+    builder.block_params(done_block)[0]
 }
 
 fn bigint_load_sign(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
@@ -3526,48 +3570,64 @@ fn define_rt_map_has(
             let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
             let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
             let entries_ptr = map_load_ptr(b, header_ptr);
-            let len = map_load_len(b, header_ptr);
+            let cap = map_load_cap(b, header_ptr);
             let zero = b.ins().iconst(types::I64, 0);
             let one = b.ins().iconst(types::I64, 1);
+            let hash = string_hash_bytes(b, key_ptr);
+            let start_idx = b.ins().urem(hash, cap);
 
             let loop_block = b.create_block();
             let body_block = b.create_block();
+            let cmp_block = b.create_block();
+            let next_block = b.create_block();
             let found_block = b.create_block();
             let done_block = b.create_block();
             b.append_block_param(loop_block, types::I64);
+            b.append_block_param(loop_block, types::I64);
             b.append_block_param(done_block, types::I64);
-            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+            b.ins().jump(loop_block, &[BlockArg::Value(start_idx), BlockArg::Value(zero)]);
 
             b.switch_to_block(loop_block);
             let idx = b.block_params(loop_block)[0];
-            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            let probes = b.block_params(loop_block)[1];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, probes, cap);
             b.ins().brif(more, body_block, &[], done_block, &[BlockArg::Value(zero)]);
 
             b.switch_to_block(body_block);
             let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
             let state =
                 b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let empty = b.ins().icmp_imm(IntCC::Equal, state, 0);
             let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
-            let skip_block = b.create_block();
-            let cmp_block = b.create_block();
-            b.ins().brif(occupied, cmp_block, &[], skip_block, &[]);
+            b.ins().brif(empty, done_block, &[BlockArg::Value(zero)], cmp_block, &[]);
             b.seal_block(body_block);
 
             b.switch_to_block(cmp_block);
-            let stored_key =
-                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
-            let equal = string_eq_bytes(b, stored_key, key_ptr);
-            b.ins().brif(equal, found_block, &[], skip_block, &[]);
+            b.ins().brif(occupied, found_block, &[], next_block, &[]);
             b.seal_block(cmp_block);
 
             b.switch_to_block(found_block);
-            b.ins().jump(done_block, &[BlockArg::Value(one)]);
+            let stored_hash =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_HASH_OFFSET);
+            let hash_equal = b.ins().icmp(IntCC::Equal, stored_hash, hash);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let key_equal = string_eq_bytes(b, stored_key, key_ptr);
+            let hash_equal_raw = b.ins().select(hash_equal, one, zero);
+            let both = b.ins().band(hash_equal_raw, key_equal);
+            let match_block = b.create_block();
+            b.ins().brif(both, match_block, &[], next_block, &[]);
             b.seal_block(found_block);
 
-            b.switch_to_block(skip_block);
-            let next = b.ins().iadd_imm(idx, 1);
-            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
-            b.seal_block(skip_block);
+            b.switch_to_block(match_block);
+            b.ins().jump(done_block, &[BlockArg::Value(one)]);
+            b.seal_block(match_block);
+
+            b.switch_to_block(next_block);
+            let next_idx = map_next_index(b, idx, cap);
+            let next_probes = b.ins().iadd_imm(probes, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next_idx), BlockArg::Value(next_probes)]);
+            b.seal_block(next_block);
 
             b.switch_to_block(done_block);
             let raw = b.block_params(done_block)[0];
@@ -3598,39 +3658,55 @@ fn define_rt_map_get(
             let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
             let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
             let entries_ptr = map_load_ptr(b, header_ptr);
-            let len = map_load_len(b, header_ptr);
+            let cap = map_load_cap(b, header_ptr);
             let zero = b.ins().iconst(types::I64, 0);
+            let one = b.ins().iconst(types::I64, 1);
+            let hash = string_hash_bytes(b, key_ptr);
+            let start_idx = b.ins().urem(hash, cap);
 
             let loop_block = b.create_block();
             let body_block = b.create_block();
+            let cmp_block = b.create_block();
+            let next_block = b.create_block();
             let found_block = b.create_block();
             let trap_block = b.create_block();
             b.append_block_param(loop_block, types::I64);
-            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+            b.append_block_param(loop_block, types::I64);
+            b.ins().jump(loop_block, &[BlockArg::Value(start_idx), BlockArg::Value(zero)]);
 
             b.switch_to_block(loop_block);
             let idx = b.block_params(loop_block)[0];
-            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            let probes = b.block_params(loop_block)[1];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, probes, cap);
             b.ins().brif(more, body_block, &[], trap_block, &[]);
 
             b.switch_to_block(body_block);
             let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
             let state =
                 b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let empty = b.ins().icmp_imm(IntCC::Equal, state, 0);
             let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
-            let skip_block = b.create_block();
-            let cmp_block = b.create_block();
-            b.ins().brif(occupied, cmp_block, &[], skip_block, &[]);
+            b.ins().brif(empty, trap_block, &[], cmp_block, &[]);
             b.seal_block(body_block);
 
             b.switch_to_block(cmp_block);
-            let stored_key =
-                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
-            let equal = string_eq_bytes(b, stored_key, key_ptr);
-            b.ins().brif(equal, found_block, &[], skip_block, &[]);
+            b.ins().brif(occupied, found_block, &[], next_block, &[]);
             b.seal_block(cmp_block);
 
             b.switch_to_block(found_block);
+            let stored_hash =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_HASH_OFFSET);
+            let hash_equal = b.ins().icmp(IntCC::Equal, stored_hash, hash);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let key_equal = string_eq_bytes(b, stored_key, key_ptr);
+            let hash_equal_raw = b.ins().select(hash_equal, one, zero);
+            let both = b.ins().band(hash_equal_raw, key_equal);
+            let match_block = b.create_block();
+            b.ins().brif(both, match_block, &[], next_block, &[]);
+            b.seal_block(found_block);
+
+            b.switch_to_block(match_block);
             let tag =
                 b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
             let payload = b.ins().load(
@@ -3640,12 +3716,13 @@ fn define_rt_map_get(
                 MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
             );
             b.ins().return_(&[tag, payload]);
-            b.seal_block(found_block);
+            b.seal_block(match_block);
 
-            b.switch_to_block(skip_block);
-            let next = b.ins().iadd_imm(idx, 1);
-            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
-            b.seal_block(skip_block);
+            b.switch_to_block(next_block);
+            let next_idx = map_next_index(b, idx, cap);
+            let next_probes = b.ins().iadd_imm(probes, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next_idx), BlockArg::Value(next_probes)]);
+            b.seal_block(next_block);
 
             b.switch_to_block(trap_block);
             let one = b.ins().iconst(types::I64, 1);
@@ -3682,31 +3759,62 @@ fn define_rt_map_set(
             let len = map_load_len(b, header_ptr);
             let cap = map_load_cap(b, header_ptr);
             let zero = b.ins().iconst(types::I64, 0);
+            let one = b.ins().iconst(types::I64, 1);
+            let hash = string_hash_bytes(b, key_ptr);
+            let start_idx = b.ins().urem(hash, cap);
+            let neg_one = b.ins().iconst(types::I64, -1);
 
             let loop_block = b.create_block();
             let body_block = b.create_block();
+            let cmp_block = b.create_block();
+            let next_block = b.create_block();
+            let record_tombstone_block = b.create_block();
             let insert_block = b.create_block();
-            let done_block = b.create_block();
+            let update_block = b.create_block();
             let full_block = b.create_block();
             b.append_block_param(loop_block, types::I64);
-            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+            b.append_block_param(loop_block, types::I64);
+            b.append_block_param(loop_block, types::I64);
+            b.ins().jump(
+                loop_block,
+                &[BlockArg::Value(start_idx), BlockArg::Value(zero), BlockArg::Value(neg_one)],
+            );
 
             b.switch_to_block(loop_block);
             let idx = b.block_params(loop_block)[0];
-            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
-            b.ins().brif(more, body_block, &[], insert_block, &[]);
+            let probes = b.block_params(loop_block)[1];
+            let first_tombstone = b.block_params(loop_block)[2];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, probes, cap);
+            b.ins().brif(more, body_block, &[], full_block, &[]);
 
             b.switch_to_block(body_block);
             let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
-            let stored_key =
-                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
-            let equal = string_eq_bytes(b, stored_key, key_ptr);
-            let next_block = b.create_block();
-            let update_block = b.create_block();
-            b.ins().brif(equal, update_block, &[], next_block, &[]);
+            let state =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let empty = b.ins().icmp_imm(IntCC::Equal, state, 0);
+            let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
+            let tombstone = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_TOMBSTONE);
+            b.ins().brif(empty, insert_block, &[], cmp_block, &[]);
             b.seal_block(body_block);
 
+            b.switch_to_block(cmp_block);
+            b.ins().brif(occupied, update_block, &[], record_tombstone_block, &[]);
+            b.seal_block(cmp_block);
+
             b.switch_to_block(update_block);
+            let stored_hash =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_HASH_OFFSET);
+            let hash_equal = b.ins().icmp(IntCC::Equal, stored_hash, hash);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let key_equal = string_eq_bytes(b, stored_key, key_ptr);
+            let hash_equal_raw = b.ins().select(hash_equal, one, zero);
+            let both = b.ins().band(hash_equal_raw, key_equal);
+            let update_match_block = b.create_block();
+            b.ins().brif(both, update_match_block, &[], next_block, &[]);
+            b.seal_block(update_block);
+
+            b.switch_to_block(update_match_block);
             b.ins().store(MemFlags::new(), value_tag, entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
             b.ins().store(
                 MemFlags::new(),
@@ -3715,40 +3823,67 @@ fn define_rt_map_set(
                 MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
             );
             b.ins().return_(&[map_tag, map_payload]);
-            b.seal_block(update_block);
+            b.seal_block(update_match_block);
+
+            b.switch_to_block(record_tombstone_block);
+            let has_tombstone = b.ins().icmp_imm(IntCC::Equal, first_tombstone, -1);
+            let tombstone_next_block = b.create_block();
+            b.ins().brif(tombstone, tombstone_next_block, &[], next_block, &[]);
+            b.seal_block(record_tombstone_block);
+
+            b.switch_to_block(tombstone_next_block);
+            let chosen = b.ins().select(has_tombstone, idx, first_tombstone);
+            let next_idx = map_next_index(b, idx, cap);
+            let next_probes = b.ins().iadd_imm(probes, 1);
+            b.ins().jump(
+                loop_block,
+                &[BlockArg::Value(next_idx), BlockArg::Value(next_probes), BlockArg::Value(chosen)],
+            );
+            b.seal_block(tombstone_next_block);
 
             b.switch_to_block(next_block);
-            let next = b.ins().iadd_imm(idx, 1);
-            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
+            let next_idx = map_next_index(b, idx, cap);
+            let next_probes = b.ins().iadd_imm(probes, 1);
+            b.ins().jump(
+                loop_block,
+                &[
+                    BlockArg::Value(next_idx),
+                    BlockArg::Value(next_probes),
+                    BlockArg::Value(first_tombstone),
+                ],
+            );
             b.seal_block(next_block);
 
             b.switch_to_block(insert_block);
-            let has_room = b.ins().icmp(IntCC::UnsignedLessThan, len, cap);
-            b.ins().brif(has_room, done_block, &[], full_block, &[]);
+            let use_tombstone = b.ins().icmp_imm(IntCC::NotEqual, first_tombstone, -1);
+            let insert_idx = b.ins().select(use_tombstone, first_tombstone, idx);
+            let len_has_room = b.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+            let has_room = b.ins().bor(use_tombstone, len_has_room);
+            let do_insert_block = b.create_block();
+            b.ins().brif(has_room, do_insert_block, &[], full_block, &[]);
             b.seal_block(insert_block);
 
-            b.switch_to_block(done_block);
-            let entry_ptr = map_entry_ptr(b, entries_ptr, len);
-            let zero_hash = b.ins().iconst(types::I64, 0);
-            let occupied = b.ins().iconst(types::I64, MAP_ENTRY_OCCUPIED);
-            b.ins().store(MemFlags::new(), zero_hash, entry_ptr, MAP_ENTRY_HASH_OFFSET);
-            b.ins().store(MemFlags::new(), key_ptr, entry_ptr, MAP_ENTRY_KEY_OFFSET);
-            b.ins().store(MemFlags::new(), value_tag, entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+            b.switch_to_block(do_insert_block);
+            let insert_ptr = map_entry_ptr(b, entries_ptr, insert_idx);
+            let occupied_val = b.ins().iconst(types::I64, MAP_ENTRY_OCCUPIED);
+            b.ins().store(MemFlags::new(), hash, insert_ptr, MAP_ENTRY_HASH_OFFSET);
+            b.ins().store(MemFlags::new(), key_ptr, insert_ptr, MAP_ENTRY_KEY_OFFSET);
+            b.ins().store(MemFlags::new(), value_tag, insert_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
             b.ins().store(
                 MemFlags::new(),
                 value_payload,
-                entry_ptr,
+                insert_ptr,
                 MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
             );
-            b.ins().store(MemFlags::new(), occupied, entry_ptr, MAP_ENTRY_STATE_OFFSET);
-            let new_len = b.ins().iadd_imm(len, 1);
+            b.ins().store(MemFlags::new(), occupied_val, insert_ptr, MAP_ENTRY_STATE_OFFSET);
+            let new_len = b.ins().iadd(len, one);
             b.ins().store(MemFlags::new(), new_len, header_ptr, MAP_LEN_OFFSET);
             b.ins().return_(&[map_tag, map_payload]);
-            b.seal_block(done_block);
+            b.seal_block(do_insert_block);
 
             b.switch_to_block(full_block);
-            let one = b.ins().iconst(types::I64, 1);
-            b.ins().trapnz(one, TrapCode::HEAP_OUT_OF_BOUNDS);
+            let trap_one = b.ins().iconst(types::I64, 1);
+            b.ins().trapnz(trap_one, TrapCode::HEAP_OUT_OF_BOUNDS);
             b.ins().return_(&[zero, zero]);
             b.seal_block(full_block);
             b.seal_block(loop_block);
@@ -4009,38 +4144,55 @@ fn define_rt_map_delete(
             let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
             let entries_ptr = map_load_ptr(b, header_ptr);
             let len = map_load_len(b, header_ptr);
+            let cap = map_load_cap(b, header_ptr);
             let zero = b.ins().iconst(types::I64, 0);
+            let one = b.ins().iconst(types::I64, 1);
+            let hash = string_hash_bytes(b, key_ptr);
+            let start_idx = b.ins().urem(hash, cap);
 
             let loop_block = b.create_block();
             let body_block = b.create_block();
+            let cmp_block = b.create_block();
+            let next_block = b.create_block();
             let found_block = b.create_block();
             let trap_block = b.create_block();
             b.append_block_param(loop_block, types::I64);
-            b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+            b.append_block_param(loop_block, types::I64);
+            b.ins().jump(loop_block, &[BlockArg::Value(start_idx), BlockArg::Value(zero)]);
 
             b.switch_to_block(loop_block);
             let idx = b.block_params(loop_block)[0];
-            let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+            let probes = b.block_params(loop_block)[1];
+            let more = b.ins().icmp(IntCC::UnsignedLessThan, probes, cap);
             b.ins().brif(more, body_block, &[], trap_block, &[]);
 
             b.switch_to_block(body_block);
             let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
             let state =
                 b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let empty = b.ins().icmp_imm(IntCC::Equal, state, 0);
             let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
-            let skip_block = b.create_block();
-            let cmp_block = b.create_block();
-            b.ins().brif(occupied, cmp_block, &[], skip_block, &[]);
+            b.ins().brif(empty, trap_block, &[], cmp_block, &[]);
             b.seal_block(body_block);
 
             b.switch_to_block(cmp_block);
-            let stored_key =
-                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
-            let equal = string_eq_bytes(b, stored_key, key_ptr);
-            b.ins().brif(equal, found_block, &[], skip_block, &[]);
+            b.ins().brif(occupied, found_block, &[], next_block, &[]);
             b.seal_block(cmp_block);
 
             b.switch_to_block(found_block);
+            let stored_hash =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_HASH_OFFSET);
+            let hash_equal = b.ins().icmp(IntCC::Equal, stored_hash, hash);
+            let stored_key =
+                b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let key_equal = string_eq_bytes(b, stored_key, key_ptr);
+            let hash_equal_raw = b.ins().select(hash_equal, one, zero);
+            let both = b.ins().band(hash_equal_raw, key_equal);
+            let delete_block = b.create_block();
+            b.ins().brif(both, delete_block, &[], next_block, &[]);
+            b.seal_block(found_block);
+
+            b.switch_to_block(delete_block);
             let removed_tag =
                 b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
             let removed_payload = b.ins().load(
@@ -4049,55 +4201,18 @@ fn define_rt_map_delete(
                 entry_ptr,
                 MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
             );
-            let shift_loop = b.create_block();
-            let shift_body = b.create_block();
-            let done_block = b.create_block();
-            let start = b.ins().iadd_imm(idx, 1);
-            b.append_block_param(shift_loop, types::I64);
-            b.ins().jump(shift_loop, &[BlockArg::Value(start)]);
-            b.seal_block(found_block);
-
-            b.switch_to_block(shift_loop);
-            let cur = b.block_params(shift_loop)[0];
-            let shift_more = b.ins().icmp(IntCC::UnsignedLessThan, cur, len);
-            b.ins().brif(shift_more, shift_body, &[], done_block, &[]);
-
-            b.switch_to_block(shift_body);
-            let src_ptr = map_entry_ptr(b, entries_ptr, cur);
-            let dst_index = b.ins().iadd_imm(cur, -1);
-            let dst_ptr = map_entry_ptr(b, entries_ptr, dst_index);
-            let moved_hash =
-                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_HASH_OFFSET);
-            let moved_key =
-                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_KEY_OFFSET);
-            let moved_tag =
-                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
-            let moved_payload =
-                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_VALUE_PAYLOAD_OFFSET);
-            let moved_state =
-                b.ins().load(types::I64, MemFlags::new(), src_ptr, MAP_ENTRY_STATE_OFFSET);
-            b.ins().store(MemFlags::new(), moved_hash, dst_ptr, MAP_ENTRY_HASH_OFFSET);
-            b.ins().store(MemFlags::new(), moved_key, dst_ptr, MAP_ENTRY_KEY_OFFSET);
-            b.ins().store(MemFlags::new(), moved_tag, dst_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
-            b.ins().store(MemFlags::new(), moved_payload, dst_ptr, MAP_ENTRY_VALUE_PAYLOAD_OFFSET);
-            b.ins().store(MemFlags::new(), moved_state, dst_ptr, MAP_ENTRY_STATE_OFFSET);
-            let next = b.ins().iadd_imm(cur, 1);
-            b.ins().jump(shift_loop, &[BlockArg::Value(next)]);
-            b.seal_block(shift_body);
-
-            b.switch_to_block(done_block);
+            let tombstone = b.ins().iconst(types::I64, MAP_ENTRY_TOMBSTONE);
+            b.ins().store(MemFlags::new(), tombstone, entry_ptr, MAP_ENTRY_STATE_OFFSET);
             let new_len = b.ins().iadd_imm(len, -1);
             b.ins().store(MemFlags::new(), new_len, header_ptr, MAP_LEN_OFFSET);
-            let last_ptr = map_entry_ptr(b, entries_ptr, new_len);
-            b.ins().store(MemFlags::new(), zero, last_ptr, MAP_ENTRY_STATE_OFFSET);
             b.ins().return_(&[removed_tag, removed_payload]);
-            b.seal_block(done_block);
-            b.seal_block(shift_loop);
+            b.seal_block(delete_block);
 
-            b.switch_to_block(skip_block);
-            let next = b.ins().iadd_imm(idx, 1);
-            b.ins().jump(loop_block, &[BlockArg::Value(next)]);
-            b.seal_block(skip_block);
+            b.switch_to_block(next_block);
+            let next_idx = map_next_index(b, idx, cap);
+            let next_probes = b.ins().iadd_imm(probes, 1);
+            b.ins().jump(loop_block, &[BlockArg::Value(next_idx), BlockArg::Value(next_probes)]);
+            b.seal_block(next_block);
 
             b.switch_to_block(trap_block);
             let one = b.ins().iconst(types::I64, 1);
@@ -4123,7 +4238,7 @@ fn define_rt_map_keys(
         let list_push_ref = unsafe { (&mut *module_ptr).declare_func_in_func(list_push_id, func) };
         let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
         let entries_ptr = map_load_ptr(b, header_ptr);
-        let len = map_load_len(b, header_ptr);
+        let cap = map_load_cap(b, header_ptr);
 
         let create_call = b.ins().call(list_new_ref, &[]);
         let list_tag = b.inst_results(create_call)[0];
@@ -4139,16 +4254,28 @@ fn define_rt_map_keys(
 
         b.switch_to_block(loop_block);
         let idx = b.block_params(loop_block)[0];
-        let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+        let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, cap);
         b.ins().brif(more, body_block, &[], done_block, &[]);
 
         b.switch_to_block(body_block);
         let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
+        let state = b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+        let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
+        let push_block = b.create_block();
+        let next_block = b.create_block();
+        b.ins().brif(occupied, push_block, &[], next_block, &[]);
+        b.seal_block(body_block);
+
+        b.switch_to_block(push_block);
         let key_ptr = b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
         let _push = b.ins().call(list_push_ref, &[list_tag, list_payload, string_tag, key_ptr]);
+        b.ins().jump(next_block, &[]);
+        b.seal_block(push_block);
+
+        b.switch_to_block(next_block);
         let next = b.ins().iadd_imm(idx, 1);
         b.ins().jump(loop_block, &[BlockArg::Value(next)]);
-        b.seal_block(body_block);
+        b.seal_block(next_block);
 
         b.switch_to_block(done_block);
         b.ins().return_(&[list_tag, list_payload]);
