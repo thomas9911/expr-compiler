@@ -1503,6 +1503,10 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
             source: include_str!("./stdlib/string_try_parse_bigint.expr"),
             stdlib_deps: &[],
         }),
+        "string_from_codepoints" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_from_codepoints.expr"),
+            stdlib_deps: &[],
+        }),
         "type_of" => Some(StdlibFunction {
             source: include_str!("./stdlib/type_of.expr"),
             stdlib_deps: &[
@@ -1522,6 +1526,18 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
         "map_try_delete" => Some(StdlibFunction {
             source: include_str!("./stdlib/map_try_delete.expr"),
             stdlib_deps: &["map_try_get"],
+        }),
+        "map_try_pop" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_try_pop.expr"),
+            stdlib_deps: &["map_keys"],
+        }),
+        "map_update" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_update.expr"),
+            stdlib_deps: &[],
+        }),
+        "map_update_or_default" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_update_or_default.expr"),
+            stdlib_deps: &[],
         }),
         "string_try_first" => Some(StdlibFunction {
             source: include_str!("./stdlib/string_try_first.expr"),
@@ -3231,7 +3247,10 @@ fn infer_ast_value_shape(
                 .iter()
                 .map(|arg| infer_ast_value_shape(arg, function_analysis, value_kind_analysis))
                 .collect::<Vec<_>>();
-            if matches!(function.as_str(), "map_try_get" | "map_try_delete") {
+            if matches!(
+                function.as_str(),
+                "map_try_get" | "map_try_delete" | "map_try_pop" | "string_from_codepoints"
+            ) {
                 return infer_builtin_value_shape(function, &arg_shapes);
             }
             if let Some(function_info) = value_kind_analysis.functions.get(function) {
@@ -3393,7 +3412,13 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
             arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
             KindSet::string(),
         ]),
+        "map_try_pop" => ValueShape::from_slots(vec![
+            KindSet::int(),
+            KindSet::string(),
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ]),
         "map_keys" => ValueShape::list(KindSet::string()),
+        "string_from_codepoints" => ValueShape::scalar(KindSet::string()),
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
         }
@@ -8003,6 +8028,12 @@ fn runtime_type_predicates_and_type_of_work() {
 }
 
 #[test]
+fn string_from_codepoints_works() {
+    let src = "fn main() do\n    it = string_chars(\"hé🙂\")\n    xs = list_new()\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    print(string_from_codepoints(xs))\nend";
+    assert_cranelift_executable_output(src, "hé🙂\n", 0);
+}
+
+#[test]
 fn maps_work() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
     assert_cranelift_executable_output(src, "2\n1\n0\n11\n32\n", 0);
@@ -8018,6 +8049,18 @@ fn map_try_get_works() {
 fn map_delete_and_try_delete_work() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    print(map_delete(m, \"a\"))\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_get(m, \"b\"))\n    ok, value, err = map_try_delete(m, \"missing\")\n    print(ok)\n    print(value)\n    print(err == \"missing key\")\nend";
     assert_cranelift_executable_output(src, "10\n1\n0\n32\n0\n0\n1\n", 0);
+}
+
+#[test]
+fn map_try_pop_works() {
+    let src = "fn main() do\n    m = map_new()\n    ok1, key1, value1 = map_try_pop(m)\n    print(ok1)\n    print(key1 == \"\")\n    print(value1)\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    ok2, key2, value2 = map_try_pop(m)\n    print(ok2)\n    print(map_len(m))\n    print(key2 == \"a\" or key2 == \"b\")\n    print((key2 == \"a\" and value2 == 10) or (key2 == \"b\" and value2 == 32))\n    print(list_len(map_keys(m)))\nend";
+    assert_cranelift_executable_output(src, "0\n1\n0\n1\n1\n1\n1\n1\n", 0);
+}
+
+#[test]
+fn map_update_and_map_update_or_default_work() {
+    let src = "fn inc(x) do\n    x + 1\nend\n\nfn main() do\n    m = map_new()\n    print(map_update(m, \"count\", inc))\n    print(map_has(m, \"count\"))\n    print(map_update_or_default(m, \"count\", 0, inc))\n    print(map_get(m, \"count\"))\n    print(map_update(m, \"count\", inc))\n    print(map_get(m, \"count\"))\nend";
+    assert_cranelift_executable_output(src, "0\n0\n1\n1\n1\n2\n", 0);
 }
 
 #[test]
@@ -8749,6 +8792,13 @@ fn llvm_runtime_type_predicates_and_type_of_work() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_string_from_codepoints_works() {
+    let src = "fn main() do\n    it = string_chars(\"hé🙂\")\n    xs = list_new()\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    print(string_from_codepoints(xs))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "hé🙂\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_maps_work() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "2\n1\n0\n11\n32\n", 0);
@@ -8766,6 +8816,20 @@ fn llvm_map_try_get_works() {
 fn llvm_map_delete_and_try_delete_work() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    print(map_delete(m, \"a\"))\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_get(m, \"b\"))\n    ok, value, err = map_try_delete(m, \"missing\")\n    print(ok)\n    print(value)\n    print(err == \"missing key\")\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "10\n1\n0\n32\n0\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_try_pop_works() {
+    let src = "fn main() do\n    m = map_new()\n    ok1, key1, value1 = map_try_pop(m)\n    print(ok1)\n    print(key1 == \"\")\n    print(value1)\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    ok2, key2, value2 = map_try_pop(m)\n    print(ok2)\n    print(map_len(m))\n    print(key2 == \"a\" or key2 == \"b\")\n    print((key2 == \"a\" and value2 == 10) or (key2 == \"b\" and value2 == 32))\n    print(list_len(map_keys(m)))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n1\n0\n1\n1\n1\n1\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_update_and_map_update_or_default_work() {
+    let src = "fn inc(x) do\n    x + 1\nend\n\nfn main() do\n    m = map_new()\n    print(map_update(m, \"count\", inc))\n    print(map_has(m, \"count\"))\n    print(map_update_or_default(m, \"count\", 0, inc))\n    print(map_get(m, \"count\"))\n    print(map_update(m, \"count\", inc))\n    print(map_get(m, \"count\"))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n0\n1\n1\n1\n2\n", 0);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -9483,6 +9547,25 @@ fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_get() {
 #[test]
 fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_try_get() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    ok, value, err = map_try_get(m, \"count\")\n    bytes_len(value)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_try_pop() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    ok, key, value = map_try_pop(m)\n    bytes_len(value)\nend";
     let module = Module::try_from_source(src).expect("source should parse");
     let err = match module.try_compile_to_jit() {
         Ok(_) => panic!("jit compile should fail"),

@@ -3,6 +3,20 @@ fn main(args) do
         print("usage: <op> <lhs> <rhs>")
         1
     else
+        ops = {
+            "+": fn lhs, rhs -> lhs + rhs end,
+            "-": fn lhs, rhs -> lhs - rhs end,
+            "*": fn lhs, rhs -> lhs * rhs end,
+            "/": fn lhs, rhs -> lhs / rhs end,
+            "%": fn lhs, rhs -> lhs % rhs end,
+            "&": fn lhs, rhs -> lhs & rhs end,
+            "|": fn lhs, rhs -> lhs | rhs end,
+            "^": fn lhs, rhs -> lhs ^ rhs end,
+        }
+        shift_ops = {
+            "<<": fn lhs, rhs -> lhs << rhs end,
+            ">>": fn lhs, rhs -> lhs >> rhs end,
+        }
         op = list_get(args, 0)
         lhs_text = list_get(args, 1)
         rhs_text = list_get(args, 2)
@@ -11,66 +25,35 @@ fn main(args) do
         if not lhs_ok do
             print(string_concat("left operand error: ", lhs_err))
             1
-        else if op == "<<" or op == ">>" do
+        else if map_has(shift_ops, op) do
             rhs_ok, rhs, rhs_err = string_try_parse_integer(rhs_text)
             if not rhs_ok do
                 print(string_concat("right operand error: ", rhs_err))
                 1
             else
-                apply_and_print_shift(op, lhs, rhs)
+                apply_and_print_shift(map_get(shift_ops, op), lhs, rhs)
             end
-        else
+        else if map_has(ops, op) do
             rhs_ok, rhs, rhs_err = string_try_parse_bigint(rhs_text)
             if not rhs_ok do
                 print(string_concat("right operand error: ", rhs_err))
                 1
             else
-                apply_and_print(op, lhs, rhs)
+                apply_and_print(map_get(ops, op), lhs, rhs)
             end
+        else
+            print("unknown operator")
+            1
         end
     end
 end
 
-fn apply_and_print(op, lhs, rhs) do
-    if op == "+" do
-        print(lhs + rhs)
-        0
-    else if op == "-" do
-        print(lhs - rhs)
-        0
-    else if op == "*" do
-        print(lhs * rhs)
-        0
-    else if op == "/" do
-        print(lhs / rhs)
-        0
-    else if op == "%" do
-        print(lhs % rhs)
-        0
-    else if op == "&" do
-        print(lhs & rhs)
-        0
-    else if op == "|" do
-        print(lhs | rhs)
-        0
-    else if op == "^" do
-        print(lhs ^ rhs)
-        0
-    else
-        print("unknown operator")
-        1
-    end
+fn apply_and_print(op_fn, lhs, rhs) do
+    print(op_fn(lhs, rhs))
+    0
 end
 
-fn apply_and_print_shift(op, lhs, rhs) do
-    if op == "<<" do
-        print(lhs << rhs)
-        0
-    else if op == ">>" do
-        print(lhs >> rhs)
-        0
-    else
-        print("unknown operator")
-        1
-    end
+fn apply_and_print_shift(op_fn, lhs, rhs) do
+    print(op_fn(lhs, rhs))
+    0
 end

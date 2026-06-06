@@ -527,7 +527,10 @@ fn infer_expression(
         );
         merge_input_kinds(calls, callback_name, &[callback_input]);
     }
-    if matches!(expr.function.as_str(), "map_try_get" | "map_try_delete") {
+    if matches!(
+        expr.function.as_str(),
+        "map_try_get" | "map_try_delete" | "map_try_pop" | "string_from_codepoints"
+    ) {
         return builtin_shape(&expr.function, &arg_shapes);
     }
     if let Some(summary) = summaries.get(&expr.function) {
@@ -792,7 +795,13 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
             args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
             KindSet::string(),
         ]),
+        "map_try_pop" => ValueShape::from_slots(vec![
+            KindSet::int(),
+            KindSet::string(),
+            args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ]),
         "map_keys" => ValueShape::list(KindSet::string()),
+        "string_from_codepoints" => ValueShape::scalar(KindSet::string()),
         "list_push" | "list_insert" | "list_set" | "list_swap" => {
             ValueShape::scalar(KindSet::int())
         }
@@ -1010,6 +1019,17 @@ mod tests {
         assert_eq!(main.variables.get("ok"), Some(&ValueShape::scalar(KindSet::int())));
         assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
         assert_eq!(main.variables.get("err"), Some(&ValueShape::scalar(KindSet::string())));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_map_try_pop_slots_from_map_values() {
+        let src = "fn main() do\n    m = map_new()\n    map_set(m, \"name\", \"x\")\n    ok, key, value = map_try_pop(m)\n    print(ok)\n    print(key)\n    print(value)\n    0\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("key"), Some(&ValueShape::scalar(KindSet::string())));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
     }
 
     #[test]

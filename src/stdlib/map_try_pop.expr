@@ -1,0 +1,8 @@
+fn map_try_pop(map) do
+    if map_len(map) == 0 do
+        false, "", 0
+    else
+        key = map_keys(map)[0]
+        true, key, map_delete(map, key)
+    end
+end
