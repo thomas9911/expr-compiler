@@ -199,6 +199,9 @@ fn format_value_shape(shape: &ValueShape) -> String {
     if let Some(items) = shape.list_items() {
         return format!("list<{}>", format_kind_set(items));
     }
+    if let Some(values) = shape.map_values() {
+        return format!("map<string, {}>", format_kind_set(values));
+    }
 
     if shape.arity() == 1 {
         return shape.slot(0).map(format_kind_set).unwrap_or_else(|| "unknown".to_string());
@@ -823,6 +826,18 @@ mod tests {
             .expect("debug types should render");
         assert!(rendered.contains("#? inputs [args: list<string>]; returns list<string>"));
         assert!(rendered.contains("#? xs: list<int | string>"));
+    }
+
+    #[test]
+    fn format_debug_types_includes_map_value_kinds() {
+        let source = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    map_set(m, \"name\", \"x\")\n    m\nend\n";
+        let module = Module::try_from_source(source).expect("source should parse");
+        let user_functions =
+            parse_user_functions_for_debug(source).expect("user functions should parse");
+        let rendered = format_debug_types(source, &user_functions, &module)
+            .expect("debug types should render");
+        assert!(rendered.contains("#? returns map<string, int | string>"));
+        assert!(rendered.contains("#? m: map<string, int | string>"));
     }
 
     #[test]

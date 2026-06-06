@@ -1,5 +1,6 @@
 use crate::analysis::{
     FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, ValueKind, ValueShape,
+    narrowed_function_analyses_for_condition,
 };
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst};
 use crate::source::Span;
@@ -2955,13 +2956,15 @@ fn validate_if_ast_user_facing(
         value_kind_analysis,
         function_analysis,
     )?;
+    let (then_analysis, else_analysis) =
+        narrowed_function_analyses_for_condition(condition, function_analysis);
     validate_ast_sequence(
         &then.lines,
         locals,
         function_names,
         function_arities,
         value_kind_analysis,
-        function_analysis,
+        &then_analysis,
     )?;
     if let Some(else_) = else_ {
         validate_ast_sequence(
@@ -2970,7 +2973,7 @@ fn validate_if_ast_user_facing(
             function_names,
             function_arities,
             value_kind_analysis,
-            function_analysis,
+            &else_analysis,
         )?;
     }
     Ok(())
@@ -3144,6 +3147,9 @@ fn infer_ast_value_shape(
                 .iter()
                 .map(|arg| infer_ast_value_shape(arg, function_analysis, value_kind_analysis))
                 .collect::<Vec<_>>();
+            if matches!(function.as_str(), "map_try_get" | "map_try_delete") {
+                return infer_builtin_value_shape(function, &arg_shapes);
+            }
             if let Some(function_info) = value_kind_analysis.functions.get(function) {
                 return function_info.returns.clone();
             }
@@ -3271,7 +3277,7 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         }
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
         "list_new" => ValueShape::list(KindSet::empty()),
-        "map_new" => ValueShape::scalar(KindSet::map()),
+        "map_new" => ValueShape::map(KindSet::empty()),
         "list_range" => ValueShape::list(KindSet::int()),
         "list_copy" | "list_filter" => arg_shapes
             .first()
@@ -3283,11 +3289,26 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
             ValueShape::scalar(KindSet::int())
         }
         "map_len" | "map_has" => ValueShape::scalar(KindSet::int()),
-        "map_set" => ValueShape::scalar(KindSet::map()),
+        "map_set" => ValueShape::map(
+            arg_shapes
+                .first()
+                .and_then(ValueShape::map_values)
+                .unwrap_or_else(KindSet::empty)
+                .union(
+                    arg_shapes.get(2).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty),
+                ),
+        ),
         "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
             arg_shapes.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
         ),
-        "map_get" | "map_delete" => ValueShape::scalar(KindSet::any()),
+        "map_get" | "map_delete" => ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ),
+        "map_try_get" | "map_try_delete" => ValueShape::from_slots(vec![
+            KindSet::int(),
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+            KindSet::string(),
+        ]),
         "map_keys" => ValueShape::list(KindSet::string()),
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
@@ -9205,6 +9226,70 @@ fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_inline_lambd
 #[test]
 fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_lambda_alias() {
     let src = "fn main() do\n    f = fn item -> item * 2 end\n    xs = [1]\n    ys = list_map(xs, f)\n    bytes_len(ys[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_get() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    bytes_len(map_get(m, \"count\"))\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_try_get() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    ok, value, err = map_try_get(m, \"count\")\n    bytes_len(value)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_allows_string_builtin_in_is_string_then_branch() {
+    let src = "fn main() do\n    x = 0\n    if 1 do\n        x = \"a\"\n    else\n        x = 1\n    end\n    if is_string(x) do\n        bytes_len(x)\n    else\n        0\n    end\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    module.try_compile_to_jit().expect("jit compile should succeed");
+}
+
+#[test]
+fn try_compile_to_jit_rejects_string_builtin_in_not_is_string_then_branch() {
+    let src = "fn main() do\n    x = 0\n    if 1 do\n        x = \"a\"\n    else\n        x = 1\n    end\n    if not is_string(x) do\n        bytes_len(x)\n    else\n        0\n    end\nend";
     let module = Module::try_from_source(src).expect("source should parse");
     let err = match module.try_compile_to_jit() {
         Ok(_) => panic!("jit compile should fail"),
