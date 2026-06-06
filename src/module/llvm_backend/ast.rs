@@ -1,4 +1,5 @@
 use super::*;
+use crate::parser::{MapEntryAst, MapKeyAst};
 
 impl<'ctx> LlvmCompiler<'ctx> {
     pub(super) fn compile_ast(
@@ -34,6 +35,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             ),
             Ast::ListLiteral(items) => self.compile_list_literal_ast(
                 items,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
+            Ast::MapLiteral(entries) => self.compile_map_literal_ast(
+                entries,
                 vars,
                 capture_slots,
                 env_ptr,
@@ -456,6 +465,47 @@ impl<'ctx> LlvmCompiler<'ctx> {
             );
         }
         list
+    }
+
+    fn compile_map_literal_ast(
+        &self,
+        entries: &[MapEntryAst],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+    ) -> CompiledValue<'ctx> {
+        let map = self.build_internal_call(self.require_func("__rt_map_new"), &[], "map_new");
+        for entry in entries {
+            let key = match &entry.key {
+                MapKeyAst::Static(key) => {
+                    self.build_string_literal(key.as_bytes(), "map_key_literal")
+                }
+                MapKeyAst::Dynamic(key) => self.compile_ast(
+                    key,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                ),
+            };
+            let value = self.compile_ast(
+                &entry.value,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
+            let _ = self.build_internal_call(
+                self.require_func("__rt_map_set"),
+                &[map, key, value],
+                "map_set",
+            );
+        }
+        map
     }
 
     fn compile_index_ast(

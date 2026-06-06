@@ -410,6 +410,17 @@ fn infer_ast(
             });
             ValueShape::list(items)
         }
+        Ast::MapLiteral(entries) => {
+            let values = entries.iter().fold(KindSet::empty(), |kinds, entry| {
+                if let crate::parser::MapKeyAst::Dynamic(key) = &entry.key {
+                    let _ = infer_ast(key, env, function_bindings, summaries, calls);
+                }
+                kinds.union(
+                    infer_ast(&entry.value, env, function_bindings, summaries, calls).scalar_slot(),
+                )
+            });
+            ValueShape::map(values)
+        }
         Ast::Index { collection, index, .. } => {
             let collection_shape = infer_ast(collection, env, function_bindings, summaries, calls);
             let _ = infer_ast(index, env, function_bindings, summaries, calls);

@@ -2,7 +2,9 @@ use crate::analysis::{
     FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, ValueKind, ValueShape,
     narrowed_function_analyses_for_condition,
 };
-use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst};
+use crate::parser::{
+    Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
+};
 use crate::source::Span;
 use crate::value::{
     CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, LIST_LEN_OFFSET,
@@ -1680,6 +1682,14 @@ fn collect_stdlib_references_from_ast(
                 collect_stdlib_references_from_ast(item, scope, refs);
             }
         }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_stdlib_references_from_ast(key, scope, refs);
+                }
+                collect_stdlib_references_from_ast(&entry.value, scope, refs);
+            }
+        }
         Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
@@ -1776,6 +1786,16 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             features.lists = true;
             for item in items {
                 collect_used_features_from_ast(item, features);
+            }
+        }
+        Ast::MapLiteral(entries) => {
+            features.maps = true;
+            features.lists = true;
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_used_features_from_ast(key, features);
+                }
+                collect_used_features_from_ast(&entry.value, features);
             }
         }
         Ast::Index { collection, index, .. } => {
@@ -2213,6 +2233,41 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_ast_user_facing(
+                        key,
+                        locals,
+                        function_names,
+                        function_arities,
+                        value_kind_analysis,
+                        function_analysis,
+                    )?;
+                    let key_kinds =
+                        infer_ast_value_shape(key, function_analysis, value_kind_analysis)
+                            .scalar_slot();
+                    if !key_kinds.is_empty() && !kind_sets_intersect(key_kinds, KindSet::string()) {
+                        return Err(CompileError::InvalidArgumentType {
+                            function: "map literal".to_string(),
+                            argument: 1,
+                            expected: "string".to_string(),
+                            found: format_kind_set_for_error(key_kinds),
+                            span: span_of_ast(key),
+                        });
+                    }
+                }
+                validate_ast_user_facing(
+                    &entry.value,
+                    locals,
+                    function_names,
+                    function_arities,
+                    value_kind_analysis,
+                    function_analysis,
+                )?;
+            }
+            Ok(())
+        }
         Ast::Index { collection, index, .. } => validate_index_ast(
             collection,
             index,
@@ -2384,6 +2439,27 @@ fn validate_ast_multi_return_usage(
             function_return_arities,
             expected_arity,
         ),
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_child_multi_return_usage(
+                        key,
+                        current_function,
+                        locals,
+                        function_names,
+                        function_return_arities,
+                    )?;
+                }
+                validate_child_multi_return_usage(
+                    &entry.value,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                )?;
+            }
+            validate_single_value_multi_return_usage(expected_arity, None)
+        }
         Ast::Index { collection, index, span } => validate_index_multi_return_usage(
             collection,
             index,
@@ -3133,6 +3209,14 @@ fn infer_ast_value_shape(
                 )
             }))
         }
+        Ast::MapLiteral(entries) => {
+            ValueShape::map(entries.iter().fold(KindSet::empty(), |kinds, entry| {
+                kinds.union(
+                    infer_ast_value_shape(&entry.value, function_analysis, value_kind_analysis)
+                        .scalar_slot(),
+                )
+            }))
+        }
         Ast::MultiValue(values) => ValueShape::from_slots(
             values
                 .iter()
@@ -3373,7 +3457,8 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
         | Ast::Lambda { .. }
         | Ast::MultiValue(_)
         | Ast::Literal(_)
-        | Ast::ListLiteral(_) => None,
+        | Ast::ListLiteral(_)
+        | Ast::MapLiteral(_) => None,
     }
 }
 
@@ -3390,6 +3475,15 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
         Ast::ListLiteral(items) => {
             for item in items {
                 validate_no_nested_function_defs(item)?;
+            }
+            Ok(())
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_no_nested_function_defs(key)?;
+                }
+                validate_no_nested_function_defs(&entry.value)?;
             }
             Ok(())
         }
@@ -3496,6 +3590,14 @@ impl LambdaLifter {
                     self.lift_ast(item, scope_names);
                 }
             }
+            Ast::MapLiteral(entries) => {
+                for entry in entries {
+                    if let MapKeyAst::Dynamic(key) = &mut entry.key {
+                        self.lift_ast(key, scope_names);
+                    }
+                    self.lift_ast(&mut entry.value, scope_names);
+                }
+            }
             Ast::Index { collection, index, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
@@ -3554,6 +3656,14 @@ fn collect_captures_into(
         Ast::ListLiteral(items) => {
             for item in items {
                 collect_captures_into(item, local_names, scope_names, captures);
+            }
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_captures_into(key, local_names, scope_names, captures);
+                }
+                collect_captures_into(&entry.value, local_names, scope_names, captures);
             }
         }
         Ast::Index { collection, index, .. } => {
@@ -3636,6 +3746,14 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             collect_var_names(collection, names);
             collect_var_names(index, names);
             collect_var_names(value, names);
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_var_names(key, names);
+                }
+                collect_var_names(&entry.value, names);
+            }
         }
         Ast::If { condition, then, else_, .. } => {
             collect_var_names(condition, names);
@@ -4966,6 +5084,62 @@ fn compile_list_literal(
     handle
 }
 
+fn compile_map_literal(
+    builder: &mut FunctionBuilder,
+    entries: &[MapEntryAst],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let map_new_ref = *func_refs
+        .get("map_new")
+        .expect("internal compiler error: builtin function 'map_new' is missing");
+    let create_call = builder.ins().call(map_new_ref, &[]);
+    let created = builder.inst_results(create_call);
+    let map = CompiledValue { tag: created[0], payload: created[1] };
+
+    for entry in entries {
+        let key = match &entry.key {
+            MapKeyAst::Static(key) => compile_string_literal(builder, func_refs, key),
+            MapKeyAst::Dynamic(key) => compile_ast(
+                builder,
+                key,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+                function_analysis,
+                value_kind_analysis,
+            ),
+        };
+        let value = compile_ast(
+            builder,
+            &entry.value,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        );
+        let _ = call_ternary(builder, func_refs, "map_set", map, key, value);
+    }
+
+    map
+}
+
 fn create_empty_list(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
@@ -5732,6 +5906,19 @@ fn compile_ast(
         Ast::ListLiteral(items) => compile_list_literal(
             builder,
             items,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
+        Ast::MapLiteral(entries) => compile_map_literal(
+            builder,
+            entries,
             vars,
             func_refs,
             function_ordinals,
@@ -7839,6 +8026,12 @@ fn map_keys_work() {
     assert_cranelift_executable_output(src, "2\na\nb\n", 0);
 }
 
+#[test]
+fn map_literal_works() {
+    let src = "fn main() do\n    dyn_key = \"count\"\n    m = {\n        name: \"expr\",\n        dyn_key => 3,\n    }\n    print(map_get(m, \"name\"))\n    print(map_get(m, \"count\"))\n    print(map_len(m))\nend";
+    assert_cranelift_executable_output(src, "expr\n3\n2\n", 0);
+}
+
 #[cfg(test)]
 fn test_map_bucket_index(key: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -8584,6 +8777,13 @@ fn llvm_map_keys_work() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_map_literal_works() {
+    let src = "fn main() do\n    dyn_key = \"count\"\n    m = {\n        name: \"expr\",\n        dyn_key => 3,\n    }\n    print(map_get(m, \"name\"))\n    print(map_get(m, \"count\"))\n    print(map_len(m))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "expr\n3\n2\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_map_delete_preserves_probe_chain_and_reuses_tombstone() {
     let (key1, key2) = test_find_colliding_map_keys();
     let src = format!(
@@ -8936,6 +9136,25 @@ fn try_compile_to_jit_rejects_invalid_map_key_argument_type() {
         CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
             assert_eq!(function, "map_set");
             assert_eq!(argument, 2);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_literal_dynamic_key_type() {
+    let src = "fn main() do\n    m = {\n        1 => 2,\n    }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map literal");
+            assert_eq!(argument, 1);
             assert_eq!(expected, "string");
             assert_eq!(found, "int");
         }

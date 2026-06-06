@@ -135,6 +135,30 @@ impl std::fmt::Display for ParseError<'_> {
 }
 
 #[derive(Debug, Clone)]
+pub enum MapKeyAst {
+    Static(String),
+    Dynamic(Box<Ast>),
+}
+
+impl PartialEq for MapKeyAst {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Static(a), Self::Static(b)) => a == b,
+            (Self::Dynamic(a), Self::Dynamic(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for MapKeyAst {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapEntryAst {
+    pub key: MapKeyAst,
+    pub value: Ast,
+}
+
+#[derive(Debug, Clone)]
 pub enum Ast {
     Block(BlockAst),
     FunctionDef(FunctionDefAst),
@@ -144,6 +168,7 @@ pub enum Ast {
     MultiValue(Vec<Ast>),
     Literal(LiteralAst),
     ListLiteral(Vec<Ast>),
+    MapLiteral(Vec<MapEntryAst>),
     Index { collection: Box<Ast>, index: Box<Ast>, span: Option<Span> },
     IndexAssign { collection: Box<Ast>, index: Box<Ast>, value: Box<Ast>, span: Option<Span> },
     Variable(Ident),
@@ -166,6 +191,7 @@ impl PartialEq for Ast {
             (Ast::MultiValue(a), Ast::MultiValue(b)) => a == b,
             (Ast::Literal(a), Ast::Literal(b)) => a == b,
             (Ast::ListLiteral(a), Ast::ListLiteral(b)) => a == b,
+            (Ast::MapLiteral(a), Ast::MapLiteral(b)) => a == b,
             (
                 Ast::Index { collection: a_collection, index: a_index, .. },
                 Ast::Index { collection: b_collection, index: b_index, .. },
@@ -751,6 +777,50 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
             }
             Ast::ListLiteral(items)
         }
+        Some(Ok(Token::OpenBrace)) => {
+            lex.next();
+            let mut entries = vec![];
+            loop {
+                let next = lex.peek().cloned();
+                let next_next = lex.peek_n(1).cloned();
+                match next {
+                    Some(Ok(Token::CloseBrace)) => {
+                        lex.next();
+                        break;
+                    }
+                    Some(Ok(Token::Comma)) | Some(Ok(Token::Newline)) | Some(Ok(Token::Indent)) => {
+                        lex.next();
+                    }
+                    Some(Ok(Token::Symbol(_))) if next_next == Some(Ok(Token::ColonBlock)) => {
+                        let Token::Symbol(key) = lex.next().unwrap().unwrap() else {
+                            unreachable!()
+                        };
+                        lex.next();
+                        let value = parse_expr(lex, 0)?;
+                        entries.push(MapEntryAst { key: MapKeyAst::Static(key), value });
+                    }
+                    Some(Ok(Token::StringLiteral(_)))
+                        if next_next == Some(Ok(Token::ColonBlock)) =>
+                    {
+                        let Token::StringLiteral(key) = lex.next().unwrap().unwrap() else {
+                            unreachable!()
+                        };
+                        lex.next();
+                        let value = parse_expr(lex, 0)?;
+                        entries.push(MapEntryAst { key: MapKeyAst::Static(key), value });
+                    }
+                    _ => {
+                        let key = parse_expr(lex, 0)?;
+                        if lex.next() != Some(Ok(Token::FatArrow)) {
+                            return Err(ParseError::unexpected(lex));
+                        }
+                        let value = parse_expr(lex, 0)?;
+                        entries.push(MapEntryAst { key: MapKeyAst::Dynamic(Box::new(key)), value });
+                    }
+                }
+            }
+            Ast::MapLiteral(entries)
+        }
         _ => return Err(ParseError::unexpected(lex)),
     };
 
@@ -1309,6 +1379,56 @@ fn parse_list_literal() {
     });
 
     assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_map_literal() {
+    use Ast::*;
+
+    let text = "fn main() do\n    a = {name: 1, other => 2}\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let result = Ast::from_lexer(&mut lexer);
+
+    assert_eq!(
+        result.unwrap(),
+        FunctionDef(FunctionDefAst {
+            name: "main".to_string(),
+            inputs: vec![],
+            output: None,
+            block: BlockAst {
+                lines: vec![Assign {
+                    name: "a".to_string(),
+                    value: Box::new(MapLiteral(vec![
+                        MapEntryAst {
+                            key: MapKeyAst::Static("name".to_string()),
+                            value: Literal(LiteralAst::Integer(1)),
+                        },
+                        MapEntryAst {
+                            key: MapKeyAst::Dynamic(Box::new(Variable(Ident::synthetic(
+                                "other".to_string(),
+                            )))),
+                            value: Literal(LiteralAst::Integer(2)),
+                        },
+                    ])),
+                    span: None,
+                }],
+            },
+            span: None,
+        })
+    );
+}
+
+#[test]
+fn parse_multiline_map_literal() {
+    let text = "fn main() do\n    a = {\n        normal_key: 3,\n        \"key with spaces\": 1,\n        dyn_key => 2,\n    }\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let result = Ast::from_lexer(&mut lexer).expect("map literal should parse");
+    let Ast::FunctionDef(func) = &result else { panic!("expected function") };
+    let Ast::Assign { value, .. } = &func.block.lines[0] else { panic!("expected assign") };
+    let Ast::MapLiteral(entries) = &**value else { panic!("expected map literal") };
+    assert_eq!(entries.len(), 3);
 }
 
 #[test]
