@@ -115,9 +115,10 @@ Current behavior:
     - `is_string(value)`
     - `is_list(value)`
     - `is_map(value)`
+    - `is_map_iter(value)`
     - `is_function(value)`
     - `is_string_iter(value)`
-  - `type_of(value)` returns a debuggable stable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"map"`, `"function"`, or `"string_iter"`
+  - `type_of(value)` returns a debuggable stable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"map"`, `"map_iter"`, `"function"`, or `"string_iter"`
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
   - `string_try_first(s)` returns `(ok, value, err)` where `value` is the first byte as an `Int`
@@ -175,13 +176,21 @@ Current behavior:
 - `map_set(m, key, value)` mutates the map in place
 - `map_get(m, key)` traps when the key is missing
 - `map_delete(m, key)` removes the key and returns the removed value
+- `map_iter(m)` returns a map iterator over the current entries
+- `map_iter_done(it)` reports whether a map iterator is exhausted
+- `map_iter_next(it)` returns `(key, value)` and advances the iterator
+- `map_iter_key(it)` returns the current key
+- `map_iter_value(it)` returns the current value
+- `map_iter_advance(it)` advances to the next occupied entry
 - `map_keys(m)` returns a list of string keys
+- `map_values(m)` returns a list of stored values
 - `map_try_get(m, key)` returns `(ok, value, err)` with `err == "missing key"` on failure
 - `map_try_delete(m, key)` returns `(ok, value, err)` with the same missing-key contract
 - `map_try_pop(m)` returns `(ok, key, value)` and removes an arbitrary entry on success
 - `map_update(m, key, callback)` updates an existing entry with `callback(value)` and returns `true`/`false`
 - `map_update_or_default(m, key, default_value, callback)` stores and returns `callback(current_or_default_value)`
 - empty `map_try_pop(m)` returns `(false, "", 0)`
+- `type_of(map_iter(m)) == "map_iter"`
 - map literals are supported:
   - `{}`
   - `{ name: "x", count: 1 }`
@@ -474,3 +483,4 @@ You can override the LLVM path with either:
 - `LLVM_SYS_201_PREFIX`
 
 If both are unset, the helper scripts now fail and ask you to configure the path explicitly.
+

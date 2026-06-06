@@ -1,0 +1,13 @@
+fn map_keys(map) do
+    __map_keys_loop(map_iter(map), list_new())
+end
+
+fn __map_keys_loop(it, acc) do
+    if map_iter_done(it) do
+        acc
+    else
+        key, value = map_iter_next(it)
+        list_push(acc, key)
+        __map_keys_loop(it, acc)
+    end
+end

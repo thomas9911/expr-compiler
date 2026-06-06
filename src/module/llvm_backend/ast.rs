@@ -143,6 +143,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 )
             })
             .collect::<Vec<_>>();
+        self.compile_multi_compiled_values(&compiled)
+    }
+
+    fn compile_multi_compiled_values(
+        &self,
+        compiled: &[CompiledValue<'ctx>],
+    ) -> CompiledValue<'ctx> {
         let alloc = self.require_func("__alloc");
         let align = self.i64_type.const_int(8, false);
         let data_bytes =
@@ -163,7 +170,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_struct_gep(self.multi_header_type(), header_ptr, 0, "multi_len_ptr")
             .expect("failed to build multi len gep");
         self.builder
-            .build_store(len_ptr, self.i64_type.const_int(values.len() as u64, false))
+            .build_store(len_ptr, self.i64_type.const_int(compiled.len() as u64, false))
             .expect("failed to store multi len");
         let data_ptr_ptr = self
             .builder
@@ -601,6 +608,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 | "is_string"
                 | "is_list"
                 | "is_map"
+                | "is_map_iter"
                 | "is_function"
                 | "is_string_iter"
         ) {
@@ -619,6 +627,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "is_string" => TAG_STRING,
                 "is_list" => TAG_LIST,
                 "is_map" => TAG_MAP,
+                "is_map_iter" => TAG_MAP_ITER,
                 "is_function" => TAG_FUNCTION,
                 "is_string_iter" => TAG_STRING_ITER,
                 _ => unreachable!(),
@@ -1354,10 +1363,48 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 compiled,
                 "map_delete",
             )),
-            "map_keys" => Some(self.build_internal_call(
-                self.require_func("__rt_map_keys"),
+            "map_iter" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter"),
                 compiled,
-                "map_keys",
+                "map_iter",
+            )),
+            "map_iter_done" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_done"),
+                compiled,
+                "map_iter_done",
+            )),
+            "map_iter_next" => {
+                let key = self.build_internal_call(
+                    self.require_func("__rt_map_iter_key"),
+                    compiled,
+                    "map_iter_next_key",
+                );
+                let value = self.build_internal_call(
+                    self.require_func("__rt_map_iter_value"),
+                    compiled,
+                    "map_iter_next_value",
+                );
+                let _advance = self.build_internal_call(
+                    self.require_func("__rt_map_iter_advance"),
+                    compiled,
+                    "map_iter_next_advance",
+                );
+                Some(self.compile_multi_compiled_values(&[key, value]))
+            }
+            "map_iter_key" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_key"),
+                compiled,
+                "map_iter_key",
+            )),
+            "map_iter_value" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_value"),
+                compiled,
+                "map_iter_value",
+            )),
+            "map_iter_advance" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_advance"),
+                compiled,
+                "map_iter_advance",
             )),
             "map_set" => Some(self.build_internal_call(
                 self.require_func("__rt_map_set"),

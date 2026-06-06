@@ -6,6 +6,7 @@ pub const TAG_BIGINT: i64 = 5;
 pub const TAG_STRING_ITER: i64 = 6;
 pub const TAG_MULTI: i64 = 7;
 pub const TAG_MAP: i64 = 8;
+pub const TAG_MAP_ITER: i64 = 9;
 
 pub const VALUE_SIZE: i64 = 16;
 pub const VALUE_PAYLOAD_OFFSET: i32 = 8;
@@ -23,6 +24,9 @@ pub const STRING_PTR_OFFSET: i32 = 16;
 pub const STRING_ITER_HEADER_SIZE: i64 = 16;
 pub const STRING_ITER_STRING_OFFSET: i32 = 0;
 pub const STRING_ITER_INDEX_OFFSET: i32 = 8;
+pub const MAP_ITER_HEADER_SIZE: i64 = 16;
+pub const MAP_ITER_MAP_OFFSET: i32 = 0;
+pub const MAP_ITER_INDEX_OFFSET: i32 = 8;
 pub const MULTI_HEADER_SIZE: i64 = 16;
 pub const MULTI_LEN_OFFSET: i32 = 0;
 pub const MULTI_PTR_OFFSET: i32 = 8;
@@ -57,6 +61,7 @@ pub enum ValueTag {
     StringIter = TAG_STRING_ITER as u8,
     Multi = TAG_MULTI as u8,
     Map = TAG_MAP as u8,
+    MapIter = TAG_MAP_ITER as u8,
 }
 
 impl ValueTag {
@@ -70,6 +75,7 @@ impl ValueTag {
             TAG_STRING_ITER => Some(Self::StringIter),
             TAG_MULTI => Some(Self::Multi),
             TAG_MAP => Some(Self::Map),
+            TAG_MAP_ITER => Some(Self::MapIter),
             _ => None,
         }
     }
@@ -104,6 +110,13 @@ pub struct StringHeader {
 pub struct StringIterHeader {
     pub string_ptr: i64,
     pub byte_index: i64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct MapIterHeader {
+    pub map_ptr: i64,
+    pub index: i64,
 }
 
 #[repr(C)]
@@ -150,4 +163,5 @@ fn verify_value() {
     assert_eq!(ValueTag::from_raw(TAG_STRING_ITER as u8).unwrap(), ValueTag::StringIter);
     assert_eq!(ValueTag::from_raw(TAG_MULTI as u8).unwrap(), ValueTag::Multi);
     assert_eq!(ValueTag::from_raw(TAG_MAP as u8).unwrap(), ValueTag::Map);
+    assert_eq!(ValueTag::from_raw(TAG_MAP_ITER as u8).unwrap(), ValueTag::MapIter);
 }

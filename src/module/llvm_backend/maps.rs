@@ -2,8 +2,8 @@ use super::{CompiledValue, LlvmCompiler};
 use crate::value::{
     MAP_CAP_OFFSET, MAP_ENTRY_HASH_OFFSET, MAP_ENTRY_KEY_OFFSET, MAP_ENTRY_OCCUPIED,
     MAP_ENTRY_SIZE, MAP_ENTRY_STATE_OFFSET, MAP_ENTRY_TOMBSTONE, MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
-    MAP_ENTRY_VALUE_TAG_OFFSET, MAP_HEADER_SIZE, MAP_LEN_OFFSET, MAP_PTR_OFFSET, TAG_INT, TAG_MAP,
-    TAG_STRING,
+    MAP_ENTRY_VALUE_TAG_OFFSET, MAP_HEADER_SIZE, MAP_ITER_HEADER_SIZE, MAP_LEN_OFFSET,
+    MAP_PTR_OFFSET, TAG_INT, TAG_MAP, TAG_MAP_ITER, TAG_STRING,
 };
 use inkwell::IntPredicate;
 use inkwell::module::Linkage;
@@ -248,6 +248,148 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_select(in_bounds, next, self.i64_type.const_zero(), &format!("{label}_wrapped"))
             .expect("failed map next select")
             .into_int_value()
+    }
+
+    fn map_iter_header_type(&self) -> inkwell::types::StructType<'ctx> {
+        self.context.struct_type(&[self.i64_type.into(), self.i64_type.into()], false)
+    }
+
+    fn build_map_iter_header_ptr(
+        &self,
+        payload: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) -> inkwell::values::PointerValue<'ctx> {
+        self.builder
+            .build_int_to_ptr(
+                payload,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_map_iter_header_ptr"),
+            )
+            .expect("failed to convert map iter payload to pointer")
+    }
+
+    fn build_map_iter_map_load(
+        &self,
+        payload: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) -> inkwell::values::IntValue<'ctx> {
+        let ptr = self.build_map_iter_header_ptr(payload, label);
+        let map_ptr = self
+            .builder
+            .build_struct_gep(self.map_iter_header_type(), ptr, 0, &format!("{label}_map_ptr_ptr"))
+            .expect("failed to build map iter map ptr");
+        self.builder
+            .build_load(self.i64_type, map_ptr, &format!("{label}_map_ptr"))
+            .expect("failed to load map iter map ptr")
+            .into_int_value()
+    }
+
+    fn build_map_iter_map_store(
+        &self,
+        payload: inkwell::values::IntValue<'ctx>,
+        map_payload: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) {
+        let ptr = self.build_map_iter_header_ptr(payload, label);
+        let map_ptr = self
+            .builder
+            .build_struct_gep(self.map_iter_header_type(), ptr, 0, &format!("{label}_map_ptr_ptr"))
+            .expect("failed to build map iter map ptr");
+        self.builder.build_store(map_ptr, map_payload).expect("failed to store map iter map");
+    }
+
+    fn build_map_iter_index_load(
+        &self,
+        payload: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) -> inkwell::values::IntValue<'ctx> {
+        let ptr = self.build_map_iter_header_ptr(payload, label);
+        let index_ptr = self
+            .builder
+            .build_struct_gep(self.map_iter_header_type(), ptr, 1, &format!("{label}_index_ptr"))
+            .expect("failed to build map iter index ptr");
+        self.builder
+            .build_load(self.i64_type, index_ptr, &format!("{label}_index"))
+            .expect("failed to load map iter index")
+            .into_int_value()
+    }
+
+    fn build_map_iter_index_store(
+        &self,
+        payload: inkwell::values::IntValue<'ctx>,
+        index: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) {
+        let ptr = self.build_map_iter_header_ptr(payload, label);
+        let index_ptr = self
+            .builder
+            .build_struct_gep(self.map_iter_header_type(), ptr, 1, &format!("{label}_index_ptr"))
+            .expect("failed to build map iter index ptr");
+        self.builder.build_store(index_ptr, index).expect("failed to store map iter index");
+    }
+
+    fn build_map_find_next_occupied(
+        &self,
+        entries_ptr: inkwell::values::IntValue<'ctx>,
+        cap: inkwell::values::IntValue<'ctx>,
+        start: inkwell::values::IntValue<'ctx>,
+        function: inkwell::values::FunctionValue<'ctx>,
+        label: &str,
+    ) -> inkwell::values::IntValue<'ctx> {
+        let loop_block = self.context.append_basic_block(function, &format!("{label}_loop"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let next_block = self.context.append_basic_block(function, &format!("{label}_next"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
+        self.builder.build_unconditional_branch(loop_block).expect("failed map iter scan jump");
+        let start_block = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(loop_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_idx"))
+            .expect("failed map iter idx phi");
+        idx_phi.add_incoming(&[(&start, start_block)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, idx, cap, &format!("{label}_more"))
+            .expect("failed map iter more compare");
+        self.builder
+            .build_conditional_branch(more, body_block, done_block)
+            .expect("failed map iter more branch");
+
+        self.builder.position_at_end(body_block);
+        let entry_ptr = self.build_map_entry_ptr(entries_ptr, idx, label);
+        let state = self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_STATE_OFFSET, label);
+        let occupied = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                state,
+                self.i64_type.const_int(MAP_ENTRY_OCCUPIED as u64, false),
+                &format!("{label}_occupied"),
+            )
+            .expect("failed map iter occupied compare");
+        self.builder
+            .build_conditional_branch(occupied, done_block, next_block)
+            .expect("failed map iter occupied branch");
+
+        self.builder.position_at_end(next_block);
+        let next = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next_idx"))
+            .expect("failed map iter next idx");
+        self.builder.build_unconditional_branch(loop_block).expect("failed map iter loop branch");
+        let next_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next, next_end)]);
+
+        self.builder.position_at_end(done_block);
+        let result_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_result"))
+            .expect("failed map iter result phi");
+        result_phi.add_incoming(&[(&cap, loop_block), (&idx, body_block)]);
+        result_phi.as_basic_value().into_int_value()
     }
 
     fn build_string_hash_bytes(
@@ -1454,7 +1596,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.build_trap_and_unreachable();
     }
 
-    pub(super) fn define_pair_map_keys(&mut self, name: &str, symbol: &str) {
+    pub(super) fn define_pair_map_iter(&mut self, name: &str, symbol: &str) {
         let function = self.module.add_function(
             symbol,
             self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
@@ -1464,85 +1606,248 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let entry = self.context.append_basic_block(function, "entry");
         let ok_block = self.context.append_basic_block(function, "ok");
         let trap_block = self.context.append_basic_block(function, "trap");
-        let loop_block = self.context.append_basic_block(function, "loop");
-        let body_block = self.context.append_basic_block(function, "body");
-        let done_block = self.context.append_basic_block(function, "done");
         self.builder.position_at_end(entry);
         let map = CompiledValue {
             tag: function.get_first_param().unwrap().into_int_value(),
             payload: function.get_nth_param(1).unwrap().into_int_value(),
         };
-        let map_payload = self.expect_tag_payload(map, TAG_MAP, "map_keys", ok_block, trap_block);
+        let map_payload = self.expect_tag_payload(map, TAG_MAP, "map_iter", ok_block, trap_block);
 
         self.builder.position_at_end(ok_block);
-        let list =
-            self.build_internal_call(self.require_func("__rt_list_new"), &[], "map_keys_new_list");
-        let list_tag = list.tag;
-        let list_payload = list.payload;
-        let entries_ptr = self.build_map_ptr_load(map_payload, "map_keys");
-        let cap = self.build_map_cap_load(map_payload, "map_keys");
-        self.builder.build_unconditional_branch(loop_block).expect("failed map keys loop jump");
-        let ok_end = self.builder.get_insert_block().unwrap();
-
-        self.builder.position_at_end(loop_block);
-        let idx_phi =
-            self.builder.build_phi(self.i64_type, "map_keys_idx").expect("failed map keys phi");
-        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), ok_end)]);
-        let idx = idx_phi.as_basic_value().into_int_value();
-        let more = self
-            .builder
-            .build_int_compare(IntPredicate::ULT, idx, cap, "map_keys_more")
-            .expect("failed map keys more");
-        self.builder
-            .build_conditional_branch(more, body_block, done_block)
-            .expect("failed map keys branch");
-
-        self.builder.position_at_end(body_block);
-        let entry_ptr = self.build_map_entry_ptr(entries_ptr, idx, "map_keys");
-        let state =
-            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_STATE_OFFSET, "map_keys_state");
-        let occupied = self
-            .builder
-            .build_int_compare(
-                IntPredicate::EQ,
-                state,
-                self.i64_type.const_int(MAP_ENTRY_OCCUPIED as u64, false),
-                "map_keys_occupied",
-            )
-            .expect("failed map keys occupied");
-        let push_block = self.context.append_basic_block(function, "map_keys_push");
-        let next_block = self.context.append_basic_block(function, "map_keys_next");
-        self.builder
-            .build_conditional_branch(occupied, push_block, next_block)
-            .expect("failed map keys occupied branch");
-
-        self.builder.position_at_end(push_block);
-        let key_ptr =
-            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_keys_key");
-        let string_value = CompiledValue {
-            tag: self.i64_type.const_int(TAG_STRING as u64, false),
-            payload: key_ptr,
-        };
-        let _push = self.build_internal_call(
-            self.require_func("__rt_list_push"),
-            &[CompiledValue { tag: list_tag, payload: list_payload }, string_value],
-            "map_keys_push",
+        let entries_ptr = self.build_map_ptr_load(map_payload, "map_iter");
+        let cap = self.build_map_cap_load(map_payload, "map_iter");
+        let first = self.build_map_find_next_occupied(
+            entries_ptr,
+            cap,
+            self.i64_type.const_zero(),
+            function,
+            "map_iter",
         );
-        self.builder.build_unconditional_branch(next_block).expect("failed map keys push jump");
-
-        self.builder.position_at_end(next_block);
-        let next = self
-            .builder
-            .build_int_add(idx, self.i64_type.const_int(1, false), "map_keys_next")
-            .expect("failed map keys next");
-        self.builder.build_unconditional_branch(loop_block).expect("failed map keys loop");
-        let next_end = self.builder.get_insert_block().unwrap();
-        idx_phi.add_incoming(&[(&next, next_end)]);
-
-        self.builder.position_at_end(done_block);
+        let alloc = self.require_func("__alloc");
+        let header_size = self.i64_type.const_int(MAP_ITER_HEADER_SIZE as u64, false);
+        let align = self.i64_type.const_int(8, false);
+        let iter_raw = self.build_boxed_call(alloc, &[header_size, align], "map_iter_header");
+        self.build_map_iter_map_store(iter_raw, map_payload, "map_iter");
+        self.build_map_iter_index_store(iter_raw, first, "map_iter");
         self.builder
-            .build_return(Some(&self.make_pair_value(list_tag, list_payload, "map_keys_result")))
-            .expect("failed map keys return");
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_MAP_ITER as u64, false),
+                iter_raw,
+                "map_iter_result",
+            )))
+            .expect("failed map items return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    pub(super) fn define_pair_map_iter_done(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+        let iter = CompiledValue {
+            tag: function.get_first_param().unwrap().into_int_value(),
+            payload: function.get_nth_param(1).unwrap().into_int_value(),
+        };
+        let iter_payload =
+            self.expect_tag_payload(iter, TAG_MAP_ITER, "map_iter_done", ok_block, trap_block);
+
+        self.builder.position_at_end(ok_block);
+        let map_payload = self.build_map_iter_map_load(iter_payload, "map_iter_done");
+        let idx = self.build_map_iter_index_load(iter_payload, "map_iter_done");
+        let entries_ptr = self.build_map_ptr_load(map_payload, "map_iter_done");
+        let cap = self.build_map_cap_load(map_payload, "map_iter_done");
+        let found =
+            self.build_map_find_next_occupied(entries_ptr, cap, idx, function, "map_iter_done");
+        self.build_map_iter_index_store(iter_payload, found, "map_iter_done");
+        let done = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, found, cap, "map_iter_done_cmp")
+            .expect("failed map iter done compare");
+        let payload = self
+            .builder
+            .build_int_z_extend(done, self.i64_type, "map_iter_done_i64")
+            .expect("failed map iter done zext");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_INT as u64, false),
+                payload,
+                "map_iter_done_result",
+            )))
+            .expect("failed map iter done return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    pub(super) fn define_pair_map_iter_key(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        let item_ok = self.context.append_basic_block(function, "item_ok");
+        self.builder.position_at_end(entry);
+        let iter = CompiledValue {
+            tag: function.get_first_param().unwrap().into_int_value(),
+            payload: function.get_nth_param(1).unwrap().into_int_value(),
+        };
+        let iter_payload =
+            self.expect_tag_payload(iter, TAG_MAP_ITER, "map_iter_key", ok_block, trap_block);
+
+        self.builder.position_at_end(ok_block);
+        let map_payload = self.build_map_iter_map_load(iter_payload, "map_iter_key");
+        let idx = self.build_map_iter_index_load(iter_payload, "map_iter_key");
+        let entries_ptr = self.build_map_ptr_load(map_payload, "map_iter_key");
+        let cap = self.build_map_cap_load(map_payload, "map_iter_key");
+        let found =
+            self.build_map_find_next_occupied(entries_ptr, cap, idx, function, "map_iter_key");
+        self.build_map_iter_index_store(iter_payload, found, "map_iter_key");
+        let has_item = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, found, cap, "map_iter_key_has_item")
+            .expect("failed map iter key has item");
+        self.builder
+            .build_conditional_branch(has_item, item_ok, trap_block)
+            .expect("failed map iter key branch");
+
+        self.builder.position_at_end(item_ok);
+        let entry_ptr = self.build_map_entry_ptr(entries_ptr, found, "map_iter_key");
+        let key_ptr =
+            self.build_map_entry_field_load(entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_iter_key");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_STRING as u64, false),
+                key_ptr,
+                "map_iter_key_result",
+            )))
+            .expect("failed map iter key return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    pub(super) fn define_pair_map_iter_value(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        let item_ok = self.context.append_basic_block(function, "item_ok");
+        self.builder.position_at_end(entry);
+        let iter = CompiledValue {
+            tag: function.get_first_param().unwrap().into_int_value(),
+            payload: function.get_nth_param(1).unwrap().into_int_value(),
+        };
+        let iter_payload =
+            self.expect_tag_payload(iter, TAG_MAP_ITER, "map_iter_value", ok_block, trap_block);
+
+        self.builder.position_at_end(ok_block);
+        let map_payload = self.build_map_iter_map_load(iter_payload, "map_iter_value");
+        let idx = self.build_map_iter_index_load(iter_payload, "map_iter_value");
+        let entries_ptr = self.build_map_ptr_load(map_payload, "map_iter_value");
+        let cap = self.build_map_cap_load(map_payload, "map_iter_value");
+        let found =
+            self.build_map_find_next_occupied(entries_ptr, cap, idx, function, "map_iter_value");
+        self.build_map_iter_index_store(iter_payload, found, "map_iter_value");
+        let has_item = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, found, cap, "map_iter_value_has_item")
+            .expect("failed map iter value has item");
+        self.builder
+            .build_conditional_branch(has_item, item_ok, trap_block)
+            .expect("failed map iter value branch");
+
+        self.builder.position_at_end(item_ok);
+        let entry_ptr = self.build_map_entry_ptr(entries_ptr, found, "map_iter_value");
+        let value_tag = self.build_map_entry_field_load(
+            entry_ptr,
+            MAP_ENTRY_VALUE_TAG_OFFSET,
+            "map_iter_value_tag",
+        );
+        let value_payload = self.build_map_entry_field_load(
+            entry_ptr,
+            MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            "map_iter_value_payload",
+        );
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                value_tag,
+                value_payload,
+                "map_iter_value_result",
+            )))
+            .expect("failed map iter value return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+    }
+
+    pub(super) fn define_pair_map_iter_advance(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        self.builder.position_at_end(entry);
+        let iter = CompiledValue {
+            tag: function.get_first_param().unwrap().into_int_value(),
+            payload: function.get_nth_param(1).unwrap().into_int_value(),
+        };
+        let iter_payload =
+            self.expect_tag_payload(iter, TAG_MAP_ITER, "map_iter_advance", ok_block, trap_block);
+
+        self.builder.position_at_end(ok_block);
+        let map_payload = self.build_map_iter_map_load(iter_payload, "map_iter_advance");
+        let idx = self.build_map_iter_index_load(iter_payload, "map_iter_advance");
+        let cap = self.build_map_cap_load(map_payload, "map_iter_advance");
+        let entries_ptr = self.build_map_ptr_load(map_payload, "map_iter_advance");
+        let next_start = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), "map_iter_advance_next_start")
+            .expect("failed map iter advance next start");
+        let in_bounds = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, next_start, cap, "map_iter_advance_in_bounds")
+            .expect("failed map iter advance bounds");
+        let start = self
+            .builder
+            .build_select(in_bounds, next_start, cap, "map_iter_advance_start")
+            .expect("failed map iter advance select")
+            .into_int_value();
+        let found = self.build_map_find_next_occupied(
+            entries_ptr,
+            cap,
+            start,
+            function,
+            "map_iter_advance",
+        );
+        self.build_map_iter_index_store(iter_payload, found, "map_iter_advance");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                self.i64_type.const_int(TAG_INT as u64, false),
+                self.i64_type.const_zero(),
+                "map_iter_advance_result",
+            )))
+            .expect("failed map iter advance return");
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();

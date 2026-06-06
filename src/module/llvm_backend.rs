@@ -6,8 +6,8 @@ use crate::analysis::{FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysi
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
     BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, MULTI_HEADER_SIZE, STRING_HEADER_SIZE,
-    STRING_ITER_HEADER_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_MAP, TAG_MULTI,
-    TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    STRING_ITER_HEADER_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER,
+    TAG_MULTI, TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -560,7 +560,11 @@ impl<'ctx> LlvmCompiler<'ctx> {
             self.define_pair_map_get("__rt_map_get", "llvm_rt_map_get");
             self.define_pair_map_has("__rt_map_has", "llvm_rt_map_has");
             self.define_pair_map_delete("__rt_map_delete", "llvm_rt_map_delete");
-            self.define_pair_map_keys("__rt_map_keys", "llvm_rt_map_keys");
+            self.define_pair_map_iter("__rt_map_iter", "llvm_rt_map_iter");
+            self.define_pair_map_iter_done("__rt_map_iter_done", "llvm_rt_map_iter_done");
+            self.define_pair_map_iter_key("__rt_map_iter_key", "llvm_rt_map_iter_key");
+            self.define_pair_map_iter_value("__rt_map_iter_value", "llvm_rt_map_iter_value");
+            self.define_pair_map_iter_advance("__rt_map_iter_advance", "llvm_rt_map_iter_advance");
         }
     }
 

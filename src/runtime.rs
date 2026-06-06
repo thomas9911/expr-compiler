@@ -2,7 +2,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::value::{
     BigIntHeader, ListHeader, MapHeader, StringHeader, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST,
-    TAG_MAP, TAG_STRING, TAG_STRING_ITER, Value, ValueTag,
+    TAG_MAP, TAG_MAP_ITER, TAG_STRING, TAG_STRING_ITER, Value, ValueTag,
 };
 
 const DEFAULT_ARENA_BYTES: usize = 16 * 1024 * 1024;
@@ -169,6 +169,7 @@ fn print_value_ref(value: &Value) {
             let _header = unsafe { &*(value.payload as usize as *const MapHeader) };
             runtime_trap("map values are not printable yet");
         }
+        ValueTag::MapIter => runtime_trap("map iterators are not printable"),
         ValueTag::StringIter => runtime_trap("string iterators are not printable"),
         ValueTag::Multi => runtime_trap("multi-value temporaries are not printable"),
     }
@@ -335,6 +336,7 @@ pub extern "C" fn __expr_box_value_host(tag: i64, payload: i64) -> i64 {
         TAG_BIGINT => with_arena(|arena| alloc_value(arena, ValueTag::BigInt, payload)),
         TAG_STRING_ITER => with_arena(|arena| alloc_value(arena, ValueTag::StringIter, payload)),
         TAG_MAP => with_arena(|arena| alloc_value(arena, ValueTag::Map, payload)),
+        TAG_MAP_ITER => with_arena(|arena| alloc_value(arena, ValueTag::MapIter, payload)),
         _ => runtime_trap("unknown value tag"),
     }
 }
@@ -511,7 +513,9 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
-    use crate::value::{TAG_BIGINT, TAG_FUNCTION, TAG_LIST, TAG_STRING, TAG_STRING_ITER};
+    use crate::value::{
+        TAG_BIGINT, TAG_FUNCTION, TAG_LIST, TAG_MAP_ITER, TAG_STRING, TAG_STRING_ITER,
+    };
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -626,6 +630,10 @@ mod tests {
         let iter = __expr_box_value_host(TAG_STRING_ITER, 789);
         assert_eq!(value_ref(iter).tag, ValueTag::StringIter);
         assert_eq!(value_ref(iter).payload, 789);
+
+        let map_iter = __expr_box_value_host(TAG_MAP_ITER, 987);
+        assert_eq!(value_ref(map_iter).tag, ValueTag::MapIter);
+        assert_eq!(value_ref(map_iter).payload, 987);
     }
 
     #[test]

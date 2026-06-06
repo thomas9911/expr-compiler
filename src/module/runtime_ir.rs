@@ -16,8 +16,9 @@ use crate::value::{
     BIGINT_SIGN_OFFSET, LIST_CAP_OFFSET, LIST_HEADER_SIZE, LIST_LEN_OFFSET, LIST_PTR_OFFSET,
     MAP_CAP_OFFSET, MAP_ENTRY_HASH_OFFSET, MAP_ENTRY_KEY_OFFSET, MAP_ENTRY_OCCUPIED,
     MAP_ENTRY_SIZE, MAP_ENTRY_STATE_OFFSET, MAP_ENTRY_TOMBSTONE, MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
-    MAP_ENTRY_VALUE_TAG_OFFSET, MAP_HEADER_SIZE, MAP_LEN_OFFSET, MAP_PTR_OFFSET, STRING_LEN_OFFSET,
-    STRING_PTR_OFFSET, TAG_BIGINT, TAG_INT, TAG_LIST, TAG_MAP, TAG_STRING, VALUE_PAYLOAD_OFFSET,
+    MAP_ENTRY_VALUE_TAG_OFFSET, MAP_HEADER_SIZE, MAP_ITER_HEADER_SIZE, MAP_ITER_INDEX_OFFSET,
+    MAP_ITER_MAP_OFFSET, MAP_LEN_OFFSET, MAP_PTR_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET,
+    TAG_BIGINT, TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER, TAG_STRING, VALUE_PAYLOAD_OFFSET,
     VALUE_SIZE,
 };
 
@@ -192,7 +193,11 @@ fn build_builtin_map(
         builtins.insert("map_get".to_string(), runtime.map_get.unwrap());
         builtins.insert("map_has".to_string(), runtime.map_has.unwrap());
         builtins.insert("map_delete".to_string(), runtime.map_delete.unwrap());
-        builtins.insert("map_keys".to_string(), runtime.map_keys.unwrap());
+        builtins.insert("map_iter".to_string(), runtime.map_iter.unwrap());
+        builtins.insert("map_iter_done".to_string(), runtime.map_iter_done.unwrap());
+        builtins.insert("map_iter_key".to_string(), runtime.map_iter_key.unwrap());
+        builtins.insert("map_iter_value".to_string(), runtime.map_iter_value.unwrap());
+        builtins.insert("map_iter_advance".to_string(), runtime.map_iter_advance.unwrap());
     }
     builtins
 }
@@ -247,7 +252,11 @@ struct RuntimeBuiltins {
     map_get: Option<FuncId>,
     map_has: Option<FuncId>,
     map_delete: Option<FuncId>,
-    map_keys: Option<FuncId>,
+    map_iter: Option<FuncId>,
+    map_iter_done: Option<FuncId>,
+    map_iter_key: Option<FuncId>,
+    map_iter_value: Option<FuncId>,
+    map_iter_advance: Option<FuncId>,
 }
 
 struct RuntimeData {
@@ -610,10 +619,21 @@ fn declare_runtime_function_ids(
             &[types::I64, types::I64, types::I64, types::I64],
         )
     });
-    let map_keys = map_enabled.then(|| {
-        declare_local_pair_builtin(module, isa, "__rt_map_keys", &[types::I64, types::I64])
+    let map_iter = map_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_map_iter", &[types::I64, types::I64])
     });
-
+    let map_iter_done = map_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_map_iter_done", &[types::I64, types::I64])
+    });
+    let map_iter_key = map_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_map_iter_key", &[types::I64, types::I64])
+    });
+    let map_iter_value = map_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_map_iter_value", &[types::I64, types::I64])
+    });
+    let map_iter_advance = map_enabled.then(|| {
+        declare_local_pair_builtin(module, isa, "__rt_map_iter_advance", &[types::I64, types::I64])
+    });
     RuntimeFunctionIds {
         alloc,
         oom,
@@ -668,7 +688,11 @@ fn declare_runtime_function_ids(
             map_get,
             map_has,
             map_delete,
-            map_keys,
+            map_iter,
+            map_iter_done,
+            map_iter_key,
+            map_iter_value,
+            map_iter_advance,
         },
     }
 }
@@ -997,13 +1021,22 @@ fn define_runtime_operations(
             ids.builtins.value_int,
         );
         define_rt_map_delete(module, isa, flags, ids.builtins.map_delete.unwrap());
-        define_rt_map_keys(
+        define_rt_map_iter(module, isa, flags, ids.builtins.map_iter.unwrap(), ids.alloc);
+        define_rt_map_iter_done(
             module,
             isa,
             flags,
-            ids.builtins.map_keys.unwrap(),
-            ids.builtins.list_new.expect("internal compiler error: map_keys requires list_new"),
-            ids.builtins.list_push.expect("internal compiler error: map_keys requires list_push"),
+            ids.builtins.map_iter_done.unwrap(),
+            ids.builtins.value_int,
+        );
+        define_rt_map_iter_key(module, isa, flags, ids.builtins.map_iter_key.unwrap());
+        define_rt_map_iter_value(module, isa, flags, ids.builtins.map_iter_value.unwrap());
+        define_rt_map_iter_advance(
+            module,
+            isa,
+            flags,
+            ids.builtins.map_iter_advance.unwrap(),
+            ids.builtins.value_int,
         );
     }
 }
@@ -1185,6 +1218,43 @@ fn map_next_index(builder: &mut FunctionBuilder, idx: Value, cap: Value) -> Valu
     let next = builder.ins().iadd_imm(idx, 1);
     let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, next, cap);
     builder.ins().select(in_bounds, next, zero)
+}
+
+fn map_find_next_occupied(
+    builder: &mut FunctionBuilder,
+    entries_ptr: Value,
+    cap: Value,
+    start: Value,
+) -> Value {
+    let loop_block = builder.create_block();
+    let body_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, types::I64);
+    builder.append_block_param(done_block, types::I64);
+    builder.ins().jump(loop_block, &[BlockArg::Value(start)]);
+
+    builder.switch_to_block(loop_block);
+    let idx = builder.block_params(loop_block)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, idx, cap);
+    builder.ins().brif(more, body_block, &[], done_block, &[BlockArg::Value(cap)]);
+
+    builder.switch_to_block(body_block);
+    let entry_ptr = map_entry_ptr(builder, entries_ptr, idx);
+    let state = builder.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
+    let occupied = builder.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
+    let next_block = builder.create_block();
+    builder.ins().brif(occupied, done_block, &[BlockArg::Value(idx)], next_block, &[]);
+    builder.seal_block(body_block);
+
+    builder.switch_to_block(next_block);
+    let next = builder.ins().iadd_imm(idx, 1);
+    builder.ins().jump(loop_block, &[BlockArg::Value(next)]);
+    builder.seal_block(next_block);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    builder.seal_block(loop_block);
+    builder.block_params(done_block)[0]
 }
 
 fn string_hash_bytes(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
@@ -4328,63 +4398,124 @@ fn define_rt_map_delete(
     );
 }
 
-fn define_rt_map_keys(
+fn define_rt_map_iter(
     module: &mut impl CraneliftModule,
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     id: FuncId,
-    list_new_id: FuncId,
-    list_push_id: FuncId,
+    alloc_id: FuncId,
 ) {
     let module_ptr: *mut _ = module;
     define_runtime_pair_fn(module, isa, flags, id, &[types::I64, types::I64], |b, p, func| {
-        let list_new_ref = unsafe { (&mut *module_ptr).declare_func_in_func(list_new_id, func) };
-        let list_push_ref = unsafe { (&mut *module_ptr).declare_func_in_func(list_push_id, func) };
+        let alloc_ref = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
         let header_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP);
         let entries_ptr = map_load_ptr(b, header_ptr);
         let cap = map_load_cap(b, header_ptr);
-
-        let create_call = b.ins().call(list_new_ref, &[]);
-        let list_tag = b.inst_results(create_call)[0];
-        let list_payload = b.inst_results(create_call)[1];
         let zero = b.ins().iconst(types::I64, 0);
-        let string_tag = b.ins().iconst(types::I64, TAG_STRING);
+        let first = map_find_next_occupied(b, entries_ptr, cap, zero);
 
-        let loop_block = b.create_block();
-        let body_block = b.create_block();
-        let done_block = b.create_block();
-        b.append_block_param(loop_block, types::I64);
-        b.ins().jump(loop_block, &[BlockArg::Value(zero)]);
+        let align = b.ins().iconst(types::I64, 8);
+        let header_size = b.ins().iconst(types::I64, MAP_ITER_HEADER_SIZE);
+        let call = b.ins().call(alloc_ref, &[header_size, align]);
+        let iter_ptr = b.inst_results(call)[0];
+        b.ins().store(MemFlags::new(), header_ptr, iter_ptr, MAP_ITER_MAP_OFFSET);
+        b.ins().store(MemFlags::new(), first, iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let tag = b.ins().iconst(types::I64, TAG_MAP_ITER);
+        b.ins().return_(&[tag, iter_ptr]);
+    });
+}
 
-        b.switch_to_block(loop_block);
-        let idx = b.block_params(loop_block)[0];
-        let more = b.ins().icmp(IntCC::UnsignedLessThan, idx, cap);
-        b.ins().brif(more, body_block, &[], done_block, &[]);
+fn define_rt_map_iter_done(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    _value_int_id: FuncId,
+) {
+    define_runtime_pair_fn(module, isa, flags, id, &[types::I64, types::I64], |b, p, _func| {
+        let iter_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP_ITER);
+        let map_ptr = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_MAP_OFFSET);
+        let idx = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let entries_ptr = map_load_ptr(b, map_ptr);
+        let cap = map_load_cap(b, map_ptr);
+        let found = map_find_next_occupied(b, entries_ptr, cap, idx);
+        b.ins().store(MemFlags::new(), found, iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let done = b.ins().icmp(IntCC::Equal, found, cap);
+        let tag = b.ins().iconst(types::I64, TAG_INT);
+        let payload = b.ins().uextend(types::I64, done);
+        b.ins().return_(&[tag, payload]);
+    });
+}
 
-        b.switch_to_block(body_block);
-        let entry_ptr = map_entry_ptr(b, entries_ptr, idx);
-        let state = b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_STATE_OFFSET);
-        let occupied = b.ins().icmp_imm(IntCC::Equal, state, MAP_ENTRY_OCCUPIED);
-        let push_block = b.create_block();
-        let next_block = b.create_block();
-        b.ins().brif(occupied, push_block, &[], next_block, &[]);
-        b.seal_block(body_block);
-
-        b.switch_to_block(push_block);
+fn define_rt_map_iter_key(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+) {
+    define_runtime_pair_fn(module, isa, flags, id, &[types::I64, types::I64], |b, p, _func| {
+        let iter_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP_ITER);
+        let map_ptr = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_MAP_OFFSET);
+        let idx = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let entries_ptr = map_load_ptr(b, map_ptr);
+        let cap = map_load_cap(b, map_ptr);
+        let found = map_find_next_occupied(b, entries_ptr, cap, idx);
+        b.ins().store(MemFlags::new(), found, iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let has_item = b.ins().icmp(IntCC::UnsignedLessThan, found, cap);
+        b.ins().trapz(has_item, TrapCode::HEAP_OUT_OF_BOUNDS);
+        let entry_ptr = map_entry_ptr(b, entries_ptr, found);
         let key_ptr = b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_KEY_OFFSET);
-        let _push = b.ins().call(list_push_ref, &[list_tag, list_payload, string_tag, key_ptr]);
-        b.ins().jump(next_block, &[]);
-        b.seal_block(push_block);
+        let tag = b.ins().iconst(types::I64, TAG_STRING);
+        b.ins().return_(&[tag, key_ptr]);
+    });
+}
 
-        b.switch_to_block(next_block);
-        let next = b.ins().iadd_imm(idx, 1);
-        b.ins().jump(loop_block, &[BlockArg::Value(next)]);
-        b.seal_block(next_block);
+fn define_rt_map_iter_value(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+) {
+    define_runtime_pair_fn(module, isa, flags, id, &[types::I64, types::I64], |b, p, _func| {
+        let iter_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP_ITER);
+        let map_ptr = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_MAP_OFFSET);
+        let idx = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let entries_ptr = map_load_ptr(b, map_ptr);
+        let cap = map_load_cap(b, map_ptr);
+        let found = map_find_next_occupied(b, entries_ptr, cap, idx);
+        b.ins().store(MemFlags::new(), found, iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let has_item = b.ins().icmp(IntCC::UnsignedLessThan, found, cap);
+        b.ins().trapz(has_item, TrapCode::HEAP_OUT_OF_BOUNDS);
+        let entry_ptr = map_entry_ptr(b, entries_ptr, found);
+        let value_tag =
+            b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_VALUE_TAG_OFFSET);
+        let value_payload =
+            b.ins().load(types::I64, MemFlags::new(), entry_ptr, MAP_ENTRY_VALUE_PAYLOAD_OFFSET);
+        b.ins().return_(&[value_tag, value_payload]);
+    });
+}
 
-        b.switch_to_block(done_block);
-        b.ins().return_(&[list_tag, list_payload]);
-        b.seal_block(done_block);
-        b.seal_block(loop_block);
+fn define_rt_map_iter_advance(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    flags: &settings::Flags,
+    id: FuncId,
+    _value_int_id: FuncId,
+) {
+    define_runtime_pair_fn(module, isa, flags, id, &[types::I64, types::I64], |b, p, _func| {
+        let iter_ptr = pair_payload_for_tag(b, p[0], p[1], TAG_MAP_ITER);
+        let map_ptr = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_MAP_OFFSET);
+        let idx = b.ins().load(types::I64, MemFlags::new(), iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let cap = map_load_cap(b, map_ptr);
+        let entries_ptr = map_load_ptr(b, map_ptr);
+        let next_start = b.ins().iadd_imm(idx, 1);
+        let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, next_start, cap);
+        let start = b.ins().select(in_bounds, next_start, cap);
+        let found = map_find_next_occupied(b, entries_ptr, cap, start);
+        b.ins().store(MemFlags::new(), found, iter_ptr, MAP_ITER_INDEX_OFFSET);
+        let tag = b.ins().iconst(types::I64, TAG_INT);
+        let zero = b.ins().iconst(types::I64, 0);
+        b.ins().return_(&[tag, zero]);
     });
 }
 

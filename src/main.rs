@@ -184,6 +184,8 @@ fn format_kind_set(kinds: KindSet) -> String {
         (ValueKind::BigInt, "bigint"),
         (ValueKind::String, "string"),
         (ValueKind::List, "list"),
+        (ValueKind::Map, "map"),
+        (ValueKind::MapIter, "map_iter"),
         (ValueKind::Function, "function"),
         (ValueKind::StringIter, "string_iter"),
     ] {
@@ -201,6 +203,9 @@ fn format_value_shape(shape: &ValueShape) -> String {
     }
     if let Some(values) = shape.map_values() {
         return format!("map<string, {}>", format_kind_set(values));
+    }
+    if let Some(values) = shape.map_iter_values() {
+        return format!("map_iter<string, {}>", format_kind_set(values));
     }
 
     if shape.arity() == 1 {

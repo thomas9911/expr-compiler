@@ -8,6 +8,7 @@ pub enum ValueKind {
     String,
     List,
     Map,
+    MapIter,
     Function,
     StringIter,
 }
@@ -21,13 +22,15 @@ impl KindSet {
     const STRING_BIT: u8 = 1 << 2;
     const LIST_BIT: u8 = 1 << 3;
     const MAP_BIT: u8 = 1 << 4;
-    const FUNCTION_BIT: u8 = 1 << 5;
-    const STRING_ITER_BIT: u8 = 1 << 6;
+    const MAP_ITER_BIT: u8 = 1 << 5;
+    const FUNCTION_BIT: u8 = 1 << 6;
+    const STRING_ITER_BIT: u8 = 1 << 7;
     const ALL_BITS: u8 = Self::INT_BIT
         | Self::BIGINT_BIT
         | Self::STRING_BIT
         | Self::LIST_BIT
         | Self::MAP_BIT
+        | Self::MAP_ITER_BIT
         | Self::FUNCTION_BIT
         | Self::STRING_ITER_BIT;
 
@@ -59,6 +62,10 @@ impl KindSet {
         Self(Self::MAP_BIT)
     }
 
+    pub const fn map_iter() -> Self {
+        Self(Self::MAP_ITER_BIT)
+    }
+
     pub const fn function() -> Self {
         Self(Self::FUNCTION_BIT)
     }
@@ -78,6 +85,7 @@ impl KindSet {
             ValueKind::String => Self::STRING_BIT,
             ValueKind::List => Self::LIST_BIT,
             ValueKind::Map => Self::MAP_BIT,
+            ValueKind::MapIter => Self::MAP_ITER_BIT,
             ValueKind::Function => Self::FUNCTION_BIT,
             ValueKind::StringIter => Self::STRING_ITER_BIT,
         };
@@ -99,6 +107,7 @@ impl KindSet {
             ValueKind::String => Self::STRING_BIT,
             ValueKind::List => Self::LIST_BIT,
             ValueKind::Map => Self::MAP_BIT,
+            ValueKind::MapIter => Self::MAP_ITER_BIT,
             ValueKind::Function => Self::FUNCTION_BIT,
             ValueKind::StringIter => Self::STRING_ITER_BIT,
         };
@@ -112,6 +121,7 @@ pub enum ValueShape {
     Multi(Vec<KindSet>),
     List { items: KindSet },
     Map { values: KindSet },
+    MapIter { values: KindSet },
 }
 
 impl ValueShape {
@@ -125,6 +135,10 @@ impl ValueShape {
 
     pub fn map(values: KindSet) -> Self {
         Self::Map { values }
+    }
+
+    pub fn map_iter(values: KindSet) -> Self {
+        Self::MapIter { values }
     }
 
     pub fn unknown_scalar() -> Self {
@@ -145,7 +159,7 @@ impl ValueShape {
 
     pub fn arity(&self) -> usize {
         match self {
-            Self::Scalar(_) | Self::List { .. } | Self::Map { .. } => 1,
+            Self::Scalar(_) | Self::List { .. } | Self::Map { .. } | Self::MapIter { .. } => 1,
             Self::Multi(slots) => slots.len(),
         }
     }
@@ -155,6 +169,7 @@ impl ValueShape {
             Self::Scalar(kinds) => (index == 0).then_some(*kinds),
             Self::List { .. } => (index == 0).then_some(KindSet::list()),
             Self::Map { .. } => (index == 0).then_some(KindSet::map()),
+            Self::MapIter { .. } => (index == 0).then_some(KindSet::map_iter()),
             Self::Multi(slots) => slots.get(index).copied(),
         }
     }
@@ -177,11 +192,21 @@ impl ValueShape {
         }
     }
 
+    pub fn map_iter_values(&self) -> Option<KindSet> {
+        match self {
+            Self::MapIter { values } => Some(*values),
+            _ => None,
+        }
+    }
+
     pub fn union(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Scalar(lhs), Self::Scalar(rhs)) => Self::scalar(lhs.union(*rhs)),
             (Self::List { items: lhs }, Self::List { items: rhs }) => Self::list(lhs.union(*rhs)),
             (Self::Map { values: lhs }, Self::Map { values: rhs }) => Self::map(lhs.union(*rhs)),
+            (Self::MapIter { values: lhs }, Self::MapIter { values: rhs }) => {
+                Self::map_iter(lhs.union(*rhs))
+            }
             (Self::Multi(lhs), Self::Multi(rhs)) => {
                 assert_eq!(lhs.len(), rhs.len(), "cannot union shapes of different arity");
                 Self::from_slots(
@@ -529,7 +554,11 @@ fn infer_expression(
     }
     if matches!(
         expr.function.as_str(),
-        "map_try_get" | "map_try_delete" | "map_try_pop" | "string_from_codepoints"
+        "map_try_get"
+            | "map_try_delete"
+            | "map_try_pop"
+            | "map_iter_next"
+            | "string_from_codepoints"
     ) {
         return builtin_shape(&expr.function, &arg_shapes);
     }
@@ -624,6 +653,7 @@ fn predicate_kind(function: &str) -> Option<ValueKind> {
         "is_string" => Some(ValueKind::String),
         "is_list" => Some(ValueKind::List),
         "is_map" => Some(ValueKind::Map),
+        "is_map_iter" => Some(ValueKind::MapIter),
         "is_function" => Some(ValueKind::Function),
         "is_string_iter" => Some(ValueKind::StringIter),
         _ => None,
@@ -662,6 +692,10 @@ fn narrowed_shape(shape: &ValueShape, kind: ValueKind, positive: bool) -> ValueS
             ValueShape::Map { values } => ValueShape::map(*values),
             _ => ValueShape::scalar(KindSet::map()),
         },
+        ValueKind::MapIter => match shape {
+            ValueShape::MapIter { values } => ValueShape::map_iter(*values),
+            _ => ValueShape::scalar(KindSet::map_iter()),
+        },
         ValueKind::Function => ValueShape::scalar(KindSet::function()),
         ValueKind::StringIter => ValueShape::scalar(KindSet::string_iter()),
     };
@@ -677,6 +711,9 @@ fn narrowed_shape(shape: &ValueShape, kind: ValueKind, positive: bool) -> ValueS
                 ValueShape::scalar(KindSet::empty())
             }
             ValueShape::Map { .. } if kind == ValueKind::Map => {
+                ValueShape::scalar(KindSet::empty())
+            }
+            ValueShape::MapIter { .. } if kind == ValueKind::MapIter => {
                 ValueShape::scalar(KindSet::empty())
             }
             _ => ValueShape::scalar(shape.scalar_slot().without(kind)),
@@ -747,7 +784,7 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
             ValueShape::scalar(KindSet::int())
         }
         "is_int" | "is_bigint" | "is_string" | "is_list" | "is_map" | "is_function"
-        | "is_string_iter" => ValueShape::scalar(KindSet::int()),
+        | "is_string_iter" | "is_map_iter" => ValueShape::scalar(KindSet::int()),
         "print" | "list_print" => ValueShape::scalar(KindSet::int()),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
         | "bigint_divide" | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
@@ -775,6 +812,11 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
         "list_new" => ValueShape::list(KindSet::empty()),
         "map_new" => ValueShape::map(KindSet::empty()),
+        "map_iter" => args
+            .first()
+            .and_then(ValueShape::map_values)
+            .map(ValueShape::map_iter)
+            .unwrap_or_else(|| ValueShape::map_iter(KindSet::empty())),
         "list_range" => ValueShape::list(KindSet::int()),
         "list_copy" | "list_filter" => args
             .first()
@@ -800,7 +842,21 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
             KindSet::string(),
             args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
         ]),
+        "map_iter_next" => ValueShape::from_slots(vec![
+            KindSet::string(),
+            args.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        ]),
+        "map_iter_done" | "map_iter_advance" => ValueShape::scalar(KindSet::int()),
+        "map_iter_key" => ValueShape::scalar(KindSet::string()),
+        "map_iter_value" => ValueShape::scalar(
+            args.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        ),
         "map_keys" => ValueShape::list(KindSet::string()),
+        "map_values" => args
+            .first()
+            .and_then(ValueShape::map_values)
+            .map(ValueShape::list)
+            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
         "string_from_codepoints" => ValueShape::scalar(KindSet::string()),
         "list_push" | "list_insert" | "list_set" | "list_swap" => {
             ValueShape::scalar(KindSet::int())
@@ -1028,6 +1084,16 @@ mod tests {
         let analysis = module.analyze_value_kinds().expect("analysis should succeed");
         let main = analysis.functions.get("main").expect("main analysis missing");
         assert_eq!(main.variables.get("ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("key"), Some(&ValueShape::scalar(KindSet::string())));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_map_iter_next_slots_from_map_values() {
+        let src = "fn main() do\n    m = map_new()\n    map_set(m, \"name\", \"x\")\n    it = map_iter(m)\n    key, value = map_iter_next(it)\n    print(key)\n    print(value)\n    0\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
         assert_eq!(main.variables.get("key"), Some(&ValueShape::scalar(KindSet::string())));
         assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
     }

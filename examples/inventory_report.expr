@@ -1,0 +1,51 @@
+fn main() do
+    inventory = {
+        apples: 7,
+        bananas: 2,
+        coffee: 5,
+        rice: 9,
+        tea: 3,
+    }
+
+    summary = {
+        total_units: 0,
+        low_stock_count: 0,
+        best_name: "",
+        best_units: 0,
+    }
+
+    analyze_inventory(map_iter(inventory), summary)
+
+    print("inventory report")
+    print("products")
+    print(map_len(inventory))
+    print("total units")
+    print(map_get(summary, "total_units"))
+    print("low stock items")
+    print(map_get(summary, "low_stock_count"))
+    print("best stocked product")
+    print(map_get(summary, "best_name"))
+    print("best stocked units")
+    print(map_get(summary, "best_units"))
+end
+
+fn analyze_inventory(it, summary) do
+    if map_iter_done(it) do
+        0
+    else
+        key, value = map_iter_next(it)
+
+        map_update_or_default(summary, "total_units", 0, fn current -> current + value end)
+
+        if value < 4 do
+            map_update_or_default(summary, "low_stock_count", 0, fn current -> current + 1 end)
+        end
+
+        if value > map_get(summary, "best_units") do
+            map_set(summary, "best_name", key)
+            map_set(summary, "best_units", value)
+        end
+
+        analyze_inventory(it, summary)
+    end
+end

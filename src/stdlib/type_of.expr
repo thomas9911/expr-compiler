@@ -14,13 +14,17 @@ fn type_of(value) do
                     if is_map(value) do
                         "map"
                     else
-                        if is_function(value) do
-                            "function"
+                        if is_map_iter(value) do
+                            "map_iter"
                         else
-                            if is_string_iter(value) do
-                                "string_iter"
+                            if is_function(value) do
+                                "function"
                             else
-                                "unknown"
+                                if is_string_iter(value) do
+                                    "string_iter"
+                                else
+                                    "unknown"
+                                end
                             end
                         end
                     end
