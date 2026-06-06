@@ -554,6 +554,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         }
         if self.map_enabled {
             self.define_pair_map_new("__rt_map_new", "llvm_rt_map_new");
+            self.define_pair_map_grow("__rt_map_grow", "llvm_rt_map_grow");
             self.define_pair_map_set("__rt_map_set", "llvm_rt_map_set");
             self.define_pair_map_len("__rt_map_len", "llvm_rt_map_len");
             self.define_pair_map_get("__rt_map_get", "llvm_rt_map_get");

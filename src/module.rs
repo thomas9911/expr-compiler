@@ -7426,6 +7426,19 @@ fn extract_llvm_wasm_symbol_asm<'a>(asm: &'a str, symbol: &str) -> &'a str {
     &rest[..next]
 }
 
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+#[ignore = "debug helper for inspecting LLVM map symbols"]
+fn dump_llvm_map_growth_symbols() {
+    let src = build_large_map_growth_source(65);
+    let asm = compile_llvm_wasm_assembly_for_test(&src);
+    println!("--- llvm_rt_map_set ---\n{}", extract_llvm_wasm_symbol_asm(&asm, "llvm_rt_map_set"));
+    println!(
+        "--- llvm_rt_map_grow ---\n{}",
+        extract_llvm_wasm_symbol_asm(&asm, "llvm_rt_map_grow")
+    );
+}
+
 #[test]
 fn ir_bytes_len_known_string_omits_bad_conversion_trap_in_main() {
     let src = "fn main() do\n    bytes_len(\"abc\")\nend";
@@ -7832,6 +7845,20 @@ fn test_find_colliding_map_keys() -> (String, String) {
     panic!("failed to find colliding test map keys")
 }
 
+#[cfg(test)]
+fn build_large_map_growth_source(count: usize) -> String {
+    let mut src = String::from("fn main() do\n    m = map_new()\n");
+    for idx in 0..count {
+        src.push_str(&format!("    map_set(m, \"k{idx}\", {})\n", idx + 1));
+    }
+    src.push_str(&format!(
+        "    print(map_len(m))\n    print(map_get(m, \"k0\"))\n    print(map_get(m, \"k{}\"))\n    print(map_get(m, \"k{}\"))\n    map_set(m, \"k10\", 999)\n    print(map_get(m, \"k10\"))\nend",
+        count / 2,
+        count - 1
+    ));
+    src
+}
+
 #[test]
 fn map_delete_preserves_probe_chain_and_reuses_tombstone() {
     let (key1, key2) = test_find_colliding_map_keys();
@@ -7839,6 +7866,12 @@ fn map_delete_preserves_probe_chain_and_reuses_tombstone() {
         "fn main() do\n    m = map_new()\n    map_set(m, \"{key1}\", 10)\n    map_set(m, \"{key2}\", 32)\n    print(map_delete(m, \"{key1}\"))\n    print(map_has(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    map_set(m, \"{key1}\", 11)\n    print(map_get(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    print(map_len(m))\nend"
     );
     assert_cranelift_executable_output(&src, "10\n0\n32\n11\n32\n2\n", 0);
+}
+
+#[test]
+fn map_grows_past_initial_capacity() {
+    let src = build_large_map_growth_source(80);
+    assert_cranelift_executable_output(&src, "80\n1\n41\n80\n999\n", 0);
 }
 
 #[test]
@@ -8536,6 +8569,13 @@ fn llvm_map_delete_preserves_probe_chain_and_reuses_tombstone() {
         "fn main() do\n    m = map_new()\n    map_set(m, \"{key1}\", 10)\n    map_set(m, \"{key2}\", 32)\n    print(map_delete(m, \"{key1}\"))\n    print(map_has(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    map_set(m, \"{key1}\", 11)\n    print(map_get(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    print(map_len(m))\nend"
     );
     assert_backend_executable_output(&src, CodegenBackend::Llvm, "10\n0\n32\n11\n32\n2\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_grows_past_initial_capacity() {
+    let src = build_large_map_growth_source(80);
+    assert_backend_executable_output(&src, CodegenBackend::Llvm, "80\n1\n41\n80\n999\n", 0);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]

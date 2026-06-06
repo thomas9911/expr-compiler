@@ -113,6 +113,52 @@ impl<'ctx> LlvmCompiler<'ctx> {
         self.builder.build_store(ptr, value).expect("failed map len store");
     }
 
+    fn build_map_cap_store(
+        &self,
+        map_payload: inkwell::values::IntValue<'ctx>,
+        value: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) {
+        let ptr = self
+            .builder
+            .build_int_to_ptr(
+                self.builder
+                    .build_int_add(
+                        map_payload,
+                        self.i64_type.const_int(MAP_CAP_OFFSET as u64, false),
+                        &format!("{label}_map_cap_store_addr"),
+                    )
+                    .expect("failed map cap store addr"),
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_map_cap_store_ptr"),
+            )
+            .expect("failed map cap store ptr");
+        self.builder.build_store(ptr, value).expect("failed map cap store");
+    }
+
+    fn build_map_ptr_store(
+        &self,
+        map_payload: inkwell::values::IntValue<'ctx>,
+        value: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) {
+        let ptr = self
+            .builder
+            .build_int_to_ptr(
+                self.builder
+                    .build_int_add(
+                        map_payload,
+                        self.i64_type.const_int(MAP_PTR_OFFSET as u64, false),
+                        &format!("{label}_map_ptr_store_addr"),
+                    )
+                    .expect("failed map ptr store addr"),
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_map_ptr_store_ptr"),
+            )
+            .expect("failed map ptr store ptr");
+        self.builder.build_store(ptr, value).expect("failed map ptr store");
+    }
+
     fn build_map_entry_ptr(
         &self,
         entries_ptr: inkwell::values::IntValue<'ctx>,
@@ -362,6 +408,244 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "map_new_result",
             )))
             .expect("failed map new return");
+    }
+
+    pub(super) fn define_pair_map_grow(&mut self, name: &str, symbol: &str) {
+        let function = self.module.add_function(
+            symbol,
+            self.pair_type().fn_type(&[self.i64_type.into(), self.i64_type.into()], false),
+            Some(Linkage::Private),
+        );
+        self.functions.insert(name.to_string(), function);
+
+        let entry = self.context.append_basic_block(function, "entry");
+        let ok_block = self.context.append_basic_block(function, "ok");
+        let trap_block = self.context.append_basic_block(function, "trap");
+        let zero_loop = self.context.append_basic_block(function, "zero_loop");
+        let zero_body = self.context.append_basic_block(function, "zero_body");
+        let zero_done = self.context.append_basic_block(function, "zero_done");
+        let rehash_loop = self.context.append_basic_block(function, "rehash_loop");
+        let rehash_body = self.context.append_basic_block(function, "rehash_body");
+        let probe_loop = self.context.append_basic_block(function, "probe_loop");
+        let probe_body = self.context.append_basic_block(function, "probe_body");
+        let probe_store = self.context.append_basic_block(function, "probe_store");
+        let probe_next = self.context.append_basic_block(function, "probe_next");
+        let rehash_done = self.context.append_basic_block(function, "rehash_done");
+        self.builder.position_at_end(entry);
+
+        let map = CompiledValue {
+            tag: function.get_first_param().unwrap().into_int_value(),
+            payload: function.get_nth_param(1).unwrap().into_int_value(),
+        };
+        let map_payload = self.expect_tag_payload(map, TAG_MAP, "map_grow", ok_block, trap_block);
+
+        self.builder.position_at_end(ok_block);
+        let alloc = self.require_func("__alloc");
+        let len = self.build_map_len_load(map_payload, "map_grow");
+        let cap = self.build_map_cap_load(map_payload, "map_grow");
+        let old_entries_ptr = self.build_map_ptr_load(map_payload, "map_grow");
+        let new_cap = self
+            .builder
+            .build_int_mul(cap, self.i64_type.const_int(2, false), "map_grow_new_cap")
+            .expect("failed map grow new cap");
+        let bytes = self
+            .builder
+            .build_int_mul(
+                new_cap,
+                self.i64_type.const_int(MAP_ENTRY_SIZE as u64, false),
+                "map_grow_bytes",
+            )
+            .expect("failed map grow bytes");
+        let align = self.i64_type.const_int(8, false);
+        let new_entries_ptr = self.build_boxed_call(alloc, &[bytes, align], "map_grow_entries");
+        self.build_map_ptr_store(map_payload, new_entries_ptr, "map_grow");
+        self.build_map_cap_store(map_payload, new_cap, "map_grow");
+        self.build_map_len_store(map_payload, self.i64_type.const_zero(), "map_grow");
+        self.builder.build_unconditional_branch(zero_loop).expect("failed map grow zero jump");
+        let ok_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(zero_loop);
+        let zero_idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_grow_zero_idx")
+            .expect("failed map grow zero idx phi");
+        zero_idx_phi.add_incoming(&[(&self.i64_type.const_zero(), ok_end)]);
+        let zero_idx = zero_idx_phi.as_basic_value().into_int_value();
+        let zero_more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, zero_idx, new_cap, "map_grow_zero_more")
+            .expect("failed map grow zero more");
+        self.builder
+            .build_conditional_branch(zero_more, zero_body, zero_done)
+            .expect("failed map grow zero branch");
+
+        self.builder.position_at_end(zero_body);
+        let zero_entry_ptr = self.build_map_entry_ptr(new_entries_ptr, zero_idx, "map_grow_zero");
+        self.build_map_entry_field_store(
+            zero_entry_ptr,
+            MAP_ENTRY_STATE_OFFSET,
+            self.i64_type.const_zero(),
+            "map_grow_zero_state",
+        );
+        let zero_next = self
+            .builder
+            .build_int_add(zero_idx, self.i64_type.const_int(1, false), "map_grow_zero_next")
+            .expect("failed map grow zero next");
+        self.builder.build_unconditional_branch(zero_loop).expect("failed map grow zero loop");
+        let zero_body_end = self.builder.get_insert_block().unwrap();
+        zero_idx_phi.add_incoming(&[(&zero_next, zero_body_end)]);
+
+        self.builder.position_at_end(zero_done);
+        self.builder.build_unconditional_branch(rehash_loop).expect("failed map grow rehash jump");
+        let zero_done_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(rehash_loop);
+        let rehash_idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_grow_rehash_idx")
+            .expect("failed map grow rehash idx phi");
+        rehash_idx_phi.add_incoming(&[(&self.i64_type.const_zero(), zero_done_end)]);
+        let rehash_idx = rehash_idx_phi.as_basic_value().into_int_value();
+        let rehash_more = self
+            .builder
+            .build_int_compare(IntPredicate::ULT, rehash_idx, cap, "map_grow_rehash_more")
+            .expect("failed map grow rehash more");
+        self.builder
+            .build_conditional_branch(rehash_more, rehash_body, rehash_done)
+            .expect("failed map grow rehash branch");
+
+        self.builder.position_at_end(rehash_body);
+        let old_entry_ptr = self.build_map_entry_ptr(old_entries_ptr, rehash_idx, "map_grow_old");
+        let old_state = self.build_map_entry_field_load(
+            old_entry_ptr,
+            MAP_ENTRY_STATE_OFFSET,
+            "map_grow_state",
+        );
+        let old_occupied = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                old_state,
+                self.i64_type.const_int(MAP_ENTRY_OCCUPIED as u64, false),
+                "map_grow_occupied",
+            )
+            .expect("failed map grow occupied");
+        let insert_block = self.context.append_basic_block(function, "map_grow_insert");
+        let next_block = self.context.append_basic_block(function, "map_grow_next");
+        self.builder
+            .build_conditional_branch(old_occupied, insert_block, next_block)
+            .expect("failed map grow occupied branch");
+
+        self.builder.position_at_end(insert_block);
+        let old_hash =
+            self.build_map_entry_field_load(old_entry_ptr, MAP_ENTRY_HASH_OFFSET, "map_grow_hash");
+        let old_key =
+            self.build_map_entry_field_load(old_entry_ptr, MAP_ENTRY_KEY_OFFSET, "map_grow_key");
+        let old_value_tag = self.build_map_entry_field_load(
+            old_entry_ptr,
+            MAP_ENTRY_VALUE_TAG_OFFSET,
+            "map_grow_value_tag",
+        );
+        let old_value_payload = self.build_map_entry_field_load(
+            old_entry_ptr,
+            MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            "map_grow_value_payload",
+        );
+        let start_idx = self
+            .builder
+            .build_int_unsigned_rem(old_hash, new_cap, "map_grow_start_idx")
+            .expect("failed map grow start idx");
+        let insert_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(probe_loop).expect("failed map grow probe jump");
+
+        self.builder.position_at_end(probe_loop);
+        let probe_idx_phi = self
+            .builder
+            .build_phi(self.i64_type, "map_grow_probe_idx")
+            .expect("failed map grow probe idx phi");
+        probe_idx_phi.add_incoming(&[(&start_idx, insert_end)]);
+        let probe_idx = probe_idx_phi.as_basic_value().into_int_value();
+        self.builder
+            .build_unconditional_branch(probe_body)
+            .expect("failed map grow probe body jump");
+
+        self.builder.position_at_end(probe_body);
+        let probe_entry_ptr =
+            self.build_map_entry_ptr(new_entries_ptr, probe_idx, "map_grow_probe");
+        let probe_state = self.build_map_entry_field_load(
+            probe_entry_ptr,
+            MAP_ENTRY_STATE_OFFSET,
+            "map_grow_probe_state",
+        );
+        let probe_empty = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                probe_state,
+                self.i64_type.const_zero(),
+                "map_grow_probe_empty",
+            )
+            .expect("failed map grow probe empty");
+        self.builder
+            .build_conditional_branch(probe_empty, probe_store, probe_next)
+            .expect("failed map grow probe branch");
+
+        self.builder.position_at_end(probe_store);
+        self.build_map_entry_field_store(
+            probe_entry_ptr,
+            MAP_ENTRY_HASH_OFFSET,
+            old_hash,
+            "map_grow_store_hash",
+        );
+        self.build_map_entry_field_store(
+            probe_entry_ptr,
+            MAP_ENTRY_KEY_OFFSET,
+            old_key,
+            "map_grow_store_key",
+        );
+        self.build_map_entry_field_store(
+            probe_entry_ptr,
+            MAP_ENTRY_VALUE_TAG_OFFSET,
+            old_value_tag,
+            "map_grow_store_tag",
+        );
+        self.build_map_entry_field_store(
+            probe_entry_ptr,
+            MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            old_value_payload,
+            "map_grow_store_payload",
+        );
+        self.build_map_entry_field_store(
+            probe_entry_ptr,
+            MAP_ENTRY_STATE_OFFSET,
+            self.i64_type.const_int(MAP_ENTRY_OCCUPIED as u64, false),
+            "map_grow_store_state",
+        );
+        self.builder.build_unconditional_branch(next_block).expect("failed map grow stored jump");
+
+        self.builder.position_at_end(probe_next);
+        let probe_next_idx = self.build_map_next_index(probe_idx, new_cap, "map_grow_probe");
+        self.builder.build_unconditional_branch(probe_loop).expect("failed map grow probe loop");
+        let probe_next_end = self.builder.get_insert_block().unwrap();
+        probe_idx_phi.add_incoming(&[(&probe_next_idx, probe_next_end)]);
+
+        self.builder.position_at_end(next_block);
+        let rehash_next = self
+            .builder
+            .build_int_add(rehash_idx, self.i64_type.const_int(1, false), "map_grow_rehash_next")
+            .expect("failed map grow rehash next");
+        self.builder.build_unconditional_branch(rehash_loop).expect("failed map grow rehash loop");
+        let next_end = self.builder.get_insert_block().unwrap();
+        rehash_idx_phi.add_incoming(&[(&rehash_next, next_end)]);
+
+        self.builder.position_at_end(rehash_done);
+        self.build_map_len_store(map_payload, len, "map_grow_restore_len");
+        self.builder
+            .build_return(Some(&self.make_pair_value(map.tag, map.payload, "map_grow_result")))
+            .expect("failed map grow return");
+
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
     }
 
     pub(super) fn define_pair_map_len(&mut self, name: &str, symbol: &str) {
@@ -721,6 +1005,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
         let trap_block = self.context.append_basic_block(function, "trap");
         let loop_block = self.context.append_basic_block(function, "loop");
         let body_block = self.context.append_basic_block(function, "body");
+        let grow_block = self.context.append_basic_block(function, "map_set_grow");
         let insert_block = self.context.append_basic_block(function, "insert");
         self.builder.position_at_end(entry);
         let map = CompiledValue {
@@ -773,7 +1058,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_int_compare(IntPredicate::ULT, probes, cap, "map_set_more")
             .expect("failed map set more");
         self.builder
-            .build_conditional_branch(more, body_block, trap_block)
+            .build_conditional_branch(more, body_block, grow_block)
             .expect("failed map set loop branch");
 
         self.builder.position_at_end(body_block);
@@ -976,6 +1261,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "map_set_insert_result",
             )))
             .expect("failed map set insert return");
+
+        self.builder.position_at_end(grow_block);
+        let grow_func = self.require_func("__rt_map_grow");
+        let grown_map = self.build_internal_call(grow_func, &[map], "map_set_grow_call");
+        let retry =
+            self.build_internal_call(function, &[grown_map, key, value], "map_set_grow_retry");
+        self.builder
+            .build_return(Some(&self.make_pair_value(
+                retry.tag,
+                retry.payload,
+                "map_set_grow_retry_result",
+            )))
+            .expect("failed map set grow-only return");
 
         self.builder.position_at_end(trap_block);
         self.build_trap_and_unreachable();

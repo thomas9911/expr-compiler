@@ -1162,6 +1162,18 @@ fn map_load_ptr(builder: &mut FunctionBuilder, header_ptr: Value) -> Value {
     builder.ins().load(types::I64, MemFlags::new(), header_ptr, MAP_PTR_OFFSET)
 }
 
+fn map_store_cap(builder: &mut FunctionBuilder, header_ptr: Value, cap: Value) {
+    builder.ins().store(MemFlags::new(), cap, header_ptr, MAP_CAP_OFFSET);
+}
+
+fn map_store_ptr(builder: &mut FunctionBuilder, header_ptr: Value, ptr: Value) {
+    builder.ins().store(MemFlags::new(), ptr, header_ptr, MAP_PTR_OFFSET);
+}
+
+fn map_store_len(builder: &mut FunctionBuilder, header_ptr: Value, len: Value) {
+    builder.ins().store(MemFlags::new(), len, header_ptr, MAP_LEN_OFFSET);
+}
+
 fn map_entry_ptr(builder: &mut FunctionBuilder, entries_ptr: Value, index: Value) -> Value {
     let entry_size = builder.ins().iconst(types::I64, MAP_ENTRY_SIZE);
     let off = builder.ins().imul(index, entry_size);
@@ -3739,16 +3751,19 @@ fn define_rt_map_set(
     isa: &OwnedTargetIsa,
     flags: &settings::Flags,
     id: FuncId,
-    _alloc_id: FuncId,
+    alloc_id: FuncId,
     _memcpy_id: FuncId,
 ) {
+    let module_ptr: *mut _ = module;
     define_runtime_pair_fn(
         module,
         isa,
         flags,
         id,
         &[types::I64, types::I64, types::I64, types::I64, types::I64, types::I64],
-        |b, p, _func| {
+        |b, p, func| {
+            let alloc = unsafe { (&mut *module_ptr).declare_func_in_func(alloc_id, func) };
+            let self_ref = unsafe { (&mut *module_ptr).declare_func_in_func(id, func) };
             let map_tag = p[0];
             let map_payload = p[1];
             let key_ptr = pair_payload_for_tag(b, p[2], p[3], TAG_STRING);
@@ -3882,11 +3897,100 @@ fn define_rt_map_set(
             b.seal_block(do_insert_block);
 
             b.switch_to_block(full_block);
-            let trap_one = b.ins().iconst(types::I64, 1);
-            b.ins().trapnz(trap_one, TrapCode::HEAP_OUT_OF_BOUNDS);
-            b.ins().return_(&[zero, zero]);
+            let two = b.ins().iconst(types::I64, 2);
+            let new_cap = b.ins().imul(cap, two);
+            let align = b.ins().iconst(types::I64, 8);
+            let entry_size = b.ins().iconst(types::I64, MAP_ENTRY_SIZE);
+            let data_bytes = b.ins().imul(new_cap, entry_size);
+            let data_call = b.ins().call(alloc, &[data_bytes, align]);
+            let new_entries_ptr = b.inst_results(data_call)[0];
+            map_store_ptr(b, header_ptr, new_entries_ptr);
+            map_store_cap(b, header_ptr, new_cap);
+            map_store_len(b, header_ptr, zero);
+
+            let zero_loop = b.create_block();
+            let zero_body = b.create_block();
+            let zero_done = b.create_block();
+            b.append_block_param(zero_loop, types::I64);
+            b.ins().jump(zero_loop, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(zero_loop);
+            let zero_idx = b.block_params(zero_loop)[0];
+            let zero_more = b.ins().icmp(IntCC::UnsignedLessThan, zero_idx, new_cap);
+            b.ins().brif(zero_more, zero_body, &[], zero_done, &[]);
+
+            b.switch_to_block(zero_body);
+            let zero_entry_ptr = map_entry_ptr(b, new_entries_ptr, zero_idx);
+            b.ins().store(MemFlags::new(), zero, zero_entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let zero_next = b.ins().iadd_imm(zero_idx, 1);
+            b.ins().jump(zero_loop, &[BlockArg::Value(zero_next)]);
+            b.seal_block(zero_body);
+
+            let rehash_loop = b.create_block();
+            let rehash_body = b.create_block();
+            let rehash_done = b.create_block();
+            let rehash_insert = b.create_block();
+            b.append_block_param(rehash_loop, types::I64);
+
+            b.switch_to_block(zero_done);
+            b.ins().jump(rehash_loop, &[BlockArg::Value(zero)]);
+            b.seal_block(zero_done);
+
+            b.switch_to_block(rehash_loop);
+            let rehash_idx = b.block_params(rehash_loop)[0];
+            let rehash_more = b.ins().icmp(IntCC::UnsignedLessThan, rehash_idx, cap);
+            b.ins().brif(rehash_more, rehash_body, &[], rehash_done, &[]);
+
+            b.switch_to_block(rehash_body);
+            let old_entry_ptr = map_entry_ptr(b, entries_ptr, rehash_idx);
+            let old_state =
+                b.ins().load(types::I64, MemFlags::new(), old_entry_ptr, MAP_ENTRY_STATE_OFFSET);
+            let old_occupied = b.ins().icmp_imm(IntCC::Equal, old_state, MAP_ENTRY_OCCUPIED);
+            let rehash_next = b.create_block();
+            b.ins().brif(old_occupied, rehash_insert, &[], rehash_next, &[]);
+            b.seal_block(rehash_body);
+
+            b.switch_to_block(rehash_insert);
+            let old_key_ptr =
+                b.ins().load(types::I64, MemFlags::new(), old_entry_ptr, MAP_ENTRY_KEY_OFFSET);
+            let old_value_tag = b.ins().load(
+                types::I64,
+                MemFlags::new(),
+                old_entry_ptr,
+                MAP_ENTRY_VALUE_TAG_OFFSET,
+            );
+            let old_value_payload = b.ins().load(
+                types::I64,
+                MemFlags::new(),
+                old_entry_ptr,
+                MAP_ENTRY_VALUE_PAYLOAD_OFFSET,
+            );
+            let string_tag = b.ins().iconst(types::I64, TAG_STRING);
+            let reinsert = b.ins().call(
+                self_ref,
+                &[map_tag, map_payload, string_tag, old_key_ptr, old_value_tag, old_value_payload],
+            );
+            let _ = b.inst_results(reinsert);
+            b.ins().jump(rehash_next, &[]);
+            b.seal_block(rehash_insert);
+
+            b.switch_to_block(rehash_next);
+            let rehash_next_idx = b.ins().iadd_imm(rehash_idx, 1);
+            b.ins().jump(rehash_loop, &[BlockArg::Value(rehash_next_idx)]);
+            b.seal_block(rehash_next);
+
+            b.switch_to_block(rehash_done);
+            let retry = b
+                .ins()
+                .call(self_ref, &[map_tag, map_payload, p[2], p[3], value_tag, value_payload]);
+            let result_tag = b.inst_results(retry)[0];
+            let result_payload = b.inst_results(retry)[1];
+            b.ins().return_(&[result_tag, result_payload]);
+            b.seal_block(rehash_done);
             b.seal_block(full_block);
             b.seal_block(loop_block);
+            b.seal_block(zero_loop);
+            b.seal_block(rehash_loop);
         },
     );
 }
