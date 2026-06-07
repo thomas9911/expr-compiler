@@ -1,5 +1,5 @@
 examples:
-    for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file" --run-jit; done
+    for file in examples/*.expr; do echo "$file"; cargo run --release -q -- run "$file"; done
 
 llvm-test:
     bash scripts/llvm-backend.sh test
@@ -22,7 +22,7 @@ crap:
     cargo crap --lcov lcov.relative.info --exclude 'src/wrapper/*.rs' --exclude 'out/**' --top 20 --format json
 
 compile-examples:
-    for file in examples/*.expr; do echo "$file"; cargo run --release -q -- "$file"; done
+    for file in examples/*.expr; do echo "$file"; cargo run --release -q -- build "$file"; done
 
 compile-llvm-examples:
     for file in examples/*.expr; do echo "$file"; bash scripts/llvm-backend.sh compile --input "$file"; done
@@ -30,13 +30,13 @@ compile-llvm-examples:
 compile-wasm-examples:
     for file in examples/*.expr; do \
         echo "$file"; \
-        cargo run --release --features llvm-backend -- "$file" --backend llvm -o "${file%.expr}.wasm"; \
+        cargo run --release --features llvm-backend -- wasm core "$file" -o "${file%.expr}.wasm"; \
     done
 
 compile-component-examples:
     for file in examples/*.expr; do \
         echo "$file"; \
-        cargo run --release --features llvm-backend,wasi -- "$file" --backend llvm -o "${file%.expr}.component.wasm"; \
+        cargo run --release --features llvm-backend,wasi -- wasm component "$file" -o "${file%.expr}.component.wasm"; \
     done
 
 run-examples:

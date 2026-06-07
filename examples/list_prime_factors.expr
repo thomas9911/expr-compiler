@@ -8,12 +8,11 @@ fn factor_out(n, found, d):
 fn factor_loop(n, found, d):
     if n < 2:
         0
+    elif d * d > n:
+        list_push(found, n)
+        0
     else:
-        if d * d > n:
-            list_push(found, n)
-            0
-        else:
-            factor_out(n, found, d)
+        factor_out(n, found, d)
 
 fn prime_factors(n):
     found = []

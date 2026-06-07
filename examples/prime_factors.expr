@@ -8,12 +8,11 @@ fn factor_out(n, d):
 fn factor_loop(n, d):
     if n < 2:
         0
+    elif d * d > n:
+        print(n)
+        0
     else:
-        if d * d > n:
-            print(n)
-            0
-        else:
-            factor_out(n, d)
+        factor_out(n, d)
 
 fn prime_factors(n):
     factor_loop(n, 2)

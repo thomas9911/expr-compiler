@@ -1,35 +1,21 @@
 fn type_of(value) do
     if is_int(value) do
         "int"
+    else if is_bigint(value) do
+        "bigint"
+    else if is_string(value) do
+        "string"
+    else if is_list(value) do
+        "list"
+    else if is_map(value) do
+        "map"
+    else if is_map_iter(value) do
+        "map_iter"
+    else if is_function(value) do
+        "function"
+    else if is_string_iter(value) do
+        "string_iter"
     else
-        if is_bigint(value) do
-            "bigint"
-        else
-            if is_string(value) do
-                "string"
-            else
-                if is_list(value) do
-                    "list"
-                else
-                    if is_map(value) do
-                        "map"
-                    else
-                        if is_map_iter(value) do
-                            "map_iter"
-                        else
-                            if is_function(value) do
-                                "function"
-                            else
-                                if is_string_iter(value) do
-                                    "string_iter"
-                                else
-                                    "unknown"
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
+        "unknown"
     end
 end

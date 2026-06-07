@@ -336,7 +336,7 @@ def run_cranelift_jit(
 ) -> subprocess.CompletedProcess[str]:
     return run_compiler(
         compiler,
-        [str(example), "--run-jit", "--", *example_run_args(example)],
+        ["run", str(example), "--", *example_run_args(example)],
         env=env,
     )
 
@@ -350,7 +350,7 @@ def run_cranelift_native(
     output = binary_path_for(staging_dir, example)
     compile_proc = run_compiler(
         compiler,
-        [str(example), "-o", str(output)],
+        ["build", str(example), "-o", str(output)],
         env=env,
     )
     if compile_proc.returncode != 0:
@@ -364,7 +364,7 @@ def run_cranelift_run_ir(
 ) -> subprocess.CompletedProcess[str]:
     return run_compiler(
         compiler,
-        [str(example), "--run-ir"],
+        ["ir", str(example), "--run"],
         env=env,
     )
 
@@ -374,7 +374,7 @@ def run_cranelift_emit_ir(
 ) -> subprocess.CompletedProcess[str]:
     return run_compiler(
         compiler,
-        [str(example), "--emit-ir"],
+        ["ir", str(example)],
         env=env,
     )
 
@@ -385,8 +385,8 @@ def run_llvm_jit(
     return run_compiler(
         compiler,
         [
+            "run",
             str(example),
-            "--run-jit",
             "--backend",
             "llvm",
             "--",
@@ -405,7 +405,7 @@ def run_llvm_native(
     output = binary_path_for(staging_dir, example)
     compile_proc = run_compiler(
         compiler,
-        [str(example), "--backend", "llvm", "-o", str(output)],
+        ["build", str(example), "--backend", "llvm", "-o", str(output)],
         env=env,
     )
     if compile_proc.returncode != 0:
@@ -423,7 +423,7 @@ def run_llvm_wasm(
     output = staging_dir / f"{example.stem}.wasm"
     compile_proc = run_compiler(
         compiler,
-        [str(example), "--backend", "llvm", "-o", str(output)],
+        ["wasm", "core", str(example), "-o", str(output)],
         env=env,
     )
     if compile_proc.returncode != 0:
@@ -451,7 +451,7 @@ def run_llvm_component(
     output = staging_dir / f"{example.stem}.component.wasm"
     compile_proc = run_compiler(
         compiler,
-        [str(example), "--backend", "llvm", "-o", str(output)],
+        ["wasm", "component", str(example), "-o", str(output)],
         env=env,
     )
     if compile_proc.returncode != 0:

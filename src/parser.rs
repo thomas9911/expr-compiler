@@ -816,11 +816,11 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
     let lhs = match lex.peek() {
         Some(Ok(Token::True)) => {
             lex.next();
-            Ast::Literal(LiteralAst::Integer(1))
+            Ast::Literal(LiteralAst::Bool(true))
         }
         Some(Ok(Token::False)) => {
             lex.next();
-            Ast::Literal(LiteralAst::Integer(0))
+            Ast::Literal(LiteralAst::Bool(false))
         }
         Some(Ok(Token::Integer(_) | Token::BigIntLiteral(_) | Token::StringLiteral(_))) => {
             Ast::Literal(LiteralAst::from_lexer(lex)?)
@@ -914,6 +914,7 @@ fn parse_expr_with_lhs<'a>(
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralAst {
+    Bool(bool),
     Integer(i64),
     BigInt(String),
     String(String),
@@ -2061,11 +2062,11 @@ fn parse_boolean_alias_literals() {
                 function_span: None,
                 function: "and".to_string(),
                 args: vec![
-                    Literal(LiteralAst::Integer(1)),
+                    Literal(LiteralAst::Bool(true)),
                     Expression(ExpressionAst {
                         function_span: None,
                         function: "not".to_string(),
-                        args: vec![Literal(LiteralAst::Integer(0))],
+                        args: vec![Literal(LiteralAst::Bool(false))],
                     }),
                 ],
             })],

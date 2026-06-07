@@ -257,14 +257,14 @@ Current behavior:
 - only actual CLI arguments are passed; the executable name is omitted
 - `main` currently supports at most one argument in these runnable output modes
 - for JIT execution through the CLI, pass program arguments after `--`, for example:
-  - `cargo run --release -q -- examples/args.expr --run-jit -- hello world`
+  - `cargo run --release -q -- run examples/args.expr -- hello world`
 
 ## Debugging inferred kinds
 
 You can print the original source annotated with inferred runtime value kinds:
 
 ```text
-cargo run --release -q -- examples/strings.expr --debug-types
+cargo run --release -q -- types examples/strings.expr
 ```
 
 Current behavior:
@@ -328,12 +328,12 @@ Current constraints:
 The repo has an optional LLVM backend behind the Cargo feature `llvm-backend`.
 
 - Default backend: `cranelift`
-- LLVM backend selector: `--backend llvm`
+- LLVM backend selector where relevant: `--backend llvm`
 - LLVM modes currently used in this repo:
-  - JIT: `--run-jit --backend llvm`
-  - Native compile: `--backend llvm`
-  - Core Wasm module: `--backend llvm -o out.wasm`
-  - WASI Preview 2 command component: `--features llvm-backend,wasi --backend llvm -o out.component.wasm`
+  - JIT: `run <file> --backend llvm`
+  - Native compile: `build <file> --backend llvm`
+  - Core Wasm module: `wasm core <file> -o out.wasm`
+  - WASI Preview 2 command component: `wasm component <file> -o out.component.wasm`
 
 ### Bash helper
 
@@ -352,7 +352,7 @@ You can emit a core WebAssembly module with the LLVM backend by choosing a
 `.wasm` output path:
 
 ```bash
-cargo run --release --features llvm-backend -- examples/fib.expr --backend llvm -o fib.wasm
+cargo run --release --features llvm-backend -- wasm core examples/fib.expr -o fib.wasm
 ```
 
 Current behavior:
@@ -370,7 +370,7 @@ You can emit a runnable `wasi:cli/command` component with the LLVM backend by
 choosing a `.component.wasm` output path:
 
 ```bash
-cargo run --release --features llvm-backend,wasi -- examples/fib.expr --backend llvm -o fib.component.wasm
+cargo run --release --features llvm-backend,wasi -- wasm component examples/fib.expr -o fib.component.wasm
 ```
 
 Current behavior:
