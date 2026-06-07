@@ -12,6 +12,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         match ast {
+            Ast::Literal(LiteralAst::Bool(value)) => {
+                self.int_value(self.i64_type.const_int(if *value { 1 } else { 0 }, false))
+            }
             Ast::Literal(LiteralAst::Integer(n)) => {
                 self.int_value(self.i64_type.const_int(*n as u64, true))
             }

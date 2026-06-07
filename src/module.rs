@@ -3194,6 +3194,7 @@ fn infer_ast_value_shape(
     value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> ValueShape {
     match ast {
+        Ast::Literal(LiteralAst::Bool(_)) => ValueShape::scalar(KindSet::int()),
         Ast::Literal(LiteralAst::Integer(_)) => ValueShape::scalar(KindSet::int()),
         Ast::Literal(LiteralAst::BigInt(_)) => ValueShape::scalar(KindSet::bigint()),
         Ast::Literal(LiteralAst::String(_)) => ValueShape::scalar(KindSet::string()),
@@ -6039,6 +6040,9 @@ fn compile_ast(
     value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> CompiledValue {
     match ast {
+        Ast::Literal(LiteralAst::Bool(value)) => {
+            boxed_int_const(builder, if *value { 1 } else { 0 })
+        }
         Ast::Literal(LiteralAst::Integer(n)) => boxed_int_const(builder, *n),
         Ast::Literal(LiteralAst::String(value)) => {
             compile_string_literal(builder, func_refs, value)

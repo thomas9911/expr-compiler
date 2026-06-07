@@ -1,13 +1,11 @@
 fn inner_fib(a, b, i, n, do_print):
     if i + 1 == n:
-        if do_print do
+        if do_print:
             print(a)
-        end
         b
     else:
-        if do_print do
+        if do_print:
             print(a)
-        end
         inner_fib(b, a + b, i + 1, n, do_print)
 
 fn fibonacci(n):

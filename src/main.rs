@@ -1,5 +1,6 @@
 use cranelift::{codegen::data_value::DataValue, interpreter::step::ControlFlow};
 use expr_compiler::analysis::{FunctionValueKindAnalysis, KindSet, ValueKind, ValueShape};
+use expr_compiler::format::{FormatConfig, format_source};
 use expr_compiler::module::{CodegenBackend, CompileError, Module, llvm_backend_available};
 use expr_compiler::parser::{Ast, BlockAst, FunctionDefAst, ParseLexer};
 use expr_compiler::runtime::{
@@ -16,7 +17,9 @@ const USAGE: &str = "usage:
   expr-compiler wasm core <source-file> [-o <output>]
   expr-compiler wasm component <source-file> [-o <output>]
   expr-compiler ir <source-file> [-o <output>] [--run]
-  expr-compiler types <source-file>";
+  expr-compiler types <source-file>
+  expr-compiler fmt <source-path>
+  expr-compiler format <source-path>";
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum WasmSubcommand {
@@ -31,6 +34,7 @@ enum CliCommand {
     Wasm { target: WasmSubcommand, input: PathBuf, output: Option<PathBuf> },
     Ir { input: PathBuf, output: Option<PathBuf>, run: bool },
     Types { input: PathBuf },
+    Format { input: PathBuf },
 }
 
 #[derive(Debug)]
@@ -129,7 +133,7 @@ fn validate_cli_runtime(
                 );
             }
         }
-        CliCommand::Ir { .. } | CliCommand::Types { .. } => {}
+        CliCommand::Ir { .. } | CliCommand::Types { .. } | CliCommand::Format { .. } => {}
     }
     Ok(())
 }
@@ -188,6 +192,11 @@ where
             let input = parse_input_arg(&mut args)?;
             reject_unknown_args(args)?;
             CliCommand::Types { input }
+        }
+        "fmt" | "format" => {
+            let input = parse_input_arg(&mut args)?;
+            reject_unknown_args(args)?;
+            CliCommand::Format { input }
         }
         _ => return Err(format!("unknown command: {command}\n{USAGE}")),
     };
@@ -421,6 +430,44 @@ fn format_debug_types(
         }
     }
     Ok(rendered)
+}
+
+fn format_file_in_place(input: &Path, source: &str) -> Result<(), String> {
+    let formatted = format_source(source, &FormatConfig::inferred_from_source(source))
+        .map_err(|err| format_compile_error(input, source, &err))?;
+    std::fs::write(input, formatted)
+        .map_err(|err| format!("error writing {}: {err}", input.display()))?;
+    Ok(())
+}
+
+fn handle_format(input: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(input)
+        .map_err(|err| format!("error reading {}: {err}", input.display()))?;
+    if metadata.is_file() {
+        let source = read_source_or_exit(input);
+        return format_file_in_place(input, &source);
+    }
+    if metadata.is_dir() {
+        let mut files = std::fs::read_dir(input)
+            .map_err(|err| format!("error reading {}: {err}", input.display()))?
+            .filter_map(|entry| entry.ok().map(|item| item.path()))
+            .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "expr"))
+            .collect::<Vec<_>>();
+        files.sort();
+        let mut had_errors = false;
+        for file in files {
+            let source = read_source_or_exit(&file);
+            if let Err(err) = format_file_in_place(&file, &source) {
+                eprintln!("{err}");
+                had_errors = true;
+            }
+        }
+        if had_errors {
+            return Err(format!("one or more files failed to format in {}", input.display()));
+        }
+        return Ok(());
+    }
+    Err(format!("unsupported path type: {}", input.display()))
 }
 
 fn format_compile_error(path: &Path, source: &str, err: &CompileError) -> String {
@@ -665,6 +712,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        CliCommand::Format { input } => {
+            let input = Path::new(input);
+            if let Err(err) = handle_format(input) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -717,6 +771,77 @@ mod tests {
             CliCommand::Types { input } => assert_eq!(input, PathBuf::from("examples/test.expr")),
             _ => panic!("expected types command"),
         }
+    }
+
+    #[test]
+    fn cli_fmt_and_format_parse() {
+        let cli = parse_ok(&["fmt", "examples/test.expr"]);
+        match cli.command {
+            CliCommand::Format { input } => {
+                assert_eq!(input, PathBuf::from("examples/test.expr"));
+            }
+            _ => panic!("expected format command"),
+        }
+
+        let cli = parse_ok(&["format", "examples/test.expr"]);
+        match cli.command {
+            CliCommand::Format { input } => {
+                assert_eq!(input, PathBuf::from("examples/test.expr"));
+            }
+            _ => panic!("expected format command"),
+        }
+    }
+
+    #[test]
+    fn handle_format_formats_all_expr_files_in_directory() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "expr-compiler-format-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let first = temp_root.join("a.expr");
+        let second = temp_root.join("b.expr");
+        let ignored = temp_root.join("note.txt");
+
+        std::fs::write(&first, "fn main():\n    x=1\n").unwrap();
+        std::fs::write(&second, "fn main() do\n    y=2\nend\n").unwrap();
+        std::fs::write(&ignored, "keep me                                           ").unwrap();
+
+        handle_format(&temp_root).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "fn main():\n    x = 1\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "fn main() do\n    y = 2\nend\n");
+        assert_eq!(
+            std::fs::read_to_string(&ignored).unwrap(),
+            "keep me                                           "
+        );
+
+        std::fs::remove_dir_all(&temp_root).unwrap();
+    }
+
+    #[test]
+    fn handle_format_continues_after_parse_error_in_directory() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "expr-compiler-format-dir-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let valid = temp_root.join("a.expr");
+        let invalid = temp_root.join("b.expr");
+
+        std::fs::write(&valid, "fn main():\n    x=1\n").unwrap();
+        std::fs::write(&invalid, "fn main() do\n    if\nend\n").unwrap();
+
+        let err =
+            handle_format(&temp_root).expect_err("directory formatting should report failure");
+        assert!(err.contains("one or more files failed to format"));
+        assert_eq!(std::fs::read_to_string(&valid).unwrap(), "fn main():\n    x = 1\n");
+
+        std::fs::remove_dir_all(&temp_root).unwrap();
     }
 
     #[test]
@@ -873,6 +998,29 @@ mod tests {
             .expect("debug types should render");
         assert!(rendered.contains("#? returns map<string, int | string>"));
         assert!(rendered.contains("#? m: map<string, int | string>"));
+    }
+
+    #[test]
+    fn format_source_preserves_python_style_blocks() {
+        let source =
+            "fn main():\n    value=1+2\n    if true:\n        value\n    else:\n        0\n";
+        let formatted = format_source(source, &FormatConfig::inferred_from_source(source))
+            .expect("source should format");
+        assert_eq!(
+            formatted,
+            "fn main():\n    value = 1 + 2\n    if true:\n        value\n    else:\n        0\n"
+        );
+    }
+
+    #[test]
+    fn format_source_preserves_map_and_lambda_syntax() {
+        let source = "fn main() do\n    ops={\"+\": fn lhs, rhs -> lhs+rhs end}\n    ops\nend\n";
+        let formatted =
+            format_source(source, &FormatConfig::default()).expect("source should format");
+        assert_eq!(
+            formatted,
+            "fn main() do\n    ops = {\n        \"+\": fn lhs, rhs -> lhs + rhs end,\n    }\n    ops\nend\n"
+        );
     }
 
     #[test]

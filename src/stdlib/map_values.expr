@@ -11,4 +11,3 @@ fn __map_values_loop(it, acc) do
         __map_values_loop(it, acc)
     end
 end
-

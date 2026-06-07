@@ -768,6 +768,7 @@ pub fn narrowed_function_analyses_for_condition(
 
 fn infer_literal(literal: &LiteralAst) -> ValueShape {
     match literal {
+        LiteralAst::Bool(_) => ValueShape::scalar(KindSet::int()),
         LiteralAst::Integer(_) => ValueShape::scalar(KindSet::int()),
         LiteralAst::BigInt(_) => ValueShape::scalar(KindSet::bigint()),
         LiteralAst::String(_) => ValueShape::scalar(KindSet::string()),
