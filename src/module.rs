@@ -1449,71 +1449,40 @@ fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileEr
     Ok(functions)
 }
 
-fn stdlib_function(name: &str) -> Option<StdlibFunction> {
+fn stdlib(source: &'static str, stdlib_deps: &'static [&'static str]) -> StdlibFunction {
+    StdlibFunction { source, stdlib_deps }
+}
+
+fn string_stdlib_function(name: &str) -> Option<StdlibFunction> {
     match name {
-        "string_is_empty" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_is_empty.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_is_not_empty" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_is_not_empty.expr"),
-            stdlib_deps: &["string_is_empty"],
-        }),
-        "string_len" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_len.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_first" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_first.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_last" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_last.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_starts_with" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_starts_with.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_ends_with" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_ends_with.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_contains" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_contains.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_is_ascii" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_is_ascii.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_all" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_all.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_any" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_any.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_is_integer" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_is_integer.expr"),
-            stdlib_deps: &["string_all"],
-        }),
-        "string_try_parse_integer" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_try_parse_integer.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_try_parse_bigint" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_try_parse_bigint.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_from_codepoints" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_from_codepoints.expr"),
-            stdlib_deps: &[],
-        }),
-        "type_of" => Some(StdlibFunction {
-            source: include_str!("./stdlib/type_of.expr"),
-            stdlib_deps: &[
+        "string_is_empty" => Some(stdlib(include_str!("./stdlib/string_is_empty.expr"), &[])),
+        "string_is_not_empty" => {
+            Some(stdlib(include_str!("./stdlib/string_is_not_empty.expr"), &["string_is_empty"]))
+        }
+        "string_len" => Some(stdlib(include_str!("./stdlib/string_len.expr"), &[])),
+        "string_first" => Some(stdlib(include_str!("./stdlib/string_first.expr"), &[])),
+        "string_last" => Some(stdlib(include_str!("./stdlib/string_last.expr"), &[])),
+        "string_starts_with" => Some(stdlib(include_str!("./stdlib/string_starts_with.expr"), &[])),
+        "string_ends_with" => Some(stdlib(include_str!("./stdlib/string_ends_with.expr"), &[])),
+        "string_contains" => Some(stdlib(include_str!("./stdlib/string_contains.expr"), &[])),
+        "string_is_ascii" => Some(stdlib(include_str!("./stdlib/string_is_ascii.expr"), &[])),
+        "string_all" => Some(stdlib(include_str!("./stdlib/string_all.expr"), &[])),
+        "string_any" => Some(stdlib(include_str!("./stdlib/string_any.expr"), &[])),
+        "string_is_integer" => {
+            Some(stdlib(include_str!("./stdlib/string_is_integer.expr"), &["string_all"]))
+        }
+        "string_try_parse_integer" => {
+            Some(stdlib(include_str!("./stdlib/string_try_parse_integer.expr"), &[]))
+        }
+        "string_try_parse_bigint" => {
+            Some(stdlib(include_str!("./stdlib/string_try_parse_bigint.expr"), &[]))
+        }
+        "string_from_codepoints" => {
+            Some(stdlib(include_str!("./stdlib/string_from_codepoints.expr"), &[]))
+        }
+        "type_of" => Some(stdlib(
+            include_str!("./stdlib/type_of.expr"),
+            &[
                 "is_int",
                 "is_bigint",
                 "is_string",
@@ -1523,69 +1492,50 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
                 "is_function",
                 "is_string_iter",
             ],
-        }),
-        "map_try_get" => Some(StdlibFunction {
-            source: include_str!("./stdlib/map_try_get.expr"),
-            stdlib_deps: &[],
-        }),
-        "map_try_delete" => Some(StdlibFunction {
-            source: include_str!("./stdlib/map_try_delete.expr"),
-            stdlib_deps: &["map_try_get"],
-        }),
-        "map_try_pop" => Some(StdlibFunction {
-            source: include_str!("./stdlib/map_try_pop.expr"),
-            stdlib_deps: &["map_keys"],
-        }),
-        "map_update" => Some(StdlibFunction {
-            source: include_str!("./stdlib/map_update.expr"),
-            stdlib_deps: &[],
-        }),
-        "map_update_or_default" => Some(StdlibFunction {
-            source: include_str!("./stdlib/map_update_or_default.expr"),
-            stdlib_deps: &[],
-        }),
-        "map_keys" => Some(StdlibFunction {
-            source: include_str!("./stdlib/map_keys.expr"),
-            stdlib_deps: &[],
-        }),
-        "map_values" => Some(StdlibFunction {
-            source: include_str!("./stdlib/map_values.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_try_first" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_try_first.expr"),
-            stdlib_deps: &["string_first"],
-        }),
-        "string_try_last" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_try_last.expr"),
-            stdlib_deps: &["string_last"],
-        }),
-        "bytes_try_get" => Some(StdlibFunction {
-            source: include_str!("./stdlib/bytes_try_get.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_try_pop" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_try_pop.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_repeat" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_repeat.expr"),
-            stdlib_deps: &[],
-        }),
-        "string_reverse" => Some(StdlibFunction {
-            source: include_str!("./stdlib/string_reverse.expr"),
-            stdlib_deps: &[],
-        }),
-        "list_all" => Some(StdlibFunction {
-            source: include_str!("./stdlib/list_all.expr"),
-            stdlib_deps: &[],
-        }),
-        "list_any" => Some(StdlibFunction {
-            source: include_str!("./stdlib/list_any.expr"),
-            stdlib_deps: &[],
-        }),
+        )),
+        "string_try_first" => {
+            Some(stdlib(include_str!("./stdlib/string_try_first.expr"), &["string_first"]))
+        }
+        "string_try_last" => {
+            Some(stdlib(include_str!("./stdlib/string_try_last.expr"), &["string_last"]))
+        }
+        "bytes_try_get" => Some(stdlib(include_str!("./stdlib/bytes_try_get.expr"), &[])),
+        "string_try_pop" => Some(stdlib(include_str!("./stdlib/string_try_pop.expr"), &[])),
+        "string_repeat" => Some(stdlib(include_str!("./stdlib/string_repeat.expr"), &[])),
+        "string_reverse" => Some(stdlib(include_str!("./stdlib/string_reverse.expr"), &[])),
         _ => None,
     }
+}
+
+fn map_stdlib_function(name: &str) -> Option<StdlibFunction> {
+    match name {
+        "map_try_get" => Some(stdlib(include_str!("./stdlib/map_try_get.expr"), &[])),
+        "map_try_delete" => {
+            Some(stdlib(include_str!("./stdlib/map_try_delete.expr"), &["map_try_get"]))
+        }
+        "map_try_pop" => Some(stdlib(include_str!("./stdlib/map_try_pop.expr"), &["map_keys"])),
+        "map_update" => Some(stdlib(include_str!("./stdlib/map_update.expr"), &[])),
+        "map_update_or_default" => {
+            Some(stdlib(include_str!("./stdlib/map_update_or_default.expr"), &[]))
+        }
+        "map_keys" => Some(stdlib(include_str!("./stdlib/map_keys.expr"), &[])),
+        "map_values" => Some(stdlib(include_str!("./stdlib/map_values.expr"), &[])),
+        _ => None,
+    }
+}
+
+fn list_stdlib_function(name: &str) -> Option<StdlibFunction> {
+    match name {
+        "list_all" => Some(stdlib(include_str!("./stdlib/list_all.expr"), &[])),
+        "list_any" => Some(stdlib(include_str!("./stdlib/list_any.expr"), &[])),
+        _ => None,
+    }
+}
+
+fn stdlib_function(name: &str) -> Option<StdlibFunction> {
+    string_stdlib_function(name)
+        .or_else(|| map_stdlib_function(name))
+        .or_else(|| list_stdlib_function(name))
 }
 
 fn autoload_stdlib_functions(mut functions: Vec<FunctionDefAst>) -> Vec<FunctionDefAst> {
@@ -3370,74 +3320,154 @@ fn shape_is_exact_kind(shape: &ValueShape, expected: KindSet) -> bool {
     shape.arity() == 1 && shape.scalar_slot() == expected
 }
 
-fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> ValueShape {
-    let scalar_arg = |index: usize| {
-        arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any)
-    };
+fn infer_builtin_boolean_shape(function: &str) -> Option<ValueShape> {
+    if matches!(
+        function,
+        "gt" | "lt"
+            | "gte"
+            | "lte"
+            | "eq"
+            | "ne"
+            | "and"
+            | "or"
+            | "not"
+            | "is_int"
+            | "is_bigint"
+            | "is_string"
+            | "is_list"
+            | "is_map"
+            | "is_map_iter"
+            | "is_function"
+            | "is_string_iter"
+            | "bytes_len"
+            | "bytes_get"
+            | "bytes_pop"
+            | "string_iter_done"
+            | "string_iter_next"
+            | "string_first"
+            | "string_last"
+            | "string_try_first"
+            | "string_try_last"
+            | "bytes_try_get"
+            | "string_try_pop"
+            | "string_len"
+            | "string_is_empty"
+            | "string_is_not_empty"
+            | "string_starts_with"
+            | "string_ends_with"
+            | "string_contains"
+            | "string_is_ascii"
+            | "string_all"
+            | "string_any"
+            | "string_is_integer"
+            | "bigint_compare"
+            | "list_len"
+            | "list_push"
+            | "list_insert"
+            | "list_set"
+            | "list_swap"
+            | "map_len"
+            | "map_has"
+            | "map_iter_done"
+            | "map_iter_advance"
+    ) {
+        Some(ValueShape::scalar(KindSet::int()))
+    } else {
+        None
+    }
+}
+
+fn infer_builtin_numeric_shape(
+    function: &str,
+    scalar_arg: &dyn Fn(usize) -> KindSet,
+) -> Option<ValueShape> {
     match function {
         "add" | "subtract" | "multiply" | "divide" | "modulo" => {
-            ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1)))
+            Some(ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1))))
         }
         "bitand" | "bitor" | "bitxor" => {
-            ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1)))
+            Some(ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1))))
         }
-        "shl" | "shr" => ValueShape::scalar(scalar_arg(0)),
-        "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
-            ValueShape::scalar(KindSet::int())
-        }
-        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_map" | "is_map_iter"
-        | "is_function" | "is_string_iter" => ValueShape::scalar(KindSet::int()),
-        "bytes_len"
-        | "bytes_get"
-        | "bytes_pop"
-        | "string_iter_done"
-        | "string_iter_next"
-        | "string_first"
-        | "string_last"
-        | "string_try_first"
-        | "string_try_last"
-        | "bytes_try_get"
-        | "string_try_pop"
-        | "string_len"
-        | "string_is_empty"
-        | "string_is_not_empty"
-        | "string_starts_with"
-        | "string_ends_with"
-        | "string_contains"
-        | "string_is_ascii"
-        | "string_all"
-        | "string_any"
-        | "string_is_integer" => ValueShape::scalar(KindSet::int()),
-        "bigint_compare" => ValueShape::scalar(KindSet::int()),
+        "shl" | "shr" => Some(ValueShape::scalar(scalar_arg(0))),
         "bigint_bitand" | "bigint_bitor" | "bigint_bitxor" => {
-            ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1)))
+            Some(ValueShape::scalar(infer_numeric_result_kind(scalar_arg(0), scalar_arg(1))))
         }
-        "bigint_shl" | "bigint_shr" => ValueShape::scalar(scalar_arg(0)),
+        "bigint_shl" | "bigint_shr" => Some(ValueShape::scalar(scalar_arg(0))),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
-        | "bigint_divide" | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
-        "string_concat" | "bytes_slice" | "string_copy" | "string_repeat" | "string_reverse" => {
-            ValueShape::scalar(KindSet::string())
+        | "bigint_divide" | "bigint_modulo" => Some(ValueShape::scalar(KindSet::bigint())),
+        _ => None,
+    }
+}
+
+fn infer_builtin_string_shape(function: &str) -> Option<ValueShape> {
+    match function {
+        "string_concat"
+        | "bytes_slice"
+        | "string_copy"
+        | "string_repeat"
+        | "string_reverse"
+        | "string_from_codepoints" => Some(ValueShape::scalar(KindSet::string())),
+        "string_chars" => Some(ValueShape::scalar(KindSet::string_iter())),
+        "string_try_parse_integer" => {
+            Some(ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()]))
         }
-        "string_chars" => ValueShape::scalar(KindSet::string_iter()),
-        "list_new" => ValueShape::list(KindSet::empty()),
-        "map_new" => ValueShape::map(KindSet::empty()),
-        "map_iter" => arg_shapes
-            .first()
-            .and_then(ValueShape::map_values)
-            .map(ValueShape::map_iter)
-            .unwrap_or_else(|| ValueShape::map_iter(KindSet::empty())),
-        "list_range" => ValueShape::list(KindSet::int()),
-        "list_copy" | "list_filter" => arg_shapes
-            .first()
-            .and_then(ValueShape::list_items)
-            .map(ValueShape::list)
-            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
-        "list_map" => ValueShape::list(KindSet::empty()),
-        "list_len" | "list_push" | "list_insert" | "list_set" | "list_swap" => {
-            ValueShape::scalar(KindSet::int())
+        "string_try_parse_bigint" => {
+            Some(ValueShape::from_slots(vec![KindSet::int(), KindSet::bigint(), KindSet::string()]))
         }
-        "map_len" | "map_has" => ValueShape::scalar(KindSet::int()),
-        "map_set" => ValueShape::map(
+        _ => None,
+    }
+}
+
+fn infer_builtin_list_shape(function: &str, arg_shapes: &[ValueShape]) -> Option<ValueShape> {
+    match function {
+        "list_new" => Some(ValueShape::list(KindSet::empty())),
+        "list_range" => Some(ValueShape::list(KindSet::int())),
+        "list_copy" | "list_filter" => Some(
+            arg_shapes
+                .first()
+                .and_then(ValueShape::list_items)
+                .map(ValueShape::list)
+                .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
+        ),
+        "list_map" => Some(ValueShape::list(KindSet::empty())),
+        "list_get" | "list_pop" | "list_delete" => Some(ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
+        )),
+        _ => None,
+    }
+}
+
+fn infer_builtin_map_iterator_shape(
+    function: &str,
+    arg_shapes: &[ValueShape],
+) -> Option<ValueShape> {
+    match function {
+        "map_iter" => Some(
+            arg_shapes
+                .first()
+                .and_then(ValueShape::map_values)
+                .map(ValueShape::map_iter)
+                .unwrap_or_else(|| ValueShape::map_iter(KindSet::empty())),
+        ),
+        "map_iter_next" => Some(ValueShape::from_slots(vec![
+            KindSet::string(),
+            arg_shapes.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        ])),
+        "map_iter_key" => Some(ValueShape::scalar(KindSet::string())),
+        "map_iter_value" => Some(ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        )),
+        _ => None,
+    }
+}
+
+fn infer_builtin_map_collection_shape(
+    function: &str,
+    arg_shapes: &[ValueShape],
+) -> Option<ValueShape> {
+    match function {
+        "map_new" => Some(ValueShape::map(KindSet::empty())),
+        "map_set" => Some(ValueShape::map(
             arg_shapes
                 .first()
                 .and_then(ValueShape::map_values)
@@ -3445,47 +3475,54 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
                 .union(
                     arg_shapes.get(2).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty),
                 ),
+        )),
+        "map_keys" => Some(ValueShape::list(KindSet::string())),
+        "map_values" => Some(
+            arg_shapes
+                .first()
+                .and_then(ValueShape::map_values)
+                .map(ValueShape::list)
+                .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
         ),
-        "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
-            arg_shapes.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
-        ),
-        "map_get" | "map_delete" => ValueShape::scalar(
-            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
-        ),
-        "map_try_get" | "map_try_delete" => ValueShape::from_slots(vec![
-            KindSet::int(),
-            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
-            KindSet::string(),
-        ]),
-        "map_try_pop" => ValueShape::from_slots(vec![
-            KindSet::int(),
-            KindSet::string(),
-            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
-        ]),
-        "map_iter_next" => ValueShape::from_slots(vec![
-            KindSet::string(),
-            arg_shapes.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
-        ]),
-        "map_iter_done" | "map_iter_advance" => ValueShape::scalar(KindSet::int()),
-        "map_iter_key" => ValueShape::scalar(KindSet::string()),
-        "map_iter_value" => ValueShape::scalar(
-            arg_shapes.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
-        ),
-        "map_keys" => ValueShape::list(KindSet::string()),
-        "map_values" => arg_shapes
-            .first()
-            .and_then(ValueShape::map_values)
-            .map(ValueShape::list)
-            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
-        "string_from_codepoints" => ValueShape::scalar(KindSet::string()),
-        "string_try_parse_integer" => {
-            ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
-        }
-        "string_try_parse_bigint" => {
-            ValueShape::from_slots(vec![KindSet::int(), KindSet::bigint(), KindSet::string()])
-        }
-        _ => ValueShape::scalar(KindSet::any()),
+        _ => None,
     }
+}
+
+fn infer_builtin_map_access_shape(function: &str, arg_shapes: &[ValueShape]) -> Option<ValueShape> {
+    match function {
+        "map_get" | "map_delete" => Some(ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        )),
+        "map_try_get" | "map_try_delete" => Some(ValueShape::from_slots(vec![
+            KindSet::int(),
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+            KindSet::string(),
+        ])),
+        "map_try_pop" => Some(ValueShape::from_slots(vec![
+            KindSet::int(),
+            KindSet::string(),
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ])),
+        _ => None,
+    }
+}
+
+fn infer_builtin_map_shape(function: &str, arg_shapes: &[ValueShape]) -> Option<ValueShape> {
+    infer_builtin_map_iterator_shape(function, arg_shapes)
+        .or_else(|| infer_builtin_map_collection_shape(function, arg_shapes))
+        .or_else(|| infer_builtin_map_access_shape(function, arg_shapes))
+}
+
+fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> ValueShape {
+    let scalar_arg = |index: usize| {
+        arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any)
+    };
+    infer_builtin_boolean_shape(function)
+        .or_else(|| infer_builtin_numeric_shape(function, &scalar_arg))
+        .or_else(|| infer_builtin_string_shape(function))
+        .or_else(|| infer_builtin_list_shape(function, arg_shapes))
+        .or_else(|| infer_builtin_map_shape(function, arg_shapes))
+        .unwrap_or_else(|| ValueShape::scalar(KindSet::any()))
 }
 
 fn infer_known_callback_return_shape(
@@ -3547,30 +3584,41 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
 }
 
 fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
+    fn validate_nested_free_slice(values: &[Ast]) -> Result<(), CompileError> {
+        for value in values {
+            validate_no_nested_function_defs(value)?;
+        }
+        Ok(())
+    }
+
+    fn validate_nested_free_map_entries(entries: &[MapEntryAst]) -> Result<(), CompileError> {
+        for entry in entries {
+            if let MapKeyAst::Dynamic(key) = &entry.key {
+                validate_no_nested_function_defs(key)?;
+            }
+            validate_no_nested_function_defs(&entry.value)?;
+        }
+        Ok(())
+    }
+
+    fn validate_nested_free_if(
+        condition: &Ast,
+        then: &BlockAst,
+        else_: Option<&BlockAst>,
+    ) -> Result<(), CompileError> {
+        validate_no_nested_function_defs(condition)?;
+        validate_nested_free_slice(&then.lines)?;
+        if let Some(else_block) = else_ {
+            validate_nested_free_slice(&else_block.lines)?;
+        }
+        Ok(())
+    }
+
     match ast {
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
         Ast::Lambda { body, .. } => validate_no_nested_function_defs(body),
-        Ast::MultiValue(values) => {
-            for value in values {
-                validate_no_nested_function_defs(value)?;
-            }
-            Ok(())
-        }
-        Ast::ListLiteral(items) => {
-            for item in items {
-                validate_no_nested_function_defs(item)?;
-            }
-            Ok(())
-        }
-        Ast::MapLiteral(entries) => {
-            for entry in entries {
-                if let MapKeyAst::Dynamic(key) = &entry.key {
-                    validate_no_nested_function_defs(key)?;
-                }
-                validate_no_nested_function_defs(&entry.value)?;
-            }
-            Ok(())
-        }
+        Ast::MultiValue(values) | Ast::ListLiteral(values) => validate_nested_free_slice(values),
+        Ast::MapLiteral(entries) => validate_nested_free_map_entries(entries),
         Ast::Index { collection, index, .. } => {
             validate_no_nested_function_defs(collection)?;
             validate_no_nested_function_defs(index)
@@ -3580,27 +3628,12 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
             validate_no_nested_function_defs(index)?;
             validate_no_nested_function_defs(value)
         }
-        Ast::Expression(ExpressionAst { args, .. }) => {
-            for arg in args {
-                validate_no_nested_function_defs(arg)?;
-            }
-            Ok(())
-        }
-        Ast::Block(block) => {
-            for line in &block.lines {
-                validate_no_nested_function_defs(line)?;
-            }
-            Ok(())
-        }
+        Ast::Expression(ExpressionAst { args, .. }) => validate_nested_free_slice(args),
+        Ast::Block(block) => validate_nested_free_slice(&block.lines),
         Ast::Assign { value, .. } => validate_no_nested_function_defs(value),
         Ast::MultiAssign { value, .. } => validate_no_nested_function_defs(value),
         Ast::If { condition, then, else_, .. } => {
-            validate_no_nested_function_defs(condition)?;
-            validate_no_nested_function_defs(&Ast::Block(then.clone()))?;
-            if let Some(else_) = else_ {
-                validate_no_nested_function_defs(&Ast::Block(else_.clone()))?;
-            }
-            Ok(())
+            validate_nested_free_if(condition, then, else_.as_ref())
         }
         Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => Ok(()),
     }
@@ -3712,6 +3745,77 @@ fn collect_captures(ast: &Ast, local_names: &[String], scope_names: &[String]) -
     captures
 }
 
+fn maybe_collect_variable_capture(
+    name: &Ident,
+    local_names: &[String],
+    scope_names: &[String],
+    captures: &mut Vec<String>,
+) {
+    if !local_names.contains(&name.name)
+        && scope_names.contains(&name.name)
+        && !captures.contains(&name.name)
+    {
+        captures.push(name.to_string());
+    }
+}
+
+fn collect_captures_from_slice(
+    values: &[Ast],
+    local_names: &[String],
+    scope_names: &[String],
+    captures: &mut Vec<String>,
+) {
+    for value in values {
+        collect_captures_into(value, local_names, scope_names, captures);
+    }
+}
+
+fn collect_captures_from_map_entries(
+    entries: &[MapEntryAst],
+    local_names: &[String],
+    scope_names: &[String],
+    captures: &mut Vec<String>,
+) {
+    for entry in entries {
+        if let MapKeyAst::Dynamic(key) = &entry.key {
+            collect_captures_into(key, local_names, scope_names, captures);
+        }
+        collect_captures_into(&entry.value, local_names, scope_names, captures);
+    }
+}
+
+fn collect_captures_from_if(
+    condition: &Ast,
+    then: &BlockAst,
+    else_: Option<&BlockAst>,
+    local_names: &[String],
+    scope_names: &[String],
+    captures: &mut Vec<String>,
+) {
+    collect_captures_into(condition, local_names, scope_names, captures);
+    collect_captures_from_slice(&then.lines, local_names, scope_names, captures);
+    if let Some(else_block) = else_ {
+        collect_captures_from_slice(&else_block.lines, local_names, scope_names, captures);
+    }
+}
+
+fn collect_captures_from_lambda(
+    inputs: &[String],
+    body: &Ast,
+    local_names: &[String],
+    scope_names: &[String],
+    captures: &mut Vec<String>,
+) {
+    let mut nested_local_names = local_names.to_vec();
+    for input in inputs {
+        if !nested_local_names.contains(input) {
+            nested_local_names.push(input.clone());
+        }
+    }
+    collect_var_names(body, &mut nested_local_names);
+    collect_captures_into(body, &nested_local_names, scope_names, captures);
+}
+
 fn collect_captures_into(
     ast: &Ast,
     local_names: &[String],
@@ -3720,35 +3824,16 @@ fn collect_captures_into(
 ) {
     match ast {
         Ast::Variable(name) => {
-            if !local_names.contains(&name.name)
-                && scope_names.contains(&name.name)
-                && !captures.contains(&name.name)
-            {
-                captures.push(name.to_string());
-            }
+            maybe_collect_variable_capture(name, local_names, scope_names, captures)
         }
         Ast::Expression(ExpressionAst { args, .. }) => {
-            for arg in args {
-                collect_captures_into(arg, local_names, scope_names, captures);
-            }
+            collect_captures_from_slice(args, local_names, scope_names, captures);
         }
-        Ast::MultiValue(values) => {
-            for value in values {
-                collect_captures_into(value, local_names, scope_names, captures);
-            }
-        }
-        Ast::ListLiteral(items) => {
-            for item in items {
-                collect_captures_into(item, local_names, scope_names, captures);
-            }
+        Ast::MultiValue(values) | Ast::ListLiteral(values) => {
+            collect_captures_from_slice(values, local_names, scope_names, captures);
         }
         Ast::MapLiteral(entries) => {
-            for entry in entries {
-                if let MapKeyAst::Dynamic(key) = &entry.key {
-                    collect_captures_into(key, local_names, scope_names, captures);
-                }
-                collect_captures_into(&entry.value, local_names, scope_names, captures);
-            }
+            collect_captures_from_map_entries(entries, local_names, scope_names, captures);
         }
         Ast::Index { collection, index, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
@@ -3760,30 +3845,20 @@ fn collect_captures_into(
             collect_captures_into(value, local_names, scope_names, captures);
         }
         Ast::If { condition, then, else_, .. } => {
-            collect_captures_into(condition, local_names, scope_names, captures);
-            for line in &then.lines {
-                collect_captures_into(line, local_names, scope_names, captures);
-            }
-            if let Some(else_block) = else_ {
-                for line in &else_block.lines {
-                    collect_captures_into(line, local_names, scope_names, captures);
-                }
-            }
+            collect_captures_from_if(
+                condition,
+                then,
+                else_.as_ref(),
+                local_names,
+                scope_names,
+                captures,
+            );
         }
         Ast::Lambda { inputs, body } => {
-            let mut nested_local_names = local_names.to_vec();
-            for input in inputs {
-                if !nested_local_names.contains(input) {
-                    nested_local_names.push(input.clone());
-                }
-            }
-            collect_var_names(body, &mut nested_local_names);
-            collect_captures_into(body, &nested_local_names, scope_names, captures);
+            collect_captures_from_lambda(inputs, body, local_names, scope_names, captures);
         }
         Ast::Block(block) => {
-            for line in &block.lines {
-                collect_captures_into(line, local_names, scope_names, captures);
-            }
+            collect_captures_from_slice(&block.lines, local_names, scope_names, captures);
         }
         Ast::Literal(_) | Ast::FunctionRef(_) => {}
         Ast::Assign { value, .. } => {
@@ -8656,6 +8731,70 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
             &module_analysis
         ),
         ValueShape::scalar(KindSet::empty())
+    );
+}
+
+#[test]
+fn infer_builtin_map_shape_covers_iterator_collection_and_access_cases() {
+    let map_string = ValueShape::map(KindSet::string());
+    let map_mixed = ValueShape::map(KindSet::int().union(KindSet::string()));
+    let map_iter_string = ValueShape::map_iter(KindSet::string());
+
+    assert_eq!(infer_builtin_map_shape("map_new", &[]), Some(ValueShape::map(KindSet::empty())));
+    assert_eq!(
+        infer_builtin_map_shape("map_iter", std::slice::from_ref(&map_string)),
+        Some(ValueShape::map_iter(KindSet::string()))
+    );
+    assert_eq!(
+        infer_builtin_map_shape(
+            "map_set",
+            &[
+                map_string.clone(),
+                ValueShape::scalar(KindSet::string()),
+                ValueShape::scalar(KindSet::int())
+            ],
+        ),
+        Some(ValueShape::map(KindSet::int().union(KindSet::string())))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_get", std::slice::from_ref(&map_mixed)),
+        Some(ValueShape::scalar(KindSet::int().union(KindSet::string())))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_try_get", std::slice::from_ref(&map_mixed)),
+        Some(ValueShape::from_slots(vec![
+            KindSet::int(),
+            KindSet::int().union(KindSet::string()),
+            KindSet::string(),
+        ]))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_try_pop", std::slice::from_ref(&map_mixed)),
+        Some(ValueShape::from_slots(vec![
+            KindSet::int(),
+            KindSet::string(),
+            KindSet::int().union(KindSet::string()),
+        ]))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_iter_next", std::slice::from_ref(&map_iter_string)),
+        Some(ValueShape::from_slots(vec![KindSet::string(), KindSet::string()]))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_iter_key", std::slice::from_ref(&map_iter_string)),
+        Some(ValueShape::scalar(KindSet::string()))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_iter_value", std::slice::from_ref(&map_iter_string)),
+        Some(ValueShape::scalar(KindSet::string()))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_keys", std::slice::from_ref(&map_mixed)),
+        Some(ValueShape::list(KindSet::string()))
+    );
+    assert_eq!(
+        infer_builtin_map_shape("map_values", std::slice::from_ref(&map_mixed)),
+        Some(ValueShape::list(KindSet::int().union(KindSet::string())))
     );
 }
 

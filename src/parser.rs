@@ -718,19 +718,99 @@ fn parse_lambda<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
     Ok(Ast::Lambda { inputs, body: Box::new(body) })
 }
 
+fn parse_not_expression<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    lex.next();
+    let rhs = parse_expr(lex, 2)?;
+    Ok(Ast::Expression(ExpressionAst {
+        function_span: lex.last_span(),
+        function: "not".to_string(),
+        args: vec![rhs],
+    }))
+}
+
+fn parse_symbol_variable<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
+    Ok(Ast::Variable(Ident::spanned(
+        name,
+        lex.last_span().expect("consumed symbol should have a span"),
+    )))
+}
+
+fn parse_grouped_expression<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    lex.next();
+    let expr = parse_expr(lex, 0)?;
+    if lex.next() != Some(Ok(Token::CloseBracket)) {
+        return Err(ParseError::unexpected(lex));
+    }
+    Ok(expr)
+}
+
+fn parse_list_literal_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    lex.next();
+    let mut items = vec![];
+    loop {
+        match lex.peek() {
+            Some(Ok(Token::CloseSquareBracket)) => {
+                lex.next();
+                break;
+            }
+            Some(Ok(Token::Comma)) => {
+                lex.next();
+            }
+            _ => items.push(parse_expr(lex, 0)?),
+        }
+    }
+    Ok(Ast::ListLiteral(items))
+}
+
+fn parse_map_literal_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
+    lex.next();
+    let mut entries = vec![];
+    loop {
+        let next = lex.peek().cloned();
+        let next_next = lex.peek_n(1).cloned();
+        match next {
+            Some(Ok(Token::CloseBrace)) => {
+                lex.next();
+                break;
+            }
+            Some(Ok(Token::Comma)) | Some(Ok(Token::Newline)) | Some(Ok(Token::Indent)) => {
+                lex.next();
+            }
+            Some(Ok(Token::Symbol(_))) if next_next == Some(Ok(Token::ColonBlock)) => {
+                let Token::Symbol(key) = lex.next().unwrap().unwrap() else { unreachable!() };
+                lex.next();
+                let value = parse_expr(lex, 0)?;
+                entries.push(MapEntryAst { key: MapKeyAst::Static(key), value });
+            }
+            Some(Ok(Token::StringLiteral(_))) if next_next == Some(Ok(Token::ColonBlock)) => {
+                let Token::StringLiteral(key) = lex.next().unwrap().unwrap() else {
+                    unreachable!()
+                };
+                lex.next();
+                let value = parse_expr(lex, 0)?;
+                entries.push(MapEntryAst { key: MapKeyAst::Static(key), value });
+            }
+            _ => {
+                let key = parse_expr(lex, 0)?;
+                if lex.next() != Some(Ok(Token::FatArrow)) {
+                    return Err(ParseError::unexpected(lex));
+                }
+                let value = parse_expr(lex, 0)?;
+                entries.push(MapEntryAst { key: MapKeyAst::Dynamic(Box::new(key)), value });
+            }
+        }
+    }
+    Ok(Ast::MapLiteral(entries))
+}
+
 fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
     if is_lambda_start(lex) {
         return parse_lambda(lex);
     }
 
     if lex.peek() == Some(&Ok(Token::Not)) {
-        lex.next();
-        let rhs = parse_expr(lex, 2)?;
-        return Ok(Ast::Expression(ExpressionAst {
-            function_span: lex.last_span(),
-            function: "not".to_string(),
-            args: vec![rhs],
-        }));
+        return parse_not_expression(lex);
     }
 
     let lhs = match lex.peek() {
@@ -745,82 +825,10 @@ fn parse_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
         Some(Ok(Token::Integer(_) | Token::BigIntLiteral(_) | Token::StringLiteral(_))) => {
             Ast::Literal(LiteralAst::from_lexer(lex)?)
         }
-        Some(Ok(Token::Symbol(_))) => {
-            let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
-            Ast::Variable(Ident::spanned(
-                name,
-                lex.last_span().expect("consumed symbol should have a span"),
-            ))
-        }
-        Some(Ok(Token::OpenBracket)) => {
-            lex.next();
-            let expr = parse_expr(lex, 0)?;
-            if lex.next() != Some(Ok(Token::CloseBracket)) {
-                return Err(ParseError::unexpected(lex));
-            }
-            expr
-        }
-        Some(Ok(Token::OpenSquareBracket)) => {
-            lex.next();
-            let mut items = vec![];
-            loop {
-                match lex.peek() {
-                    Some(Ok(Token::CloseSquareBracket)) => {
-                        lex.next();
-                        break;
-                    }
-                    Some(Ok(Token::Comma)) => {
-                        lex.next();
-                    }
-                    _ => items.push(parse_expr(lex, 0)?),
-                }
-            }
-            Ast::ListLiteral(items)
-        }
-        Some(Ok(Token::OpenBrace)) => {
-            lex.next();
-            let mut entries = vec![];
-            loop {
-                let next = lex.peek().cloned();
-                let next_next = lex.peek_n(1).cloned();
-                match next {
-                    Some(Ok(Token::CloseBrace)) => {
-                        lex.next();
-                        break;
-                    }
-                    Some(Ok(Token::Comma)) | Some(Ok(Token::Newline)) | Some(Ok(Token::Indent)) => {
-                        lex.next();
-                    }
-                    Some(Ok(Token::Symbol(_))) if next_next == Some(Ok(Token::ColonBlock)) => {
-                        let Token::Symbol(key) = lex.next().unwrap().unwrap() else {
-                            unreachable!()
-                        };
-                        lex.next();
-                        let value = parse_expr(lex, 0)?;
-                        entries.push(MapEntryAst { key: MapKeyAst::Static(key), value });
-                    }
-                    Some(Ok(Token::StringLiteral(_)))
-                        if next_next == Some(Ok(Token::ColonBlock)) =>
-                    {
-                        let Token::StringLiteral(key) = lex.next().unwrap().unwrap() else {
-                            unreachable!()
-                        };
-                        lex.next();
-                        let value = parse_expr(lex, 0)?;
-                        entries.push(MapEntryAst { key: MapKeyAst::Static(key), value });
-                    }
-                    _ => {
-                        let key = parse_expr(lex, 0)?;
-                        if lex.next() != Some(Ok(Token::FatArrow)) {
-                            return Err(ParseError::unexpected(lex));
-                        }
-                        let value = parse_expr(lex, 0)?;
-                        entries.push(MapEntryAst { key: MapKeyAst::Dynamic(Box::new(key)), value });
-                    }
-                }
-            }
-            Ast::MapLiteral(entries)
-        }
+        Some(Ok(Token::Symbol(_))) => parse_symbol_variable(lex)?,
+        Some(Ok(Token::OpenBracket)) => parse_grouped_expression(lex)?,
+        Some(Ok(Token::OpenSquareBracket)) => parse_list_literal_primary(lex)?,
+        Some(Ok(Token::OpenBrace)) => parse_map_literal_primary(lex)?,
         _ => return Err(ParseError::unexpected(lex)),
     };
 

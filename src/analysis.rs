@@ -679,45 +679,46 @@ fn condition_predicate_binding(condition: &Ast) -> Option<(&str, ValueKind, bool
     }
 }
 
-fn narrowed_shape(shape: &ValueShape, kind: ValueKind, positive: bool) -> ValueShape {
-    let exact = match kind {
+fn exact_shape_for_kind(shape: &ValueShape, kind: ValueKind) -> ValueShape {
+    match kind {
         ValueKind::Int => ValueShape::scalar(KindSet::int()),
         ValueKind::BigInt => ValueShape::scalar(KindSet::bigint()),
         ValueKind::String => ValueShape::scalar(KindSet::string()),
-        ValueKind::List => match shape {
-            ValueShape::List { items } => ValueShape::list(*items),
-            _ => ValueShape::scalar(KindSet::list()),
-        },
-        ValueKind::Map => match shape {
-            ValueShape::Map { values } => ValueShape::map(*values),
-            _ => ValueShape::scalar(KindSet::map()),
-        },
-        ValueKind::MapIter => match shape {
-            ValueShape::MapIter { values } => ValueShape::map_iter(*values),
-            _ => ValueShape::scalar(KindSet::map_iter()),
-        },
+        ValueKind::List => shape
+            .list_items()
+            .map(ValueShape::list)
+            .unwrap_or_else(|| ValueShape::scalar(KindSet::list())),
+        ValueKind::Map => shape
+            .map_values()
+            .map(ValueShape::map)
+            .unwrap_or_else(|| ValueShape::scalar(KindSet::map())),
+        ValueKind::MapIter => shape
+            .map_iter_values()
+            .map(ValueShape::map_iter)
+            .unwrap_or_else(|| ValueShape::scalar(KindSet::map_iter())),
         ValueKind::Function => ValueShape::scalar(KindSet::function()),
         ValueKind::StringIter => ValueShape::scalar(KindSet::string_iter()),
-    };
+    }
+}
+
+fn negative_narrowed_shape(shape: &ValueShape, kind: ValueKind) -> ValueShape {
+    match (shape, kind) {
+        (ValueShape::List { .. }, ValueKind::List)
+        | (ValueShape::Map { .. }, ValueKind::Map)
+        | (ValueShape::MapIter { .. }, ValueKind::MapIter) => ValueShape::scalar(KindSet::empty()),
+        _ => ValueShape::scalar(shape.scalar_slot().without(kind)),
+    }
+}
+
+fn narrowed_shape(shape: &ValueShape, kind: ValueKind, positive: bool) -> ValueShape {
     if positive {
         if shape.scalar_slot().contains(kind) {
-            exact
+            exact_shape_for_kind(shape, kind)
         } else {
             ValueShape::scalar(KindSet::empty())
         }
     } else {
-        match shape {
-            ValueShape::List { .. } if kind == ValueKind::List => {
-                ValueShape::scalar(KindSet::empty())
-            }
-            ValueShape::Map { .. } if kind == ValueKind::Map => {
-                ValueShape::scalar(KindSet::empty())
-            }
-            ValueShape::MapIter { .. } if kind == ValueKind::MapIter => {
-                ValueShape::scalar(KindSet::empty())
-            }
-            _ => ValueShape::scalar(shape.scalar_slot().without(kind)),
-        }
+        negative_narrowed_shape(shape, kind)
     }
 }
 
@@ -773,111 +774,168 @@ fn infer_literal(literal: &LiteralAst) -> ValueShape {
     }
 }
 
-fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
+fn builtin_boolean_shape(name: &str) -> Option<ValueShape> {
+    if matches!(
+        name,
+        "gt" | "lt"
+            | "gte"
+            | "lte"
+            | "eq"
+            | "ne"
+            | "and"
+            | "or"
+            | "not"
+            | "is_int"
+            | "is_bigint"
+            | "is_string"
+            | "is_list"
+            | "is_map"
+            | "is_function"
+            | "is_string_iter"
+            | "is_map_iter"
+            | "print"
+            | "list_print"
+            | "bigint_compare"
+            | "bytes_len"
+            | "bytes_get"
+            | "bytes_pop"
+            | "string_iter_done"
+            | "string_iter_next"
+            | "string_first"
+            | "string_last"
+            | "string_len"
+            | "string_is_empty"
+            | "string_is_not_empty"
+            | "string_starts_with"
+            | "string_ends_with"
+            | "string_contains"
+            | "string_is_ascii"
+            | "string_all"
+            | "string_any"
+            | "string_is_integer"
+            | "list_len"
+            | "list_push"
+            | "list_insert"
+            | "list_set"
+            | "list_swap"
+            | "map_len"
+            | "map_has"
+            | "map_iter_done"
+            | "map_iter_advance"
+    ) {
+        Some(ValueShape::scalar(KindSet::int()))
+    } else {
+        None
+    }
+}
+
+fn builtin_numeric_shape(name: &str, args: &[ValueShape]) -> Option<ValueShape> {
+    let lhs = args.first().map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any);
+    let rhs = args.get(1).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any);
     match name {
         "add" | "subtract" | "multiply" | "divide" | "modulo" => {
-            let lhs = args.first().map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any);
-            let rhs = args.get(1).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any);
-            ValueShape::scalar(numeric_result_kinds(lhs, rhs))
+            Some(ValueShape::scalar(numeric_result_kinds(lhs, rhs)))
         }
-        "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
-            ValueShape::scalar(KindSet::int())
-        }
-        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_map" | "is_function"
-        | "is_string_iter" | "is_map_iter" => ValueShape::scalar(KindSet::int()),
-        "print" | "list_print" => ValueShape::scalar(KindSet::int()),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
-        | "bigint_divide" | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
-        "bigint_compare" => ValueShape::scalar(KindSet::int()),
-        "string_concat" | "bytes_slice" | "string_copy" | "string_repeat" | "string_reverse" => {
-            ValueShape::scalar(KindSet::string())
+        | "bigint_divide" | "bigint_modulo" => Some(ValueShape::scalar(KindSet::bigint())),
+        _ => None,
+    }
+}
+
+fn builtin_string_shape(name: &str) -> Option<ValueShape> {
+    match name {
+        "string_concat"
+        | "bytes_slice"
+        | "string_copy"
+        | "string_repeat"
+        | "string_reverse"
+        | "string_from_codepoints" => Some(ValueShape::scalar(KindSet::string())),
+        "string_chars" => Some(ValueShape::scalar(KindSet::string_iter())),
+        "string_try_parse_integer" => {
+            Some(ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()]))
         }
-        "bytes_len"
-        | "bytes_get"
-        | "bytes_pop"
-        | "string_iter_done"
-        | "string_iter_next"
-        | "string_first"
-        | "string_last"
-        | "string_len"
-        | "string_is_empty"
-        | "string_is_not_empty"
-        | "string_starts_with"
-        | "string_ends_with"
-        | "string_contains"
-        | "string_is_ascii"
-        | "string_all"
-        | "string_any"
-        | "string_is_integer" => ValueShape::scalar(KindSet::int()),
-        "string_chars" => ValueShape::scalar(KindSet::string_iter()),
-        "list_new" => ValueShape::list(KindSet::empty()),
-        "map_new" => ValueShape::map(KindSet::empty()),
-        "map_iter" => args
-            .first()
-            .and_then(ValueShape::map_values)
-            .map(ValueShape::map_iter)
-            .unwrap_or_else(|| ValueShape::map_iter(KindSet::empty())),
-        "list_range" => ValueShape::list(KindSet::int()),
-        "list_copy" | "list_filter" => args
-            .first()
-            .and_then(ValueShape::list_items)
-            .map(ValueShape::list)
-            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
-        "list_map" => ValueShape::list(KindSet::empty()),
-        "list_len" => ValueShape::scalar(KindSet::int()),
-        "map_len" | "map_has" => ValueShape::scalar(KindSet::int()),
-        "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
+        "string_try_parse_bigint" => {
+            Some(ValueShape::from_slots(vec![KindSet::int(), KindSet::bigint(), KindSet::string()]))
+        }
+        "string_try_first" | "string_try_last" | "bytes_try_get" | "string_try_pop" => {
+            Some(ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()]))
+        }
+        _ => None,
+    }
+}
+
+fn builtin_list_shape(name: &str, args: &[ValueShape]) -> Option<ValueShape> {
+    match name {
+        "list_new" => Some(ValueShape::list(KindSet::empty())),
+        "list_range" => Some(ValueShape::list(KindSet::int())),
+        "list_copy" | "list_filter" => Some(
+            args.first()
+                .and_then(ValueShape::list_items)
+                .map(ValueShape::list)
+                .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
+        ),
+        "list_map" => Some(ValueShape::list(KindSet::empty())),
+        "list_get" | "list_pop" | "list_delete" => Some(ValueShape::scalar(
             args.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
+        )),
+        _ => None,
+    }
+}
+
+fn builtin_map_shape(name: &str, args: &[ValueShape]) -> Option<ValueShape> {
+    match name {
+        "map_new" => Some(ValueShape::map(KindSet::empty())),
+        "map_iter" => Some(
+            args.first()
+                .and_then(ValueShape::map_values)
+                .map(ValueShape::map_iter)
+                .unwrap_or_else(|| ValueShape::map_iter(KindSet::empty())),
         ),
-        "map_get" | "map_delete" => ValueShape::scalar(
+        "map_get" | "map_delete" => Some(ValueShape::scalar(
             args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
-        ),
-        "map_try_get" | "map_try_delete" => ValueShape::from_slots(vec![
+        )),
+        "map_try_get" | "map_try_delete" => Some(ValueShape::from_slots(vec![
             KindSet::int(),
             args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
             KindSet::string(),
-        ]),
-        "map_try_pop" => ValueShape::from_slots(vec![
+        ])),
+        "map_try_pop" => Some(ValueShape::from_slots(vec![
             KindSet::int(),
             KindSet::string(),
             args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
-        ]),
-        "map_iter_next" => ValueShape::from_slots(vec![
+        ])),
+        "map_iter_next" => Some(ValueShape::from_slots(vec![
             KindSet::string(),
             args.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
-        ]),
-        "map_iter_done" | "map_iter_advance" => ValueShape::scalar(KindSet::int()),
-        "map_iter_key" => ValueShape::scalar(KindSet::string()),
-        "map_iter_value" => ValueShape::scalar(
+        ])),
+        "map_iter_key" => Some(ValueShape::scalar(KindSet::string())),
+        "map_iter_value" => Some(ValueShape::scalar(
             args.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        )),
+        "map_keys" => Some(ValueShape::list(KindSet::string())),
+        "map_values" => Some(
+            args.first()
+                .and_then(ValueShape::map_values)
+                .map(ValueShape::list)
+                .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
         ),
-        "map_keys" => ValueShape::list(KindSet::string()),
-        "map_values" => args
-            .first()
-            .and_then(ValueShape::map_values)
-            .map(ValueShape::list)
-            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
-        "string_from_codepoints" => ValueShape::scalar(KindSet::string()),
-        "list_push" | "list_insert" | "list_set" | "list_swap" => {
-            ValueShape::scalar(KindSet::int())
-        }
-        "map_set" => ValueShape::map(
+        "map_set" => Some(ValueShape::map(
             args.first()
                 .and_then(ValueShape::map_values)
                 .unwrap_or_else(KindSet::empty)
                 .union(args.get(2).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty)),
-        ),
-        "string_try_parse_integer" => {
-            ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
-        }
-        "string_try_parse_bigint" => {
-            ValueShape::from_slots(vec![KindSet::int(), KindSet::bigint(), KindSet::string()])
-        }
-        "string_try_first" | "string_try_last" | "bytes_try_get" | "string_try_pop" => {
-            ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
-        }
-        _ => ValueShape::unknown_scalar(),
+        )),
+        _ => None,
     }
+}
+
+fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
+    builtin_boolean_shape(name)
+        .or_else(|| builtin_numeric_shape(name, args))
+        .or_else(|| builtin_string_shape(name))
+        .or_else(|| builtin_list_shape(name, args))
+        .or_else(|| builtin_map_shape(name, args))
+        .unwrap_or_else(ValueShape::unknown_scalar)
 }
 
 fn numeric_result_kinds(lhs: KindSet, rhs: KindSet) -> KindSet {
@@ -967,8 +1025,40 @@ fn merge_input_kinds(
 
 #[cfg(test)]
 mod tests {
-    use super::{KindSet, ValueKind, ValueShape};
+    use super::{KindSet, ValueKind, ValueShape, narrowed_shape};
     use crate::module::Module;
+
+    #[test]
+    fn narrowed_shape_preserves_container_metadata_on_positive_narrowing() {
+        assert_eq!(
+            narrowed_shape(&ValueShape::list(KindSet::string()), ValueKind::List, true),
+            ValueShape::list(KindSet::string())
+        );
+        assert_eq!(
+            narrowed_shape(&ValueShape::map(KindSet::int()), ValueKind::Map, true),
+            ValueShape::map(KindSet::int())
+        );
+        assert_eq!(
+            narrowed_shape(&ValueShape::map_iter(KindSet::bigint()), ValueKind::MapIter, true),
+            ValueShape::map_iter(KindSet::bigint())
+        );
+    }
+
+    #[test]
+    fn narrowed_shape_removes_exact_container_kinds_on_negative_narrowing() {
+        assert_eq!(
+            narrowed_shape(&ValueShape::list(KindSet::string()), ValueKind::List, false),
+            ValueShape::scalar(KindSet::empty())
+        );
+        assert_eq!(
+            narrowed_shape(&ValueShape::map(KindSet::int()), ValueKind::Map, false),
+            ValueShape::scalar(KindSet::empty())
+        );
+        assert_eq!(
+            narrowed_shape(&ValueShape::map_iter(KindSet::bigint()), ValueKind::MapIter, false),
+            ValueShape::scalar(KindSet::empty())
+        );
+    }
 
     #[test]
     fn analyze_value_kinds_tracks_try_parse_integer_slots() {
