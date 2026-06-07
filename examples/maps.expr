@@ -1,4 +1,4 @@
-fn main() do
+fn function() do
     m = map_new()
 
     map_set(m, "name", "expr-compiler")
@@ -58,4 +58,72 @@ fn main() do
     print(list_len(remaining))
     # probably gives different results each run
     print(remaining[0])
+end
+
+fn methods() do
+    m = {}
+
+    m.set("name", "expr-compiler")
+    m.set("year", 2026)
+    m.set("year", 2027)
+
+    print(type_of(m))
+    print(m.len())
+    print(m.has("name"))
+    print(m.has("missing"))
+    print(m.get("name"))
+    print(m.get("year"))
+
+    ok1, value1, err1 = m.try_get("year")
+    print(ok1)
+    print(value1)
+    print(err1 == "")
+
+    ok2, value2, err2 = m.try_get("missing")
+    print(ok2)
+    print(value2)
+    print(err2 == "missing key")
+
+    keys = m.keys()
+    print(keys.len())
+    print(keys[0])
+    print(keys[1])
+
+    ok_pop1, key_pop1, value_pop1 = map_try_pop(m)
+    print(ok_pop1)
+    print(key_pop1 == "name" or key_pop1 == "year")
+    print((key_pop1 == "name" and value_pop1 == "expr-compiler") or (key_pop1 == "year" and value_pop1 == 2027))
+    print(map_len(m))
+
+    ok_pop2, key_pop2, value_pop2 = m.try_pop()
+    print(ok_pop2)
+    print(key_pop2 == "name" or key_pop2 == "year")
+    print((key_pop2 == "name" and value_pop2 == "expr-compiler") or (key_pop2 == "year" and value_pop2 == 2027))
+    print(m.len())
+
+    ok_pop3, key_pop3, value_pop3 = m.try_pop()
+    print(ok_pop3)
+    print(key_pop3 == "")
+    print(value_pop3)
+
+    m.set("name", "expr-compiler")
+    m.set("year", 2027)
+    print(m.delete("name"))
+    print(m.len())
+
+    ok3, value3, err3 = m.try_delete("missing")
+    print(ok3)
+    print(value3)
+    print(err3 == "missing key")
+
+    remaining = m.keys()
+    print(remaining.len())
+    # probably gives different results each run
+    print(remaining[0])
+end
+
+fn main() do
+    function()
+    print("====")
+    methods()
 end

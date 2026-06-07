@@ -2,6 +2,7 @@ use crate::analysis::{
     FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, ValueKind, ValueShape,
     narrowed_function_analyses_for_condition,
 };
+use crate::methods::{MethodResolutionError, method_target_functions, resolve_method};
 use crate::parser::{
     Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
 };
@@ -86,6 +87,12 @@ pub enum CompileError {
         found: String,
         span: Option<Span>,
     },
+    #[error("cannot resolve method call .{method}() because receiver kind is unknown")]
+    UnknownMethodReceiver { method: String, span: Option<Span> },
+    #[error("cannot resolve method call .{method}(); possible receiver kinds: {receiver_kinds}")]
+    AmbiguousMethodReceiver { method: String, receiver_kinds: String, span: Option<Span> },
+    #[error("{receiver_kind} has no method {method}")]
+    UnknownMethod { receiver_kind: String, method: String, span: Option<Span> },
     #[error("function `{function}` returns {expected} values in one path and {found} in another")]
     ReturnArityMismatch { function: String, expected: usize, found: usize, span: Option<Span> },
     #[error("destructuring assignment expects {expected} values, found {found}")]
@@ -109,6 +116,9 @@ impl CompileError {
             | Self::UndefinedFunction { span, .. }
             | Self::UndefinedVariable { span, .. }
             | Self::InvalidArgumentType { span, .. }
+            | Self::UnknownMethodReceiver { span, .. }
+            | Self::AmbiguousMethodReceiver { span, .. }
+            | Self::UnknownMethod { span, .. }
             | Self::ReturnArityMismatch { span, .. }
             | Self::DestructuringArityMismatch { span, .. }
             | Self::UnsupportedMultiValueContext { span }
@@ -1415,6 +1425,17 @@ fn infer_ast_return_arity(
                 Ok(*function_return_arities.get(function).unwrap_or(&1))
             }
         }
+        Ast::MethodCall { method, .. } => {
+            let arities = method_target_functions(method.as_str())
+                .into_iter()
+                .map(|function| expression_return_arity(&function, function_return_arities))
+                .collect::<HashSet<_>>();
+            match arities.len() {
+                0 => Ok(1),
+                1 => Ok(*arities.iter().next().expect("single method arity should exist")),
+                _ => Ok(1),
+            }
+        }
         _ => Ok(1),
     }
 }
@@ -1626,6 +1647,17 @@ fn collect_stdlib_references_from_ast(
                 collect_stdlib_references_from_ast(arg, scope, refs);
             }
         }
+        Ast::MethodCall { receiver, method, args, .. } => {
+            collect_stdlib_references_from_ast(receiver, scope, refs);
+            for function in method_target_functions(method.as_str()) {
+                if stdlib_function(&function).is_some() && !scope.contains(&function) {
+                    refs.insert(function);
+                }
+            }
+            for arg in args {
+                collect_stdlib_references_from_ast(arg, scope, refs);
+            }
+        }
         Ast::MultiValue(values) => {
             for value in values {
                 collect_stdlib_references_from_ast(value, scope, refs);
@@ -1757,6 +1789,22 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             ) {
                 features.lists = true;
                 features.list_mutation = true;
+            }
+            for arg in args {
+                collect_used_features_from_ast(arg, features);
+            }
+        }
+        Ast::MethodCall { receiver, method, args, .. } => {
+            collect_used_features_from_ast(receiver, features);
+            for function in method_target_functions(method.as_str()) {
+                collect_used_features_from_ast(
+                    &Ast::Expression(ExpressionAst {
+                        function_span: None,
+                        function: function.to_string(),
+                        args: vec![],
+                    }),
+                    features,
+                );
             }
             for arg in args {
                 collect_used_features_from_ast(arg, features);
@@ -2208,6 +2256,43 @@ fn validate_ast_user_facing(
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
         Ast::FunctionRef(name) => validate_function_reference(name, function_names),
+        Ast::MethodCall { receiver, method, args, .. } => {
+            validate_ast_user_facing(
+                receiver,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )?;
+            validate_ast_sequence(
+                args,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )?;
+            let function = resolve_method_call_or_error(
+                receiver,
+                method,
+                function_analysis,
+                value_kind_analysis,
+            )?;
+            let mut resolved_args = Vec::with_capacity(args.len() + 1);
+            resolved_args.push((**receiver).clone());
+            resolved_args.extend(args.iter().cloned());
+            validate_expression_user_facing(
+                &function,
+                &resolved_args,
+                method.span.clone(),
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )
+        }
         Ast::MultiValue(values) => validate_ast_sequence(
             values,
             locals,
@@ -2306,14 +2391,33 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
-        Ast::MultiAssign { value, .. } => validate_ast_user_facing(
-            value,
-            locals,
-            function_names,
-            function_arities,
-            value_kind_analysis,
-            function_analysis,
-        ),
+        Ast::MultiAssign { names, value, span } => {
+            validate_ast_user_facing(
+                value,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )?;
+            if let Ast::MethodCall { receiver, method, .. } = value.as_ref() {
+                let function = resolve_method_call_or_error(
+                    receiver,
+                    method,
+                    function_analysis,
+                    value_kind_analysis,
+                )?;
+                let actual_arity = resolved_method_return_arity(&function);
+                if actual_arity != names.len() {
+                    return Err(CompileError::DestructuringArityMismatch {
+                        expected: names.len(),
+                        found: actual_arity,
+                        span: span.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
         Ast::If { condition, then, else_, .. } => validate_if_ast_user_facing(
             condition,
             then,
@@ -2410,6 +2514,40 @@ fn validate_ast_multi_return_usage(
             validate_single_value_multi_return_usage(expected_arity, None)
         }
         Ast::Lambda { .. } | Ast::FunctionDef(_) => Ok(()),
+        Ast::MethodCall { receiver, method, args, .. } => {
+            validate_child_multi_return_usage(
+                receiver,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+            )?;
+            for arg in args {
+                validate_child_multi_return_usage(
+                    arg,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                )?;
+            }
+            let arities = method_target_functions(method.as_str())
+                .into_iter()
+                .map(|function| expression_return_arity(&function, function_return_arities))
+                .collect::<HashSet<_>>();
+            let supports_expected_arity = arities.contains(&expected_arity);
+            let has_multi_value_target = arities.iter().any(|arity| *arity > 1);
+            if has_multi_value_target && !(is_tail && supports_expected_arity) {
+                return Err(CompileError::UnsupportedMultiValueContext {
+                    span: method.span.clone(),
+                });
+            }
+            if expected_arity == 1 || (is_tail && supports_expected_arity) {
+                Ok(())
+            } else {
+                Err(CompileError::UnsupportedMultiValueContext { span: method.span.clone() })
+            }
+        }
         Ast::MultiValue(values) => validate_multi_value_ast(
             values,
             current_function,
@@ -2727,19 +2865,24 @@ fn validate_multi_assign_multi_return_usage(
     function_return_arities: &HashMap<String, usize>,
     expected_arity: usize,
 ) -> Result<(), CompileError> {
+    let skip_arity_check = matches!(value, Ast::MethodCall { .. });
     match value {
         Ast::Expression(ExpressionAst { function, .. }) if !function.is_empty() => {}
+        Ast::MethodCall { .. } => {}
         _ => {
             return Err(CompileError::UnsupportedMultiValueContext { span: span.cloned() });
         }
     }
-    let actual_arity = infer_ast_return_arity(value, current_function, function_return_arities)?;
-    if actual_arity != names.len() {
-        return Err(CompileError::DestructuringArityMismatch {
-            expected: names.len(),
-            found: actual_arity,
-            span: span.cloned(),
-        });
+    if !skip_arity_check {
+        let actual_arity =
+            infer_ast_return_arity(value, current_function, function_return_arities)?;
+        if actual_arity != names.len() {
+            return Err(CompileError::DestructuringArityMismatch {
+                expected: names.len(),
+                found: actual_arity,
+                span: span.cloned(),
+            });
+        }
     }
     validate_ast_multi_return_usage(
         value,
@@ -3188,6 +3331,51 @@ fn kind_sets_intersect(lhs: KindSet, rhs: KindSet) -> bool {
     .any(|kind| lhs.contains(kind) && rhs.contains(kind))
 }
 
+fn resolve_method_call_or_error(
+    receiver: &Ast,
+    method: &Ident,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> Result<String, CompileError> {
+    let receiver_shape = infer_ast_value_shape(receiver, function_analysis, value_kind_analysis);
+    resolve_method(&receiver_shape, method.as_str()).map_err(|err| match err {
+        MethodResolutionError::UnknownReceiver => CompileError::UnknownMethodReceiver {
+            method: method.to_string(),
+            span: method.span.clone(),
+        },
+        MethodResolutionError::AmbiguousReceiver(kinds) => CompileError::AmbiguousMethodReceiver {
+            method: method.to_string(),
+            receiver_kinds: kinds
+                .into_iter()
+                .map(|kind| format_kind_set_for_error(single_kind_set(kind)))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            span: method.span.clone(),
+        },
+    })
+}
+
+fn single_kind_set(kind: ValueKind) -> KindSet {
+    match kind {
+        ValueKind::Int => KindSet::int(),
+        ValueKind::BigInt => KindSet::bigint(),
+        ValueKind::String => KindSet::string(),
+        ValueKind::List => KindSet::list(),
+        ValueKind::Map => KindSet::map(),
+        ValueKind::MapIter => KindSet::map_iter(),
+        ValueKind::Function => KindSet::function(),
+        ValueKind::StringIter => KindSet::string_iter(),
+    }
+}
+
+fn resolved_method_return_arity(function: &str) -> usize {
+    match function {
+        "map_iter_next" => 2,
+        "map_try_get" | "map_try_delete" | "map_try_pop" => 3,
+        _ => 1,
+    }
+}
+
 fn infer_ast_value_shape(
     ast: &Ast,
     function_analysis: &FunctionValueKindAnalysis,
@@ -3204,6 +3392,28 @@ fn infer_ast_value_shape(
             .cloned()
             .unwrap_or_else(|| ValueShape::scalar(KindSet::empty())),
         Ast::FunctionRef(_) | Ast::Lambda { .. } => ValueShape::scalar(KindSet::function()),
+        Ast::MethodCall { receiver, method, args, .. } => {
+            let Ok(function) = resolve_method_call_or_error(
+                receiver,
+                method,
+                function_analysis,
+                value_kind_analysis,
+            ) else {
+                return ValueShape::unknown_scalar();
+            };
+            let mut resolved_args = Vec::with_capacity(args.len() + 1);
+            resolved_args.push((**receiver).clone());
+            resolved_args.extend(args.iter().cloned());
+            infer_ast_value_shape(
+                &Ast::Expression(ExpressionAst {
+                    function_span: method.span.clone(),
+                    function,
+                    args: resolved_args,
+                }),
+                function_analysis,
+                value_kind_analysis,
+            )
+        }
         Ast::ListLiteral(items) => {
             ValueShape::list(items.iter().fold(KindSet::empty(), |kinds, item| {
                 kinds.union(
@@ -3569,6 +3779,7 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
     match ast {
         Ast::Variable(name) | Ast::FunctionRef(name) => name.span.clone(),
         Ast::Expression(ExpressionAst { function_span, .. }) => function_span.clone(),
+        Ast::MethodCall { span, .. } => span.clone(),
         Ast::Index { span, .. }
         | Ast::IndexAssign { span, .. }
         | Ast::Assign { span, .. }
@@ -3630,6 +3841,10 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
             validate_no_nested_function_defs(value)
         }
         Ast::Expression(ExpressionAst { args, .. }) => validate_nested_free_slice(args),
+        Ast::MethodCall { receiver, args, .. } => {
+            validate_no_nested_function_defs(receiver)?;
+            validate_nested_free_slice(args)
+        }
         Ast::Block(block) => validate_nested_free_slice(&block.lines),
         Ast::Assign { value, .. } => validate_no_nested_function_defs(value),
         Ast::MultiAssign { value, .. } => validate_no_nested_function_defs(value),
@@ -3694,6 +3909,12 @@ impl LambdaLifter {
             }
             Ast::Block(block) => self.lift_block(block, scope_names),
             Ast::Expression(ExpressionAst { args, .. }) => {
+                for arg in args {
+                    self.lift_ast(arg, scope_names);
+                }
+            }
+            Ast::MethodCall { receiver, args, .. } => {
+                self.lift_ast(receiver, scope_names);
                 for arg in args {
                     self.lift_ast(arg, scope_names);
                 }
@@ -3830,6 +4051,10 @@ fn collect_captures_into(
         Ast::Expression(ExpressionAst { args, .. }) => {
             collect_captures_from_slice(args, local_names, scope_names, captures);
         }
+        Ast::MethodCall { receiver, args, .. } => {
+            collect_captures_into(receiver, local_names, scope_names, captures);
+            collect_captures_from_slice(args, local_names, scope_names, captures);
+        }
         Ast::MultiValue(values) | Ast::ListLiteral(values) => {
             collect_captures_from_slice(values, local_names, scope_names, captures);
         }
@@ -3883,6 +4108,12 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             }
         }
         Ast::FunctionRef(_) => {}
+        Ast::MethodCall { receiver, args, .. } => {
+            collect_var_names(receiver, names);
+            for arg in args {
+                collect_var_names(arg, names);
+            }
+        }
         Ast::MultiValue(values) => {
             for value in values {
                 collect_var_names(value, names);
@@ -6061,6 +6292,49 @@ fn compile_ast(
             capture_slots,
             env_ptr,
         ),
+        Ast::MethodCall { receiver, method, args, .. } => {
+            let function = resolve_method_call_or_error(
+                receiver,
+                method,
+                function_analysis,
+                value_kind_analysis,
+            )
+            .or_else(|_| {
+                let mut candidates = method_target_functions(method.as_str())
+                    .into_iter()
+                    .filter(|function| func_refs.contains_key(function))
+                    .collect::<Vec<_>>();
+                candidates.sort_unstable();
+                candidates.dedup();
+                match candidates.as_slice() {
+                    [function] => Ok(function.clone()),
+                    _ => Err(CompileError::UnknownMethodReceiver {
+                        method: method.to_string(),
+                        span: method.span.clone(),
+                    }),
+                }
+            })
+            .unwrap_or_else(|err| {
+                panic!("method call should have been validated before codegen: {err}")
+            });
+            let mut resolved_args = Vec::with_capacity(args.len() + 1);
+            resolved_args.push((**receiver).clone());
+            resolved_args.extend(args.iter().cloned());
+            compile_expression_ast(
+                builder,
+                &function,
+                &resolved_args,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+                function_analysis,
+                value_kind_analysis,
+            )
+        }
         Ast::MultiValue(values) => compile_multi_value(
             builder,
             values,
@@ -8202,6 +8476,12 @@ fn map_iter_and_map_values_work() {
 }
 
 #[test]
+fn method_calls_work() {
+    let src = "fn main() do\n    print(\"1234\".is_integer())\n    print(\"12x\".is_integer())\n    m = {name: 1}\n    print(list_len(m.keys()))\n    it = m.iter()\n    key, value = it.next()\n    print(key == \"name\")\n    print(value)\nend";
+    assert_cranelift_executable_output(src, "1\n0\n1\n1\n1\n", 0);
+}
+
+#[test]
 fn maps_work() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
     assert_cranelift_executable_output(src, "2\n1\n0\n11\n32\n", 0);
@@ -9043,6 +9323,13 @@ fn llvm_map_iter_and_map_values_work() {
 
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
+fn llvm_method_calls_work() {
+    let src = "fn main() do\n    print(\"1234\".is_integer())\n    print(\"12x\".is_integer())\n    m = {name: 1}\n    print(list_len(m.keys()))\n    it = m.iter()\n    key, value = it.next()\n    print(key == \"name\")\n    print(value)\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n0\n1\n1\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
 fn llvm_maps_work() {
     let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "2\n1\n0\n11\n32\n", 0);
@@ -9834,6 +10121,13 @@ fn try_compile_to_jit_allows_string_builtin_in_is_string_then_branch() {
 }
 
 #[test]
+fn try_compile_to_jit_allows_method_call_in_is_string_then_branch() {
+    let src = "fn main() do\n    x = 0\n    if 1 do\n        x = \"123\"\n    else\n        x = 1\n    end\n    if is_string(x) do\n        x.is_integer()\n    else\n        0\n    end\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    module.try_compile_to_jit().expect("jit compile should succeed");
+}
+
+#[test]
 fn try_compile_to_jit_rejects_string_builtin_in_not_is_string_then_branch() {
     let src = "fn main() do\n    x = 0\n    if 1 do\n        x = \"a\"\n    else\n        x = 1\n    end\n    if not is_string(x) do\n        bytes_len(x)\n    else\n        0\n    end\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -9847,6 +10141,40 @@ fn try_compile_to_jit_rejects_string_builtin_in_not_is_string_then_branch() {
             assert_eq!(argument, 1);
             assert_eq!(expected, "string");
             assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_method_call_with_ambiguous_receiver_kind() {
+    let src =
+        "fn main() do\n    x = \"a\"\n    if 0 do\n        x = [1]\n    end\n    x.len()\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::AmbiguousMethodReceiver { method, receiver_kinds, .. } => {
+            assert_eq!(method, "len");
+            assert_eq!(receiver_kinds, "string | list");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_method_call_with_unknown_receiver_kind() {
+    let src = "fn helper(x) do\n    x.is_integer()\nend\n\nfn main() do\n    0\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::UnknownMethodReceiver { method, .. } => {
+            assert_eq!(method, "is_integer");
         }
         other => panic!("unexpected error: {other:?}"),
     }

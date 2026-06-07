@@ -1,6 +1,7 @@
 // pub mod compiler;
 pub mod analysis;
 pub mod format;
+pub(crate) mod methods;
 pub mod module;
 pub mod parser;
 pub mod runtime;

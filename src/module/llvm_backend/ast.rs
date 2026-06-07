@@ -1,4 +1,6 @@
 use super::*;
+use crate::methods::{method_target_functions, resolve_method};
+use crate::module::stdlib_function;
 use crate::parser::{MapEntryAst, MapKeyAst};
 
 impl<'ctx> LlvmCompiler<'ctx> {
@@ -81,6 +83,45 @@ impl<'ctx> LlvmCompiler<'ctx> {
                     function,
                     current_function_name,
                 ),
+            Ast::MethodCall { receiver, method, args, .. } => {
+                let function_analysis = self.function_analysis(current_function_name);
+                let receiver_shape =
+                    infer_ast_value_shape(receiver, function_analysis, &self.value_kind_analysis);
+                let resolved_function = resolve_method(&receiver_shape, method.as_str())
+                    .or_else(|_| {
+                        let mut candidates = method_target_functions(method.as_str())
+                            .into_iter()
+                            .filter(|function| {
+                                is_builtin_name(function.as_str())
+                                    || stdlib_function(function.as_str()).is_some()
+                                    || self.function_arities.contains_key(function.as_str())
+                            })
+                            .collect::<Vec<_>>();
+                        candidates.sort_unstable();
+                        candidates.dedup();
+                        match candidates.as_slice() {
+                            [function] => Ok(function.clone()),
+                            _ => Err(crate::methods::MethodResolutionError::UnknownReceiver),
+                        }
+                    })
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "method call should have been validated before LLVM codegen: {err:?}"
+                        )
+                    });
+                let mut resolved_args = Vec::with_capacity(args.len() + 1);
+                resolved_args.push((**receiver).clone());
+                resolved_args.extend(args.iter().cloned());
+                self.compile_expression_ast(
+                    resolved_function.as_str(),
+                    &resolved_args,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                )
+            }
             Ast::Block(block) => self.compile_block_ast(
                 block,
                 vars,

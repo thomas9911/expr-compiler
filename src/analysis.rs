@@ -1,3 +1,4 @@
+use crate::methods::resolve_method;
 use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
 use std::collections::{HashMap, HashSet};
 
@@ -418,6 +419,25 @@ fn infer_ast(
         Ast::Block(block) => infer_block(block, env, function_bindings, summaries, calls),
         Ast::FunctionDef(_) => ValueShape::unknown_scalar(),
         Ast::Lambda { .. } | Ast::FunctionRef(_) => ValueShape::scalar(KindSet::function()),
+        Ast::MethodCall { receiver, method, args, .. } => {
+            let receiver_shape = infer_ast(receiver, env, function_bindings, summaries, calls);
+            let Ok(function) = resolve_method(&receiver_shape, method.as_str()) else {
+                return ValueShape::unknown_scalar();
+            };
+            let mut resolved_args = vec![(**receiver).clone()];
+            resolved_args.extend(args.iter().cloned());
+            infer_expression(
+                &ExpressionAst {
+                    function: function.to_string(),
+                    args: resolved_args,
+                    function_span: method.span.clone(),
+                },
+                env,
+                function_bindings,
+                summaries,
+                calls,
+            )
+        }
         Ast::Expression(expr) => infer_expression(expr, env, function_bindings, summaries, calls),
         Ast::MultiValue(values) => ValueShape::from_slots(
             values

@@ -141,6 +141,8 @@ pub enum Token {
     CloseBrace,
     #[token(",")]
     Comma,
+    #[token(".")]
+    Dot,
     #[token("=>")]
     FatArrow,
     #[token("=")]
