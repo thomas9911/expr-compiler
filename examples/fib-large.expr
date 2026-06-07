@@ -12,13 +12,13 @@ fn fibonacci(n):
     if n == 0:
         0
     else:
-        inner_fib(0, 1, 0, n, 1)
+        inner_fib(0, 1, 0, n, true)
 
 fn fibonacci_bigint(n):
     if n == 0:
         bigint_from_int(0)
     else:
-        inner_fib(bigint_from_int(0), bigint_from_int(1), 0, n, 0)
+        inner_fib(bigint_from_int(0), bigint_from_int(1), 0, n, false)
 
 fn main():
     # calculate to the 92th fibonacci number (max for i64)
