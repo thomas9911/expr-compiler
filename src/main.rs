@@ -10,26 +10,32 @@ use expr_compiler::tokenizer::{Logos, Token};
 use pico_args::Arguments;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: expr-compiler <source-file> [-o <output>] [--emit-ir] [--run-ir] [--run-jit] [--debug-types] [--backend <cranelift|llvm>] [--arena-mb <n>] [-- <arg>...]";
+const USAGE: &str = "usage:
+  expr-compiler run <source-file> [--backend <cranelift|llvm>] [--arena-mb <n>] [-- <arg>...]
+  expr-compiler build <source-file> [-o <output>] [--backend <cranelift|llvm>]
+  expr-compiler wasm core <source-file> [-o <output>]
+  expr-compiler wasm component <source-file> [-o <output>]
+  expr-compiler ir <source-file> [-o <output>] [--run]
+  expr-compiler types <source-file>";
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum WasmSubcommand {
+    Core,
+    Component,
+}
+
+#[derive(Debug)]
+enum CliCommand {
+    Run { input: PathBuf, backend: CodegenBackend, arena_mb: usize, program_args: Vec<String> },
+    Build { input: PathBuf, output: Option<PathBuf>, backend: CodegenBackend },
+    Wasm { target: WasmSubcommand, input: PathBuf, output: Option<PathBuf> },
+    Ir { input: PathBuf, output: Option<PathBuf>, run: bool },
+    Types { input: PathBuf },
+}
 
 #[derive(Debug)]
 struct CliArgs {
-    input: PathBuf,
-    output: Option<PathBuf>,
-    emit_ir: bool,
-    run_ir: bool,
-    run_jit: bool,
-    debug_types: bool,
-    backend: CodegenBackend,
-    arena_mb: usize,
-    program_args: Vec<String>,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum OutputKind {
-    Native,
-    Wasm,
-    Component,
+    command: CliCommand,
 }
 
 fn finalize_output_path(mut output: PathBuf) -> PathBuf {
@@ -39,51 +45,93 @@ fn finalize_output_path(mut output: PathBuf) -> PathBuf {
     output
 }
 
-fn classify_output(output: Option<&Path>) -> OutputKind {
-    let wants_wasm = output
-        .and_then(|path| path.extension())
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"));
-    let wants_component = output
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".component.wasm"));
-    if wants_component {
-        OutputKind::Component
-    } else if wants_wasm {
-        OutputKind::Wasm
-    } else {
-        OutputKind::Native
+fn parse_backend_arg(
+    args: &mut Arguments,
+    flag: &'static str,
+    default: CodegenBackend,
+) -> Result<CodegenBackend, String> {
+    args.opt_value_from_str::<_, String>(flag)
+        .map_err(|e| format!("failed to parse {flag}: {e}"))?
+        .map(|value| value.parse())
+        .transpose()?
+        .map_or(Ok(default), Ok)
+}
+
+fn parse_output_arg(args: &mut Arguments) -> Result<Option<PathBuf>, String> {
+    Ok(args
+        .opt_value_from_str::<_, String>("-o")
+        .map_err(|e| format!("failed to parse -o: {e}"))?
+        .map(PathBuf::from))
+}
+
+fn parse_input_arg(args: &mut Arguments) -> Result<PathBuf, String> {
+    args.free_from_str::<String>().map(PathBuf::from).map_err(|_| USAGE.to_string())
+}
+
+fn parse_arena_mb_arg(args: &mut Arguments) -> Result<usize, String> {
+    let arena_mb = args
+        .opt_value_from_str::<_, usize>("--arena-mb")
+        .map_err(|e| format!("failed to parse --arena-mb: {e}"))?
+        .unwrap_or(16);
+    if arena_mb == 0 {
+        return Err("--arena-mb must be > 0".to_string());
     }
+    Ok(arena_mb)
+}
+
+fn parse_program_args(args: Arguments) -> Vec<String> {
+    let mut program_args =
+        args.finish().into_iter().map(|x| x.to_string_lossy().to_string()).collect::<Vec<_>>();
+    if matches!(program_args.first().map(String::as_str), Some("--")) {
+        program_args.remove(0);
+    }
+    program_args
+}
+
+fn reject_unknown_args(args: Arguments) -> Result<(), String> {
+    let leftovers = args.finish();
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    let unknown = leftovers
+        .into_iter()
+        .map(|x| x.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(format!("unknown arguments: {unknown}\n{USAGE}"))
 }
 
 fn validate_cli_runtime(
     cli: &CliArgs,
     llvm_available: bool,
     wasi_available: bool,
-) -> Result<OutputKind, String> {
-    if cli.backend == CodegenBackend::Llvm && !llvm_available {
-        return Err(
-            "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
-                .to_string(),
-        );
+) -> Result<(), String> {
+    match &cli.command {
+        CliCommand::Run { backend, .. } | CliCommand::Build { backend, .. } => {
+            if *backend == CodegenBackend::Llvm && !llvm_available {
+                return Err(
+                    "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
+                        .to_string(),
+                );
+            }
+        }
+        CliCommand::Wasm { target, .. } => {
+            if !llvm_available {
+                return Err(
+                    "llvm backend is not available in this build; enable the `llvm-backend` cargo feature"
+                        .to_string(),
+                );
+            }
+            if *target == WasmSubcommand::Component && !wasi_available {
+                return Err(
+                    "component wasm output requires building with the `wasi` cargo feature"
+                        .to_string(),
+                );
+            }
+        }
+        CliCommand::Ir { .. } | CliCommand::Types { .. } => {}
     }
-
-    if cli.backend == CodegenBackend::Llvm && (cli.emit_ir || cli.run_ir) {
-        return Err("llvm backend does not support --emit-ir or --run-ir".to_string());
-    }
-
-    let output_kind = classify_output(cli.output.as_deref());
-    if output_kind == OutputKind::Wasm && cli.backend != CodegenBackend::Llvm {
-        return Err("wasm output currently supports only --backend llvm".to_string());
-    }
-    if output_kind == OutputKind::Component && !wasi_available {
-        return Err(
-            "component wasm output requires building with the `wasi` cargo feature".to_string()
-        );
-    }
-
-    Ok(output_kind)
+    Ok(())
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
@@ -101,52 +149,50 @@ where
         return Err(USAGE.to_string());
     }
 
-    let output = args
-        .opt_value_from_str::<_, String>("-o")
-        .map_err(|e| format!("failed to parse -o: {e}"))?
-        .map(PathBuf::from);
+    let command = args.free_from_str::<String>().map_err(|_| USAGE.to_string())?;
+    let command = match command.as_str() {
+        "run" => {
+            let backend = parse_backend_arg(&mut args, "--backend", CodegenBackend::Cranelift)?;
+            let arena_mb = parse_arena_mb_arg(&mut args)?;
+            let input = parse_input_arg(&mut args)?;
+            let program_args = parse_program_args(args);
+            CliCommand::Run { input, backend, arena_mb, program_args }
+        }
+        "build" => {
+            let output = parse_output_arg(&mut args)?;
+            let backend = parse_backend_arg(&mut args, "--backend", CodegenBackend::Cranelift)?;
+            let input = parse_input_arg(&mut args)?;
+            reject_unknown_args(args)?;
+            CliCommand::Build { input, output, backend }
+        }
+        "wasm" => {
+            let target = args.free_from_str::<String>().map_err(|_| USAGE.to_string())?;
+            let target = match target.as_str() {
+                "core" => WasmSubcommand::Core,
+                "component" => WasmSubcommand::Component,
+                _ => return Err(format!("unknown wasm target: {target}\n{USAGE}")),
+            };
+            let output = parse_output_arg(&mut args)?;
+            let input = parse_input_arg(&mut args)?;
+            reject_unknown_args(args)?;
+            CliCommand::Wasm { target, input, output }
+        }
+        "ir" => {
+            let output = parse_output_arg(&mut args)?;
+            let run = args.contains("--run");
+            let input = parse_input_arg(&mut args)?;
+            reject_unknown_args(args)?;
+            CliCommand::Ir { input, output, run }
+        }
+        "types" => {
+            let input = parse_input_arg(&mut args)?;
+            reject_unknown_args(args)?;
+            CliCommand::Types { input }
+        }
+        _ => return Err(format!("unknown command: {command}\n{USAGE}")),
+    };
 
-    let emit_ir = args.contains("--emit-ir");
-    let run_ir = args.contains("--run-ir");
-    let run_jit = args.contains("--run-jit");
-    let debug_types = args.contains("--debug-types");
-    let backend = args
-        .opt_value_from_str::<_, String>("--backend")
-        .map_err(|e| format!("failed to parse --backend: {e}"))?
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(CodegenBackend::Cranelift);
-    let arena_mb = args
-        .opt_value_from_str::<_, usize>("--arena-mb")
-        .map_err(|e| format!("failed to parse --arena-mb: {e}"))?
-        .unwrap_or(16);
-    if arena_mb == 0 {
-        return Err("--arena-mb must be > 0".to_string());
-    }
-
-    let input = args.free_from_str::<String>().map_err(|_| USAGE.to_string())?;
-
-    let mut program_args =
-        args.finish().into_iter().map(|x| x.to_string_lossy().to_string()).collect::<Vec<_>>();
-    if matches!(program_args.first().map(String::as_str), Some("--")) {
-        program_args.remove(0);
-    }
-    if !run_jit && !program_args.is_empty() {
-        let unknown = program_args.join(" ");
-        return Err(format!("unknown arguments: {unknown}\n{USAGE}"));
-    }
-
-    Ok(CliArgs {
-        input: PathBuf::from(input),
-        output,
-        emit_ir,
-        run_ir,
-        run_jit,
-        debug_types,
-        backend,
-        arena_mb,
-        program_args,
-    })
+    Ok(CliArgs { command })
 }
 
 fn print_cli_error_and_exit(err: &str) -> ! {
@@ -448,33 +494,25 @@ fn run_ir(ir: &str) -> Result<Option<i64>, String> {
     Ok(None)
 }
 
-fn maybe_handle_ir_modes(cli: &CliArgs, input: &Path, source: &str) -> Result<bool, String> {
-    if !cli.emit_ir && !cli.run_ir {
-        return Ok(false);
-    }
-
+fn handle_ir(input: &Path, output: Option<&Path>, run: bool, source: &str) -> Result<(), String> {
     let ir = Module::try_from_source(source)
         .map_err(|err| format_compile_error(input, source, &err))?
         .try_compile_to_ir()
         .map_err(|err| format_compile_error(input, source, &err))?;
-    if cli.emit_ir {
-        write_ir_or_stdout(&ir, cli.output.as_deref());
+    if output.is_some() || !run {
+        write_ir_or_stdout(&ir, output);
     }
-    if cli.run_ir {
+    if run {
         match run_ir(&ir) {
             Ok(Some(value)) => println!("{value}"),
             Ok(None) => {}
             Err(err) => return Err(err),
         }
     }
-    Ok(!cli.run_jit)
+    Ok(())
 }
 
-fn maybe_handle_debug_types(cli: &CliArgs, input: &Path, source: &str) -> Result<bool, String> {
-    if !cli.debug_types {
-        return Ok(false);
-    }
-
+fn handle_debug_types(input: &Path, source: &str) -> Result<(), String> {
     let module =
         Module::try_from_source(source).map_err(|err| format_compile_error(input, source, &err))?;
     let user_functions = parse_user_functions_for_debug(source)
@@ -482,7 +520,7 @@ fn maybe_handle_debug_types(cli: &CliArgs, input: &Path, source: &str) -> Result
     let rendered = format_debug_types(source, &user_functions, &module)
         .map_err(|err| format_compile_error(input, source, &err))?;
     print!("{rendered}");
-    Ok(true)
+    Ok(())
 }
 
 fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
@@ -494,8 +532,14 @@ fn select_jit_entry(module: &Module) -> Result<(String, usize), String> {
     Ok((func.name.clone(), func.inputs.len()))
 }
 
-fn run_jit(cli: &CliArgs, input: &Path, source: &str) -> Result<i32, String> {
-    configure_runtime_arena(cli.arena_mb * 1024 * 1024);
+fn run_jit(
+    input: &Path,
+    source: &str,
+    backend: CodegenBackend,
+    arena_mb: usize,
+    program_args: &[String],
+) -> Result<i32, String> {
+    configure_runtime_arena(arena_mb * 1024 * 1024);
     reset_runtime_arena();
     let module =
         Module::try_from_source(source).map_err(|err| format_compile_error(input, source, &err))?;
@@ -505,11 +549,11 @@ fn run_jit(cli: &CliArgs, input: &Path, source: &str) -> Result<i32, String> {
     }
 
     let jit = module
-        .try_compile_to_jit_with_backend(cli.backend)
+        .try_compile_to_jit_with_backend(backend)
         .map_err(|err| format_compile_error(input, source, &err))?;
     let int_result = if let Some(ptr) = jit.get_int_result_fn_ptr(&func_name) {
         if func_arity == 1 {
-            let (arg_tag, arg_payload) = build_argv_list_value(&cli.program_args);
+            let (arg_tag, arg_payload) = build_argv_list_value(program_args);
             let func =
                 unsafe { std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(ptr) };
             func(arg_tag, arg_payload)
@@ -527,13 +571,45 @@ fn run_jit(cli: &CliArgs, input: &Path, source: &str) -> Result<i32, String> {
     Ok(int_result as i32)
 }
 
-fn compile_native_or_exit(cli: &CliArgs, input: &Path, source: &str) {
-    let output = finalize_output_path(
-        cli.output.clone().unwrap_or_else(|| input.with_extension("").to_path_buf()),
-    );
+fn default_build_output(input: &Path) -> PathBuf {
+    finalize_output_path(input.with_extension("").to_path_buf())
+}
 
+fn default_wasm_output(input: &Path, target: WasmSubcommand) -> PathBuf {
+    match target {
+        WasmSubcommand::Core => input.with_extension("wasm"),
+        WasmSubcommand::Component => {
+            let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+            input.with_file_name(format!("{stem}.component.wasm"))
+        }
+    }
+}
+
+fn compile_native_or_exit(
+    input: &Path,
+    output: Option<&Path>,
+    source: &str,
+    backend: CodegenBackend,
+) {
+    let output = finalize_output_path(
+        output.map(Path::to_path_buf).unwrap_or_else(|| default_build_output(input)),
+    );
     Module::try_from_source(source)
-        .and_then(|module| module.try_compile_to_executable_with_backend(&output, cli.backend))
+        .and_then(|module| module.try_compile_to_executable_with_backend(&output, backend))
+        .unwrap_or_else(|err| {
+            eprintln!("{}", format_compile_error(input, source, &err));
+            std::process::exit(1);
+        });
+    println!("compiled to {}", output.display());
+}
+
+fn compile_wasm_or_exit(input: &Path, output: Option<&Path>, target: WasmSubcommand, source: &str) {
+    let output =
+        output.map(Path::to_path_buf).unwrap_or_else(|| default_wasm_output(input, target));
+    Module::try_from_source(source)
+        .and_then(|module| {
+            module.try_compile_to_executable_with_backend(&output, CodegenBackend::Llvm)
+        })
         .unwrap_or_else(|err| {
             eprintln!("{}", format_compile_error(input, source, &err));
             std::process::exit(1);
@@ -547,42 +623,49 @@ fn main() {
         Err(err) => print_cli_error_and_exit(&err),
     };
 
-    let input = Path::new(&cli.input);
-    let source = read_source_or_exit(input);
-
-    match maybe_handle_debug_types(&cli, input, &source) {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(err) => {
-            eprintln!("{err}");
-            std::process::exit(1);
-        }
-    }
-
     if let Err(err) = validate_cli_runtime(&cli, llvm_backend_available(), cfg!(feature = "wasi")) {
         print_cli_error_and_exit(&err);
     }
 
-    match maybe_handle_ir_modes(&cli, input, &source) {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(err) => {
-            eprintln!("{err}");
-            std::process::exit(1);
+    match &cli.command {
+        CliCommand::Run { input, backend, arena_mb, program_args } => {
+            let input = Path::new(input);
+            let source = read_source_or_exit(input);
+            match run_jit(input, &source, *backend, *arena_mb, program_args) {
+                Ok(code) => std::process::exit(code),
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(1);
+                }
+            }
         }
-    }
-
-    if cli.run_jit {
-        match run_jit(&cli, input, &source) {
-            Ok(code) => std::process::exit(code),
-            Err(err) => {
+        CliCommand::Build { input, output, backend } => {
+            let input = Path::new(input);
+            let source = read_source_or_exit(input);
+            compile_native_or_exit(input, output.as_deref(), &source, *backend);
+        }
+        CliCommand::Wasm { target, input, output } => {
+            let input = Path::new(input);
+            let source = read_source_or_exit(input);
+            compile_wasm_or_exit(input, output.as_deref(), *target, &source);
+        }
+        CliCommand::Ir { input, output, run } => {
+            let input = Path::new(input);
+            let source = read_source_or_exit(input);
+            if let Err(err) = handle_ir(input, output.as_deref(), *run, &source) {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+        CliCommand::Types { input } => {
+            let input = Path::new(input);
+            let source = read_source_or_exit(input);
+            if let Err(err) = handle_debug_types(input, &source) {
                 eprintln!("{err}");
                 std::process::exit(1);
             }
         }
     }
-
-    compile_native_or_exit(&cli, input, &source);
 }
 
 #[cfg(test)]
@@ -594,52 +677,81 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_to_cranelift() {
-        let cli = parse_ok(&["examples/test.expr"]);
-        assert_eq!(cli.backend, CodegenBackend::Cranelift);
-        assert_eq!(cli.arena_mb, 16);
-        assert!(!cli.run_jit);
-        assert!(!cli.debug_types);
+    fn cli_run_defaults_to_cranelift() {
+        let cli = parse_ok(&["run", "examples/test.expr"]);
+        match cli.command {
+            CliCommand::Run { input, backend, arena_mb, program_args } => {
+                assert_eq!(input, PathBuf::from("examples/test.expr"));
+                assert_eq!(backend, CodegenBackend::Cranelift);
+                assert_eq!(arena_mb, 16);
+                assert!(program_args.is_empty());
+            }
+            _ => panic!("expected run command"),
+        }
     }
 
     #[test]
-    fn cli_accepts_llvm_backend() {
-        let cli = parse_ok(&["examples/test.expr", "--run-jit", "--backend", "llvm"]);
-        assert_eq!(cli.backend, CodegenBackend::Llvm);
-        assert!(cli.run_jit);
+    fn cli_run_accepts_llvm_backend() {
+        let cli = parse_ok(&["run", "examples/test.expr", "--backend", "llvm"]);
+        match cli.command {
+            CliCommand::Run { backend, .. } => assert_eq!(backend, CodegenBackend::Llvm),
+            _ => panic!("expected run command"),
+        }
     }
 
     #[test]
-    fn cli_collects_program_args_for_run_jit() {
-        let cli = parse_ok(&["examples/test.expr", "--run-jit", "--", "hello", "world"]);
-        assert_eq!(cli.program_args, vec!["hello", "world"]);
+    fn cli_run_collects_program_args() {
+        let cli = parse_ok(&["run", "examples/test.expr", "--", "hello", "world"]);
+        match cli.command {
+            CliCommand::Run { program_args, .. } => {
+                assert_eq!(program_args, vec!["hello", "world"]);
+            }
+            _ => panic!("expected run command"),
+        }
     }
 
     #[test]
-    fn cli_accepts_debug_types() {
-        let cli = parse_ok(&["examples/test.expr", "--debug-types"]);
-        assert!(cli.debug_types);
+    fn cli_types_parses() {
+        let cli = parse_ok(&["types", "examples/test.expr"]);
+        match cli.command {
+            CliCommand::Types { input } => assert_eq!(input, PathBuf::from("examples/test.expr")),
+            _ => panic!("expected types command"),
+        }
+    }
+
+    #[test]
+    fn cli_wasm_component_parses() {
+        let cli =
+            parse_ok(&["wasm", "component", "examples/test.expr", "-o", "out.component.wasm"]);
+        match cli.command {
+            CliCommand::Wasm { target, input, output } => {
+                assert_eq!(target, WasmSubcommand::Component);
+                assert_eq!(input, PathBuf::from("examples/test.expr"));
+                assert_eq!(output, Some(PathBuf::from("out.component.wasm")));
+            }
+            _ => panic!("expected wasm command"),
+        }
     }
 
     #[test]
     fn cli_rejects_unknown_backend() {
-        let err = parse_cli_args_from(["examples/test.expr", "--backend", "nope"])
+        let err = parse_cli_args_from(["run", "examples/test.expr", "--backend", "nope"])
             .expect_err("cli parse should fail");
         assert!(err.contains("unknown backend: nope"));
     }
 
     #[test]
     fn cli_rejects_zero_arena() {
-        let err = parse_cli_args_from(["examples/test.expr", "--arena-mb", "0"])
+        let err = parse_cli_args_from(["run", "examples/test.expr", "--arena-mb", "0"])
             .expect_err("cli parse should fail");
         assert_eq!(err, "--arena-mb must be > 0");
     }
 
     #[test]
-    fn cli_rejects_program_args_without_run_jit() {
-        let err = parse_cli_args_from(["examples/test.expr", "--", "hello"])
-            .expect_err("cli parse should fail");
-        assert!(err.contains("unknown arguments: hello"));
+    fn cli_rejects_unknown_command() {
+        let err =
+            parse_cli_args_from(["nope", "examples/test.expr"]).expect_err("cli parse should fail");
+        assert!(err.contains("unknown command: nope"));
     }
 
     #[test]
@@ -666,60 +778,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_output_detects_native() {
-        assert_eq!(classify_output(None), OutputKind::Native);
-        assert_eq!(classify_output(Some(Path::new("examples/out"))), OutputKind::Native);
-    }
-
-    #[test]
-    fn classify_output_detects_wasm() {
-        assert_eq!(classify_output(Some(Path::new("examples/out.wasm"))), OutputKind::Wasm);
-    }
-
-    #[test]
-    fn classify_output_detects_component_wasm() {
-        assert_eq!(
-            classify_output(Some(Path::new("examples/out.component.wasm"))),
-            OutputKind::Component
-        );
-    }
-
-    #[test]
     fn validate_cli_rejects_missing_llvm_backend() {
-        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm"]);
+        let cli = parse_ok(&["build", "examples/test.expr", "--backend", "llvm"]);
         let err = validate_cli_runtime(&cli, false, true)
             .expect_err("llvm-less build should reject llvm backend");
         assert!(err.contains("llvm backend is not available"));
     }
 
     #[test]
-    fn validate_cli_rejects_emit_ir_with_llvm_backend() {
-        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm", "--emit-ir"]);
-        let err =
-            validate_cli_runtime(&cli, true, true).expect_err("llvm backend should reject emit-ir");
-        assert_eq!(err, "llvm backend does not support --emit-ir or --run-ir");
-    }
-
-    #[test]
-    fn validate_cli_rejects_run_ir_with_llvm_backend() {
-        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm", "--run-ir"]);
-        let err =
-            validate_cli_runtime(&cli, true, true).expect_err("llvm backend should reject run-ir");
-        assert_eq!(err, "llvm backend does not support --emit-ir or --run-ir");
-    }
-
-    #[test]
-    fn validate_cli_rejects_wasm_output_without_llvm_backend() {
-        let cli = parse_ok(&["examples/test.expr", "-o", "out.wasm"]);
-        let err = validate_cli_runtime(&cli, true, true)
-            .expect_err("cranelift should reject wasm output");
-        assert_eq!(err, "wasm output currently supports only --backend llvm");
-    }
-
-    #[test]
     fn validate_cli_rejects_component_output_without_wasi_feature() {
-        let cli =
-            parse_ok(&["examples/test.expr", "--backend", "llvm", "-o", "out.component.wasm"]);
+        let cli = parse_ok(&["wasm", "component", "examples/test.expr"]);
         let err = validate_cli_runtime(&cli, true, false)
             .expect_err("component output should require wasi");
         assert_eq!(err, "component wasm output requires building with the `wasi` cargo feature");
@@ -727,18 +795,14 @@ mod tests {
 
     #[test]
     fn validate_cli_accepts_component_output_when_available() {
-        let cli =
-            parse_ok(&["examples/test.expr", "--backend", "llvm", "-o", "out.component.wasm"]);
-        let kind =
-            validate_cli_runtime(&cli, true, true).expect("component output should be accepted");
-        assert_eq!(kind, OutputKind::Component);
+        let cli = parse_ok(&["wasm", "component", "examples/test.expr"]);
+        validate_cli_runtime(&cli, true, true).expect("component output should be accepted");
     }
 
     #[test]
     fn validate_cli_accepts_wasm_output_with_llvm_backend() {
-        let cli = parse_ok(&["examples/test.expr", "--backend", "llvm", "-o", "out.wasm"]);
-        let kind = validate_cli_runtime(&cli, true, true).expect("wasm output should be accepted");
-        assert_eq!(kind, OutputKind::Wasm);
+        let cli = parse_ok(&["wasm", "core", "examples/test.expr"]);
+        validate_cli_runtime(&cli, true, true).expect("wasm output should be accepted");
     }
 
     #[test]
@@ -749,25 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_handle_ir_modes_returns_false_when_ir_modes_are_disabled() {
-        let cli = parse_ok(&["examples/test.expr"]);
-        let handled =
-            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
-                .expect("ir handling should not fail");
-        assert!(!handled);
-    }
-
-    #[test]
-    fn maybe_handle_debug_types_returns_false_when_disabled() {
-        let cli = parse_ok(&["examples/test.expr"]);
-        let handled =
-            maybe_handle_debug_types(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
-                .expect("debug-types handling should not fail");
-        assert!(!handled);
-    }
-
-    #[test]
-    fn maybe_handle_ir_modes_writes_ir_file_and_returns_true() {
+    fn handle_ir_writes_ir_file() {
         let unique = format!(
             "expr-compiler-main-test-{}.clif",
             std::time::SystemTime::now()
@@ -776,13 +822,8 @@ mod tests {
                 .as_nanos()
         );
         let output = std::env::temp_dir().join(unique);
-        let output_str = output.to_string_lossy().into_owned();
-        let cli = parse_ok(&["examples/test.expr", "--emit-ir", "-o", &output_str]);
-
-        let handled =
-            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
-                .expect("emit-ir handling should succeed");
-        assert!(handled);
+        handle_ir(Path::new("input.expr"), Some(&output), false, "fn main() do\n    7\nend")
+            .expect("ir writing should succeed");
 
         let ir = std::fs::read_to_string(&output).expect("ir output should exist");
         assert!(ir.contains("function"));
@@ -791,20 +832,9 @@ mod tests {
     }
 
     #[test]
-    fn maybe_handle_ir_modes_returns_false_when_run_jit_is_also_requested() {
-        let cli = parse_ok(&["examples/test.expr", "--emit-ir", "--run-jit"]);
-        let handled =
-            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    7\nend")
-                .expect("emit-ir handling should succeed");
-        assert!(!handled);
-    }
-
-    #[test]
-    fn maybe_handle_ir_modes_propagates_run_ir_errors() {
-        let cli = parse_ok(&["examples/test.expr", "--run-ir"]);
-        let err =
-            maybe_handle_ir_modes(&cli, Path::new("input.expr"), "fn main() do\n    1 / 0\nend")
-                .expect_err("run-ir should propagate traps as errors");
+    fn handle_ir_propagates_run_ir_errors() {
+        let err = handle_ir(Path::new("input.expr"), None, true, "fn main() do\n    1 / 0\nend")
+            .expect_err("run-ir should propagate traps as errors");
         assert!(!err.is_empty());
     }
 
@@ -847,19 +877,26 @@ mod tests {
 
     #[test]
     fn run_jit_executes_compiled_program() {
-        let cli = parse_ok(&["examples/test.expr", "--run-jit"]);
-        let result = run_jit(&cli, Path::new("input.expr"), "fn main() do\n    1 + 2 * 3\nend")
-            .expect("run_jit should succeed");
+        let result = run_jit(
+            Path::new("input.expr"),
+            "fn main() do\n    1 + 2 * 3\nend",
+            CodegenBackend::Cranelift,
+            16,
+            &[],
+        )
+        .expect("run_jit should succeed");
         assert_eq!(result, 7);
     }
 
     #[test]
     fn run_jit_passes_program_args() {
-        let cli = parse_ok(&["examples/test.expr", "--run-jit", "--", "hello", "world"]);
+        let program_args = vec!["hello".to_string(), "world".to_string()];
         let result = run_jit(
-            &cli,
             Path::new("input.expr"),
             "fn main(args) do\n    list_len(args) + bytes_len(list_get(args, 0))\nend",
+            CodegenBackend::Cranelift,
+            16,
+            &program_args,
         )
         .expect("run_jit should succeed");
         assert_eq!(result, 7);
