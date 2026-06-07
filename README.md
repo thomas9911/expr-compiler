@@ -1,6 +1,22 @@
 # another programming language (or expression thing)
 
-Concept, have compiled output plus JIT and IR execution paths.
+Goal:
+
+- dynamically typed
+- high-level
+- compiled
+- focused on small binary output size
+- not intended as a general-purpose language
+- uses a preallocated arena for memory management
+  - arena size is fixed at compile time for the produced binary
+
+Current execution paths:
+
+- native compiled output
+- JIT
+- LLVM WebAssembly output
+- LLVM `wasi:cli/command` component output
+- IR/codegen inspection paths
 
 ## Runtime model
 
@@ -14,8 +30,11 @@ Current tag usage:
 
 - `Int`
 - `List`
+- `Map`
+- `MapIter`
 - `BigInt`
 - `String`
+- `StringIter`
 - `Function`
 
 ## BigInt
@@ -162,11 +181,23 @@ Current map surface:
 ```text
 m = map_new()
 map_set(m, "name", "expr-compiler")
+map_set(m, "year", 2027)
 print(map_len(m))
 print(map_has(m, "name"))
 print(map_get(m, "name"))
 ok, value, err = map_try_get(m, "missing")
 ok, key, value = map_try_pop(m)
+keys = map_keys(m)
+values = map_values(m)
+it = map_iter(m)
+if not map_iter_done(it) do
+    key, value = map_iter_next(it)
+end
+
+config = {
+    name: "expr-compiler",
+    version: 1,
+}
 ```
 
 Current behavior:
