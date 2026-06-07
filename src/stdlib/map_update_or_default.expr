@@ -1,0 +1,11 @@
+fn map_update_or_default(map, key, default_value, callback) do
+    if map_has(map, key) do
+        value = callback(map_get(map, key))
+        map_set(map, key, value)
+        value
+    else
+        value = callback(default_value)
+        map_set(map, key, value)
+        value
+    end
+end

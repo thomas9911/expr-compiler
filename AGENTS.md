@@ -85,13 +85,35 @@ Guidance for coding agents working in this repository.
   - `string_is_integer(s)`
   - `string_try_parse_integer(s)`
   - `string_try_parse_bigint(s)`
+  - `string_from_codepoints(xs)`
   - `type_of(value)`
   - `is_int(value)`
   - `is_bigint(value)`
   - `is_string(value)`
   - `is_list(value)`
+  - `is_map(value)`
+  - `is_map_iter(value)`
   - `is_function(value)`
   - `is_string_iter(value)`
+  - `map_new()`
+  - `map_set(m, key, value)`
+  - `map_len(m)`
+  - `map_has(m, key)`
+  - `map_get(m, key)`
+  - `map_delete(m, key)`
+  - `map_iter(m)`
+  - `map_iter_done(it)`
+  - `map_iter_next(it)`
+  - `map_iter_key(it)`
+  - `map_iter_value(it)`
+  - `map_iter_advance(it)`
+  - `map_keys(m)`
+  - `map_values(m)`
+  - `map_try_get(m, key)`
+  - `map_try_delete(m, key)`
+  - `map_try_pop(m)`
+  - `map_update(m, key, callback)`
+  - `map_update_or_default(m, key, default_value, callback)`
   - `string_repeat(s, n)`
   - `string_reverse(s)`
   - `"a" == "a"`
@@ -114,9 +136,22 @@ Guidance for coding agents working in this repository.
   - current autoloaded helpers include `string_is_empty(s)`, `string_is_not_empty(s)`, `string_len(s)`, `string_first(s)`, `string_last(s)`, `string_try_first(s)`, `string_try_last(s)`, `string_starts_with(s, prefix)`, `string_ends_with(s, suffix)`, `string_contains(s, needle)`, `bytes_try_get(s, index)`, `string_try_pop(s)`, `string_is_ascii(s)`, `string_all(s, predicate)`, `string_is_integer(s)`, `string_repeat(s, n)`, and `string_reverse(s)`
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is a boolean alias, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
+  - `string_from_codepoints(xs)` takes a `list<int>` of Unicode scalar values and returns a UTF-8 string
   - `string_try_first(s)`, `string_try_last(s)`, `bytes_try_get(s, index)`, and `string_try_pop(s)` also return `(ok, value, err)` instead of trapping on empty strings or out-of-bounds access
-  - `type_of(value)` returns a stable debuggable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"function"`, or `"string_iter"`
-  - `is_int(value)`, `is_bigint(value)`, `is_string(value)`, `is_list(value)`, `is_function(value)`, and `is_string_iter(value)` return normalized integer booleans based on the runtime tag
+  - `map_try_get(m, key)` returns `(ok, value, err)` where `value` is the stored value or `0`, and `err` is `""` on success or `"missing key"` on failure
+  - `map_try_delete(m, key)` returns `(ok, value, err)` with the same failure contract and removes the entry on success
+  - `map_try_pop(m)` returns `(ok, key, value)` and removes an arbitrary entry on success; on an empty map it returns `(false, "", 0)`
+  - `map_update(m, key, callback)` updates an existing entry with `callback(value)` and returns normalized integer boolean success
+  - `map_update_or_default(m, key, default_value, callback)` stores and returns `callback(current_or_default_value)`
+  - `map_iter(m)` returns a map iterator over the current entries
+  - `map_iter_done(it)` reports whether the iterator is exhausted
+  - `map_iter_next(it)` returns `(key, value)` and advances the iterator
+  - `map_iter_key(it)` returns the current key
+  - `map_iter_value(it)` returns the current value
+  - `map_iter_advance(it)` advances to the next occupied entry
+  - `map_keys(m)` and `map_values(m)` are collection helpers built on that iterator surface
+  - `type_of(value)` returns a stable debuggable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"map"`, `"map_iter"`, `"function"`, or `"string_iter"`
+  - `is_int(value)`, `is_bigint(value)`, `is_string(value)`, `is_list(value)`, `is_map(value)`, `is_map_iter(value)`, `is_function(value)`, and `is_string_iter(value)` return normalized integer booleans based on the runtime tag
   - the compiler now performs conservative compile-time kind checks for obvious builtin and indexing misuse
   - it rejects only when the inferred kinds are confident; unknown values still rely on runtime checks
   - UTF-8 iterator operations validate encoding and trap on invalid byte sequences
@@ -246,3 +281,4 @@ From `Justfile`:
 2. A simple arithmetic example runs with `--run-jit`.
 3. A list example runs with `--run-jit`.
 4. Native compile path still links and runs on the target platform.
+

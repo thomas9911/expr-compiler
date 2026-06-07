@@ -1,14 +1,18 @@
 use crate::analysis::{
     FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, ValueKind, ValueShape,
+    narrowed_function_analyses_for_condition,
 };
-use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst};
+use crate::parser::{
+    Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
+};
 use crate::source::Span;
 use crate::value::{
     CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, LIST_LEN_OFFSET,
     LIST_PTR_OFFSET, MULTI_HEADER_SIZE, MULTI_LEN_OFFSET, MULTI_PTR_OFFSET, STRING_CAP_OFFSET,
     STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
     STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION,
-    TAG_INT, TAG_LIST, TAG_MULTI, TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER, TAG_MULTI, TAG_STRING, TAG_STRING_ITER,
+    VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
 use cranelift::codegen::ir::condcodes::IntCC;
@@ -155,6 +159,7 @@ struct UsedFeatures {
     bigint: bool,
     lists: bool,
     list_mutation: bool,
+    maps: bool,
 }
 
 impl Module {
@@ -310,6 +315,11 @@ impl Module {
         self.used_features.list_mutation
     }
 
+    #[cfg(feature = "llvm-backend")]
+    pub(super) fn uses_maps(&self) -> bool {
+        self.used_features.maps
+    }
+
     pub fn compile_to_jit(self) -> JitArtifact {
         self.try_compile_to_jit().unwrap_or_else(|err| panic!("{err}"))
     }
@@ -366,6 +376,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
             crate::runtime::__expr_print_host as usize as i64,
             crate::runtime::__expr_list_print_host as usize as i64,
             arena_base_addr,
@@ -454,6 +465,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
         );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
@@ -561,6 +573,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
         );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
@@ -693,6 +706,7 @@ impl Module {
             self.used_features.bigint,
             self.used_features.lists,
             self.used_features.list_mutation,
+            self.used_features.maps,
         );
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
@@ -1395,7 +1409,11 @@ fn infer_ast_return_arity(
             Ok(then_arity)
         }
         Ast::Expression(ExpressionAst { function, .. }) if !function.is_empty() => {
-            Ok(*function_return_arities.get(function).unwrap_or(&1))
+            if function == "map_iter_next" {
+                Ok(2)
+            } else {
+                Ok(*function_return_arities.get(function).unwrap_or(&1))
+            }
         }
         _ => Ok(1),
     }
@@ -1489,6 +1507,10 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
             source: include_str!("./stdlib/string_try_parse_bigint.expr"),
             stdlib_deps: &[],
         }),
+        "string_from_codepoints" => Some(StdlibFunction {
+            source: include_str!("./stdlib/string_from_codepoints.expr"),
+            stdlib_deps: &[],
+        }),
         "type_of" => Some(StdlibFunction {
             source: include_str!("./stdlib/type_of.expr"),
             stdlib_deps: &[
@@ -1496,9 +1518,39 @@ fn stdlib_function(name: &str) -> Option<StdlibFunction> {
                 "is_bigint",
                 "is_string",
                 "is_list",
+                "is_map",
+                "is_map_iter",
                 "is_function",
                 "is_string_iter",
             ],
+        }),
+        "map_try_get" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_try_get.expr"),
+            stdlib_deps: &[],
+        }),
+        "map_try_delete" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_try_delete.expr"),
+            stdlib_deps: &["map_try_get"],
+        }),
+        "map_try_pop" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_try_pop.expr"),
+            stdlib_deps: &["map_keys"],
+        }),
+        "map_update" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_update.expr"),
+            stdlib_deps: &[],
+        }),
+        "map_update_or_default" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_update_or_default.expr"),
+            stdlib_deps: &[],
+        }),
+        "map_keys" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_keys.expr"),
+            stdlib_deps: &[],
+        }),
+        "map_values" => Some(StdlibFunction {
+            source: include_str!("./stdlib/map_values.expr"),
+            stdlib_deps: &[],
         }),
         "string_try_first" => Some(StdlibFunction {
             source: include_str!("./stdlib/string_try_first.expr"),
@@ -1659,6 +1711,14 @@ fn collect_stdlib_references_from_ast(
                 collect_stdlib_references_from_ast(item, scope, refs);
             }
         }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_stdlib_references_from_ast(key, scope, refs);
+                }
+                collect_stdlib_references_from_ast(&entry.value, scope, refs);
+            }
+        }
         Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
@@ -1724,6 +1784,25 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             }
             if matches!(
                 function.as_str(),
+                "map_new"
+                    | "map_set"
+                    | "map_len"
+                    | "map_get"
+                    | "map_has"
+                    | "map_delete"
+                    | "map_iter"
+                    | "map_iter_done"
+                    | "map_iter_next"
+                    | "map_iter_key"
+                    | "map_iter_value"
+                    | "map_iter_advance"
+                    | "map_keys"
+            ) {
+                features.maps = true;
+                features.lists = true;
+            }
+            if matches!(
+                function.as_str(),
                 "list_insert" | "list_set" | "list_swap" | "list_pop" | "list_delete" | "list_copy"
             ) {
                 features.lists = true;
@@ -1742,6 +1821,16 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             features.lists = true;
             for item in items {
                 collect_used_features_from_ast(item, features);
+            }
+        }
+        Ast::MapLiteral(entries) => {
+            features.maps = true;
+            features.lists = true;
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_used_features_from_ast(key, features);
+                }
+                collect_used_features_from_ast(&entry.value, features);
             }
         }
         Ast::Index { collection, index, .. } => {
@@ -2015,6 +2104,8 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "is_bigint"
                 | "is_string"
                 | "is_list"
+                | "is_map"
+                | "is_map_iter"
                 | "is_function"
                 | "is_string_iter"
                 | "list_new"
@@ -2027,6 +2118,18 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "list_pop"
                 | "list_delete"
                 | "list_copy"
+                | "map_new"
+                | "map_set"
+                | "map_len"
+                | "map_get"
+                | "map_has"
+                | "map_delete"
+                | "map_iter"
+                | "map_iter_done"
+                | "map_iter_next"
+                | "map_iter_key"
+                | "map_iter_value"
+                | "map_iter_advance"
                 | "list_range"
                 | "list_map"
                 | "list_filter"
@@ -2171,6 +2274,41 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_ast_user_facing(
+                        key,
+                        locals,
+                        function_names,
+                        function_arities,
+                        value_kind_analysis,
+                        function_analysis,
+                    )?;
+                    let key_kinds =
+                        infer_ast_value_shape(key, function_analysis, value_kind_analysis)
+                            .scalar_slot();
+                    if !key_kinds.is_empty() && !kind_sets_intersect(key_kinds, KindSet::string()) {
+                        return Err(CompileError::InvalidArgumentType {
+                            function: "map literal".to_string(),
+                            argument: 1,
+                            expected: "string".to_string(),
+                            found: format_kind_set_for_error(key_kinds),
+                            span: span_of_ast(key),
+                        });
+                    }
+                }
+                validate_ast_user_facing(
+                    &entry.value,
+                    locals,
+                    function_names,
+                    function_arities,
+                    value_kind_analysis,
+                    function_analysis,
+                )?;
+            }
+            Ok(())
+        }
         Ast::Index { collection, index, .. } => validate_index_ast(
             collection,
             index,
@@ -2266,7 +2404,13 @@ fn expression_return_arity(
     function: &str,
     function_return_arities: &HashMap<String, usize>,
 ) -> usize {
-    if function.is_empty() { 1 } else { *function_return_arities.get(function).unwrap_or(&1) }
+    if function.is_empty() {
+        1
+    } else if function == "map_iter_next" {
+        2
+    } else {
+        *function_return_arities.get(function).unwrap_or(&1)
+    }
 }
 
 fn validate_block_multi_return_usage(
@@ -2342,6 +2486,27 @@ fn validate_ast_multi_return_usage(
             function_return_arities,
             expected_arity,
         ),
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_child_multi_return_usage(
+                        key,
+                        current_function,
+                        locals,
+                        function_names,
+                        function_return_arities,
+                    )?;
+                }
+                validate_child_multi_return_usage(
+                    &entry.value,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                )?;
+            }
+            validate_single_value_multi_return_usage(expected_arity, None)
+        }
         Ast::Index { collection, index, span } => validate_index_multi_return_usage(
             collection,
             index,
@@ -2914,13 +3079,15 @@ fn validate_if_ast_user_facing(
         value_kind_analysis,
         function_analysis,
     )?;
+    let (then_analysis, else_analysis) =
+        narrowed_function_analyses_for_condition(condition, function_analysis);
     validate_ast_sequence(
         &then.lines,
         locals,
         function_names,
         function_arities,
         value_kind_analysis,
-        function_analysis,
+        &then_analysis,
     )?;
     if let Some(else_) = else_ {
         validate_ast_sequence(
@@ -2929,7 +3096,7 @@ fn validate_if_ast_user_facing(
             function_names,
             function_arities,
             value_kind_analysis,
-            function_analysis,
+            &else_analysis,
         )?;
     }
     Ok(())
@@ -2948,6 +3115,8 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
     const BIGINT_OR_INT: BuiltinArgSpec =
         Spec { expected: KindSet::bigint().union(KindSet::int()) };
     const LIST: BuiltinArgSpec = Spec { expected: KindSet::list() };
+    const MAP: BuiltinArgSpec = Spec { expected: KindSet::map() };
+    const MAP_ITER: BuiltinArgSpec = Spec { expected: KindSet::map_iter() };
     const FUNCTION: BuiltinArgSpec = Spec { expected: KindSet::function() };
 
     match function {
@@ -2984,6 +3153,11 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
         "list_swap" => Some(&[LIST, INT, INT]),
         "list_map" | "list_filter" => Some(&[LIST, FUNCTION]),
         "list_range" => Some(&[INT, INT]),
+        "map_len" | "map_keys" | "map_iter" | "map_values" => Some(&[MAP]),
+        "map_has" | "map_get" | "map_delete" => Some(&[MAP, STRING]),
+        "map_set" => Some(&[MAP, STRING]),
+        "map_iter_done" | "map_iter_next" | "map_iter_key" | "map_iter_value"
+        | "map_iter_advance" => Some(&[MAP_ITER]),
         "bigint_from_int" => Some(&[INT]),
         "add" | "subtract" | "multiply" | "divide" | "modulo" | "gt" | "lt" | "gte" | "lte"
         | "bigint_compare" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
@@ -3003,6 +3177,8 @@ fn format_kind_set_for_error(kinds: KindSet) -> String {
         (ValueKind::BigInt, "bigint"),
         (ValueKind::String, "string"),
         (ValueKind::List, "list"),
+        (ValueKind::Map, "map"),
+        (ValueKind::MapIter, "map_iter"),
         (ValueKind::Function, "function"),
         (ValueKind::StringIter, "string_iter"),
     ] {
@@ -3053,6 +3229,8 @@ fn kind_sets_intersect(lhs: KindSet, rhs: KindSet) -> bool {
         ValueKind::BigInt,
         ValueKind::String,
         ValueKind::List,
+        ValueKind::Map,
+        ValueKind::MapIter,
         ValueKind::Function,
         ValueKind::StringIter,
     ]
@@ -3083,6 +3261,14 @@ fn infer_ast_value_shape(
                 )
             }))
         }
+        Ast::MapLiteral(entries) => {
+            ValueShape::map(entries.iter().fold(KindSet::empty(), |kinds, entry| {
+                kinds.union(
+                    infer_ast_value_shape(&entry.value, function_analysis, value_kind_analysis)
+                        .scalar_slot(),
+                )
+            }))
+        }
         Ast::MultiValue(values) => ValueShape::from_slots(
             values
                 .iter()
@@ -3097,6 +3283,16 @@ fn infer_ast_value_shape(
                 .iter()
                 .map(|arg| infer_ast_value_shape(arg, function_analysis, value_kind_analysis))
                 .collect::<Vec<_>>();
+            if matches!(
+                function.as_str(),
+                "map_try_get"
+                    | "map_try_delete"
+                    | "map_try_pop"
+                    | "map_iter_next"
+                    | "string_from_codepoints"
+            ) {
+                return infer_builtin_value_shape(function, &arg_shapes);
+            }
             if let Some(function_info) = value_kind_analysis.functions.get(function) {
                 return function_info.returns.clone();
             }
@@ -3189,9 +3385,8 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
             ValueShape::scalar(KindSet::int())
         }
-        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter" => {
-            ValueShape::scalar(KindSet::int())
-        }
+        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_map" | "is_map_iter"
+        | "is_function" | "is_string_iter" => ValueShape::scalar(KindSet::int()),
         "bytes_len"
         | "bytes_get"
         | "bytes_pop"
@@ -3225,6 +3420,12 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         }
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
         "list_new" => ValueShape::list(KindSet::empty()),
+        "map_new" => ValueShape::map(KindSet::empty()),
+        "map_iter" => arg_shapes
+            .first()
+            .and_then(ValueShape::map_values)
+            .map(ValueShape::map_iter)
+            .unwrap_or_else(|| ValueShape::map_iter(KindSet::empty())),
         "list_range" => ValueShape::list(KindSet::int()),
         "list_copy" | "list_filter" => arg_shapes
             .first()
@@ -3235,9 +3436,48 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
         "list_len" | "list_push" | "list_insert" | "list_set" | "list_swap" => {
             ValueShape::scalar(KindSet::int())
         }
+        "map_len" | "map_has" => ValueShape::scalar(KindSet::int()),
+        "map_set" => ValueShape::map(
+            arg_shapes
+                .first()
+                .and_then(ValueShape::map_values)
+                .unwrap_or_else(KindSet::empty)
+                .union(
+                    arg_shapes.get(2).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty),
+                ),
+        ),
         "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
             arg_shapes.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
         ),
+        "map_get" | "map_delete" => ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ),
+        "map_try_get" | "map_try_delete" => ValueShape::from_slots(vec![
+            KindSet::int(),
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+            KindSet::string(),
+        ]),
+        "map_try_pop" => ValueShape::from_slots(vec![
+            KindSet::int(),
+            KindSet::string(),
+            arg_shapes.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ]),
+        "map_iter_next" => ValueShape::from_slots(vec![
+            KindSet::string(),
+            arg_shapes.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        ]),
+        "map_iter_done" | "map_iter_advance" => ValueShape::scalar(KindSet::int()),
+        "map_iter_key" => ValueShape::scalar(KindSet::string()),
+        "map_iter_value" => ValueShape::scalar(
+            arg_shapes.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        ),
+        "map_keys" => ValueShape::list(KindSet::string()),
+        "map_values" => arg_shapes
+            .first()
+            .and_then(ValueShape::map_values)
+            .map(ValueShape::list)
+            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
+        "string_from_codepoints" => ValueShape::scalar(KindSet::string()),
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
         }
@@ -3301,7 +3541,8 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
         | Ast::Lambda { .. }
         | Ast::MultiValue(_)
         | Ast::Literal(_)
-        | Ast::ListLiteral(_) => None,
+        | Ast::ListLiteral(_)
+        | Ast::MapLiteral(_) => None,
     }
 }
 
@@ -3318,6 +3559,15 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
         Ast::ListLiteral(items) => {
             for item in items {
                 validate_no_nested_function_defs(item)?;
+            }
+            Ok(())
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_no_nested_function_defs(key)?;
+                }
+                validate_no_nested_function_defs(&entry.value)?;
             }
             Ok(())
         }
@@ -3424,6 +3674,14 @@ impl LambdaLifter {
                     self.lift_ast(item, scope_names);
                 }
             }
+            Ast::MapLiteral(entries) => {
+                for entry in entries {
+                    if let MapKeyAst::Dynamic(key) = &mut entry.key {
+                        self.lift_ast(key, scope_names);
+                    }
+                    self.lift_ast(&mut entry.value, scope_names);
+                }
+            }
             Ast::Index { collection, index, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
@@ -3482,6 +3740,14 @@ fn collect_captures_into(
         Ast::ListLiteral(items) => {
             for item in items {
                 collect_captures_into(item, local_names, scope_names, captures);
+            }
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_captures_into(key, local_names, scope_names, captures);
+                }
+                collect_captures_into(&entry.value, local_names, scope_names, captures);
             }
         }
         Ast::Index { collection, index, .. } => {
@@ -3564,6 +3830,14 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             collect_var_names(collection, names);
             collect_var_names(index, names);
             collect_var_names(value, names);
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    collect_var_names(key, names);
+                }
+                collect_var_names(&entry.value, names);
+            }
         }
         Ast::If { condition, then, else_, .. } => {
             collect_var_names(condition, names);
@@ -4894,6 +5168,62 @@ fn compile_list_literal(
     handle
 }
 
+fn compile_map_literal(
+    builder: &mut FunctionBuilder,
+    entries: &[MapEntryAst],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let map_new_ref = *func_refs
+        .get("map_new")
+        .expect("internal compiler error: builtin function 'map_new' is missing");
+    let create_call = builder.ins().call(map_new_ref, &[]);
+    let created = builder.inst_results(create_call);
+    let map = CompiledValue { tag: created[0], payload: created[1] };
+
+    for entry in entries {
+        let key = match &entry.key {
+            MapKeyAst::Static(key) => compile_string_literal(builder, func_refs, key),
+            MapKeyAst::Dynamic(key) => compile_ast(
+                builder,
+                key,
+                vars,
+                func_refs,
+                function_ordinals,
+                function_arities,
+                closure_metadata,
+                capture_slots,
+                env_ptr,
+                function_analysis,
+                value_kind_analysis,
+            ),
+        };
+        let value = compile_ast(
+            builder,
+            &entry.value,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        );
+        let _ = call_ternary(builder, func_refs, "map_set", map, key, value);
+    }
+
+    map
+}
+
 fn create_empty_list(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
@@ -4964,6 +5294,14 @@ fn compile_multi_value(
             )
         })
         .collect::<Vec<_>>();
+    compile_multi_compiled_values(builder, &compiled, func_refs)
+}
+
+fn compile_multi_compiled_values(
+    builder: &mut FunctionBuilder,
+    compiled: &[CompiledValue],
+    func_refs: &HashMap<String, FuncRef>,
+) -> CompiledValue {
     let alloc_ref = require_func(func_refs, "__alloc");
     let align = builder.ins().iconst(types::I64, 8);
     let data_bytes =
@@ -4976,7 +5314,7 @@ fn compile_multi_value(
     let len_value = builder.ins().iconst(types::I64, compiled.len() as i64);
     builder.ins().store(MemFlags::new(), len_value, header_ptr, MULTI_LEN_OFFSET);
     builder.ins().store(MemFlags::new(), data_ptr, header_ptr, MULTI_PTR_OFFSET);
-    for (index, value) in compiled.into_iter().enumerate() {
+    for (index, value) in compiled.iter().enumerate() {
         let slot_offset = i32::try_from(i64::try_from(index).unwrap() * VALUE_SIZE)
             .expect("multi slot offset overflow");
         let tag_i8 = builder.ins().ireduce(types::I8, value.tag);
@@ -5670,6 +6008,19 @@ fn compile_ast(
             function_analysis,
             value_kind_analysis,
         ),
+        Ast::MapLiteral(entries) => compile_map_literal(
+            builder,
+            entries,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
         Ast::Index { collection, index, .. } => compile_index_ast(
             builder,
             collection,
@@ -6236,7 +6587,14 @@ fn compile_type_predicate_expression_ast(
 ) -> Option<CompiledValue> {
     if !matches!(
         function,
-        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter"
+        "is_int"
+            | "is_bigint"
+            | "is_string"
+            | "is_list"
+            | "is_map"
+            | "is_map_iter"
+            | "is_function"
+            | "is_string_iter"
     ) {
         return None;
     }
@@ -6259,6 +6617,8 @@ fn compile_type_predicate_expression_ast(
         "is_bigint" => TAG_BIGINT,
         "is_string" => TAG_STRING,
         "is_list" => TAG_LIST,
+        "is_map" => TAG_MAP,
+        "is_map_iter" => TAG_MAP_ITER,
         "is_function" => TAG_FUNCTION,
         "is_string_iter" => TAG_STRING_ITER,
         _ => unreachable!(),
@@ -6918,11 +7278,32 @@ fn compile_named_expression_ast(
         "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
         "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
         "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
+        "map_new" => {
+            let func_ref = require_func(func_refs, "map_new");
+            let call = builder.ins().call(func_ref, &[]);
+            let results = builder.inst_results(call);
+            CompiledValue { tag: results[0], payload: results[1] }
+        }
+        "map_iter_next" => {
+            // This wants to be a stdlib helper, but current multi-return parsing/validation
+            // for helper-style functions is still too restrictive. Keep the semantics here
+            // as a thin lowering over the primitive iterator builtins until that is fixed.
+            let key = call_unary(builder, func_refs, "map_iter_key", compiled[0]);
+            let value = call_unary(builder, func_refs, "map_iter_value", compiled[0]);
+            let _advance = call_unary(builder, func_refs, "map_iter_advance", compiled[0]);
+            compile_multi_compiled_values(builder, &[key, value], func_refs)
+        }
+        "map_len" | "map_iter" | "map_iter_done" | "map_iter_key" | "map_iter_value"
+        | "map_iter_advance" => call_unary(builder, func_refs, function, compiled[0]),
+        "map_has" | "map_get" | "map_delete" => {
+            call_binary(builder, func_refs, function, compiled[0], compiled[1])
+        }
+        "map_set" => {
+            call_ternary(builder, func_refs, "map_set", compiled[0], compiled[1], compiled[2])
+        }
         "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
         | "bigint_modulo" | "bigint_compare" | "bigint_bitand" | "bigint_bitor"
-        | "bigint_bitxor" => {
-            compile_bigint_builtin(builder, func_refs, function, &compiled)
-        }
+        | "bigint_bitxor" => compile_bigint_builtin(builder, func_refs, function, &compiled),
         "bigint_shl" | "bigint_shr" => {
             compile_bigint_shift_builtin(builder, func_refs, function, compiled[0], compiled[1])
         }
@@ -7357,6 +7738,19 @@ fn extract_llvm_wasm_symbol_asm<'a>(asm: &'a str, symbol: &str) -> &'a str {
     &rest[..next]
 }
 
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+#[ignore = "debug helper for inspecting LLVM map symbols"]
+fn dump_llvm_map_growth_symbols() {
+    let src = build_large_map_growth_source(65);
+    let asm = compile_llvm_wasm_assembly_for_test(&src);
+    println!("--- llvm_rt_map_set ---\n{}", extract_llvm_wasm_symbol_asm(&asm, "llvm_rt_map_set"));
+    println!(
+        "--- llvm_rt_map_grow ---\n{}",
+        extract_llvm_wasm_symbol_asm(&asm, "llvm_rt_map_grow")
+    );
+}
+
 #[test]
 fn ir_bytes_len_known_string_omits_bad_conversion_trap_in_main() {
     let src = "fn main() do\n    bytes_len(\"abc\")\nend";
@@ -7708,8 +8102,122 @@ fn autoloaded_stdlib_functions_can_be_used_as_values() {
 
 #[test]
 fn runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
-    assert_cranelift_executable_output(src, "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n", 0);
+    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
+    assert_cranelift_executable_output(
+        src,
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        0,
+    );
+}
+
+#[test]
+fn string_from_codepoints_works() {
+    let src = "fn main() do\n    it = string_chars(\"hé🙂\")\n    xs = list_new()\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    print(string_from_codepoints(xs))\nend";
+    assert_cranelift_executable_output(src, "hé🙂\n", 0);
+}
+
+#[test]
+fn map_iter_and_map_values_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    it = map_iter(m)\n    print(map_iter_done(it))\n    key1, value1 = map_iter_next(it)\n    print(key1 == \"a\" or key1 == \"b\")\n    print((key1 == \"a\" and value1 == 10) or (key1 == \"b\" and value1 == 32))\n    print(map_iter_done(it))\n    key2, value2 = map_iter_next(it)\n    print(key2 == \"a\" or key2 == \"b\")\n    print(key1 != key2)\n    print(value1 + value2)\n    print(map_iter_done(it))\n    values = map_values(m)\n    print(list_len(values))\n    print(values[0] + values[1])\nend";
+    assert_cranelift_executable_output(src, "0\n1\n1\n0\n1\n1\n42\n1\n2\n42\n", 0);
+}
+
+#[test]
+fn maps_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
+    assert_cranelift_executable_output(src, "2\n1\n0\n11\n32\n", 0);
+}
+
+#[test]
+fn map_try_get_works() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"answer\", 42)\n    ok1, value1, err1 = map_try_get(m, \"answer\")\n    print(ok1)\n    print(value1)\n    print(err1 == \"\")\n    ok2, value2, err2 = map_try_get(m, \"missing\")\n    print(ok2)\n    print(value2)\n    print(err2 == \"missing key\")\nend";
+    assert_cranelift_executable_output(src, "1\n42\n1\n0\n0\n1\n", 0);
+}
+
+#[test]
+fn map_delete_and_try_delete_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    print(map_delete(m, \"a\"))\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_get(m, \"b\"))\n    ok, value, err = map_try_delete(m, \"missing\")\n    print(ok)\n    print(value)\n    print(err == \"missing key\")\nend";
+    assert_cranelift_executable_output(src, "10\n1\n0\n32\n0\n0\n1\n", 0);
+}
+
+#[test]
+fn map_try_pop_works() {
+    let src = "fn main() do\n    m = map_new()\n    ok1, key1, value1 = map_try_pop(m)\n    print(ok1)\n    print(key1 == \"\")\n    print(value1)\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    ok2, key2, value2 = map_try_pop(m)\n    print(ok2)\n    print(map_len(m))\n    print(key2 == \"a\" or key2 == \"b\")\n    print((key2 == \"a\" and value2 == 10) or (key2 == \"b\" and value2 == 32))\n    print(list_len(map_keys(m)))\nend";
+    assert_cranelift_executable_output(src, "0\n1\n0\n1\n1\n1\n1\n1\n", 0);
+}
+
+#[test]
+fn map_update_and_map_update_or_default_work() {
+    let src = "fn inc(x) do\n    x + 1\nend\n\nfn main() do\n    m = map_new()\n    print(map_update(m, \"count\", inc))\n    print(map_has(m, \"count\"))\n    print(map_update_or_default(m, \"count\", 0, inc))\n    print(map_get(m, \"count\"))\n    print(map_update(m, \"count\", inc))\n    print(map_get(m, \"count\"))\nend";
+    assert_cranelift_executable_output(src, "0\n0\n1\n1\n1\n2\n", 0);
+}
+
+#[test]
+fn map_keys_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    keys = map_keys(m)\n    print(list_len(keys))\n    print(keys[0])\n    print(keys[1])\nend";
+    assert_cranelift_executable_output(src, "2\na\nb\n", 0);
+}
+
+#[test]
+fn map_literal_works() {
+    let src = "fn main() do\n    dyn_key = \"count\"\n    m = {\n        name: \"expr\",\n        dyn_key => 3,\n    }\n    print(map_get(m, \"name\"))\n    print(map_get(m, \"count\"))\n    print(map_len(m))\nend";
+    assert_cranelift_executable_output(src, "expr\n3\n2\n", 0);
+}
+
+#[cfg(test)]
+fn test_map_bucket_index(key: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3u64);
+    }
+    hash % 64
+}
+
+#[cfg(test)]
+fn test_find_colliding_map_keys() -> (String, String) {
+    let mut buckets = std::collections::HashMap::<u64, String>::new();
+    for idx in 0..512 {
+        let key = format!("k{idx}");
+        let bucket = test_map_bucket_index(&key);
+        if let Some(existing) = buckets.get(&bucket) {
+            if existing != &key {
+                return (existing.clone(), key);
+            }
+        } else {
+            buckets.insert(bucket, key);
+        }
+    }
+    panic!("failed to find colliding test map keys")
+}
+
+#[cfg(test)]
+fn build_large_map_growth_source(count: usize) -> String {
+    let mut src = String::from("fn main() do\n    m = map_new()\n");
+    for idx in 0..count {
+        src.push_str(&format!("    map_set(m, \"k{idx}\", {})\n", idx + 1));
+    }
+    src.push_str(&format!(
+        "    print(map_len(m))\n    print(map_get(m, \"k0\"))\n    print(map_get(m, \"k{}\"))\n    print(map_get(m, \"k{}\"))\n    map_set(m, \"k10\", 999)\n    print(map_get(m, \"k10\"))\nend",
+        count / 2,
+        count - 1
+    ));
+    src
+}
+
+#[test]
+fn map_delete_preserves_probe_chain_and_reuses_tombstone() {
+    let (key1, key2) = test_find_colliding_map_keys();
+    let src = format!(
+        "fn main() do\n    m = map_new()\n    map_set(m, \"{key1}\", 10)\n    map_set(m, \"{key2}\", 32)\n    print(map_delete(m, \"{key1}\"))\n    print(map_has(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    map_set(m, \"{key1}\", 11)\n    print(map_get(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    print(map_len(m))\nend"
+    );
+    assert_cranelift_executable_output(&src, "10\n0\n32\n11\n32\n2\n", 0);
+}
+
+#[test]
+fn map_grows_past_initial_capacity() {
+    let src = build_large_map_growth_source(80);
+    assert_cranelift_executable_output(&src, "80\n1\n41\n80\n999\n", 0);
 }
 
 #[test]
@@ -8362,13 +8870,98 @@ fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\nend";
+    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
         0,
     );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_string_from_codepoints_works() {
+    let src = "fn main() do\n    it = string_chars(\"hé🙂\")\n    xs = list_new()\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    list_push(xs, string_iter_next(it))\n    print(string_from_codepoints(xs))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "hé🙂\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_iter_and_map_values_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    it = map_iter(m)\n    print(map_iter_done(it))\n    key1, value1 = map_iter_next(it)\n    print(key1 == \"a\" or key1 == \"b\")\n    print((key1 == \"a\" and value1 == 10) or (key1 == \"b\" and value1 == 32))\n    print(map_iter_done(it))\n    key2, value2 = map_iter_next(it)\n    print(key2 == \"a\" or key2 == \"b\")\n    print(key1 != key2)\n    print(value1 + value2)\n    print(map_iter_done(it))\n    values = map_values(m)\n    print(list_len(values))\n    print(values[0] + values[1])\nend";
+    assert_backend_executable_output(
+        src,
+        CodegenBackend::Llvm,
+        "0\n1\n1\n0\n1\n1\n42\n1\n2\n42\n",
+        0,
+    );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_maps_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_has(m, \"missing\"))\n    print(map_get(m, \"a\"))\n    print(map_get(m, \"b\"))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "2\n1\n0\n11\n32\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_try_get_works() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"answer\", 42)\n    ok1, value1, err1 = map_try_get(m, \"answer\")\n    print(ok1)\n    print(value1)\n    print(err1 == \"\")\n    ok2, value2, err2 = map_try_get(m, \"missing\")\n    print(ok2)\n    print(value2)\n    print(err2 == \"missing key\")\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "1\n42\n1\n0\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_delete_and_try_delete_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    print(map_delete(m, \"a\"))\n    print(map_len(m))\n    print(map_has(m, \"a\"))\n    print(map_get(m, \"b\"))\n    ok, value, err = map_try_delete(m, \"missing\")\n    print(ok)\n    print(value)\n    print(err == \"missing key\")\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "10\n1\n0\n32\n0\n0\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_try_pop_works() {
+    let src = "fn main() do\n    m = map_new()\n    ok1, key1, value1 = map_try_pop(m)\n    print(ok1)\n    print(key1 == \"\")\n    print(value1)\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    ok2, key2, value2 = map_try_pop(m)\n    print(ok2)\n    print(map_len(m))\n    print(key2 == \"a\" or key2 == \"b\")\n    print((key2 == \"a\" and value2 == 10) or (key2 == \"b\" and value2 == 32))\n    print(list_len(map_keys(m)))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n1\n0\n1\n1\n1\n1\n1\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_update_and_map_update_or_default_work() {
+    let src = "fn inc(x) do\n    x + 1\nend\n\nfn main() do\n    m = map_new()\n    print(map_update(m, \"count\", inc))\n    print(map_has(m, \"count\"))\n    print(map_update_or_default(m, \"count\", 0, inc))\n    print(map_get(m, \"count\"))\n    print(map_update(m, \"count\", inc))\n    print(map_get(m, \"count\"))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "0\n0\n1\n1\n1\n2\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_keys_work() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"a\", 10)\n    map_set(m, \"b\", 32)\n    map_set(m, \"a\", 11)\n    keys = map_keys(m)\n    print(list_len(keys))\n    print(keys[0])\n    print(keys[1])\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "2\na\nb\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_literal_works() {
+    let src = "fn main() do\n    dyn_key = \"count\"\n    m = {\n        name: \"expr\",\n        dyn_key => 3,\n    }\n    print(map_get(m, \"name\"))\n    print(map_get(m, \"count\"))\n    print(map_len(m))\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "expr\n3\n2\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_delete_preserves_probe_chain_and_reuses_tombstone() {
+    let (key1, key2) = test_find_colliding_map_keys();
+    let src = format!(
+        "fn main() do\n    m = map_new()\n    map_set(m, \"{key1}\", 10)\n    map_set(m, \"{key2}\", 32)\n    print(map_delete(m, \"{key1}\"))\n    print(map_has(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    map_set(m, \"{key1}\", 11)\n    print(map_get(m, \"{key1}\"))\n    print(map_get(m, \"{key2}\"))\n    print(map_len(m))\nend"
+    );
+    assert_backend_executable_output(&src, CodegenBackend::Llvm, "10\n0\n32\n11\n32\n2\n", 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_map_grows_past_initial_capacity() {
+    let src = build_large_map_growth_source(80);
+    assert_backend_executable_output(&src, CodegenBackend::Llvm, "80\n1\n41\n80\n999\n", 0);
 }
 
 #[cfg(all(test, feature = "llvm-backend"))]
@@ -8678,6 +9271,120 @@ fn try_compile_to_jit_rejects_invalid_bigint_builtin_argument_type() {
 }
 
 #[test]
+fn try_compile_to_jit_rejects_invalid_map_builtin_argument_type() {
+    let src = "fn main() do\n    map_len(\"abc\")\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "map");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_key_argument_type() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, 1, 2)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_set");
+            assert_eq!(argument, 2);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_literal_dynamic_key_type() {
+    let src = "fn main() do\n    m = {\n        1 => 2,\n    }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map literal");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_get_map_argument_type() {
+    let src = "fn main() do\n    map_get(list_new(), \"a\")\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_get");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "map");
+            assert_eq!(found, "list");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_delete_key_argument_type() {
+    let src = "fn main() do\n    m = map_new()\n    map_delete(m, 1)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_delete");
+            assert_eq!(argument, 2);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_map_keys_argument_type() {
+    let src = "fn main() do\n    map_keys(\"abc\")\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "map_keys");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "map");
+            assert_eq!(found, "string");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_arithmetic_argument_type() {
     let src = "fn main() do\n    \"a\" + 1\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -8903,6 +9610,89 @@ fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_inline_lambd
 #[test]
 fn try_compile_to_jit_rejects_invalid_string_builtin_after_list_map_lambda_alias() {
     let src = "fn main() do\n    f = fn item -> item * 2 end\n    xs = [1]\n    ys = list_map(xs, f)\n    bytes_len(ys[0])\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_get() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    bytes_len(map_get(m, \"count\"))\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_try_get() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    ok, value, err = map_try_get(m, \"count\")\n    bytes_len(value)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_string_builtin_after_map_try_pop() {
+    let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    ok, key, value = map_try_pop(m)\n    bytes_len(value)\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::InvalidArgumentType { function, argument, expected, found, .. } => {
+            assert_eq!(function, "bytes_len");
+            assert_eq!(argument, 1);
+            assert_eq!(expected, "string");
+            assert_eq!(found, "int");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn try_compile_to_jit_allows_string_builtin_in_is_string_then_branch() {
+    let src = "fn main() do\n    x = 0\n    if 1 do\n        x = \"a\"\n    else\n        x = 1\n    end\n    if is_string(x) do\n        bytes_len(x)\n    else\n        0\n    end\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    module.try_compile_to_jit().expect("jit compile should succeed");
+}
+
+#[test]
+fn try_compile_to_jit_rejects_string_builtin_in_not_is_string_then_branch() {
+    let src = "fn main() do\n    x = 0\n    if 1 do\n        x = \"a\"\n    else\n        x = 1\n    end\n    if not is_string(x) do\n        bytes_len(x)\n    else\n        0\n    end\nend";
     let module = Module::try_from_source(src).expect("source should parse");
     let err = match module.try_compile_to_jit() {
         Ok(_) => panic!("jit compile should fail"),

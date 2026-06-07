@@ -7,6 +7,8 @@ pub enum ValueKind {
     BigInt,
     String,
     List,
+    Map,
+    MapIter,
     Function,
     StringIter,
 }
@@ -19,12 +21,16 @@ impl KindSet {
     const BIGINT_BIT: u8 = 1 << 1;
     const STRING_BIT: u8 = 1 << 2;
     const LIST_BIT: u8 = 1 << 3;
-    const FUNCTION_BIT: u8 = 1 << 4;
-    const STRING_ITER_BIT: u8 = 1 << 5;
+    const MAP_BIT: u8 = 1 << 4;
+    const MAP_ITER_BIT: u8 = 1 << 5;
+    const FUNCTION_BIT: u8 = 1 << 6;
+    const STRING_ITER_BIT: u8 = 1 << 7;
     const ALL_BITS: u8 = Self::INT_BIT
         | Self::BIGINT_BIT
         | Self::STRING_BIT
         | Self::LIST_BIT
+        | Self::MAP_BIT
+        | Self::MAP_ITER_BIT
         | Self::FUNCTION_BIT
         | Self::STRING_ITER_BIT;
 
@@ -52,6 +58,14 @@ impl KindSet {
         Self(Self::LIST_BIT)
     }
 
+    pub const fn map() -> Self {
+        Self(Self::MAP_BIT)
+    }
+
+    pub const fn map_iter() -> Self {
+        Self(Self::MAP_ITER_BIT)
+    }
+
     pub const fn function() -> Self {
         Self(Self::FUNCTION_BIT)
     }
@@ -70,6 +84,8 @@ impl KindSet {
             ValueKind::BigInt => Self::BIGINT_BIT,
             ValueKind::String => Self::STRING_BIT,
             ValueKind::List => Self::LIST_BIT,
+            ValueKind::Map => Self::MAP_BIT,
+            ValueKind::MapIter => Self::MAP_ITER_BIT,
             ValueKind::Function => Self::FUNCTION_BIT,
             ValueKind::StringIter => Self::STRING_ITER_BIT,
         };
@@ -83,6 +99,20 @@ impl KindSet {
     pub fn is_any(self) -> bool {
         self.0 == Self::ALL_BITS
     }
+
+    pub fn without(self, kind: ValueKind) -> Self {
+        let bit = match kind {
+            ValueKind::Int => Self::INT_BIT,
+            ValueKind::BigInt => Self::BIGINT_BIT,
+            ValueKind::String => Self::STRING_BIT,
+            ValueKind::List => Self::LIST_BIT,
+            ValueKind::Map => Self::MAP_BIT,
+            ValueKind::MapIter => Self::MAP_ITER_BIT,
+            ValueKind::Function => Self::FUNCTION_BIT,
+            ValueKind::StringIter => Self::STRING_ITER_BIT,
+        };
+        Self(self.0 & !bit)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +120,8 @@ pub enum ValueShape {
     Scalar(KindSet),
     Multi(Vec<KindSet>),
     List { items: KindSet },
+    Map { values: KindSet },
+    MapIter { values: KindSet },
 }
 
 impl ValueShape {
@@ -99,6 +131,14 @@ impl ValueShape {
 
     pub fn list(items: KindSet) -> Self {
         Self::List { items }
+    }
+
+    pub fn map(values: KindSet) -> Self {
+        Self::Map { values }
+    }
+
+    pub fn map_iter(values: KindSet) -> Self {
+        Self::MapIter { values }
     }
 
     pub fn unknown_scalar() -> Self {
@@ -119,7 +159,7 @@ impl ValueShape {
 
     pub fn arity(&self) -> usize {
         match self {
-            Self::Scalar(_) | Self::List { .. } => 1,
+            Self::Scalar(_) | Self::List { .. } | Self::Map { .. } | Self::MapIter { .. } => 1,
             Self::Multi(slots) => slots.len(),
         }
     }
@@ -128,6 +168,8 @@ impl ValueShape {
         match self {
             Self::Scalar(kinds) => (index == 0).then_some(*kinds),
             Self::List { .. } => (index == 0).then_some(KindSet::list()),
+            Self::Map { .. } => (index == 0).then_some(KindSet::map()),
+            Self::MapIter { .. } => (index == 0).then_some(KindSet::map_iter()),
             Self::Multi(slots) => slots.get(index).copied(),
         }
     }
@@ -143,10 +185,28 @@ impl ValueShape {
         }
     }
 
+    pub fn map_values(&self) -> Option<KindSet> {
+        match self {
+            Self::Map { values } => Some(*values),
+            _ => None,
+        }
+    }
+
+    pub fn map_iter_values(&self) -> Option<KindSet> {
+        match self {
+            Self::MapIter { values } => Some(*values),
+            _ => None,
+        }
+    }
+
     pub fn union(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Scalar(lhs), Self::Scalar(rhs)) => Self::scalar(lhs.union(*rhs)),
             (Self::List { items: lhs }, Self::List { items: rhs }) => Self::list(lhs.union(*rhs)),
+            (Self::Map { values: lhs }, Self::Map { values: rhs }) => Self::map(lhs.union(*rhs)),
+            (Self::MapIter { values: lhs }, Self::MapIter { values: rhs }) => {
+                Self::map_iter(lhs.union(*rhs))
+            }
             (Self::Multi(lhs), Self::Multi(rhs)) => {
                 assert_eq!(lhs.len(), rhs.len(), "cannot union shapes of different arity");
                 Self::from_slots(
@@ -375,6 +435,17 @@ fn infer_ast(
             });
             ValueShape::list(items)
         }
+        Ast::MapLiteral(entries) => {
+            let values = entries.iter().fold(KindSet::empty(), |kinds, entry| {
+                if let crate::parser::MapKeyAst::Dynamic(key) = &entry.key {
+                    let _ = infer_ast(key, env, function_bindings, summaries, calls);
+                }
+                kinds.union(
+                    infer_ast(&entry.value, env, function_bindings, summaries, calls).scalar_slot(),
+                )
+            });
+            ValueShape::map(values)
+        }
         Ast::Index { collection, index, .. } => {
             let collection_shape = infer_ast(collection, env, function_bindings, summaries, calls);
             let _ = infer_ast(index, env, function_bindings, summaries, calls);
@@ -429,9 +500,11 @@ fn infer_ast(
             let _ = infer_ast(condition, env, function_bindings, summaries, calls);
             let mut then_env = env.clone();
             let mut then_bindings = function_bindings.clone();
+            apply_condition_narrowing(condition, &mut then_env, &mut then_bindings, true);
             let then_shape = infer_block(then, &mut then_env, &mut then_bindings, summaries, calls);
             let mut else_env = env.clone();
             let mut else_bindings = function_bindings.clone();
+            apply_condition_narrowing(condition, &mut else_env, &mut else_bindings, false);
             let else_shape = if let Some(else_block) = else_ {
                 infer_block(else_block, &mut else_env, &mut else_bindings, summaries, calls)
             } else {
@@ -479,6 +552,16 @@ fn infer_expression(
         );
         merge_input_kinds(calls, callback_name, &[callback_input]);
     }
+    if matches!(
+        expr.function.as_str(),
+        "map_try_get"
+            | "map_try_delete"
+            | "map_try_pop"
+            | "map_iter_next"
+            | "string_from_codepoints"
+    ) {
+        return builtin_shape(&expr.function, &arg_shapes);
+    }
     if let Some(summary) = summaries.get(&expr.function) {
         merge_input_kinds(calls, &expr.function, &arg_shapes);
         return summary.returns.clone();
@@ -513,6 +596,17 @@ fn infer_expression(
             arg_shapes.get(value_index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty),
         );
         env.insert(name.name.clone(), ValueShape::list(new_items));
+    }
+
+    if expr.function == "map_set"
+        && let Some(Ast::Variable(name)) = expr.args.first()
+        && let Some(current) = env.get(name.as_str()).cloned()
+    {
+        let new_values = current
+            .map_values()
+            .unwrap_or_else(KindSet::empty)
+            .union(arg_shapes.get(2).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty));
+        env.insert(name.name.clone(), ValueShape::map(new_values));
     }
 
     builtin_shape(&expr.function, &arg_shapes)
@@ -552,6 +646,125 @@ fn infer_known_callback_name<'a>(
     }
 }
 
+fn predicate_kind(function: &str) -> Option<ValueKind> {
+    match function {
+        "is_int" => Some(ValueKind::Int),
+        "is_bigint" => Some(ValueKind::BigInt),
+        "is_string" => Some(ValueKind::String),
+        "is_list" => Some(ValueKind::List),
+        "is_map" => Some(ValueKind::Map),
+        "is_map_iter" => Some(ValueKind::MapIter),
+        "is_function" => Some(ValueKind::Function),
+        "is_string_iter" => Some(ValueKind::StringIter),
+        _ => None,
+    }
+}
+
+fn condition_predicate_binding(condition: &Ast) -> Option<(&str, ValueKind, bool)> {
+    match condition {
+        Ast::Expression(ExpressionAst { function, args, .. })
+            if function == "not" && args.len() == 1 =>
+        {
+            let (name, kind, positive) = condition_predicate_binding(&args[0])?;
+            Some((name, kind, !positive))
+        }
+        Ast::Expression(ExpressionAst { function, args, .. }) => {
+            let kind = predicate_kind(function)?;
+            let Ast::Variable(name) = args.first()? else {
+                return None;
+            };
+            Some((name.as_ref(), kind, true))
+        }
+        _ => None,
+    }
+}
+
+fn narrowed_shape(shape: &ValueShape, kind: ValueKind, positive: bool) -> ValueShape {
+    let exact = match kind {
+        ValueKind::Int => ValueShape::scalar(KindSet::int()),
+        ValueKind::BigInt => ValueShape::scalar(KindSet::bigint()),
+        ValueKind::String => ValueShape::scalar(KindSet::string()),
+        ValueKind::List => match shape {
+            ValueShape::List { items } => ValueShape::list(*items),
+            _ => ValueShape::scalar(KindSet::list()),
+        },
+        ValueKind::Map => match shape {
+            ValueShape::Map { values } => ValueShape::map(*values),
+            _ => ValueShape::scalar(KindSet::map()),
+        },
+        ValueKind::MapIter => match shape {
+            ValueShape::MapIter { values } => ValueShape::map_iter(*values),
+            _ => ValueShape::scalar(KindSet::map_iter()),
+        },
+        ValueKind::Function => ValueShape::scalar(KindSet::function()),
+        ValueKind::StringIter => ValueShape::scalar(KindSet::string_iter()),
+    };
+    if positive {
+        if shape.scalar_slot().contains(kind) {
+            exact
+        } else {
+            ValueShape::scalar(KindSet::empty())
+        }
+    } else {
+        match shape {
+            ValueShape::List { .. } if kind == ValueKind::List => {
+                ValueShape::scalar(KindSet::empty())
+            }
+            ValueShape::Map { .. } if kind == ValueKind::Map => {
+                ValueShape::scalar(KindSet::empty())
+            }
+            ValueShape::MapIter { .. } if kind == ValueKind::MapIter => {
+                ValueShape::scalar(KindSet::empty())
+            }
+            _ => ValueShape::scalar(shape.scalar_slot().without(kind)),
+        }
+    }
+}
+
+fn apply_condition_narrowing(
+    condition: &Ast,
+    env: &mut HashMap<String, ValueShape>,
+    function_bindings: &mut HashMap<String, String>,
+    then_branch: bool,
+) {
+    let Some((name, kind, positive_when_true)) = condition_predicate_binding(condition) else {
+        return;
+    };
+    let Some(current) = env.get(name).cloned() else {
+        return;
+    };
+    let next = narrowed_shape(
+        &current,
+        kind,
+        if then_branch { positive_when_true } else { !positive_when_true },
+    );
+    if !next.scalar_slot().contains(ValueKind::Function) {
+        function_bindings.remove(name);
+    }
+    env.insert(name.to_string(), next);
+}
+
+pub fn narrowed_function_analyses_for_condition(
+    condition: &Ast,
+    base: &FunctionValueKindAnalysis,
+) -> (FunctionValueKindAnalysis, FunctionValueKindAnalysis) {
+    let mut then_analysis = base.clone();
+    apply_condition_narrowing(
+        condition,
+        &mut then_analysis.variables,
+        &mut then_analysis.function_bindings,
+        true,
+    );
+    let mut else_analysis = base.clone();
+    apply_condition_narrowing(
+        condition,
+        &mut else_analysis.variables,
+        &mut else_analysis.function_bindings,
+        false,
+    );
+    (then_analysis, else_analysis)
+}
+
 fn infer_literal(literal: &LiteralAst) -> ValueShape {
     match literal {
         LiteralAst::Integer(_) => ValueShape::scalar(KindSet::int()),
@@ -570,6 +783,8 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
         "gt" | "lt" | "gte" | "lte" | "eq" | "ne" | "and" | "or" | "not" => {
             ValueShape::scalar(KindSet::int())
         }
+        "is_int" | "is_bigint" | "is_string" | "is_list" | "is_map" | "is_function"
+        | "is_string_iter" | "is_map_iter" => ValueShape::scalar(KindSet::int()),
         "print" | "list_print" => ValueShape::scalar(KindSet::int()),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
         | "bigint_divide" | "bigint_modulo" => ValueShape::scalar(KindSet::bigint()),
@@ -596,6 +811,12 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
         | "string_is_integer" => ValueShape::scalar(KindSet::int()),
         "string_chars" => ValueShape::scalar(KindSet::string_iter()),
         "list_new" => ValueShape::list(KindSet::empty()),
+        "map_new" => ValueShape::map(KindSet::empty()),
+        "map_iter" => args
+            .first()
+            .and_then(ValueShape::map_values)
+            .map(ValueShape::map_iter)
+            .unwrap_or_else(|| ValueShape::map_iter(KindSet::empty())),
         "list_range" => ValueShape::list(KindSet::int()),
         "list_copy" | "list_filter" => args
             .first()
@@ -604,12 +825,48 @@ fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
             .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
         "list_map" => ValueShape::list(KindSet::empty()),
         "list_len" => ValueShape::scalar(KindSet::int()),
+        "map_len" | "map_has" => ValueShape::scalar(KindSet::int()),
         "list_get" | "list_pop" | "list_delete" => ValueShape::scalar(
             args.first().and_then(ValueShape::list_items).unwrap_or_else(KindSet::any),
         ),
+        "map_get" | "map_delete" => ValueShape::scalar(
+            args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ),
+        "map_try_get" | "map_try_delete" => ValueShape::from_slots(vec![
+            KindSet::int(),
+            args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+            KindSet::string(),
+        ]),
+        "map_try_pop" => ValueShape::from_slots(vec![
+            KindSet::int(),
+            KindSet::string(),
+            args.first().and_then(ValueShape::map_values).unwrap_or_else(KindSet::any),
+        ]),
+        "map_iter_next" => ValueShape::from_slots(vec![
+            KindSet::string(),
+            args.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        ]),
+        "map_iter_done" | "map_iter_advance" => ValueShape::scalar(KindSet::int()),
+        "map_iter_key" => ValueShape::scalar(KindSet::string()),
+        "map_iter_value" => ValueShape::scalar(
+            args.first().and_then(ValueShape::map_iter_values).unwrap_or_else(KindSet::any),
+        ),
+        "map_keys" => ValueShape::list(KindSet::string()),
+        "map_values" => args
+            .first()
+            .and_then(ValueShape::map_values)
+            .map(ValueShape::list)
+            .unwrap_or_else(|| ValueShape::list(KindSet::empty())),
+        "string_from_codepoints" => ValueShape::scalar(KindSet::string()),
         "list_push" | "list_insert" | "list_set" | "list_swap" => {
             ValueShape::scalar(KindSet::int())
         }
+        "map_set" => ValueShape::map(
+            args.first()
+                .and_then(ValueShape::map_values)
+                .unwrap_or_else(KindSet::empty)
+                .union(args.get(2).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::empty)),
+        ),
         "string_try_parse_integer" => {
             ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()])
         }
@@ -758,12 +1015,19 @@ mod tests {
         assert_eq!(main.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
         assert_eq!(main.variables.get("lhs_err"), Some(&ValueShape::scalar(KindSet::string())));
         assert_eq!(main.variables.get("rhs_ok"), Some(&ValueShape::scalar(KindSet::int())));
-        assert_eq!(main.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(
+            main.variables.get("rhs"),
+            Some(&ValueShape::scalar(KindSet::bigint().union(KindSet::int())))
+        );
         assert_eq!(main.variables.get("rhs_err"), Some(&ValueShape::scalar(KindSet::string())));
         let apply = analysis.functions.get("apply_and_print").expect("apply_and_print missing");
         assert_eq!(apply.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
         assert_eq!(apply.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::bigint())));
         assert!(apply.returns.slot(0).expect("return slot missing").contains(ValueKind::Int));
+        let apply_shift =
+            analysis.functions.get("apply_and_print_shift").expect("apply_and_print_shift missing");
+        assert_eq!(apply_shift.variables.get("lhs"), Some(&ValueShape::scalar(KindSet::bigint())));
+        assert_eq!(apply_shift.variables.get("rhs"), Some(&ValueShape::scalar(KindSet::int())));
     }
 
     #[test]
@@ -788,6 +1052,63 @@ mod tests {
         assert_eq!(main.inputs.get(0), Some(&ValueShape::list(KindSet::string())));
         assert_eq!(main.variables.get("args"), Some(&ValueShape::list(KindSet::string())));
         assert_eq!(main.returns, ValueShape::list(KindSet::string()));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_map_value_kinds() {
+        let src = "fn main() do\n    m = map_new()\n    map_set(m, \"count\", 1)\n    map_set(m, \"name\", \"x\")\n    value = map_get(m, \"count\")\n    m\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        let values = KindSet::int().union(KindSet::string());
+        assert_eq!(main.variables.get("m"), Some(&ValueShape::map(values)));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(values)));
+        assert_eq!(main.returns, ValueShape::map(values));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_map_try_get_slots_from_map_values() {
+        let src = "fn main() do\n    m = map_new()\n    map_set(m, \"name\", \"x\")\n    ok, value, err = map_try_get(m, \"name\")\n    print(ok)\n    print(value)\n    print(err)\n    0\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
+        assert_eq!(main.variables.get("err"), Some(&ValueShape::scalar(KindSet::string())));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_map_try_pop_slots_from_map_values() {
+        let src = "fn main() do\n    m = map_new()\n    map_set(m, \"name\", \"x\")\n    ok, key, value = map_try_pop(m)\n    print(ok)\n    print(key)\n    print(value)\n    0\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("ok"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(main.variables.get("key"), Some(&ValueShape::scalar(KindSet::string())));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_map_iter_next_slots_from_map_values() {
+        let src = "fn main() do\n    m = map_new()\n    map_set(m, \"name\", \"x\")\n    it = map_iter(m)\n    key, value = map_iter_next(it)\n    print(key)\n    print(value)\n    0\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("key"), Some(&ValueShape::scalar(KindSet::string())));
+        assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
+    }
+
+    #[test]
+    fn analyze_value_kinds_narrows_if_branches_from_is_string() {
+        let src = "fn main() do\n    x = 0\n    if 1 do\n        x = \"a\"\n    else\n        x = 1\n    end\n    if is_string(x) do\n        bytes_len(x)\n    else\n        0\n    end\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(
+            main.variables.get("x"),
+            Some(&ValueShape::scalar(KindSet::string().union(KindSet::int())))
+        );
+        assert_eq!(main.returns, ValueShape::scalar(KindSet::int()));
     }
 
     #[test]

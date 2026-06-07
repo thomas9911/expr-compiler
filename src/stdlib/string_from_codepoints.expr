@@ -1,0 +1,32 @@
+fn string_from_codepoints(xs) do
+    __string_from_codepoints_at(xs, 0, list_len(xs), "")
+end
+
+fn __string_from_codepoints_at(xs, index, len, acc) do
+    if index == len do
+        acc
+    else
+        __string_push_codepoint(acc, list_get(xs, index))
+        __string_from_codepoints_at(xs, index + 1, len, acc)
+    end
+end
+
+fn __string_push_codepoint(acc, codepoint) do
+    if codepoint < 0 or codepoint > 1114111 or (codepoint >= 55296 and codepoint <= 57343) do
+        bytes_get("", 0)
+    else if codepoint < 128 do
+        bytes_push(acc, codepoint)
+    else if codepoint < 2048 do
+        bytes_push(acc, 192 | (codepoint >> 6))
+        bytes_push(acc, 128 | (codepoint & 63))
+    else if codepoint < 65536 do
+        bytes_push(acc, 224 | (codepoint >> 12))
+        bytes_push(acc, 128 | ((codepoint >> 6) & 63))
+        bytes_push(acc, 128 | (codepoint & 63))
+    else
+        bytes_push(acc, 240 | (codepoint >> 18))
+        bytes_push(acc, 128 | ((codepoint >> 12) & 63))
+        bytes_push(acc, 128 | ((codepoint >> 6) & 63))
+        bytes_push(acc, 128 | (codepoint & 63))
+    end
+end

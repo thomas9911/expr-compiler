@@ -1,0 +1,8 @@
+fn map_try_delete(map, key) do
+    ok, value, err = map_try_get(map, key)
+    if ok do
+        true, map_delete(map, key), ""
+    else
+        false, value, err
+    end
+end

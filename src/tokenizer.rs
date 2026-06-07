@@ -135,8 +135,14 @@ pub enum Token {
     OpenSquareBracket,
     #[token("]")]
     CloseSquareBracket,
+    #[token("{")]
+    OpenBrace,
+    #[token("}")]
+    CloseBrace,
     #[token(",")]
     Comma,
+    #[token("=>")]
+    FatArrow,
     #[token("=")]
     Assign,
     #[token("fn")]
@@ -514,6 +520,27 @@ fn tokenize_list_literal() {
             Comma,
             Integer(3),
             CloseSquareBracket,
+        ]
+    );
+}
+
+#[test]
+fn tokenize_map_literal() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("{name: 1, key => 2}").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            OpenBrace,
+            Symbol("name".to_string()),
+            ColonBlock,
+            Integer(1),
+            Comma,
+            Symbol("key".to_string()),
+            FatArrow,
+            Integer(2),
+            CloseBrace,
         ]
     );
 }

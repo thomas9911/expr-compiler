@@ -1,4 +1,5 @@
 use super::*;
+use crate::parser::{MapEntryAst, MapKeyAst};
 
 impl<'ctx> LlvmCompiler<'ctx> {
     pub(super) fn compile_ast(
@@ -34,6 +35,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
             ),
             Ast::ListLiteral(items) => self.compile_list_literal_ast(
                 items,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
+            Ast::MapLiteral(entries) => self.compile_map_literal_ast(
+                entries,
                 vars,
                 capture_slots,
                 env_ptr,
@@ -134,6 +143,13 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 )
             })
             .collect::<Vec<_>>();
+        self.compile_multi_compiled_values(&compiled)
+    }
+
+    fn compile_multi_compiled_values(
+        &self,
+        compiled: &[CompiledValue<'ctx>],
+    ) -> CompiledValue<'ctx> {
         let alloc = self.require_func("__alloc");
         let align = self.i64_type.const_int(8, false);
         let data_bytes =
@@ -154,7 +170,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .build_struct_gep(self.multi_header_type(), header_ptr, 0, "multi_len_ptr")
             .expect("failed to build multi len gep");
         self.builder
-            .build_store(len_ptr, self.i64_type.const_int(values.len() as u64, false))
+            .build_store(len_ptr, self.i64_type.const_int(compiled.len() as u64, false))
             .expect("failed to store multi len");
         let data_ptr_ptr = self
             .builder
@@ -458,6 +474,47 @@ impl<'ctx> LlvmCompiler<'ctx> {
         list
     }
 
+    fn compile_map_literal_ast(
+        &self,
+        entries: &[MapEntryAst],
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+    ) -> CompiledValue<'ctx> {
+        let map = self.build_internal_call(self.require_func("__rt_map_new"), &[], "map_new");
+        for entry in entries {
+            let key = match &entry.key {
+                MapKeyAst::Static(key) => {
+                    self.build_string_literal(key.as_bytes(), "map_key_literal")
+                }
+                MapKeyAst::Dynamic(key) => self.compile_ast(
+                    key,
+                    vars,
+                    capture_slots,
+                    env_ptr,
+                    function,
+                    current_function_name,
+                ),
+            };
+            let value = self.compile_ast(
+                &entry.value,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            );
+            let _ = self.build_internal_call(
+                self.require_func("__rt_map_set"),
+                &[map, key, value],
+                "map_set",
+            );
+        }
+        map
+    }
+
     fn compile_index_ast(
         &self,
         collection: &Ast,
@@ -546,7 +603,14 @@ impl<'ctx> LlvmCompiler<'ctx> {
     ) -> CompiledValue<'ctx> {
         if matches!(
             name,
-            "is_int" | "is_bigint" | "is_string" | "is_list" | "is_function" | "is_string_iter"
+            "is_int"
+                | "is_bigint"
+                | "is_string"
+                | "is_list"
+                | "is_map"
+                | "is_map_iter"
+                | "is_function"
+                | "is_string_iter"
         ) {
             assert_eq!(args.len(), 1, "{name} expects 1 argument");
             let value = self.compile_ast(
@@ -562,6 +626,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "is_bigint" => TAG_BIGINT,
                 "is_string" => TAG_STRING,
                 "is_list" => TAG_LIST,
+                "is_map" => TAG_MAP,
+                "is_map_iter" => TAG_MAP_ITER,
                 "is_function" => TAG_FUNCTION,
                 "is_string_iter" => TAG_STRING_ITER,
                 _ => unreachable!(),
@@ -1091,6 +1157,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         ) {
             return value;
         }
+        if let Some(value) = self.compile_map_named_expression_ast(name, compiled) {
+            return value;
+        }
         self.compile_fallback_named_expression_ast(
             name,
             compiled,
@@ -1190,12 +1259,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             )),
             "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
             | "bigint_modulo" | "bigint_compare" | "bigint_bitand" | "bigint_bitor"
-            | "bigint_bitxor" => {
-                Some(self.compile_bigint_builtin(name, compiled, function))
+            | "bigint_bitxor" => Some(self.compile_bigint_builtin(name, compiled, function)),
+            "bigint_shl" | "bigint_shr" => {
+                Some(self.compile_bigint_shift_builtin(name, compiled[0], compiled[1], function))
             }
-            "bigint_shl" | "bigint_shr" => Some(
-                self.compile_bigint_shift_builtin(name, compiled[0], compiled[1], function),
-            ),
             "print" => {
                 Some(self.build_internal_call(self.require_func("__rt_print"), compiled, "print"))
             }
@@ -1260,6 +1327,89 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 self.require_func("__rt_list_copy"),
                 compiled,
                 "list_copy",
+            )),
+            _ => None,
+        }
+    }
+
+    fn compile_map_named_expression_ast(
+        &self,
+        name: &str,
+        compiled: &[CompiledValue<'ctx>],
+    ) -> Option<CompiledValue<'ctx>> {
+        match name {
+            "map_new" => Some(self.build_internal_call(
+                self.require_func("__rt_map_new"),
+                compiled,
+                "map_new",
+            )),
+            "map_len" => Some(self.build_internal_call(
+                self.require_func("__rt_map_len"),
+                compiled,
+                "map_len",
+            )),
+            "map_has" => Some(self.build_internal_call(
+                self.require_func("__rt_map_has"),
+                compiled,
+                "map_has",
+            )),
+            "map_get" => Some(self.build_internal_call(
+                self.require_func("__rt_map_get"),
+                compiled,
+                "map_get",
+            )),
+            "map_delete" => Some(self.build_internal_call(
+                self.require_func("__rt_map_delete"),
+                compiled,
+                "map_delete",
+            )),
+            "map_iter" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter"),
+                compiled,
+                "map_iter",
+            )),
+            "map_iter_done" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_done"),
+                compiled,
+                "map_iter_done",
+            )),
+            "map_iter_next" => {
+                let key = self.build_internal_call(
+                    self.require_func("__rt_map_iter_key"),
+                    compiled,
+                    "map_iter_next_key",
+                );
+                let value = self.build_internal_call(
+                    self.require_func("__rt_map_iter_value"),
+                    compiled,
+                    "map_iter_next_value",
+                );
+                let _advance = self.build_internal_call(
+                    self.require_func("__rt_map_iter_advance"),
+                    compiled,
+                    "map_iter_next_advance",
+                );
+                Some(self.compile_multi_compiled_values(&[key, value]))
+            }
+            "map_iter_key" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_key"),
+                compiled,
+                "map_iter_key",
+            )),
+            "map_iter_value" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_value"),
+                compiled,
+                "map_iter_value",
+            )),
+            "map_iter_advance" => Some(self.build_internal_call(
+                self.require_func("__rt_map_iter_advance"),
+                compiled,
+                "map_iter_advance",
+            )),
+            "map_set" => Some(self.build_internal_call(
+                self.require_func("__rt_map_set"),
+                compiled,
+                "map_set",
             )),
             _ => None,
         }

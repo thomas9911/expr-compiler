@@ -1,6 +1,22 @@
 # another programming language (or expression thing)
 
-Concept, have compiled output plus JIT and IR execution paths.
+Goal:
+
+- dynamically typed
+- high-level
+- compiled
+- focused on small binary output size
+- not intended as a general-purpose language
+- uses a preallocated arena for memory management
+  - arena size is fixed at compile time for the produced binary
+
+Current execution paths:
+
+- native compiled output
+- JIT
+- LLVM WebAssembly output
+- LLVM `wasi:cli/command` component output
+- IR/codegen inspection paths
 
 ## Runtime model
 
@@ -14,8 +30,11 @@ Current tag usage:
 
 - `Int`
 - `List`
+- `Map`
+- `MapIter`
 - `BigInt`
 - `String`
+- `StringIter`
 - `Function`
 
 ## BigInt
@@ -105,6 +124,7 @@ Current behavior:
     - `string_is_integer(s)`
     - `string_try_parse_integer(s)`
     - `string_try_parse_bigint(s)`
+    - `string_from_codepoints(xs)`
     - `type_of(value)`
     - `string_repeat(s, n)`
     - `string_reverse(s)`
@@ -113,15 +133,18 @@ Current behavior:
     - `is_bigint(value)`
     - `is_string(value)`
     - `is_list(value)`
+    - `is_map(value)`
+    - `is_map_iter(value)`
     - `is_function(value)`
     - `is_string_iter(value)`
-  - `type_of(value)` returns a debuggable stable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"function"`, or `"string_iter"`
+  - `type_of(value)` returns a debuggable stable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"map"`, `"map_iter"`, `"function"`, or `"string_iter"`
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
   - `string_try_first(s)` returns `(ok, value, err)` where `value` is the first byte as an `Int`
   - `string_try_last(s)` returns `(ok, value, err)` where `value` is the last byte as an `Int`
   - `bytes_try_get(s, index)` returns `(ok, value, err)` where `value` is the byte at `index` as an `Int`
   - `string_try_pop(s)` returns `(ok, value, err)` and mutates `s` on success
+  - `string_from_codepoints(xs)` takes a `list<int>` of Unicode codepoints and returns a UTF-8 string
 - `print` can print string values
 - `string_concat(a, b)` concatenates two strings and returns a fresh string
 - `bytes_len(s)` returns the byte length as an `Int`
@@ -147,7 +170,62 @@ Current behavior:
     - `1[0]`
     - `xs["0"]`
   - it only rejects when the inferred kinds are confident; unknown values still use runtime checks
-- UTF-8-aware indexing/slicing and string conversion helpers are not implemented yet
+- UTF-8-aware indexing/slicing is not implemented yet
+
+## Maps
+
+The language has a mutable `Map` runtime type with string keys.
+
+Current map surface:
+
+```text
+m = map_new()
+map_set(m, "name", "expr-compiler")
+map_set(m, "year", 2027)
+print(map_len(m))
+print(map_has(m, "name"))
+print(map_get(m, "name"))
+ok, value, err = map_try_get(m, "missing")
+ok, key, value = map_try_pop(m)
+keys = map_keys(m)
+values = map_values(m)
+it = map_iter(m)
+if not map_iter_done(it) do
+    key, value = map_iter_next(it)
+end
+
+config = {
+    name: "expr-compiler",
+    version: 1,
+}
+```
+
+Current behavior:
+
+- keys are strings
+- values can be any runtime value
+- `map_set(m, key, value)` mutates the map in place
+- `map_get(m, key)` traps when the key is missing
+- `map_delete(m, key)` removes the key and returns the removed value
+- `map_iter(m)` returns a map iterator over the current entries
+- `map_iter_done(it)` reports whether a map iterator is exhausted
+- `map_iter_next(it)` returns `(key, value)` and advances the iterator
+- `map_iter_key(it)` returns the current key
+- `map_iter_value(it)` returns the current value
+- `map_iter_advance(it)` advances to the next occupied entry
+- `map_keys(m)` returns a list of string keys
+- `map_values(m)` returns a list of stored values
+- `map_try_get(m, key)` returns `(ok, value, err)` with `err == "missing key"` on failure
+- `map_try_delete(m, key)` returns `(ok, value, err)` with the same missing-key contract
+- `map_try_pop(m)` returns `(ok, key, value)` and removes an arbitrary entry on success
+- `map_update(m, key, callback)` updates an existing entry with `callback(value)` and returns `true`/`false`
+- `map_update_or_default(m, key, default_value, callback)` stores and returns `callback(current_or_default_value)`
+- empty `map_try_pop(m)` returns `(false, "", 0)`
+- `type_of(map_iter(m)) == "map_iter"`
+- map literals are supported:
+  - `{}`
+  - `{ name: "x", count: 1 }`
+  - `{ dynamic_key => 1 }`
 
 Logical infix operators are also supported:
 
@@ -436,3 +514,4 @@ You can override the LLVM path with either:
 - `LLVM_SYS_201_PREFIX`
 
 If both are unset, the helper scripts now fail and ask you to configure the path explicitly.
+
