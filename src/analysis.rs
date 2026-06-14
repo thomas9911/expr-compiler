@@ -227,12 +227,20 @@ pub struct FunctionValueKindAnalysis {
     pub inputs: Vec<ValueShape>,
     pub variables: HashMap<String, ValueShape>,
     pub function_bindings: HashMap<String, String>,
+    pub struct_bindings: HashMap<String, String>,
     pub returns: ValueShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructValueKindMetadata {
+    pub type_id: i64,
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleValueKindAnalysis {
     pub functions: HashMap<String, FunctionValueKindAnalysis>,
+    pub structs: HashMap<String, StructValueKindMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,13 +358,14 @@ pub fn analyze_module_value_kinds(
                     inputs,
                     variables: inferred.variables,
                     function_bindings: inferred.function_bindings,
+                    struct_bindings: HashMap::new(),
                     returns: inferred.returns,
                 },
             )
         })
         .collect::<HashMap<_, _>>();
 
-    ModuleValueKindAnalysis { functions: analyses }
+    ModuleValueKindAnalysis { functions: analyses, structs: HashMap::new() }
 }
 
 fn infer_function(

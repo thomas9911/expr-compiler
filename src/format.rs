@@ -330,8 +330,8 @@ impl<'a> AstFormatter<'a> {
         let body = fields
             .iter()
             .map(|field| {
-                let value =
-                    self.with_expression_indent(field_indent, |fmt| field.value.format_node(fmt, 0));
+                let value = self
+                    .with_expression_indent(field_indent, |fmt| field.value.format_node(fmt, 0));
                 format!("{}{}: {}", self.indent(field_indent), field.name, value)
             })
             .collect::<Vec<_>>()
@@ -767,7 +767,10 @@ impl FormatNode for FunctionDefAst {
 impl FormatNode for StructDefAst {
     fn format_node(&self, fmt: &mut AstFormatter<'_>, _parent_prec: u8) -> String {
         let mut head = format!("struct {} = {{", self.name);
-        fmt.append_trailing_comment(&mut head, self.span.as_ref().map(|span| fmt.line_of_span(span)));
+        fmt.append_trailing_comment(
+            &mut head,
+            self.span.as_ref().map(|span| fmt.line_of_span(span)),
+        );
         if self.fields.is_empty() {
             return format!("{head}}}");
         }

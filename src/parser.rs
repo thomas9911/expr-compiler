@@ -1075,7 +1075,9 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                     lhs = Ast::FieldAccess {
                         base: Box::new(lhs),
                         field: Ident::spanned(method_name, field_span.clone()),
-                        span: start_span.zip(Some(field_span)).map(|(start, end)| Span::cover(start, end)),
+                        span: start_span
+                            .zip(Some(field_span))
+                            .map(|(start, end)| Span::cover(start, end)),
                     };
                     continue;
                 }
@@ -1191,7 +1193,9 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
         Ast::Lambda { body, .. } => span_of_ast(body),
         Ast::MultiValue(values) | Ast::ListLiteral(values) => span_of_ast_slice(values),
         Ast::MapLiteral(entries) => span_of_map_entries(entries),
-        Ast::StructLiteral { fields, .. } => fields.first().and_then(|field| span_of_ast(&field.value)),
+        Ast::StructLiteral { fields, .. } => {
+            fields.first().and_then(|field| span_of_ast(&field.value))
+        }
         Ast::Literal(_) => None,
     }
 }

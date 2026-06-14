@@ -1,18 +1,20 @@
 use crate::analysis::{
-    FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, ValueKind, ValueShape,
-    narrowed_function_analyses_for_condition,
+    FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, StructValueKindMetadata,
+    ValueKind, ValueShape, narrowed_function_analyses_for_condition,
 };
 use crate::methods::{MethodResolutionError, method_target_functions, resolve_method};
 use crate::parser::{
     Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
+    StructDefAst,
 };
 use crate::source::Span;
 use crate::value::{
     CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, LIST_LEN_OFFSET,
     LIST_PTR_OFFSET, MULTI_HEADER_SIZE, MULTI_LEN_OFFSET, MULTI_PTR_OFFSET, STRING_CAP_OFFSET,
     STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
-    STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION,
-    TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER, TAG_MULTI, TAG_STRING, TAG_STRING_ITER,
+    STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, STRUCT_FIELD_COUNT_OFFSET,
+    STRUCT_FIELDS_PTR_OFFSET, STRUCT_HEADER_SIZE, STRUCT_TYPE_ID_OFFSET, TAG_BIGINT, TAG_FUNCTION,
+    TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER, TAG_MULTI, TAG_STRING, TAG_STRING_ITER, TAG_STRUCT,
     VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
@@ -79,6 +81,20 @@ pub enum CompileError {
     UndefinedFunction { name: String, span: Option<Span> },
     #[error("undefined variable: {name}")]
     UndefinedVariable { name: String, span: Option<Span> },
+    #[error("struct name conflicts with an existing struct or function: {name}")]
+    StructNameConflict { name: String, span: Option<Span> },
+    #[error("duplicate field `{field}` in struct {struct_name}")]
+    DuplicateStructField { struct_name: String, field: String, span: Option<Span> },
+    #[error("undefined struct: {name}")]
+    UndefinedStruct { name: String, span: Option<Span> },
+    #[error("struct {struct_name} is missing required field `{field}`")]
+    MissingStructField { struct_name: String, field: String, span: Option<Span> },
+    #[error("struct {struct_name} has no field `{field}`")]
+    UnknownStructField { struct_name: String, field: String, span: Option<Span> },
+    #[error("duplicate field `{field}` in {struct_name} literal")]
+    DuplicateStructLiteralField { struct_name: String, field: String, span: Option<Span> },
+    #[error("cannot resolve field access .{field} because receiver struct type is unknown")]
+    UnknownStructReceiver { field: String, span: Option<Span> },
     #[error("{function} argument {argument} expects {expected}, found {found}")]
     InvalidArgumentType {
         function: String,
@@ -115,6 +131,13 @@ impl CompileError {
             | Self::InvalidMainArity { span, .. }
             | Self::UndefinedFunction { span, .. }
             | Self::UndefinedVariable { span, .. }
+            | Self::StructNameConflict { span, .. }
+            | Self::DuplicateStructField { span, .. }
+            | Self::UndefinedStruct { span, .. }
+            | Self::MissingStructField { span, .. }
+            | Self::UnknownStructField { span, .. }
+            | Self::DuplicateStructLiteralField { span, .. }
+            | Self::UnknownStructReceiver { span, .. }
             | Self::InvalidArgumentType { span, .. }
             | Self::UnknownMethodReceiver { span, .. }
             | Self::AmbiguousMethodReceiver { span, .. }
@@ -130,9 +153,16 @@ impl CompileError {
 
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
+    pub structs: Vec<StructDefAst>,
     source: Option<String>,
     closure_metadata: HashMap<String, ClosureMetadata>,
     used_features: UsedFeatures,
+}
+
+#[derive(Clone, Debug)]
+struct StructMetadata {
+    type_id: i64,
+    fields: Vec<String>,
 }
 
 struct LambdaLifter {
@@ -175,7 +205,28 @@ struct UsedFeatures {
 impl Module {
     pub fn analyze_value_kinds(&self) -> Result<ModuleValueKindAnalysis, CompileError> {
         let return_arities = function_return_arities(&self.functions)?;
-        Ok(crate::analysis::analyze_module_value_kinds(&self.functions, &return_arities))
+        let mut analysis =
+            crate::analysis::analyze_module_value_kinds(&self.functions, &return_arities);
+        let registry = struct_registry(&self.structs);
+        analysis.structs = registry
+            .iter()
+            .map(|(name, metadata)| {
+                (
+                    name.clone(),
+                    StructValueKindMetadata {
+                        type_id: metadata.type_id,
+                        fields: metadata.fields.clone(),
+                    },
+                )
+            })
+            .collect();
+        for func in &self.functions {
+            if let Some(function_analysis) = analysis.functions.get_mut(&func.name) {
+                function_analysis.struct_bindings =
+                    analyze_struct_bindings_for_function(func, &registry);
+            }
+        }
+        Ok(analysis)
     }
 
     fn validate_native_main_arity(&self) -> Result<(), CompileError> {
@@ -198,6 +249,7 @@ impl Module {
         let function_arities = function_arities(&self.functions);
         let function_return_arities = function_return_arities(&self.functions)?;
         let value_kind_analysis = self.analyze_value_kinds()?;
+        let structs = struct_registry(&self.structs);
         for func in &self.functions {
             let mut scope_names = func.inputs.clone();
             if let Some(metadata) = self.closure_metadata.get(&func.name) {
@@ -229,6 +281,7 @@ impl Module {
                 &function_return_arities,
                 *function_return_arities.get(&func.name).unwrap_or(&1),
             )?;
+            validate_struct_usage_in_block(&func.block, &mut HashMap::new(), &structs)?;
         }
         self.validate_main_return_arity(&function_return_arities)?;
         Ok(())
@@ -254,6 +307,7 @@ impl Module {
     pub fn new() -> Self {
         Module {
             functions: vec![],
+            structs: vec![],
             source: None,
             closure_metadata: HashMap::new(),
             used_features: UsedFeatures::default(),
@@ -269,7 +323,8 @@ impl Module {
     }
 
     pub fn try_from_source(source: &str) -> Result<Self, CompileError> {
-        let mut module = Self::try_from_functions(parse_source_functions(source)?)?;
+        let (functions, structs) = parse_source_items(source)?;
+        let mut module = Self::try_from_items(functions, structs)?;
         module.source = Some(source.to_string());
         Ok(module)
     }
@@ -280,28 +335,38 @@ impl Module {
 
     pub fn try_from_ast(ast: Ast) -> Result<Self, CompileError> {
         let mut functions = vec![];
+        let mut structs = vec![];
         match ast {
             Ast::FunctionDef(func) => functions.push(func),
+            Ast::StructDef(def) => structs.push(def),
             Ast::Block(block) => {
                 for line in block.lines {
-                    if let Ast::FunctionDef(func) = line {
-                        functions.push(func);
+                    match line {
+                        Ast::FunctionDef(func) => functions.push(func),
+                        Ast::StructDef(def) => structs.push(def),
+                        _ => {}
                     }
                 }
             }
             _ => {}
         }
-        Self::try_from_functions(functions)
+        Self::try_from_items(functions, structs)
     }
 
-    fn try_from_functions(functions: Vec<FunctionDefAst>) -> Result<Self, CompileError> {
+    fn try_from_items(
+        functions: Vec<FunctionDefAst>,
+        structs: Vec<StructDefAst>,
+    ) -> Result<Self, CompileError> {
         for func in &functions {
             validate_no_nested_function_defs(&Ast::Block(func.block.clone()))?;
         }
+        validate_struct_declarations(&structs, &functions)?;
         let functions = autoload_stdlib_functions(functions);
+        validate_struct_declarations(&structs, &functions)?;
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
         let module = Module {
             functions,
+            structs,
             source: None,
             closure_metadata,
             used_features: UsedFeatures::default(),
@@ -1030,6 +1095,301 @@ impl Module {
     }
 }
 
+fn infer_known_struct_name(
+    ast: &Ast,
+    env: &HashMap<String, String>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Option<String> {
+    match ast {
+        Ast::Variable(name) => env.get(name.as_str()).cloned(),
+        Ast::StructLiteral { type_name, .. } if structs.contains_key(type_name.as_str()) => {
+            Some(type_name.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn exact_struct_name(
+    ast: &Ast,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> Option<String> {
+    match ast {
+        Ast::Variable(name) => function_analysis.struct_bindings.get(name.as_str()).cloned(),
+        Ast::StructLiteral { type_name, .. }
+            if value_kind_analysis.structs.contains_key(type_name.as_str()) =>
+        {
+            Some(type_name.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn analyze_struct_bindings_for_function(
+    function: &FunctionDefAst,
+    structs: &HashMap<String, StructMetadata>,
+) -> HashMap<String, String> {
+    fn analyze_block(
+        block: &BlockAst,
+        env: &mut HashMap<String, String>,
+        structs: &HashMap<String, StructMetadata>,
+    ) {
+        for line in &block.lines {
+            analyze_ast(line, env, structs);
+        }
+    }
+
+    fn analyze_ast(
+        ast: &Ast,
+        env: &mut HashMap<String, String>,
+        structs: &HashMap<String, StructMetadata>,
+    ) {
+        match ast {
+            Ast::Assign { name, value, .. } => {
+                analyze_ast(value, env, structs);
+                if let Some(struct_name) = infer_known_struct_name(value, env, structs) {
+                    env.insert(name.clone(), struct_name);
+                } else {
+                    env.remove(name);
+                }
+            }
+            Ast::MultiAssign { names, value, .. } => {
+                analyze_ast(value, env, structs);
+                for name in names {
+                    env.remove(name);
+                }
+            }
+            Ast::If { condition, then, else_, .. } => {
+                analyze_ast(condition, env, structs);
+                let original = env.clone();
+                let mut then_env = original.clone();
+                analyze_block(then, &mut then_env, structs);
+                if let Some(else_block) = else_ {
+                    let mut else_env = original.clone();
+                    analyze_block(else_block, &mut else_env, structs);
+                    env.clear();
+                    for (name, struct_name) in then_env {
+                        if else_env.get(&name) == Some(&struct_name) {
+                            env.insert(name, struct_name);
+                        }
+                    }
+                } else {
+                    *env = original;
+                }
+            }
+            Ast::Block(block) => analyze_block(block, env, structs),
+            Ast::Expression(ExpressionAst { args, .. }) => {
+                for arg in args {
+                    analyze_ast(arg, env, structs);
+                }
+            }
+            Ast::MethodCall { receiver, args, .. } => {
+                analyze_ast(receiver, env, structs);
+                for arg in args {
+                    analyze_ast(arg, env, structs);
+                }
+            }
+            Ast::MultiValue(values) | Ast::ListLiteral(values) => {
+                for value in values {
+                    analyze_ast(value, env, structs);
+                }
+            }
+            Ast::MapLiteral(entries) => {
+                for entry in entries {
+                    if let MapKeyAst::Dynamic(key) = &entry.key {
+                        analyze_ast(key, env, structs);
+                    }
+                    analyze_ast(&entry.value, env, structs);
+                }
+            }
+            Ast::StructLiteral { fields, .. } => {
+                for field in fields {
+                    analyze_ast(&field.value, env, structs);
+                }
+            }
+            Ast::FieldAccess { base, .. } => analyze_ast(base, env, structs),
+            Ast::Index { collection, index, .. } => {
+                analyze_ast(collection, env, structs);
+                analyze_ast(index, env, structs);
+            }
+            Ast::IndexAssign { collection, index, value, .. } => {
+                analyze_ast(collection, env, structs);
+                analyze_ast(index, env, structs);
+                analyze_ast(value, env, structs);
+            }
+            Ast::Lambda { body, .. } => {
+                let mut nested = env.clone();
+                analyze_ast(body, &mut nested, structs);
+            }
+            Ast::Literal(_)
+            | Ast::Variable(_)
+            | Ast::FunctionRef(_)
+            | Ast::FunctionDef(_)
+            | Ast::StructDef(_) => {}
+        }
+    }
+
+    let mut env = HashMap::new();
+    analyze_block(&function.block, &mut env, structs);
+    env
+}
+
+fn validate_struct_usage_in_block(
+    block: &BlockAst,
+    env: &mut HashMap<String, String>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Result<(), CompileError> {
+    for line in &block.lines {
+        validate_struct_usage_in_ast(line, env, structs)?;
+    }
+    Ok(())
+}
+
+fn validate_struct_usage_in_ast(
+    ast: &Ast,
+    env: &mut HashMap<String, String>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Result<(), CompileError> {
+    match ast {
+        Ast::StructDef(_) | Ast::Literal(_) | Ast::FunctionRef(_) => Ok(()),
+        Ast::Variable(_) => Ok(()),
+        Ast::Lambda { body, .. } => {
+            let mut nested_env = env.clone();
+            validate_struct_usage_in_ast(body, &mut nested_env, structs)
+        }
+        Ast::Expression(ExpressionAst { args, .. }) => {
+            for arg in args {
+                validate_struct_usage_in_ast(arg, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::MethodCall { receiver, args, .. } => {
+            validate_struct_usage_in_ast(receiver, env, structs)?;
+            for arg in args {
+                validate_struct_usage_in_ast(arg, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::MultiValue(values) | Ast::ListLiteral(values) => {
+            for value in values {
+                validate_struct_usage_in_ast(value, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_struct_usage_in_ast(key, env, structs)?;
+                }
+                validate_struct_usage_in_ast(&entry.value, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::StructLiteral { type_name, fields, span } => {
+            let Some(metadata) = structs.get(type_name.as_str()) else {
+                return Err(CompileError::UndefinedStruct {
+                    name: type_name.to_string(),
+                    span: type_name.span.clone().or_else(|| span.clone()),
+                });
+            };
+            let mut seen = HashSet::new();
+            for field in fields {
+                if !seen.insert(field.name.clone()) {
+                    return Err(CompileError::DuplicateStructLiteralField {
+                        struct_name: type_name.to_string(),
+                        field: field.name.clone(),
+                        span: span.clone(),
+                    });
+                }
+                if !metadata.fields.contains(&field.name) {
+                    return Err(CompileError::UnknownStructField {
+                        struct_name: type_name.to_string(),
+                        field: field.name.clone(),
+                        span: span.clone(),
+                    });
+                }
+                validate_struct_usage_in_ast(&field.value, env, structs)?;
+            }
+            for required in &metadata.fields {
+                if !seen.contains(required) {
+                    return Err(CompileError::MissingStructField {
+                        struct_name: type_name.to_string(),
+                        field: required.clone(),
+                        span: span.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        Ast::FieldAccess { base, field, span } => {
+            validate_struct_usage_in_ast(base, env, structs)?;
+            let Some(struct_name) = infer_known_struct_name(base, env, structs) else {
+                return Err(CompileError::UnknownStructReceiver {
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            };
+            let metadata = structs
+                .get(&struct_name)
+                .expect("known struct inference should only produce declared structs");
+            if !metadata.fields.contains(&field.name) {
+                return Err(CompileError::UnknownStructField {
+                    struct_name,
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            }
+            Ok(())
+        }
+        Ast::Index { collection, index, .. } => {
+            validate_struct_usage_in_ast(collection, env, structs)?;
+            validate_struct_usage_in_ast(index, env, structs)
+        }
+        Ast::IndexAssign { collection, index, value, .. } => {
+            validate_struct_usage_in_ast(collection, env, structs)?;
+            validate_struct_usage_in_ast(index, env, structs)?;
+            validate_struct_usage_in_ast(value, env, structs)
+        }
+        Ast::Assign { name, value, .. } => {
+            validate_struct_usage_in_ast(value, env, structs)?;
+            if let Some(struct_name) = infer_known_struct_name(value, env, structs) {
+                env.insert(name.clone(), struct_name);
+            } else {
+                env.remove(name);
+            }
+            Ok(())
+        }
+        Ast::MultiAssign { names, value, .. } => {
+            validate_struct_usage_in_ast(value, env, structs)?;
+            for name in names {
+                env.remove(name);
+            }
+            Ok(())
+        }
+        Ast::If { condition, then, else_, .. } => {
+            validate_struct_usage_in_ast(condition, env, structs)?;
+            let original = env.clone();
+            let mut then_env = original.clone();
+            validate_struct_usage_in_block(then, &mut then_env, structs)?;
+            if let Some(else_block) = else_ {
+                let mut else_env = original.clone();
+                validate_struct_usage_in_block(else_block, &mut else_env, structs)?;
+                env.clear();
+                for (name, struct_name) in then_env {
+                    if else_env.get(&name) == Some(&struct_name) {
+                        env.insert(name, struct_name);
+                    }
+                }
+            } else {
+                *env = original;
+            }
+            Ok(())
+        }
+        Ast::Block(block) => validate_struct_usage_in_block(block, env, structs),
+        Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+    }
+}
+
 pub enum JitArtifact {
     Cranelift(CraneliftJitModule),
     #[cfg(feature = "llvm-backend")]
@@ -1330,6 +1690,43 @@ fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
     functions.iter().map(|func| (func.name.clone(), func.inputs.len())).collect()
 }
 
+fn validate_struct_declarations(
+    structs: &[StructDefAst],
+    functions: &[FunctionDefAst],
+) -> Result<(), CompileError> {
+    let mut seen_names = functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
+    for def in structs {
+        if !seen_names.insert(def.name.clone()) {
+            return Err(CompileError::StructNameConflict {
+                name: def.name.clone(),
+                span: def.span.clone(),
+            });
+        }
+        let mut seen_fields = HashSet::new();
+        for field in &def.fields {
+            if !seen_fields.insert(field.clone()) {
+                return Err(CompileError::DuplicateStructField {
+                    struct_name: def.name.clone(),
+                    field: field.clone(),
+                    span: def.span.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn struct_registry(structs: &[StructDefAst]) -> HashMap<String, StructMetadata> {
+    structs
+        .iter()
+        .enumerate()
+        .map(|(index, def)| {
+            let type_id = i64::try_from(index).expect("too many structs to assign ids");
+            (def.name.clone(), StructMetadata { type_id, fields: def.fields.clone() })
+        })
+        .collect()
+}
+
 fn function_return_arities(
     functions: &[FunctionDefAst],
 ) -> Result<HashMap<String, usize>, CompileError> {
@@ -1436,11 +1833,14 @@ fn infer_ast_return_arity(
     }
 }
 
-fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
+fn parse_source_items(
+    source: &str,
+) -> Result<(Vec<FunctionDefAst>, Vec<StructDefAst>), CompileError> {
     use crate::parser::ParseLexer;
     use crate::tokenizer::{Logos, Token};
 
     let mut functions = vec![];
+    let mut structs = vec![];
     let lex = Token::lexer(source);
     let mut lexer = ParseLexer::new(lex);
 
@@ -1453,9 +1853,7 @@ fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileEr
         }
         match Ast::from_lexer(&mut lexer) {
             Ok(Ast::FunctionDef(func)) => functions.push(func),
-            Ok(Ast::StructDef(_)) => {
-                return Err(CompileError::UnsupportedFeature("struct declarations"));
-            }
+            Ok(Ast::StructDef(def)) => structs.push(def),
             Ok(_) => return Err(CompileError::TopLevelExpression),
             Err(err) => {
                 return Err(CompileError::Parse {
@@ -1466,6 +1864,14 @@ fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileEr
         }
     }
 
+    Ok((functions, structs))
+}
+
+fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
+    let (functions, structs) = parse_source_items(source)?;
+    if !structs.is_empty() {
+        return Err(CompileError::UnsupportedFeature("struct declarations in stdlib"));
+    }
     Ok(functions)
 }
 
@@ -2287,7 +2693,7 @@ fn validate_ast_user_facing(
         Ast::Variable(name) => validate_variable_reference(name, locals, function_names),
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
-        Ast::StructDef(_) => Err(CompileError::UnsupportedFeature("struct declarations")),
+        Ast::StructDef(_) => Err(CompileError::UnsupportedFeature("nested struct definitions")),
         Ast::FunctionRef(name) => validate_function_reference(name, function_names),
         Ast::MethodCall { receiver, method, args, .. } => validate_method_call_user_facing(
             receiver,
@@ -2323,8 +2729,22 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
-        Ast::StructLiteral { .. } => Err(CompileError::UnsupportedFeature("struct literals")),
-        Ast::FieldAccess { .. } => Err(CompileError::UnsupportedFeature("struct field access")),
+        Ast::StructLiteral { fields, .. } => validate_ast_sequence(
+            &fields.iter().map(|field| field.value.clone()).collect::<Vec<_>>(),
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
+        Ast::FieldAccess { base, .. } => validate_ast_user_facing(
+            base,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
         Ast::Index { collection, index, .. } => validate_index_ast(
             collection,
             index,
@@ -5716,6 +6136,140 @@ fn compile_map_literal(
     map
 }
 
+fn compile_struct_literal(
+    builder: &mut FunctionBuilder,
+    type_name: &Ident,
+    fields: &[crate::parser::StructFieldValueAst],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let metadata = value_kind_analysis
+        .structs
+        .get(type_name.as_str())
+        .unwrap_or_else(|| panic!("validated struct literal must refer to a declared struct"));
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let field_count = i64::try_from(metadata.fields.len()).expect("too many struct fields");
+    let total_size = STRUCT_HEADER_SIZE + field_count * VALUE_SIZE;
+    let total_size_value = builder.ins().iconst(types::I64, total_size);
+    let alloc_call = builder.ins().call(alloc_ref, &[total_size_value, align]);
+    let header_ptr = builder.inst_results(alloc_call)[0];
+    let type_id_value = builder.ins().iconst(types::I64, metadata.type_id);
+    let field_count_value = builder.ins().iconst(types::I64, field_count);
+    let fields_ptr = builder.ins().iadd_imm(header_ptr, STRUCT_HEADER_SIZE);
+    builder.ins().store(MemFlags::new(), type_id_value, header_ptr, STRUCT_TYPE_ID_OFFSET);
+    builder.ins().store(MemFlags::new(), field_count_value, header_ptr, STRUCT_FIELD_COUNT_OFFSET);
+    builder.ins().store(MemFlags::new(), fields_ptr, header_ptr, STRUCT_FIELDS_PTR_OFFSET);
+
+    let compiled_fields = fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.as_str(),
+                compile_ast(
+                    builder,
+                    &field.value,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                    function_analysis,
+                    value_kind_analysis,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (index, field_name) in metadata.fields.iter().enumerate() {
+        let value = compiled_fields
+            .get(field_name.as_str())
+            .unwrap_or_else(|| panic!("validated struct literal must initialize every field"));
+        let slot_offset = i32::try_from(i64::try_from(index).unwrap() * VALUE_SIZE)
+            .expect("struct slot overflow");
+        let tag_i8 = builder.ins().ireduce(types::I8, value.tag);
+        builder.ins().store(MemFlags::new(), tag_i8, fields_ptr, slot_offset);
+        builder.ins().store(
+            MemFlags::new(),
+            value.payload,
+            fields_ptr,
+            slot_offset + VALUE_PAYLOAD_OFFSET,
+        );
+    }
+
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRUCT), payload: header_ptr }
+}
+
+fn compile_field_access(
+    builder: &mut FunctionBuilder,
+    base: &Ast,
+    field: &Ident,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let struct_name = exact_struct_name(base, function_analysis, value_kind_analysis)
+        .unwrap_or_else(|| panic!("validated field access must have an exact struct receiver"));
+    let metadata = value_kind_analysis
+        .structs
+        .get(&struct_name)
+        .unwrap_or_else(|| panic!("validated field access must use a declared struct"));
+    let field_index = metadata
+        .fields
+        .iter()
+        .position(|name| name == field.as_str())
+        .unwrap_or_else(|| panic!("validated field access must use a declared field"));
+
+    let value = compile_ast(
+        builder,
+        base,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+        function_analysis,
+        value_kind_analysis,
+    );
+    let is_struct = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_STRUCT);
+    builder.ins().trapz(is_struct, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let stored_type_id =
+        builder.ins().load(types::I64, MemFlags::new(), value.payload, STRUCT_TYPE_ID_OFFSET);
+    let expected_type_id = builder.ins().iconst(types::I64, metadata.type_id);
+    let type_ok = builder.ins().icmp(IntCC::Equal, stored_type_id, expected_type_id);
+    builder.ins().trapz(type_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let fields_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), value.payload, STRUCT_FIELDS_PTR_OFFSET);
+    let slot_offset = i32::try_from(i64::try_from(field_index).unwrap() * VALUE_SIZE)
+        .expect("struct slot overflow");
+    let tag_i8 = builder.ins().load(types::I8, MemFlags::new(), fields_ptr, slot_offset);
+    let tag = builder.ins().uextend(types::I64, tag_i8);
+    let payload = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        fields_ptr,
+        slot_offset + VALUE_PAYLOAD_OFFSET,
+    );
+    CompiledValue { tag, payload }
+}
+
 fn create_empty_list(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
@@ -6559,8 +7113,34 @@ fn compile_ast(
             function_analysis,
             value_kind_analysis,
         ),
-        Ast::StructLiteral { .. } => unimplemented!("struct literals"),
-        Ast::FieldAccess { .. } => unimplemented!("struct field access"),
+        Ast::StructLiteral { type_name, fields, .. } => compile_struct_literal(
+            builder,
+            type_name,
+            fields,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
+        Ast::FieldAccess { base, field, .. } => compile_field_access(
+            builder,
+            base,
+            field,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
         Ast::Index { collection, index, .. } => compile_index_ast(
             builder,
             collection,
@@ -6671,7 +7251,7 @@ fn compile_ast(
             value_kind_analysis,
         ),
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
-        Ast::StructDef(_) => unimplemented!("struct declarations"),
+        Ast::StructDef(_) => boxed_int_const(builder, 0),
     }
 }
 
@@ -7949,12 +8529,11 @@ fn try_from_source_rejects_top_level_expressions() {
 
 #[cfg(test)]
 #[test]
-fn try_from_source_rejects_struct_declarations_as_unsupported() {
-    let err = match Module::try_from_source("struct Person = {name}") {
-        Ok(_) => panic!("struct declarations should be rejected in the compile pipeline for now"),
-        Err(err) => err,
-    };
-    assert_eq!(err, CompileError::UnsupportedFeature("struct declarations"));
+fn try_from_source_accepts_struct_declarations() {
+    let module = Module::try_from_source("struct Person = {name}\n\nfn main() do\n    0\nend")
+        .expect("source should parse");
+    assert_eq!(module.structs.len(), 1);
+    assert_eq!(module.structs[0].name, "Person");
 }
 
 #[cfg(test)]
@@ -8988,6 +9567,7 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
             ("value_var".to_string(), ValueShape::scalar(KindSet::bigint())),
         ]),
         function_bindings: HashMap::new(),
+        struct_bindings: HashMap::new(),
         returns: ValueShape::scalar(KindSet::int()),
     };
     let module_analysis = ModuleValueKindAnalysis {
@@ -8998,6 +9578,7 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
                     inputs: vec![],
                     variables: HashMap::new(),
                     function_bindings: HashMap::new(),
+                    struct_bindings: HashMap::new(),
                     returns: ValueShape::from_slots(vec![KindSet::int(), KindSet::string()]),
                 },
             ),
@@ -9007,10 +9588,12 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
                     inputs: vec![],
                     variables: HashMap::new(),
                     function_bindings: HashMap::new(),
+                    struct_bindings: HashMap::new(),
                     returns: ValueShape::scalar(KindSet::string()),
                 },
             ),
         ]),
+        structs: HashMap::new(),
     };
 
     assert_eq!(
@@ -9994,7 +10577,13 @@ fn try_compile_to_jit_rejects_struct_literals() {
         Ok(_) => panic!("jit compile should fail"),
         Err(err) => err,
     };
-    assert_eq!(err, CompileError::UnsupportedFeature("struct literals"));
+    assert_eq!(
+        err,
+        CompileError::UndefinedStruct {
+            name: "Person".to_string(),
+            span: Some(Span { start: 17, end: 23 }),
+        }
+    );
 }
 
 #[test]
@@ -10005,7 +10594,92 @@ fn try_compile_to_jit_rejects_struct_field_access() {
         Ok(_) => panic!("jit compile should fail"),
         Err(err) => err,
     };
-    assert_eq!(err, CompileError::UnsupportedFeature("struct field access"));
+    assert_eq!(
+        err,
+        CompileError::UndefinedVariable {
+            name: "person".to_string(),
+            span: Some(Span { start: 17, end: 23 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_missing_struct_literal_field() {
+    let src = "struct Person = {name, age}\n\nfn main() do\n    Person { name: \"Ada\" }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::MissingStructField {
+            struct_name: "Person".to_string(),
+            field: "age".to_string(),
+            span: Some(Span { start: 46, end: 68 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_unknown_struct_literal_field() {
+    let src = "struct Person = {name}\n\nfn main() do\n    Person { age: 37 }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UnknownStructField {
+            struct_name: "Person".to_string(),
+            field: "age".to_string(),
+            span: Some(Span { start: 41, end: 59 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_duplicate_struct_literal_field() {
+    let src =
+        "struct Person = {name}\n\nfn main() do\n    Person { name: \"Ada\", name: \"Bob\" }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::DuplicateStructLiteralField {
+            struct_name: "Person".to_string(),
+            field: "name".to_string(),
+            span: Some(Span { start: 41, end: 76 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_unknown_field_on_known_struct_receiver() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.age\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UnknownStructField {
+            struct_name: "Person".to_string(),
+            field: "age".to_string(),
+            span: Some(Span { start: 77, end: 87 }),
+        }
+    );
+}
+
+#[test]
+fn jit_struct_literal_and_field_access_work() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    print(person.name)\n    0\nend";
+    assert_cranelift_executable_output(src, "Ada\n", 0);
 }
 
 #[test]
@@ -10789,6 +11463,13 @@ fn llvm_jit_if_else_works() {
 fn llvm_jit_lists_work() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_struct_literal_and_field_access_work() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    print(person.name)\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "Ada\n", 0);
 }
 
 #[cfg(feature = "llvm-backend")]

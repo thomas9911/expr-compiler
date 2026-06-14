@@ -7,6 +7,7 @@ pub const TAG_STRING_ITER: i64 = 6;
 pub const TAG_MULTI: i64 = 7;
 pub const TAG_MAP: i64 = 8;
 pub const TAG_MAP_ITER: i64 = 9;
+pub const TAG_STRUCT: i64 = 10;
 
 pub const VALUE_SIZE: i64 = 16;
 pub const VALUE_PAYLOAD_OFFSET: i32 = 8;
@@ -49,6 +50,10 @@ pub const MAP_ENTRY_STATE_OFFSET: i32 = 32;
 pub const MAP_ENTRY_EMPTY: i64 = 0;
 pub const MAP_ENTRY_OCCUPIED: i64 = 1;
 pub const MAP_ENTRY_TOMBSTONE: i64 = 2;
+pub const STRUCT_HEADER_SIZE: i64 = 24;
+pub const STRUCT_TYPE_ID_OFFSET: i32 = 0;
+pub const STRUCT_FIELD_COUNT_OFFSET: i32 = 8;
+pub const STRUCT_FIELDS_PTR_OFFSET: i32 = 16;
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -62,6 +67,7 @@ pub enum ValueTag {
     Multi = TAG_MULTI as u8,
     Map = TAG_MAP as u8,
     MapIter = TAG_MAP_ITER as u8,
+    Struct = TAG_STRUCT as u8,
 }
 
 impl ValueTag {
@@ -76,6 +82,7 @@ impl ValueTag {
             TAG_MULTI => Some(Self::Multi),
             TAG_MAP => Some(Self::Map),
             TAG_MAP_ITER => Some(Self::MapIter),
+            TAG_STRUCT => Some(Self::Struct),
             _ => None,
         }
     }
@@ -164,4 +171,5 @@ fn verify_value() {
     assert_eq!(ValueTag::from_raw(TAG_MULTI as u8).unwrap(), ValueTag::Multi);
     assert_eq!(ValueTag::from_raw(TAG_MAP as u8).unwrap(), ValueTag::Map);
     assert_eq!(ValueTag::from_raw(TAG_MAP_ITER as u8).unwrap(), ValueTag::MapIter);
+    assert_eq!(ValueTag::from_raw(TAG_STRUCT as u8).unwrap(), ValueTag::Struct);
 }
