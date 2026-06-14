@@ -154,54 +154,78 @@ where
     }
 
     let command = args.free_from_str::<String>().map_err(|_| USAGE.to_string())?;
-    let command = match command.as_str() {
-        "run" => {
-            let backend = parse_backend_arg(&mut args, "--backend", CodegenBackend::Cranelift)?;
-            let arena_mb = parse_arena_mb_arg(&mut args)?;
-            let input = parse_input_arg(&mut args)?;
-            let program_args = parse_program_args(args);
-            CliCommand::Run { input, backend, arena_mb, program_args }
-        }
-        "build" => {
-            let output = parse_output_arg(&mut args)?;
-            let backend = parse_backend_arg(&mut args, "--backend", CodegenBackend::Cranelift)?;
-            let input = parse_input_arg(&mut args)?;
-            reject_unknown_args(args)?;
-            CliCommand::Build { input, output, backend }
-        }
-        "wasm" => {
-            let target = args.free_from_str::<String>().map_err(|_| USAGE.to_string())?;
-            let target = match target.as_str() {
-                "core" => WasmSubcommand::Core,
-                "component" => WasmSubcommand::Component,
-                _ => return Err(format!("unknown wasm target: {target}\n{USAGE}")),
-            };
-            let output = parse_output_arg(&mut args)?;
-            let input = parse_input_arg(&mut args)?;
-            reject_unknown_args(args)?;
-            CliCommand::Wasm { target, input, output }
-        }
-        "ir" => {
-            let output = parse_output_arg(&mut args)?;
-            let run = args.contains("--run");
-            let input = parse_input_arg(&mut args)?;
-            reject_unknown_args(args)?;
-            CliCommand::Ir { input, output, run }
-        }
-        "types" => {
-            let input = parse_input_arg(&mut args)?;
-            reject_unknown_args(args)?;
-            CliCommand::Types { input }
-        }
-        "fmt" | "format" => {
-            let input = parse_input_arg(&mut args)?;
-            reject_unknown_args(args)?;
-            CliCommand::Format { input }
-        }
-        _ => return Err(format!("unknown command: {command}\n{USAGE}")),
-    };
+    let command = parse_cli_command(command.as_str(), &mut args)?;
 
     Ok(CliArgs { command })
+}
+
+fn parse_cli_command(args_name: &str, args: &mut Arguments) -> Result<CliCommand, String> {
+    match args_name {
+        "run" => parse_run_command(args),
+        "build" => parse_build_command(args),
+        "wasm" => parse_wasm_command(args),
+        "ir" => parse_ir_command(args),
+        "types" => parse_types_command(args),
+        "fmt" | "format" => parse_format_command(args),
+        _ => Err(format!("unknown command: {args_name}\n{USAGE}")),
+    }
+}
+
+fn consume_arguments(args: &mut Arguments) -> Arguments {
+    std::mem::replace(args, Arguments::from_vec(vec![]))
+}
+
+fn parse_run_command(args: &mut Arguments) -> Result<CliCommand, String> {
+    let backend = parse_backend_arg(args, "--backend", CodegenBackend::Cranelift)?;
+    let arena_mb = parse_arena_mb_arg(args)?;
+    let input = parse_input_arg(args)?;
+    let program_args = parse_program_args(consume_arguments(args));
+    Ok(CliCommand::Run { input, backend, arena_mb, program_args })
+}
+
+fn parse_build_command(args: &mut Arguments) -> Result<CliCommand, String> {
+    let output = parse_output_arg(args)?;
+    let backend = parse_backend_arg(args, "--backend", CodegenBackend::Cranelift)?;
+    let input = parse_input_arg(args)?;
+    reject_unknown_args(consume_arguments(args))?;
+    Ok(CliCommand::Build { input, output, backend })
+}
+
+fn parse_wasm_target(args: &mut Arguments) -> Result<WasmSubcommand, String> {
+    let target = args.free_from_str::<String>().map_err(|_| USAGE.to_string())?;
+    match target.as_str() {
+        "core" => Ok(WasmSubcommand::Core),
+        "component" => Ok(WasmSubcommand::Component),
+        _ => Err(format!("unknown wasm target: {target}\n{USAGE}")),
+    }
+}
+
+fn parse_wasm_command(args: &mut Arguments) -> Result<CliCommand, String> {
+    let target = parse_wasm_target(args)?;
+    let output = parse_output_arg(args)?;
+    let input = parse_input_arg(args)?;
+    reject_unknown_args(consume_arguments(args))?;
+    Ok(CliCommand::Wasm { target, input, output })
+}
+
+fn parse_ir_command(args: &mut Arguments) -> Result<CliCommand, String> {
+    let output = parse_output_arg(args)?;
+    let run = args.contains("--run");
+    let input = parse_input_arg(args)?;
+    reject_unknown_args(consume_arguments(args))?;
+    Ok(CliCommand::Ir { input, output, run })
+}
+
+fn parse_types_command(args: &mut Arguments) -> Result<CliCommand, String> {
+    let input = parse_input_arg(args)?;
+    reject_unknown_args(consume_arguments(args))?;
+    Ok(CliCommand::Types { input })
+}
+
+fn parse_format_command(args: &mut Arguments) -> Result<CliCommand, String> {
+    let input = parse_input_arg(args)?;
+    reject_unknown_args(consume_arguments(args))?;
+    Ok(CliCommand::Format { input })
 }
 
 fn print_cli_error_and_exit(err: &str) -> ! {

@@ -1494,9 +1494,10 @@ fn string_stdlib_function(name: &str) -> Option<StdlibFunction> {
         "string_try_parse_bigint" => {
             Some(stdlib(include_str!("./stdlib/string_try_parse_bigint.expr"), &[]))
         }
-        "integer_to_string" => {
-            Some(stdlib(include_str!("./stdlib/integer_to_string.expr"), &["string_from_codepoints"]))
-        }
+        "integer_to_string" => Some(stdlib(
+            include_str!("./stdlib/integer_to_string.expr"),
+            &["string_from_codepoints"],
+        )),
         "string_from_codepoints" => {
             Some(stdlib(include_str!("./stdlib/string_from_codepoints.expr"), &[]))
         }
@@ -1629,6 +1630,51 @@ fn collect_stdlib_references_from_block(
     }
 }
 
+fn maybe_collect_stdlib_reference(name: &str, scope: &HashSet<String>, refs: &mut HashSet<String>) {
+    if !scope.contains(name) && stdlib_function(name).is_some() {
+        refs.insert(name.to_string());
+    }
+}
+
+fn collect_stdlib_references_from_slice(
+    values: &[Ast],
+    scope: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    for value in values {
+        collect_stdlib_references_from_ast(value, scope, refs);
+    }
+}
+
+fn collect_stdlib_references_from_map_entries(
+    entries: &[MapEntryAst],
+    scope: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    for entry in entries {
+        if let MapKeyAst::Dynamic(key) = &entry.key {
+            collect_stdlib_references_from_ast(key, scope, refs);
+        }
+        collect_stdlib_references_from_ast(&entry.value, scope, refs);
+    }
+}
+
+fn collect_stdlib_references_from_if(
+    condition: &Ast,
+    then: &BlockAst,
+    else_: Option<&BlockAst>,
+    scope: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    collect_stdlib_references_from_ast(condition, scope, refs);
+    let mut then_scope = scope.clone();
+    collect_stdlib_references_from_block(then, &mut then_scope, refs);
+    if let Some(else_block) = else_ {
+        let mut else_scope = scope.clone();
+        collect_stdlib_references_from_block(else_block, &mut else_scope, refs);
+    }
+}
+
 fn collect_stdlib_references_from_ast(
     ast: &Ast,
     scope: &HashSet<String>,
@@ -1636,47 +1682,26 @@ fn collect_stdlib_references_from_ast(
 ) {
     match ast {
         Ast::Expression(ExpressionAst { function, args, .. }) => {
-            if !function.is_empty()
-                && !scope.contains(function)
-                && stdlib_function(function).is_some()
-            {
-                refs.insert(function.clone());
+            if !function.is_empty() {
+                maybe_collect_stdlib_reference(function, scope, refs);
             }
-            for arg in args {
-                collect_stdlib_references_from_ast(arg, scope, refs);
-            }
+            collect_stdlib_references_from_slice(args, scope, refs);
         }
         Ast::MethodCall { receiver, method, args, .. } => {
             collect_stdlib_references_from_ast(receiver, scope, refs);
             for function in method_target_functions(method.as_str()) {
-                if stdlib_function(&function).is_some() && !scope.contains(&function) {
-                    refs.insert(function);
-                }
+                maybe_collect_stdlib_reference(&function, scope, refs);
             }
-            for arg in args {
-                collect_stdlib_references_from_ast(arg, scope, refs);
-            }
+            collect_stdlib_references_from_slice(args, scope, refs);
         }
-        Ast::MultiValue(values) => {
-            for value in values {
-                collect_stdlib_references_from_ast(value, scope, refs);
-            }
-        }
+        Ast::MultiValue(values) => collect_stdlib_references_from_slice(values, scope, refs),
         Ast::Variable(name) | Ast::FunctionRef(name) => {
-            if !scope.contains(name.as_str()) && stdlib_function(name.as_ref()).is_some() {
-                refs.insert(name.to_string());
-            }
+            maybe_collect_stdlib_reference(name.as_ref(), scope, refs);
         }
         Ast::Assign { value, .. } => collect_stdlib_references_from_ast(value, scope, refs),
         Ast::MultiAssign { value, .. } => collect_stdlib_references_from_ast(value, scope, refs),
         Ast::If { condition, then, else_, .. } => {
-            collect_stdlib_references_from_ast(condition, scope, refs);
-            let mut then_scope = scope.clone();
-            collect_stdlib_references_from_block(then, &mut then_scope, refs);
-            if let Some(else_block) = else_ {
-                let mut else_scope = scope.clone();
-                collect_stdlib_references_from_block(else_block, &mut else_scope, refs);
-            }
+            collect_stdlib_references_from_if(condition, then, else_.as_ref(), scope, refs)
         }
         Ast::Block(block) => {
             let mut nested_scope = scope.clone();
@@ -1687,18 +1712,9 @@ fn collect_stdlib_references_from_ast(
             nested_scope.extend(inputs.iter().cloned());
             collect_stdlib_references_from_ast(body, &nested_scope, refs);
         }
-        Ast::ListLiteral(items) => {
-            for item in items {
-                collect_stdlib_references_from_ast(item, scope, refs);
-            }
-        }
+        Ast::ListLiteral(items) => collect_stdlib_references_from_slice(items, scope, refs),
         Ast::MapLiteral(entries) => {
-            for entry in entries {
-                if let MapKeyAst::Dynamic(key) = &entry.key {
-                    collect_stdlib_references_from_ast(key, scope, refs);
-                }
-                collect_stdlib_references_from_ast(&entry.value, scope, refs);
-            }
+            collect_stdlib_references_from_map_entries(entries, scope, refs)
         }
         Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
@@ -2255,43 +2271,16 @@ fn validate_ast_user_facing(
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
         Ast::FunctionRef(name) => validate_function_reference(name, function_names),
-        Ast::MethodCall { receiver, method, args, .. } => {
-            validate_ast_user_facing(
-                receiver,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )?;
-            validate_ast_sequence(
-                args,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )?;
-            let function = resolve_method_call_or_error(
-                receiver,
-                method,
-                function_analysis,
-                value_kind_analysis,
-            )?;
-            let mut resolved_args = Vec::with_capacity(args.len() + 1);
-            resolved_args.push((**receiver).clone());
-            resolved_args.extend(args.iter().cloned());
-            validate_expression_user_facing(
-                &function,
-                &resolved_args,
-                method.span.clone(),
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )
-        }
+        Ast::MethodCall { receiver, method, args, .. } => validate_method_call_user_facing(
+            receiver,
+            method,
+            args,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
         Ast::MultiValue(values) => validate_ast_sequence(
             values,
             locals,
@@ -2308,41 +2297,14 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
-        Ast::MapLiteral(entries) => {
-            for entry in entries {
-                if let MapKeyAst::Dynamic(key) = &entry.key {
-                    validate_ast_user_facing(
-                        key,
-                        locals,
-                        function_names,
-                        function_arities,
-                        value_kind_analysis,
-                        function_analysis,
-                    )?;
-                    let key_kinds =
-                        infer_ast_value_shape(key, function_analysis, value_kind_analysis)
-                            .scalar_slot();
-                    if !key_kinds.is_empty() && !kind_sets_intersect(key_kinds, KindSet::string()) {
-                        return Err(CompileError::InvalidArgumentType {
-                            function: "map literal".to_string(),
-                            argument: 1,
-                            expected: "string".to_string(),
-                            found: format_kind_set_for_error(key_kinds),
-                            span: span_of_ast(key),
-                        });
-                    }
-                }
-                validate_ast_user_facing(
-                    &entry.value,
-                    locals,
-                    function_names,
-                    function_arities,
-                    value_kind_analysis,
-                    function_analysis,
-                )?;
-            }
-            Ok(())
-        }
+        Ast::MapLiteral(entries) => validate_map_literal_user_facing(
+            entries,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
         Ast::Index { collection, index, .. } => validate_index_ast(
             collection,
             index,
@@ -2390,33 +2352,16 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
-        Ast::MultiAssign { names, value, span } => {
-            validate_ast_user_facing(
-                value,
-                locals,
-                function_names,
-                function_arities,
-                value_kind_analysis,
-                function_analysis,
-            )?;
-            if let Ast::MethodCall { receiver, method, .. } = value.as_ref() {
-                let function = resolve_method_call_or_error(
-                    receiver,
-                    method,
-                    function_analysis,
-                    value_kind_analysis,
-                )?;
-                let actual_arity = callable_return_arity(&function, value_kind_analysis);
-                if actual_arity != names.len() {
-                    return Err(CompileError::DestructuringArityMismatch {
-                        expected: names.len(),
-                        found: actual_arity,
-                        span: span.clone(),
-                    });
-                }
-            }
-            Ok(())
-        }
+        Ast::MultiAssign { names, value, span } => validate_multi_assign_user_facing(
+            names,
+            value,
+            span.as_ref(),
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
         Ast::If { condition, then, else_, .. } => validate_if_ast_user_facing(
             condition,
             then,
@@ -2428,6 +2373,143 @@ fn validate_ast_user_facing(
             function_analysis,
         ),
     }
+}
+
+fn validate_method_call_user_facing(
+    receiver: &Ast,
+    method: &Ident,
+    args: &[Ast],
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+    function_analysis: &FunctionValueKindAnalysis,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(
+        receiver,
+        locals,
+        function_names,
+        function_arities,
+        value_kind_analysis,
+        function_analysis,
+    )?;
+    validate_ast_sequence(
+        args,
+        locals,
+        function_names,
+        function_arities,
+        value_kind_analysis,
+        function_analysis,
+    )?;
+    let function =
+        resolve_method_call_or_error(receiver, method, function_analysis, value_kind_analysis)?;
+    let mut resolved_args = Vec::with_capacity(args.len() + 1);
+    resolved_args.push(receiver.clone());
+    resolved_args.extend(args.iter().cloned());
+    validate_expression_user_facing(
+        &function,
+        &resolved_args,
+        method.span.clone(),
+        locals,
+        function_names,
+        function_arities,
+        value_kind_analysis,
+        function_analysis,
+    )
+}
+
+fn validate_dynamic_map_key_user_facing(
+    key: &Ast,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+    function_analysis: &FunctionValueKindAnalysis,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(
+        key,
+        locals,
+        function_names,
+        function_arities,
+        value_kind_analysis,
+        function_analysis,
+    )?;
+    let key_kinds =
+        infer_ast_value_shape(key, function_analysis, value_kind_analysis).scalar_slot();
+    if !key_kinds.is_empty() && !kind_sets_intersect(key_kinds, KindSet::string()) {
+        return Err(CompileError::InvalidArgumentType {
+            function: "map literal".to_string(),
+            argument: 1,
+            expected: "string".to_string(),
+            found: format_kind_set_for_error(key_kinds),
+            span: span_of_ast(key),
+        });
+    }
+    Ok(())
+}
+
+fn validate_map_literal_user_facing(
+    entries: &[MapEntryAst],
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+    function_analysis: &FunctionValueKindAnalysis,
+) -> Result<(), CompileError> {
+    for entry in entries {
+        if let MapKeyAst::Dynamic(key) = &entry.key {
+            validate_dynamic_map_key_user_facing(
+                key,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )?;
+        }
+        validate_ast_user_facing(
+            &entry.value,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_multi_assign_user_facing(
+    names: &[String],
+    value: &Ast,
+    span: Option<&Span>,
+    locals: &HashSet<String>,
+    function_names: &HashSet<String>,
+    function_arities: &HashMap<String, usize>,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+    function_analysis: &FunctionValueKindAnalysis,
+) -> Result<(), CompileError> {
+    validate_ast_user_facing(
+        value,
+        locals,
+        function_names,
+        function_arities,
+        value_kind_analysis,
+        function_analysis,
+    )?;
+    if let Ast::MethodCall { receiver, method, .. } = value {
+        let function =
+            resolve_method_call_or_error(receiver, method, function_analysis, value_kind_analysis)?;
+        let actual_arity = callable_return_arity(&function, value_kind_analysis);
+        if actual_arity != names.len() {
+            return Err(CompileError::DestructuringArityMismatch {
+                expected: names.len(),
+                found: actual_arity,
+                span: span.cloned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_function_reference(
@@ -3385,10 +3467,7 @@ fn builtin_return_arity(function: &str) -> Option<usize> {
 fn callable_return_arity(function: &str, value_kind_analysis: &ModuleValueKindAnalysis) -> usize {
     builtin_return_arity(function)
         .or_else(|| {
-            value_kind_analysis
-                .functions
-                .get(function)
-                .map(|analysis| analysis.returns.arity())
+            value_kind_analysis.functions.get(function).map(|analysis| analysis.returns.arity())
         })
         .unwrap_or(1)
 }
@@ -7635,46 +7714,15 @@ fn compile_named_expression_ast(
     capture_slots: &HashMap<String, usize>,
     env_ptr: Value,
 ) -> CompiledValue {
+    if let Some(value) =
+        compile_named_generic_binary_expression(builder, function, compiled, func_refs)
+    {
+        return value;
+    }
+    if let Some(value) = compile_named_map_expression(builder, function, compiled, func_refs) {
+        return value;
+    }
     match function {
-        "add" => call_binary(builder, func_refs, "__op_add", compiled[0], compiled[1]),
-        "subtract" => call_binary(builder, func_refs, "__op_subtract", compiled[0], compiled[1]),
-        "multiply" => call_binary(builder, func_refs, "__op_multiply", compiled[0], compiled[1]),
-        "divide" => call_binary(builder, func_refs, "__op_divide", compiled[0], compiled[1]),
-        "modulo" => call_binary(builder, func_refs, "__op_modulo", compiled[0], compiled[1]),
-        "bitand" => call_binary(builder, func_refs, "__op_bitand", compiled[0], compiled[1]),
-        "bitor" => call_binary(builder, func_refs, "__op_bitor", compiled[0], compiled[1]),
-        "bitxor" => call_binary(builder, func_refs, "__op_bitxor", compiled[0], compiled[1]),
-        "shl" => call_binary(builder, func_refs, "__op_shl", compiled[0], compiled[1]),
-        "shr" => call_binary(builder, func_refs, "__op_shr", compiled[0], compiled[1]),
-        "gt" => call_binary(builder, func_refs, "__op_gt", compiled[0], compiled[1]),
-        "lt" => call_binary(builder, func_refs, "__op_lt", compiled[0], compiled[1]),
-        "gte" => call_binary(builder, func_refs, "__op_gte", compiled[0], compiled[1]),
-        "lte" => call_binary(builder, func_refs, "__op_lte", compiled[0], compiled[1]),
-        "eq" => call_binary(builder, func_refs, "__op_eq", compiled[0], compiled[1]),
-        "ne" => call_binary(builder, func_refs, "__op_ne", compiled[0], compiled[1]),
-        "map_new" => {
-            let func_ref = require_func(func_refs, "map_new");
-            let call = builder.ins().call(func_ref, &[]);
-            let results = builder.inst_results(call);
-            CompiledValue { tag: results[0], payload: results[1] }
-        }
-        "map_iter_next" => {
-            // This wants to be a stdlib helper, but current multi-return parsing/validation
-            // for helper-style functions is still too restrictive. Keep the semantics here
-            // as a thin lowering over the primitive iterator builtins until that is fixed.
-            let key = call_unary(builder, func_refs, "map_iter_key", compiled[0]);
-            let value = call_unary(builder, func_refs, "map_iter_value", compiled[0]);
-            let _advance = call_unary(builder, func_refs, "map_iter_advance", compiled[0]);
-            compile_multi_compiled_values(builder, &[key, value], func_refs)
-        }
-        "map_len" | "map_iter" | "map_iter_done" | "map_iter_key" | "map_iter_value"
-        | "map_iter_advance" => call_unary(builder, func_refs, function, compiled[0]),
-        "map_has" | "map_get" | "map_delete" => {
-            call_binary(builder, func_refs, function, compiled[0], compiled[1])
-        }
-        "map_set" => {
-            call_ternary(builder, func_refs, "map_set", compiled[0], compiled[1], compiled[2])
-        }
         "bigint_add" | "bigint_subtract" | "bigint_multiply" | "bigint_divide"
         | "bigint_modulo" | "bigint_compare" | "bigint_bitand" | "bigint_bitor"
         | "bigint_bitxor" => compile_bigint_builtin(builder, func_refs, function, &compiled),
@@ -7718,6 +7766,68 @@ fn compile_named_expression_ast(
             }
             unreachable!("undefined function should have been rejected before codegen: {name}");
         }
+    }
+}
+
+fn compile_named_generic_binary_expression(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    compiled: &[CompiledValue],
+    func_refs: &HashMap<String, FuncRef>,
+) -> Option<CompiledValue> {
+    let runtime_name = match function {
+        "add" => "__op_add",
+        "subtract" => "__op_subtract",
+        "multiply" => "__op_multiply",
+        "divide" => "__op_divide",
+        "modulo" => "__op_modulo",
+        "bitand" => "__op_bitand",
+        "bitor" => "__op_bitor",
+        "bitxor" => "__op_bitxor",
+        "shl" => "__op_shl",
+        "shr" => "__op_shr",
+        "gt" => "__op_gt",
+        "lt" => "__op_lt",
+        "gte" => "__op_gte",
+        "lte" => "__op_lte",
+        "eq" => "__op_eq",
+        "ne" => "__op_ne",
+        _ => return None,
+    };
+    Some(call_binary(builder, func_refs, runtime_name, compiled[0], compiled[1]))
+}
+
+fn compile_named_map_expression(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    compiled: &[CompiledValue],
+    func_refs: &HashMap<String, FuncRef>,
+) -> Option<CompiledValue> {
+    match function {
+        "map_new" => {
+            let func_ref = require_func(func_refs, "map_new");
+            let call = builder.ins().call(func_ref, &[]);
+            let results = builder.inst_results(call);
+            Some(CompiledValue { tag: results[0], payload: results[1] })
+        }
+        "map_iter_next" => {
+            // This wants to be a stdlib helper, but current multi-return parsing/validation
+            // for helper-style functions is still too restrictive. Keep the semantics here
+            // as a thin lowering over the primitive iterator builtins until that is fixed.
+            let key = call_unary(builder, func_refs, "map_iter_key", compiled[0]);
+            let value = call_unary(builder, func_refs, "map_iter_value", compiled[0]);
+            let _advance = call_unary(builder, func_refs, "map_iter_advance", compiled[0]);
+            Some(compile_multi_compiled_values(builder, &[key, value], func_refs))
+        }
+        "map_len" | "map_iter" | "map_iter_done" | "map_iter_key" | "map_iter_value"
+        | "map_iter_advance" => Some(call_unary(builder, func_refs, function, compiled[0])),
+        "map_has" | "map_get" | "map_delete" => {
+            Some(call_binary(builder, func_refs, function, compiled[0], compiled[1]))
+        }
+        "map_set" => {
+            Some(call_ternary(builder, func_refs, "map_set", compiled[0], compiled[1], compiled[2]))
+        }
+        _ => None,
     }
 }
 

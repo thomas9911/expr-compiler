@@ -308,6 +308,17 @@ impl<'a> AstFormatter<'a> {
         format!("{{\n{body},\n{}}}", self.indent(self.expression_indent))
     }
 
+    fn format_list_literal_expr(&mut self, items: &[Ast]) -> String {
+        let items =
+            items.iter().map(|item| item.format_node(self, 0)).collect::<Vec<_>>().join(", ");
+        format!("[{items}]")
+    }
+
+    fn format_method_call_expr(&mut self, receiver: &Ast, method: &str, args: &[Ast]) -> String {
+        let args = args.iter().map(|arg| arg.format_node(self, 0)).collect::<Vec<_>>().join(", ");
+        format!("{}.{}({args})", receiver.format_node(self, 10), method)
+    }
+
     fn format_lambda(&mut self, inputs: &[String], body: &Ast) -> String {
         match body {
             Ast::Block(block) => {
@@ -324,6 +335,61 @@ impl<'a> AstFormatter<'a> {
             }
             _ => format!("fn {} -> {} end", inputs.join(", "), body.format_node(self, 0)),
         }
+    }
+
+    fn format_lambda_expr(&mut self, inputs: &[String], body: &Ast, parent_prec: u8) -> String {
+        let rendered = self.format_lambda(inputs, body);
+        if parent_prec > 0 { format!("({rendered})") } else { rendered }
+    }
+
+    fn format_not_expr(&mut self, args: &[Ast], parent_prec: u8) -> String {
+        let rendered = format!("not {}", args[0].format_node(self, 9));
+        if parent_prec > 9 { format!("({rendered})") } else { rendered }
+    }
+
+    fn format_binary_expr(
+        &mut self,
+        function: &str,
+        args: &[Ast],
+        parent_prec: u8,
+    ) -> Option<String> {
+        let Some((op, prec)) = self.infix_operator(function) else {
+            return None;
+        };
+        let mut lhs = args[0].format_node(self, prec);
+        let mut rhs = args[1].format_node(self, prec + 1);
+        if self.needs_readability_parens(function, &args[0]) {
+            lhs = format!("({lhs})");
+        }
+        if self.needs_readability_parens(function, &args[1]) {
+            rhs = format!("({rhs})");
+        }
+        let rendered = format!("{lhs} {op} {rhs}");
+        Some(if parent_prec > prec { format!("({rendered})") } else { rendered })
+    }
+
+    fn format_call_expr(&mut self, function: &str, args: &[Ast]) -> String {
+        let args = args.iter().map(|arg| arg.format_node(self, 0)).collect::<Vec<_>>().join(", ");
+        format!("{function}({args})")
+    }
+
+    fn format_expression_expr(&mut self, function: &str, args: &[Ast], parent_prec: u8) -> String {
+        if function == "not" && args.len() == 1 {
+            self.format_not_expr(args, parent_prec)
+        } else if args.len() == 2 {
+            self.format_binary_expr(function, args, parent_prec)
+                .unwrap_or_else(|| self.format_call_expr(function, args))
+        } else {
+            self.format_call_expr(function, args)
+        }
+    }
+
+    fn format_index_expr(&mut self, collection: &Ast, index: &Ast) -> String {
+        format!("{}[{}]", collection.format_node(self, 10), index.format_node(self, 0))
+    }
+
+    fn format_multi_value_expr(&mut self, values: &[Ast]) -> String {
+        values.iter().map(|value| value.format_node(self, 0)).collect::<Vec<_>>().join(", ")
     }
 
     fn format_if_expr(
@@ -672,65 +738,20 @@ impl FormatNode for Ast {
         match self {
             Ast::Literal(literal) => literal.format_node(fmt, parent_prec),
             Ast::Variable(name) | Ast::FunctionRef(name) => name.to_string(),
-            Ast::ListLiteral(items) => {
-                let items = items
-                    .iter()
-                    .map(|item| item.format_node(fmt, 0))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("[{items}]")
-            }
+            Ast::ListLiteral(items) => fmt.format_list_literal_expr(items),
             Ast::MapLiteral(entries) => fmt.format_map_literal(entries),
             Ast::MethodCall { receiver, method, args, .. } => {
-                let args =
-                    args.iter().map(|arg| arg.format_node(fmt, 0)).collect::<Vec<_>>().join(", ");
-                format!("{}.{}({args})", receiver.format_node(fmt, 10), method)
+                fmt.format_method_call_expr(receiver, method, args)
             }
-            Ast::Lambda { inputs, body } => {
-                let rendered = fmt.format_lambda(inputs, body);
-                if parent_prec > 0 { format!("({rendered})") } else { rendered }
-            }
-            Ast::Expression(ExpressionAst { function, args, .. })
-                if function == "not" && args.len() == 1 =>
-            {
-                let rendered = format!("not {}", args[0].format_node(fmt, 9));
-                if parent_prec > 9 { format!("({rendered})") } else { rendered }
-            }
-            Ast::Expression(ExpressionAst { function, args, .. }) if args.len() == 2 => {
-                if let Some((op, prec)) = fmt.infix_operator(function) {
-                    let mut lhs = args[0].format_node(fmt, prec);
-                    let mut rhs = args[1].format_node(fmt, prec + 1);
-                    if fmt.needs_readability_parens(function, &args[0]) {
-                        lhs = format!("({lhs})");
-                    }
-                    if fmt.needs_readability_parens(function, &args[1]) {
-                        rhs = format!("({rhs})");
-                    }
-                    let rendered = format!("{lhs} {op} {rhs}");
-                    if parent_prec > prec { format!("({rendered})") } else { rendered }
-                } else {
-                    let args = args
-                        .iter()
-                        .map(|arg| arg.format_node(fmt, 0))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("{}({args})", function)
-                }
-            }
+            Ast::Lambda { inputs, body } => fmt.format_lambda_expr(inputs, body, parent_prec),
             Ast::Expression(ExpressionAst { function, args, .. }) => {
-                let args =
-                    args.iter().map(|arg| arg.format_node(fmt, 0)).collect::<Vec<_>>().join(", ");
-                format!("{}({args})", function)
+                fmt.format_expression_expr(function, args, parent_prec)
             }
-            Ast::Index { collection, index, .. } => {
-                format!("{}[{}]", collection.format_node(fmt, 10), index.format_node(fmt, 0))
-            }
+            Ast::Index { collection, index, .. } => fmt.format_index_expr(collection, index),
             Ast::If { condition, then, else_, .. } => {
                 fmt.format_if_expr(condition, then, else_.as_ref(), 0)
             }
-            Ast::MultiValue(values) => {
-                values.iter().map(|value| value.format_node(fmt, 0)).collect::<Vec<_>>().join(", ")
-            }
+            Ast::MultiValue(values) => fmt.format_multi_value_expr(values),
             Ast::Block(block) => block.format_node(fmt, parent_prec),
             Ast::Assign { .. }
             | Ast::MultiAssign { .. }

@@ -186,12 +186,12 @@ impl PartialEq for Ast {
             (
                 Ast::Lambda { inputs: a_inputs, body: a_body },
                 Ast::Lambda { inputs: b_inputs, body: b_body },
-            ) => a_inputs == b_inputs && a_body == b_body,
+            ) => ast_eq_lambda(a_inputs, a_body, b_inputs, b_body),
             (Ast::FunctionRef(a), Ast::FunctionRef(b)) => a == b,
             (
                 Ast::MethodCall { receiver: a_receiver, method: a_method, args: a_args, .. },
                 Ast::MethodCall { receiver: b_receiver, method: b_method, args: b_args, .. },
-            ) => a_receiver == b_receiver && a_method == b_method && a_args == b_args,
+            ) => ast_eq_method_call(a_receiver, a_method, a_args, b_receiver, b_method, b_args),
             (Ast::Expression(a), Ast::Expression(b)) => a == b,
             (Ast::MultiValue(a), Ast::MultiValue(b)) => a == b,
             (Ast::Literal(a), Ast::Literal(b)) => a == b,
@@ -200,7 +200,7 @@ impl PartialEq for Ast {
             (
                 Ast::Index { collection: a_collection, index: a_index, .. },
                 Ast::Index { collection: b_collection, index: b_index, .. },
-            ) => a_collection == b_collection && a_index == b_index,
+            ) => ast_eq_index(a_collection, a_index, b_collection, b_index),
             (
                 Ast::IndexAssign {
                     collection: a_collection, index: a_index, value: a_value, ..
@@ -208,23 +208,86 @@ impl PartialEq for Ast {
                 Ast::IndexAssign {
                     collection: b_collection, index: b_index, value: b_value, ..
                 },
-            ) => a_collection == b_collection && a_index == b_index && a_value == b_value,
+            ) => {
+                ast_eq_index_assign(a_collection, a_index, a_value, b_collection, b_index, b_value)
+            }
             (Ast::Variable(a), Ast::Variable(b)) => a == b,
             (
                 Ast::Assign { name: a_name, value: a_value, .. },
                 Ast::Assign { name: b_name, value: b_value, .. },
-            ) => a_name == b_name && a_value == b_value,
+            ) => ast_eq_assign(a_name, a_value, b_name, b_value),
             (
                 Ast::MultiAssign { names: a_names, value: a_value, .. },
                 Ast::MultiAssign { names: b_names, value: b_value, .. },
-            ) => a_names == b_names && a_value == b_value,
+            ) => ast_eq_multi_assign(a_names, a_value, b_names, b_value),
             (
                 Ast::If { condition: a_condition, then: a_then, else_: a_else, .. },
                 Ast::If { condition: b_condition, then: b_then, else_: b_else, .. },
-            ) => a_condition == b_condition && a_then == b_then && a_else == b_else,
+            ) => ast_eq_if(
+                a_condition,
+                a_then,
+                a_else.as_ref(),
+                b_condition,
+                b_then,
+                b_else.as_ref(),
+            ),
             _ => false,
         }
     }
+}
+
+fn ast_eq_lambda(a_inputs: &[String], a_body: &Ast, b_inputs: &[String], b_body: &Ast) -> bool {
+    a_inputs == b_inputs && a_body == b_body
+}
+
+fn ast_eq_method_call(
+    a_receiver: &Ast,
+    a_method: &Ident,
+    a_args: &[Ast],
+    b_receiver: &Ast,
+    b_method: &Ident,
+    b_args: &[Ast],
+) -> bool {
+    a_receiver == b_receiver && a_method == b_method && a_args == b_args
+}
+
+fn ast_eq_index(a_collection: &Ast, a_index: &Ast, b_collection: &Ast, b_index: &Ast) -> bool {
+    a_collection == b_collection && a_index == b_index
+}
+
+fn ast_eq_index_assign(
+    a_collection: &Ast,
+    a_index: &Ast,
+    a_value: &Ast,
+    b_collection: &Ast,
+    b_index: &Ast,
+    b_value: &Ast,
+) -> bool {
+    a_collection == b_collection && a_index == b_index && a_value == b_value
+}
+
+fn ast_eq_assign(a_name: &str, a_value: &Ast, b_name: &str, b_value: &Ast) -> bool {
+    a_name == b_name && a_value == b_value
+}
+
+fn ast_eq_multi_assign(
+    a_names: &[String],
+    a_value: &Ast,
+    b_names: &[String],
+    b_value: &Ast,
+) -> bool {
+    a_names == b_names && a_value == b_value
+}
+
+fn ast_eq_if(
+    a_condition: &Ast,
+    a_then: &BlockAst,
+    a_else: Option<&BlockAst>,
+    b_condition: &Ast,
+    b_then: &BlockAst,
+    b_else: Option<&BlockAst>,
+) -> bool {
+    a_condition == b_condition && a_then == b_then && a_else == b_else
 }
 
 fn trim_newlines<'a>(lex: &mut ParseLexer<'a>) {
@@ -969,6 +1032,21 @@ impl LiteralAst {
     }
 }
 
+fn span_of_ast_slice(values: &[Ast]) -> Option<Span> {
+    values.first().and_then(span_of_ast)
+}
+
+fn span_of_map_entry(entry: &MapEntryAst) -> Option<Span> {
+    match &entry.key {
+        MapKeyAst::Dynamic(key) => span_of_ast(key).or_else(|| span_of_ast(&entry.value)),
+        MapKeyAst::Static(_) => span_of_ast(&entry.value),
+    }
+}
+
+fn span_of_map_entries(entries: &[MapEntryAst]) -> Option<Span> {
+    entries.first().and_then(span_of_map_entry)
+}
+
 fn span_of_ast(ast: &Ast) -> Option<Span> {
     match ast {
         Ast::FunctionDef(func) => func.span.clone(),
@@ -980,13 +1058,10 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
         | Ast::If { span, .. } => span.clone(),
         Ast::Variable(name) | Ast::FunctionRef(name) => name.span.clone(),
         Ast::Expression(ExpressionAst { function_span, .. }) => function_span.clone(),
-        Ast::Block(block) => block.lines.first().and_then(span_of_ast),
+        Ast::Block(block) => span_of_ast_slice(&block.lines),
         Ast::Lambda { body, .. } => span_of_ast(body),
-        Ast::MultiValue(values) | Ast::ListLiteral(values) => values.first().and_then(span_of_ast),
-        Ast::MapLiteral(entries) => entries.first().and_then(|entry| match &entry.key {
-            MapKeyAst::Dynamic(key) => span_of_ast(key).or_else(|| span_of_ast(&entry.value)),
-            MapKeyAst::Static(_) => span_of_ast(&entry.value),
-        }),
+        Ast::MultiValue(values) | Ast::ListLiteral(values) => span_of_ast_slice(values),
+        Ast::MapLiteral(entries) => span_of_map_entries(entries),
         Ast::Literal(_) => None,
     }
 }
@@ -1513,6 +1588,31 @@ fn parse_method_call() {
     assert_eq!(receiver.as_ref(), &Ast::Literal(LiteralAst::String("1234".to_string())));
     assert_eq!(method.as_str(), "is_integer");
     assert!(args.is_empty());
+}
+
+#[test]
+fn span_of_ast_covers_non_literal_variants() {
+    let text = "fn main() do\n    a, b = thing()\n    value = { dynamic_key => [1, 2, 3] }\n    picked = value[0]\n    value[0] = picked\n    callback = fn x -> x end\n    callback\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let result = Ast::from_lexer(&mut lexer).expect("fixture should parse");
+    let Ast::FunctionDef(func) = result else { panic!("expected function") };
+
+    assert!(span_of_ast(&Ast::FunctionDef(func.clone())).is_some());
+    assert!(span_of_ast(&Ast::Block(func.block.clone())).is_some());
+    for line in &func.block.lines {
+        assert!(span_of_ast(line).is_some());
+    }
+
+    let Ast::Assign { value: map_value, .. } = &func.block.lines[1] else {
+        panic!("expected map assignment");
+    };
+    assert!(span_of_ast(map_value).is_some());
+
+    let Ast::Assign { value: lambda_value, .. } = &func.block.lines[4] else {
+        panic!("expected lambda assignment");
+    };
+    assert!(span_of_ast(lambda_value).is_some());
 }
 
 #[test]

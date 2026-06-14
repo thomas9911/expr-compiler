@@ -3057,10 +3057,10 @@ fn install_runtime_mappings<'ctx>(
     execution_engine: &ExecutionEngine<'ctx>,
 ) {
     let mappings = [
-        ("print", crate::runtime::__expr_print_host as usize),
-        ("list_print", crate::runtime::__expr_list_print_host as usize),
-        ("__box_value", crate::runtime::__expr_box_value_host as usize),
-        ("__alloc", crate::runtime::__expr_alloc_host as usize),
+        ("print", crate::runtime::__expr_print_host as *const () as usize),
+        ("list_print", crate::runtime::__expr_list_print_host as *const () as usize),
+        ("__box_value", crate::runtime::__expr_box_value_host as *const () as usize),
+        ("__alloc", crate::runtime::__expr_alloc_host as *const () as usize),
     ];
 
     for (name, addr) in mappings {
