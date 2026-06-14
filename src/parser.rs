@@ -188,6 +188,7 @@ pub enum Ast {
     StructLiteral { type_name: Ident, fields: Vec<StructFieldValueAst>, span: Option<Span> },
     Index { collection: Box<Ast>, index: Box<Ast>, span: Option<Span> },
     IndexAssign { collection: Box<Ast>, index: Box<Ast>, value: Box<Ast>, span: Option<Span> },
+    FieldAssign { base: Box<Ast>, field: Ident, value: Box<Ast>, span: Option<Span> },
     Variable(Ident),
     Assign { name: String, value: Box<Ast>, span: Option<Span> },
     MultiAssign { names: Vec<String>, value: Box<Ast>, span: Option<Span> },
@@ -236,6 +237,10 @@ impl PartialEq for Ast {
             ) => {
                 ast_eq_index_assign(a_collection, a_index, a_value, b_collection, b_index, b_value)
             }
+            (
+                Ast::FieldAssign { base: a_base, field: a_field, value: a_value, .. },
+                Ast::FieldAssign { base: b_base, field: b_field, value: b_value, .. },
+            ) => a_base == b_base && a_field == b_field && a_value == b_value,
             (Ast::Variable(a), Ast::Variable(b)) => a == b,
             (
                 Ast::Assign { name: a_name, value: a_value, .. },
@@ -507,6 +512,15 @@ impl Ast {
                     Ast::Index { collection, index, span } => Ok(Ast::IndexAssign {
                         collection,
                         index,
+                        value: Box::new(value),
+                        span: span
+                            .or(assign_span)
+                            .zip(lex.last_span())
+                            .map(|(start, end)| Span::cover(start, end)),
+                    }),
+                    Ast::FieldAccess { base, field, span } => Ok(Ast::FieldAssign {
+                        base,
+                        field,
                         value: Box::new(value),
                         span: span
                             .or(assign_span)
@@ -1184,6 +1198,7 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
         | Ast::FieldAccess { span, .. }
         | Ast::Index { span, .. }
         | Ast::IndexAssign { span, .. }
+        | Ast::FieldAssign { span, .. }
         | Ast::Assign { span, .. }
         | Ast::MultiAssign { span, .. }
         | Ast::If { span, .. } => span.clone(),
@@ -1836,6 +1851,24 @@ fn parse_field_access() {
     };
     assert_eq!(field.as_str(), "name");
     assert_eq!(base.as_ref(), &Ast::Variable(Ident::synthetic("person".to_string())));
+}
+
+#[test]
+fn parse_field_assign() {
+    let text = "fn main() do\n    person.name = \"Bob\"\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let Ast::FunctionDef(function) = ast else {
+        panic!("expected function definition");
+    };
+    let [Ast::FieldAssign { base, field, value, .. }] = function.block.lines.as_slice() else {
+        panic!("expected field assignment statement");
+    };
+    assert_eq!(field.as_str(), "name");
+    assert_eq!(base.as_ref(), &Ast::Variable(Ident::synthetic("person".to_string())));
+    assert_eq!(value.as_ref(), &Ast::Literal(LiteralAst::String("Bob".to_string())));
 }
 
 #[test]

@@ -152,7 +152,8 @@ impl<'a> AstFormatter<'a> {
             | Ast::Assign { span, .. }
             | Ast::MultiAssign { span, .. }
             | Ast::Index { span, .. }
-            | Ast::IndexAssign { span, .. } => span.as_ref().map(|span| self.line_of_span(span)),
+            | Ast::IndexAssign { span, .. }
+            | Ast::FieldAssign { span, .. } => span.as_ref().map(|span| self.line_of_span(span)),
             Ast::Variable(name) | Ast::FunctionRef(name) => {
                 name.span.as_ref().map(|span| self.line_of_span(span))
             }
@@ -198,7 +199,8 @@ impl<'a> AstFormatter<'a> {
             Ast::Assign { span, .. }
             | Ast::MultiAssign { span, .. }
             | Ast::Index { span, .. }
-            | Ast::IndexAssign { span, .. } => {
+            | Ast::IndexAssign { span, .. }
+            | Ast::FieldAssign { span, .. } => {
                 span.as_ref().map(|span| self.end_line_of_span(span))
             }
             Ast::Variable(name) | Ast::FunctionRef(name) => {
@@ -708,6 +710,17 @@ impl BlockAst {
                         )
                     })
                 }
+                Ast::FieldAssign { base, field, value, .. } => {
+                    fmt.with_expression_indent(indent, |fmt| {
+                        format!(
+                            "{}{}.{} = {}",
+                            fmt.indent(indent),
+                            base.format_node(fmt, 10),
+                            field,
+                            value.format_node(fmt, 0)
+                        )
+                    })
+                }
                 Ast::If { condition, then, else_, .. } => format!(
                     "{}{}",
                     fmt.indent(indent),
@@ -814,6 +827,7 @@ impl FormatNode for Ast {
             Ast::Assign { .. }
             | Ast::MultiAssign { .. }
             | Ast::IndexAssign { .. }
+            | Ast::FieldAssign { .. }
             | Ast::FunctionDef(_) => {
                 unreachable!("statement AST should not be formatted as expression")
             }

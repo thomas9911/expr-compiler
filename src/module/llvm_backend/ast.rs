@@ -1,7 +1,7 @@
 use super::*;
 use crate::methods::{method_target_functions, resolve_method};
 use crate::module::stdlib_function;
-use crate::parser::{MapEntryAst, MapKeyAst, StructFieldValueAst};
+use crate::parser::{Ident, MapEntryAst, MapKeyAst, StructFieldValueAst};
 
 impl<'ctx> LlvmCompiler<'ctx> {
     pub(super) fn compile_ast(
@@ -66,6 +66,16 @@ impl<'ctx> LlvmCompiler<'ctx> {
             Ast::FieldAccess { base, field, .. } => self.compile_field_access_ast(
                 base,
                 field,
+                vars,
+                capture_slots,
+                env_ptr,
+                function,
+                current_function_name,
+            ),
+            Ast::FieldAssign { base, field, value, .. } => self.compile_field_assign_ast(
+                base,
+                field,
+                value,
                 vars,
                 capture_slots,
                 env_ptr,
@@ -814,6 +824,121 @@ impl<'ctx> LlvmCompiler<'ctx> {
             .expect("failed to load struct field payload")
             .into_int_value();
         CompiledValue { tag, payload: payload_value }
+    }
+
+    fn compile_field_assign_ast(
+        &self,
+        base: &Ast,
+        field: &Ident,
+        value_ast: &Ast,
+        vars: &HashMap<String, PointerValue<'ctx>>,
+        capture_slots: &HashMap<String, usize>,
+        env_ptr: IntValue<'ctx>,
+        function: FunctionValue<'ctx>,
+        current_function_name: &str,
+    ) -> CompiledValue<'ctx> {
+        let function_analysis = self.function_analysis(current_function_name);
+        let struct_name = match base {
+            Ast::Variable(name) => function_analysis.struct_bindings.get(name.as_str()).cloned(),
+            Ast::StructLiteral { type_name, .. } => Some(type_name.to_string()),
+            _ => None,
+        }
+        .unwrap_or_else(|| panic!("validated field assignment must have an exact struct receiver"));
+        let metadata = self
+            .value_kind_analysis
+            .structs
+            .get(&struct_name)
+            .unwrap_or_else(|| panic!("validated field assignment must use a declared struct"));
+        let field_index = metadata
+            .fields
+            .iter()
+            .position(|name| name == field.as_str())
+            .unwrap_or_else(|| panic!("validated field assignment must use a declared field"));
+
+        let receiver =
+            self.compile_ast(base, vars, capture_slots, env_ptr, function, current_function_name);
+        let trap_block = self.context.append_basic_block(function, "struct_field_set_trap");
+        let ok_block = self.context.append_basic_block(function, "struct_field_set_ok");
+        let payload =
+            self.expect_tag_payload(receiver, TAG_STRUCT, "struct_value", ok_block, trap_block);
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(ok_block);
+
+        let stored_type_id = self
+            .builder
+            .build_load(
+                self.i64_type,
+                self.build_i64_ptr_from_base(
+                    payload,
+                    self.i64_type.const_zero(),
+                    "struct_set_type_id_ptr",
+                ),
+                "struct_set_type_id",
+            )
+            .expect("failed to load struct type id")
+            .into_int_value();
+        let expected_type_id = self.i64_type.const_int(metadata.type_id as u64, true);
+        let type_ok = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                stored_type_id,
+                expected_type_id,
+                "struct_set_type_ok",
+            )
+            .expect("failed struct type compare");
+        let type_ok_block = self.context.append_basic_block(function, "struct_set_type_ok");
+        let type_trap_block = self.context.append_basic_block(function, "struct_set_type_trap");
+        self.builder
+            .build_conditional_branch(type_ok, type_ok_block, type_trap_block)
+            .expect("failed struct type branch");
+        self.builder.position_at_end(type_trap_block);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(type_ok_block);
+
+        let fields_ptr = self
+            .builder
+            .build_load(
+                self.i64_type,
+                self.build_i64_ptr_from_base(
+                    payload,
+                    self.i64_type.const_int(STRUCT_FIELDS_PTR_OFFSET as u64, false),
+                    "struct_set_fields_ptr_ptr",
+                ),
+                "struct_set_fields_ptr",
+            )
+            .expect("failed to load struct fields ptr")
+            .into_int_value();
+        let assigned = self.compile_ast(
+            value_ast,
+            vars,
+            capture_slots,
+            env_ptr,
+            function,
+            current_function_name,
+        );
+        let slot_offset = self.i64_type.const_int((field_index as i64 * VALUE_SIZE) as u64, false);
+        let tag_ptr = self.build_value_ptr_from_base(fields_ptr, slot_offset, "struct_set_tag_ptr");
+        let tag_i8 = self
+            .builder
+            .build_int_truncate(assigned.tag, self.context.i8_type(), "struct_set_tag_i8")
+            .expect("failed to truncate struct field tag");
+        self.builder.build_store(tag_ptr, tag_i8).expect("failed to store struct field tag");
+        let payload_offset = self
+            .builder
+            .build_int_add(
+                slot_offset,
+                self.i64_type.const_int(VALUE_PAYLOAD_OFFSET as u64, false),
+                "struct_set_payload_offset",
+            )
+            .expect("failed struct payload offset");
+        let payload_ptr =
+            self.build_i64_ptr_from_base(fields_ptr, payload_offset, "struct_set_payload_ptr");
+        self.builder
+            .build_store(payload_ptr, assigned.payload)
+            .expect("failed to store struct field payload");
+        assigned
     }
 
     fn compile_index_ast(

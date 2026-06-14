@@ -1208,6 +1208,10 @@ fn analyze_struct_bindings_for_function(
                 }
             }
             Ast::FieldAccess { base, .. } => analyze_ast(base, env, structs),
+            Ast::FieldAssign { base, value, .. } => {
+                analyze_ast(base, env, structs);
+                analyze_ast(value, env, structs);
+            }
             Ast::Index { collection, index, .. } => {
                 analyze_ast(collection, env, structs);
                 analyze_ast(index, env, structs);
@@ -1323,6 +1327,27 @@ fn validate_struct_usage_in_ast(
         }
         Ast::FieldAccess { base, field, span } => {
             validate_struct_usage_in_ast(base, env, structs)?;
+            let Some(struct_name) = infer_known_struct_name(base, env, structs) else {
+                return Err(CompileError::UnknownStructReceiver {
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            };
+            let metadata = structs
+                .get(&struct_name)
+                .expect("known struct inference should only produce declared structs");
+            if !metadata.fields.contains(&field.name) {
+                return Err(CompileError::UnknownStructField {
+                    struct_name,
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            }
+            Ok(())
+        }
+        Ast::FieldAssign { base, field, value, span } => {
+            validate_struct_usage_in_ast(base, env, structs)?;
+            validate_struct_usage_in_ast(value, env, structs)?;
             let Some(struct_name) = infer_known_struct_name(base, env, structs) else {
                 return Err(CompileError::UnknownStructReceiver {
                     field: field.to_string(),
@@ -2132,6 +2157,10 @@ fn collect_stdlib_references_from_ast(
             }
         }
         Ast::FieldAccess { base, .. } => collect_stdlib_references_from_ast(base, scope, refs),
+        Ast::FieldAssign { base, value, .. } => {
+            collect_stdlib_references_from_ast(base, scope, refs);
+            collect_stdlib_references_from_ast(value, scope, refs);
+        }
         Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
@@ -2269,6 +2298,10 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
             }
         }
         Ast::FieldAccess { base, .. } => collect_used_features_from_ast(base, features),
+        Ast::FieldAssign { base, value, .. } => {
+            collect_used_features_from_ast(base, features);
+            collect_used_features_from_ast(value, features);
+        }
         Ast::Index { collection, index, .. } => {
             features.lists = true;
             collect_used_features_from_ast(collection, features);
@@ -2745,6 +2778,24 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
+        Ast::FieldAssign { base, value, .. } => {
+            validate_ast_user_facing(
+                base,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )?;
+            validate_ast_user_facing(
+                value,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )
+        }
         Ast::Index { collection, index, .. } => validate_index_ast(
             collection,
             index,
@@ -3137,6 +3188,23 @@ fn validate_ast_multi_return_usage(
                 function_return_arities,
             )?;
             validate_single_value_multi_return_usage(expected_arity, None)
+        }
+        Ast::FieldAssign { base, value, span, .. } => {
+            validate_child_multi_return_usage(
+                base,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+            )?;
+            validate_child_multi_return_usage(
+                value,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+            )?;
+            validate_single_value_multi_return_usage(expected_arity, span.as_ref())
         }
         Ast::Index { collection, index, span } => validate_index_multi_return_usage(
             collection,
@@ -4091,6 +4159,9 @@ fn infer_ast_value_shape(
             let _ = infer_ast_value_shape(base, function_analysis, value_kind_analysis);
             ValueShape::unknown_scalar()
         }
+        Ast::FieldAssign { value, .. } => {
+            infer_ast_value_shape(value, function_analysis, value_kind_analysis)
+        }
         Ast::FunctionDef(_) | Ast::StructDef(_) => ValueShape::scalar(KindSet::empty()),
     }
 }
@@ -4351,7 +4422,9 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
     match ast {
         Ast::Variable(name) | Ast::FunctionRef(name) => name.span.clone(),
         Ast::Expression(ExpressionAst { function_span, .. }) => function_span.clone(),
-        Ast::MethodCall { span, .. } | Ast::FieldAccess { span, .. } => span.clone(),
+        Ast::MethodCall { span, .. }
+        | Ast::FieldAccess { span, .. }
+        | Ast::FieldAssign { span, .. } => span.clone(),
         Ast::Index { span, .. }
         | Ast::IndexAssign { span, .. }
         | Ast::Assign { span, .. }
@@ -4413,6 +4486,10 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
             Ok(())
         }
         Ast::FieldAccess { base, .. } => validate_no_nested_function_defs(base),
+        Ast::FieldAssign { base, value, .. } => {
+            validate_no_nested_function_defs(base)?;
+            validate_no_nested_function_defs(value)
+        }
         Ast::Index { collection, index, .. } => {
             validate_no_nested_function_defs(collection)?;
             validate_no_nested_function_defs(index)
@@ -4525,6 +4602,10 @@ impl LambdaLifter {
                 }
             }
             Ast::FieldAccess { base, .. } => self.lift_ast(base, scope_names),
+            Ast::FieldAssign { base, value, .. } => {
+                self.lift_ast(base, scope_names);
+                self.lift_ast(value, scope_names);
+            }
             Ast::Index { collection, index, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
@@ -4658,6 +4739,10 @@ fn collect_captures_into(
         Ast::FieldAccess { base, .. } => {
             collect_captures_into(base, local_names, scope_names, captures);
         }
+        Ast::FieldAssign { base, value, .. } => {
+            collect_captures_into(base, local_names, scope_names, captures);
+            collect_captures_into(value, local_names, scope_names, captures);
+        }
         Ast::Index { collection, index, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
             collect_captures_into(index, local_names, scope_names, captures);
@@ -4751,6 +4836,10 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
             }
         }
         Ast::FieldAccess { base, .. } => collect_var_names(base, names),
+        Ast::FieldAssign { base, value, .. } => {
+            collect_var_names(base, names);
+            collect_var_names(value, names);
+        }
         Ast::If { condition, then, else_, .. } => {
             collect_var_names(condition, names);
             for line in &then.lines {
@@ -6270,6 +6359,81 @@ fn compile_field_access(
     CompiledValue { tag, payload }
 }
 
+fn compile_field_assign(
+    builder: &mut FunctionBuilder,
+    base: &Ast,
+    field: &Ident,
+    value_ast: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let struct_name = exact_struct_name(base, function_analysis, value_kind_analysis)
+        .unwrap_or_else(|| panic!("validated field assignment must have an exact struct receiver"));
+    let metadata = value_kind_analysis
+        .structs
+        .get(&struct_name)
+        .unwrap_or_else(|| panic!("validated field assignment must use a declared struct"));
+    let field_index = metadata
+        .fields
+        .iter()
+        .position(|name| name == field.as_str())
+        .unwrap_or_else(|| panic!("validated field assignment must use a declared field"));
+
+    let receiver = compile_ast(
+        builder,
+        base,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+        function_analysis,
+        value_kind_analysis,
+    );
+    let is_struct = builder.ins().icmp_imm(IntCC::Equal, receiver.tag, TAG_STRUCT);
+    builder.ins().trapz(is_struct, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let stored_type_id =
+        builder.ins().load(types::I64, MemFlags::new(), receiver.payload, STRUCT_TYPE_ID_OFFSET);
+    let expected_type_id = builder.ins().iconst(types::I64, metadata.type_id);
+    let type_ok = builder.ins().icmp(IntCC::Equal, stored_type_id, expected_type_id);
+    builder.ins().trapz(type_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let fields_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), receiver.payload, STRUCT_FIELDS_PTR_OFFSET);
+    let assigned = compile_ast(
+        builder,
+        value_ast,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+        function_analysis,
+        value_kind_analysis,
+    );
+    let slot_offset = i32::try_from(i64::try_from(field_index).unwrap() * VALUE_SIZE)
+        .expect("struct slot overflow");
+    let tag_i8 = builder.ins().ireduce(types::I8, assigned.tag);
+    builder.ins().store(MemFlags::new(), tag_i8, fields_ptr, slot_offset);
+    builder.ins().store(
+        MemFlags::new(),
+        assigned.payload,
+        fields_ptr,
+        slot_offset + VALUE_PAYLOAD_OFFSET,
+    );
+    assigned
+}
+
 fn create_empty_list(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
@@ -7131,6 +7295,21 @@ fn compile_ast(
             builder,
             base,
             field,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
+        Ast::FieldAssign { base, field, value, .. } => compile_field_assign(
+            builder,
+            base,
+            field,
+            value,
             vars,
             func_refs,
             function_ordinals,
@@ -10683,6 +10862,12 @@ fn jit_struct_literal_and_field_access_work() {
 }
 
 #[test]
+fn jit_struct_field_assign_works() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.name = \"Bob\"\n    print(person.name)\n    0\nend";
+    assert_cranelift_executable_output(src, "Bob\n", 0);
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_map_get_map_argument_type() {
     let src = "fn main() do\n    map_get(list_new(), \"a\")\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -11470,6 +11655,13 @@ fn llvm_jit_lists_work() {
 fn llvm_struct_literal_and_field_access_work() {
     let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    print(person.name)\n    0\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "Ada\n", 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_struct_field_assign_works() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.name = \"Bob\"\n    print(person.name)\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "Bob\n", 0);
 }
 
 #[cfg(feature = "llvm-backend")]

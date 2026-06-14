@@ -328,7 +328,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             function_ordinals: HashMap::new(),
             function_arities: HashMap::new(),
             closure_metadata: HashMap::new(),
-            value_kind_analysis: ModuleValueKindAnalysis { functions: HashMap::new() },
+            value_kind_analysis: ModuleValueKindAnalysis {
+                functions: HashMap::new(),
+                structs: HashMap::new(),
+            },
         }
     }
 

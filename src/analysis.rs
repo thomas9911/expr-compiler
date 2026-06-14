@@ -485,6 +485,10 @@ fn infer_ast(
             let _ = infer_ast(base, env, function_bindings, summaries, calls);
             ValueShape::unknown_scalar()
         }
+        Ast::FieldAssign { base, value, .. } => {
+            let _ = infer_ast(base, env, function_bindings, summaries, calls);
+            infer_ast(value, env, function_bindings, summaries, calls)
+        }
         Ast::Index { collection, index, .. } => {
             let collection_shape = infer_ast(collection, env, function_bindings, summaries, calls);
             let _ = infer_ast(index, env, function_bindings, summaries, calls);
