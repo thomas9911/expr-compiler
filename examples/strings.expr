@@ -31,18 +31,18 @@ fn main():
 
     print(bytes_len("hi\n"))
 
-    if string_is_integer("11234"):
+    if "11234".is_integer():
         print("integer!")
-    if not string_is_integer("11T234"):
+    if not "11T234".is_integer():
         print("not integer :(")
 
-    ok, value, err = string_try_first("")
+    ok, value, err = "".try_first()
     if ok:
         print(value)
     else:
         print(err)
 
-    ok, value, err = string_try_last("hello")
+    ok, value, err = "hello".try_last()
     if ok:
         print(value)
     else:
@@ -55,7 +55,7 @@ fn main():
         print(err)
 
     sample = "hello"
-    ok, value, err = string_try_pop(sample)
+    ok, value, err = sample.try_pop()
     if ok:
         print(value)
         print(sample)

@@ -14,36 +14,36 @@ fn main() do
         best_units: 0,
     }
 
-    analyze_inventory(map_iter(inventory), summary)
+    analyze_inventory(inventory.iter(), summary)
 
     print("inventory report")
     print("products")
-    print(map_len(inventory))
+    print(inventory.len())
     print("total units")
-    print(map_get(summary, "total_units"))
+    print(summary.get("total_units"))
     print("low stock items")
-    print(map_get(summary, "low_stock_count"))
+    print(summary.get("low_stock_count"))
     print("best stocked product")
-    print(map_get(summary, "best_name"))
+    print(summary.get("best_name"))
     print("best stocked units")
-    print(map_get(summary, "best_units"))
+    print(summary.get("best_units"))
 end
 
 fn analyze_inventory(it, summary) do
-    if map_iter_done(it) do
+    if it.done() do
         0
     else
-        key, value = map_iter_next(it)
+        key, value = it.next()
 
-        map_update_or_default(summary, "total_units", 0, fn current -> current + value end)
+        summary.update_or_default("total_units", 0, fn current -> current + value end)
 
         if value < 4 do
-            map_update_or_default(summary, "low_stock_count", 0, fn current -> current + 1 end)
+            summary.update_or_default("low_stock_count", 0, fn current -> current + 1 end)
         end
 
-        if value > map_get(summary, "best_units") do
-            map_set(summary, "best_name", key)
-            map_set(summary, "best_units", value)
+        if value > summary.get("best_units") do
+            summary.set("best_name", key)
+            summary.set("best_units", value)
         end
 
         analyze_inventory(it, summary)

@@ -870,6 +870,7 @@ fn builtin_string_shape(name: &str) -> Option<ValueShape> {
         | "string_copy"
         | "string_repeat"
         | "string_reverse"
+        | "integer_to_string"
         | "string_from_codepoints" => Some(ValueShape::scalar(KindSet::string())),
         "string_chars" => Some(ValueShape::scalar(KindSet::string_iter())),
         "string_try_parse_integer" => {

@@ -105,14 +105,14 @@ case "$action" in
         if [[ "$example_path" != *.expr ]]; then
             example_path="$repo_root/examples/$example_path.expr"
         fi
-        cargo_args=(run --release -q --features llvm-backend -- "$example_path" --run-jit --backend llvm)
+        cargo_args=(run --release -q --features llvm-backend -- run "$example_path" --backend llvm)
         ;;
     compile)
         if [[ -z "$input" ]]; then
             echo "action 'compile' requires --input <path-to-.expr>" >&2
             exit 1
         fi
-        cargo_args=(run --release -q --features llvm-backend -- "$input" --backend llvm)
+        cargo_args=(run --release -q --features llvm-backend -- build "$input" --backend llvm)
         ;;
 esac
 

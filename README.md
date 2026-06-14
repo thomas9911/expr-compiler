@@ -124,6 +124,7 @@ Current behavior:
     - `string_is_integer(s)`
     - `string_try_parse_integer(s)`
     - `string_try_parse_bigint(s)`
+    - `integer_to_string(x)`
     - `string_from_codepoints(xs)`
     - `type_of(value)`
     - `string_repeat(s, n)`
@@ -140,6 +141,7 @@ Current behavior:
   - `type_of(value)` returns a debuggable stable type name such as `"int"`, `"bigint"`, `"string"`, `"list"`, `"map"`, `"map_iter"`, `"function"`, or `"string_iter"`
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is `true`/`false`, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short error message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
+  - `integer_to_string(x)` converts an `Int` to its decimal string form
   - `string_try_first(s)` returns `(ok, value, err)` where `value` is the first byte as an `Int`
   - `string_try_last(s)` returns `(ok, value, err)` where `value` is the last byte as an `Int`
   - `bytes_try_get(s, index)` returns `(ok, value, err)` where `value` is the byte at `index` as an `Int`
@@ -226,6 +228,38 @@ Current behavior:
   - `{}`
   - `{ name: "x", count: 1 }`
   - `{ dynamic_key => 1 }`
+
+## Method-call sugar
+
+The language supports method-call sugar for exact-known receiver kinds:
+
+```text
+print("1234".is_integer())
+
+m = { name: "expr-compiler" }
+print(m.keys())
+
+it = m.iter()
+key, value = it.next()
+```
+
+Current behavior:
+
+- `receiver.method(arg1, arg2)` lowers at compile time to a normal function call
+- resolution uses the inferred exact receiver kind
+- the desugared target name is `{type_prefix}_{method}`
+  - examples:
+    - `"1234".is_integer()` -> `string_is_integer("1234")`
+    - `m.keys()` -> `map_keys(m)`
+    - `it.next()` -> `map_iter_next(it)`
+- user-defined helpers also work when they follow the same naming convention
+  - example:
+    - `fn string_wrap(s) do ... end`
+    - `"x".wrap()`
+- if the receiver kind is unknown, method-call resolution is a compile error
+- if the receiver kind is ambiguous, method-call resolution is a compile error
+- `is_*` guards can narrow values enough to make method calls resolvable
+- the full function name is always available as the explicit fallback
 
 Logical infix operators are also supported:
 
