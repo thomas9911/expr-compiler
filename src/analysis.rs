@@ -417,7 +417,7 @@ fn infer_ast(
 ) -> ValueShape {
     match ast {
         Ast::Block(block) => infer_block(block, env, function_bindings, summaries, calls),
-        Ast::FunctionDef(_) => ValueShape::unknown_scalar(),
+        Ast::FunctionDef(_) | Ast::StructDef(_) => ValueShape::unknown_scalar(),
         Ast::Lambda { .. } | Ast::FunctionRef(_) => ValueShape::scalar(KindSet::function()),
         Ast::MethodCall { receiver, method, args, .. } => {
             let receiver_shape = infer_ast(receiver, env, function_bindings, summaries, calls);
@@ -465,6 +465,16 @@ fn infer_ast(
                 )
             });
             ValueShape::map(values)
+        }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                let _ = infer_ast(&field.value, env, function_bindings, summaries, calls);
+            }
+            ValueShape::unknown_scalar()
+        }
+        Ast::FieldAccess { base, .. } => {
+            let _ = infer_ast(base, env, function_bindings, summaries, calls);
+            ValueShape::unknown_scalar()
         }
         Ast::Index { collection, index, .. } => {
             let collection_shape = infer_ast(collection, env, function_bindings, summaries, calls);

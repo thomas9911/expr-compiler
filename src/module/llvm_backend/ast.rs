@@ -54,6 +54,8 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 function,
                 current_function_name,
             ),
+            Ast::StructLiteral { .. } => unimplemented!("struct literals"),
+            Ast::FieldAccess { .. } => unimplemented!("struct field access"),
             Ast::Index { collection, index, .. } => self.compile_index_ast(
                 collection,
                 index,
@@ -162,6 +164,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 current_function_name,
             ),
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
+            Ast::StructDef(_) => unimplemented!("struct declarations"),
         }
     }
 

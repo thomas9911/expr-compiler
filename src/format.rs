@@ -1,6 +1,7 @@
 use crate::module::CompileError;
 use crate::parser::{
     Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst, MapEntryAst, MapKeyAst, ParseLexer,
+    StructDefAst, StructFieldValueAst,
 };
 use crate::source::{Span, offset_to_line_col};
 use crate::tokenizer::{Logos, Token};
@@ -143,7 +144,10 @@ impl<'a> AstFormatter<'a> {
     fn line_of_ast(&self, ast: &Ast) -> Option<usize> {
         match ast {
             Ast::FunctionDef(func) => func.span.as_ref().map(|span| self.line_of_span(span)),
-            Ast::MethodCall { span, .. } => span.as_ref().map(|span| self.line_of_span(span)),
+            Ast::StructDef(def) => def.span.as_ref().map(|span| self.line_of_span(span)),
+            Ast::MethodCall { span, .. } | Ast::FieldAccess { span, .. } => {
+                span.as_ref().map(|span| self.line_of_span(span))
+            }
             Ast::If { span, .. }
             | Ast::Assign { span, .. }
             | Ast::MultiAssign { span, .. }
@@ -166,6 +170,9 @@ impl<'a> AstFormatter<'a> {
                 }
                 MapKeyAst::Static(_) => self.line_of_ast(&entry.value),
             }),
+            Ast::StructLiteral { fields, .. } => {
+                fields.first().and_then(|field| self.line_of_ast(&field.value))
+            }
             Ast::Literal(_) => None,
         }
     }
@@ -173,10 +180,14 @@ impl<'a> AstFormatter<'a> {
     fn end_line_of_ast(&self, ast: &Ast) -> Option<usize> {
         match ast {
             Ast::FunctionDef(func) => func.span.as_ref().map(|span| self.end_line_of_span(span)),
+            Ast::StructDef(def) => def.span.as_ref().map(|span| self.end_line_of_span(span)),
             Ast::MethodCall { receiver, args, span, .. } => args
                 .last()
                 .and_then(|arg| self.end_line_of_ast(arg))
                 .or_else(|| self.end_line_of_ast(receiver))
+                .or_else(|| span.as_ref().map(|span| self.end_line_of_span(span))),
+            Ast::FieldAccess { base, span, .. } => self
+                .end_line_of_ast(base)
                 .or_else(|| span.as_ref().map(|span| self.end_line_of_span(span))),
             Ast::If { condition, then, else_, span } => else_
                 .as_ref()
@@ -203,6 +214,9 @@ impl<'a> AstFormatter<'a> {
             }
             Ast::MapLiteral(entries) => {
                 entries.last().and_then(|entry| self.end_line_of_ast(&entry.value))
+            }
+            Ast::StructLiteral { fields, .. } => {
+                fields.last().and_then(|field| self.end_line_of_ast(&field.value))
             }
             Ast::Literal(_) => None,
         }
@@ -306,6 +320,23 @@ impl<'a> AstFormatter<'a> {
             .collect::<Vec<_>>()
             .join(",\n");
         format!("{{\n{body},\n{}}}", self.indent(self.expression_indent))
+    }
+
+    fn format_struct_literal(&mut self, type_name: &str, fields: &[StructFieldValueAst]) -> String {
+        if fields.is_empty() {
+            return format!("{type_name} {{}}");
+        }
+        let field_indent = self.expression_indent + 1;
+        let body = fields
+            .iter()
+            .map(|field| {
+                let value =
+                    self.with_expression_indent(field_indent, |fmt| field.value.format_node(fmt, 0));
+                format!("{}{}: {}", self.indent(field_indent), field.name, value)
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("{type_name} {{\n{body},\n{}}}", self.indent(self.expression_indent))
     }
 
     fn format_list_literal_expr(&mut self, items: &[Ast]) -> String {
@@ -733,15 +764,39 @@ impl FormatNode for FunctionDefAst {
     }
 }
 
+impl FormatNode for StructDefAst {
+    fn format_node(&self, fmt: &mut AstFormatter<'_>, _parent_prec: u8) -> String {
+        let mut head = format!("struct {} = {{", self.name);
+        fmt.append_trailing_comment(&mut head, self.span.as_ref().map(|span| fmt.line_of_span(span)));
+        if self.fields.is_empty() {
+            return format!("{head}}}");
+        }
+        let body = self
+            .fields
+            .iter()
+            .map(|field| format!("{}{}", fmt.indent(1), field))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("{head}\n{body},\n}}")
+    }
+}
+
 impl FormatNode for Ast {
     fn format_node(&self, fmt: &mut AstFormatter<'_>, parent_prec: u8) -> String {
         match self {
             Ast::Literal(literal) => literal.format_node(fmt, parent_prec),
             Ast::Variable(name) | Ast::FunctionRef(name) => name.to_string(),
+            Ast::StructDef(def) => def.format_node(fmt, parent_prec),
             Ast::ListLiteral(items) => fmt.format_list_literal_expr(items),
             Ast::MapLiteral(entries) => fmt.format_map_literal(entries),
+            Ast::StructLiteral { type_name, fields, .. } => {
+                fmt.format_struct_literal(type_name.as_str(), fields)
+            }
             Ast::MethodCall { receiver, method, args, .. } => {
                 fmt.format_method_call_expr(receiver, method, args)
+            }
+            Ast::FieldAccess { base, field, .. } => {
+                format!("{}.{}", base.format_node(fmt, 10), field)
             }
             Ast::Lambda { inputs, body } => fmt.format_lambda_expr(inputs, body, parent_prec),
             Ast::Expression(ExpressionAst { function, args, .. }) => {
@@ -763,10 +818,10 @@ impl FormatNode for Ast {
     }
 }
 
-fn parse_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
+fn parse_top_level_items(source: &str) -> Result<Vec<Ast>, CompileError> {
     let lex = Token::lexer(source);
     let mut lexer = ParseLexer::new(lex);
-    let mut functions = vec![];
+    let mut items = vec![];
     loop {
         while lexer.peek() == Some(&Ok(Token::Newline)) {
             lexer.next();
@@ -775,31 +830,35 @@ fn parse_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
             break;
         }
         match Ast::from_lexer(&mut lexer) {
-            Ok(Ast::FunctionDef(func)) => functions.push(func),
+            Ok(item @ Ast::FunctionDef(_)) | Ok(item @ Ast::StructDef(_)) => items.push(item),
             Ok(_) => return Err(CompileError::TopLevelExpression),
             Err(err) => {
                 return Err(CompileError::Parse { message: err.to_string(), span: Some(err.span) });
             }
         }
     }
-    Ok(functions)
+    Ok(items)
 }
 
 pub fn format_source(source: &str, config: &FormatConfig) -> Result<String, CompileError> {
-    let functions = parse_functions(source)?;
+    let items = parse_top_level_items(source)?;
     let mut fmt = AstFormatter::new(config, source);
     let mut rendered = String::new();
-    let mut wrote_function = false;
+    let mut wrote_item = false;
     let mut previous_end_line = None;
-    for function in &functions {
-        let function_start_line = function.span.as_ref().map(|span| fmt.line_of_span(span));
-        let comments = function
-            .span
+    for item in &items {
+        let item_span = match item {
+            Ast::FunctionDef(func) => func.span.as_ref(),
+            Ast::StructDef(def) => def.span.as_ref(),
+            _ => None,
+        };
+        let item_start_line = item_span.map(|span| fmt.line_of_span(span));
+        let comments = item_span
             .as_ref()
             .map(|span| fmt.line_of_span(span))
             .map(|line| (line, fmt.take_standalone_comments_before(line, 0)));
 
-        if wrote_function {
+        if wrote_item {
             rendered.push('\n');
             if comments.as_ref().is_none_or(|(_, block)| block.lines.is_empty()) {
                 rendered.push('\n');
@@ -810,7 +869,7 @@ pub fn format_source(source: &str, config: &FormatConfig) -> Result<String, Comp
             rendered.push('\n');
         }
 
-        if let (Some(prev_end), Some(line_no)) = (previous_end_line, function_start_line)
+        if let (Some(prev_end), Some(line_no)) = (previous_end_line, item_start_line)
             && comments.as_ref().is_none_or(|(_, block)| block.lines.is_empty())
             && fmt.has_blank_line_between(prev_end, line_no)
             && !rendered.ends_with("\n\n")
@@ -833,9 +892,13 @@ pub fn format_source(source: &str, config: &FormatConfig) -> Result<String, Comp
                 rendered.push('\n');
             }
         }
-        rendered.push_str(&function.format_node(&mut fmt, 0));
-        wrote_function = true;
-        previous_end_line = function.span.as_ref().map(|span| fmt.end_line_of_span(span));
+        match item {
+            Ast::FunctionDef(func) => rendered.push_str(&func.format_node(&mut fmt, 0)),
+            Ast::StructDef(def) => rendered.push_str(&def.format_node(&mut fmt, 0)),
+            _ => unreachable!("top-level formatter only accepts functions and structs"),
+        }
+        wrote_item = true;
+        previous_end_line = item_span.map(|span| fmt.end_line_of_span(span));
     }
     for comment in fmt.take_standalone_comments_until(usize::MAX, 0) {
         if !rendered.is_empty() {
@@ -1003,5 +1066,12 @@ mod tests {
         let source = "fn first() do\n    1\nend\n\nfn second() do\n    2\nend\n";
         let formatted = format_source(source, &config(BlockStyle::DoEnd)).unwrap();
         assert_eq!(formatted, "fn first() do\n    1\nend\n\nfn second() do\n    2\nend\n");
+    }
+
+    #[test]
+    fn format_source_preserves_struct_syntax() {
+        let source = "struct Person = {\n    name,\n    age,\n}\n";
+        let formatted = format_source(source, &config(BlockStyle::DoEnd)).unwrap();
+        assert_eq!(formatted, source);
     }
 }

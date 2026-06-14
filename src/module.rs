@@ -1453,6 +1453,9 @@ fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileEr
         }
         match Ast::from_lexer(&mut lexer) {
             Ok(Ast::FunctionDef(func)) => functions.push(func),
+            Ok(Ast::StructDef(_)) => {
+                return Err(CompileError::UnsupportedFeature("struct declarations"));
+            }
             Ok(_) => return Err(CompileError::TopLevelExpression),
             Err(err) => {
                 return Err(CompileError::Parse {
@@ -1681,6 +1684,7 @@ fn collect_stdlib_references_from_ast(
     refs: &mut HashSet<String>,
 ) {
     match ast {
+        Ast::StructDef(_) => {}
         Ast::Expression(ExpressionAst { function, args, .. }) => {
             if !function.is_empty() {
                 maybe_collect_stdlib_reference(function, scope, refs);
@@ -1716,6 +1720,12 @@ fn collect_stdlib_references_from_ast(
         Ast::MapLiteral(entries) => {
             collect_stdlib_references_from_map_entries(entries, scope, refs)
         }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_stdlib_references_from_ast(&field.value, scope, refs);
+            }
+        }
+        Ast::FieldAccess { base, .. } => collect_stdlib_references_from_ast(base, scope, refs),
         Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
@@ -1749,6 +1759,7 @@ fn collect_used_features_from_block(block: &BlockAst, features: &mut UsedFeature
 
 fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
     match ast {
+        Ast::StructDef(_) => {}
         Ast::Expression(ExpressionAst { function, args, .. }) => {
             if matches!(
                 function.as_str(),
@@ -1846,6 +1857,12 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                 collect_used_features_from_ast(&entry.value, features);
             }
         }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_used_features_from_ast(&field.value, features);
+            }
+        }
+        Ast::FieldAccess { base, .. } => collect_used_features_from_ast(base, features),
         Ast::Index { collection, index, .. } => {
             features.lists = true;
             collect_used_features_from_ast(collection, features);
@@ -2270,6 +2287,7 @@ fn validate_ast_user_facing(
         Ast::Variable(name) => validate_variable_reference(name, locals, function_names),
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::StructDef(_) => Err(CompileError::UnsupportedFeature("struct declarations")),
         Ast::FunctionRef(name) => validate_function_reference(name, function_names),
         Ast::MethodCall { receiver, method, args, .. } => validate_method_call_user_facing(
             receiver,
@@ -2305,6 +2323,8 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
+        Ast::StructLiteral { .. } => Err(CompileError::UnsupportedFeature("struct literals")),
+        Ast::FieldAccess { .. } => Err(CompileError::UnsupportedFeature("struct field access")),
         Ast::Index { collection, index, .. } => validate_index_ast(
             collection,
             index,
@@ -2594,7 +2614,7 @@ fn validate_ast_multi_return_usage(
         Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {
             validate_single_value_multi_return_usage(expected_arity, None)
         }
-        Ast::Lambda { .. } | Ast::FunctionDef(_) => Ok(()),
+        Ast::Lambda { .. } | Ast::FunctionDef(_) | Ast::StructDef(_) => Ok(()),
         Ast::MethodCall { receiver, method, args, .. } => {
             validate_child_multi_return_usage(
                 receiver,
@@ -2674,6 +2694,28 @@ fn validate_ast_multi_return_usage(
                     function_return_arities,
                 )?;
             }
+            validate_single_value_multi_return_usage(expected_arity, None)
+        }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                validate_child_multi_return_usage(
+                    &field.value,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                )?;
+            }
+            validate_single_value_multi_return_usage(expected_arity, None)
+        }
+        Ast::FieldAccess { base, .. } => {
+            validate_child_multi_return_usage(
+                base,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+            )?;
             validate_single_value_multi_return_usage(expected_arity, None)
         }
         Ast::Index { collection, index, span } => validate_index_multi_return_usage(
@@ -3526,6 +3568,12 @@ fn infer_ast_value_shape(
                 )
             }))
         }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                let _ = infer_ast_value_shape(&field.value, function_analysis, value_kind_analysis);
+            }
+            ValueShape::unknown_scalar()
+        }
         Ast::MultiValue(values) => ValueShape::from_slots(
             values
                 .iter()
@@ -3619,7 +3667,11 @@ fn infer_ast_value_shape(
         Ast::IndexAssign { value, .. } => {
             infer_ast_value_shape(value, function_analysis, value_kind_analysis)
         }
-        Ast::FunctionDef(_) => ValueShape::scalar(KindSet::empty()),
+        Ast::FieldAccess { base, .. } => {
+            let _ = infer_ast_value_shape(base, function_analysis, value_kind_analysis);
+            ValueShape::unknown_scalar()
+        }
+        Ast::FunctionDef(_) | Ast::StructDef(_) => ValueShape::scalar(KindSet::empty()),
     }
 }
 
@@ -3879,19 +3931,21 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
     match ast {
         Ast::Variable(name) | Ast::FunctionRef(name) => name.span.clone(),
         Ast::Expression(ExpressionAst { function_span, .. }) => function_span.clone(),
-        Ast::MethodCall { span, .. } => span.clone(),
+        Ast::MethodCall { span, .. } | Ast::FieldAccess { span, .. } => span.clone(),
         Ast::Index { span, .. }
         | Ast::IndexAssign { span, .. }
         | Ast::Assign { span, .. }
         | Ast::MultiAssign { span, .. }
         | Ast::If { span, .. } => span.clone(),
         Ast::FunctionDef(func) => func.span.clone(),
+        Ast::StructDef(def) => def.span.clone(),
         Ast::Block(_)
         | Ast::Lambda { .. }
         | Ast::MultiValue(_)
         | Ast::Literal(_)
         | Ast::ListLiteral(_)
-        | Ast::MapLiteral(_) => None,
+        | Ast::MapLiteral(_)
+        | Ast::StructLiteral { .. } => None,
     }
 }
 
@@ -3928,9 +3982,17 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
 
     match ast {
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::StructDef(_) => Ok(()),
         Ast::Lambda { body, .. } => validate_no_nested_function_defs(body),
         Ast::MultiValue(values) | Ast::ListLiteral(values) => validate_nested_free_slice(values),
         Ast::MapLiteral(entries) => validate_nested_free_map_entries(entries),
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                validate_no_nested_function_defs(&field.value)?;
+            }
+            Ok(())
+        }
+        Ast::FieldAccess { base, .. } => validate_no_nested_function_defs(base),
         Ast::Index { collection, index, .. } => {
             validate_no_nested_function_defs(collection)?;
             validate_no_nested_function_defs(index)
@@ -4037,6 +4099,12 @@ impl LambdaLifter {
                     self.lift_ast(&mut entry.value, scope_names);
                 }
             }
+            Ast::StructLiteral { fields, .. } => {
+                for field in fields {
+                    self.lift_ast(&mut field.value, scope_names);
+                }
+            }
+            Ast::FieldAccess { base, .. } => self.lift_ast(base, scope_names),
             Ast::Index { collection, index, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
@@ -4056,6 +4124,7 @@ impl LambdaLifter {
                 }
             }
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
+            Ast::StructDef(_) => {}
             Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {}
         }
     }
@@ -4161,6 +4230,14 @@ fn collect_captures_into(
         Ast::MapLiteral(entries) => {
             collect_captures_from_map_entries(entries, local_names, scope_names, captures);
         }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_captures_into(&field.value, local_names, scope_names, captures);
+            }
+        }
+        Ast::FieldAccess { base, .. } => {
+            collect_captures_into(base, local_names, scope_names, captures);
+        }
         Ast::Index { collection, index, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
             collect_captures_into(index, local_names, scope_names, captures);
@@ -4193,12 +4270,14 @@ fn collect_captures_into(
         Ast::MultiAssign { value, .. } => {
             collect_captures_into(value, local_names, scope_names, captures);
         }
+        Ast::StructDef(_) => {}
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
 
 fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
     match ast {
+        Ast::StructDef(_) => {}
         Ast::Lambda { body, .. } => {
             collect_var_names(body, names);
         }
@@ -4246,6 +4325,12 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
                 collect_var_names(&entry.value, names);
             }
         }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_var_names(&field.value, names);
+            }
+        }
+        Ast::FieldAccess { base, .. } => collect_var_names(base, names),
         Ast::If { condition, then, else_, .. } => {
             collect_var_names(condition, names);
             for line in &then.lines {
@@ -6474,6 +6559,8 @@ fn compile_ast(
             function_analysis,
             value_kind_analysis,
         ),
+        Ast::StructLiteral { .. } => unimplemented!("struct literals"),
+        Ast::FieldAccess { .. } => unimplemented!("struct field access"),
         Ast::Index { collection, index, .. } => compile_index_ast(
             builder,
             collection,
@@ -6584,6 +6671,7 @@ fn compile_ast(
             value_kind_analysis,
         ),
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
+        Ast::StructDef(_) => unimplemented!("struct declarations"),
     }
 }
 
@@ -7857,6 +7945,16 @@ fn try_from_source_rejects_top_level_expressions() {
         Err(err) => err,
     };
     assert_eq!(err, CompileError::TopLevelExpression);
+}
+
+#[cfg(test)]
+#[test]
+fn try_from_source_rejects_struct_declarations_as_unsupported() {
+    let err = match Module::try_from_source("struct Person = {name}") {
+        Ok(_) => panic!("struct declarations should be rejected in the compile pipeline for now"),
+        Err(err) => err,
+    };
+    assert_eq!(err, CompileError::UnsupportedFeature("struct declarations"));
 }
 
 #[cfg(test)]
@@ -9886,6 +9984,28 @@ fn try_compile_to_jit_rejects_invalid_map_literal_dynamic_key_type() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn try_compile_to_jit_rejects_struct_literals() {
+    let src = "fn main() do\n    Person { name: \"Ada\" }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err, CompileError::UnsupportedFeature("struct literals"));
+}
+
+#[test]
+fn try_compile_to_jit_rejects_struct_field_access() {
+    let src = "fn main() do\n    person.name\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err, CompileError::UnsupportedFeature("struct field access"));
 }
 
 #[test]

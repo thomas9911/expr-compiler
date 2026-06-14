@@ -149,6 +149,8 @@ pub enum Token {
     Assign,
     #[token("fn")]
     DefineFunction,
+    #[token("struct")]
+    DefineStruct,
     #[token("if")]
     If,
     #[token("and")]
@@ -542,6 +544,26 @@ fn tokenize_map_literal() {
             Symbol("key".to_string()),
             FatArrow,
             Integer(2),
+            CloseBrace,
+        ]
+    );
+}
+
+#[test]
+fn tokenize_struct_declaration() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> = Token::lexer("struct Person = {name, age}").collect();
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            DefineStruct,
+            Symbol("Person".to_string()),
+            Assign,
+            OpenBrace,
+            Symbol("name".to_string()),
+            Comma,
+            Symbol("age".to_string()),
             CloseBrace,
         ]
     );
