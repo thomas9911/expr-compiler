@@ -91,7 +91,7 @@ pub(super) fn setup_builtins_jit(
         flags,
         arena_base_addr,
         arena_offset_addr,
-        crate::runtime::__expr_runtime_oom_host as usize as i64,
+        crate::runtime::__expr_runtime_oom_host as *const () as usize as i64,
         bigint_enabled,
         list_enabled,
         list_mutation_enabled,

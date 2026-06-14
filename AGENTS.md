@@ -85,6 +85,7 @@ Guidance for coding agents working in this repository.
   - `string_is_integer(s)`
   - `string_try_parse_integer(s)`
   - `string_try_parse_bigint(s)`
+  - `integer_to_string(x)`
   - `string_from_codepoints(xs)`
   - `type_of(value)`
   - `is_int(value)`
@@ -136,6 +137,7 @@ Guidance for coding agents working in this repository.
   - current autoloaded helpers include `string_is_empty(s)`, `string_is_not_empty(s)`, `string_len(s)`, `string_first(s)`, `string_last(s)`, `string_try_first(s)`, `string_try_last(s)`, `string_starts_with(s, prefix)`, `string_ends_with(s, suffix)`, `string_contains(s, needle)`, `bytes_try_get(s, index)`, `string_try_pop(s)`, `string_is_ascii(s)`, `string_all(s, predicate)`, `string_is_integer(s)`, `string_repeat(s, n)`, and `string_reverse(s)`
   - `string_try_parse_integer(s)` returns `(ok, value, err)` where `ok` is a boolean alias, `value` is the parsed `Int` or `0`, and `err` is `""` on success or a short message on failure
   - `string_try_parse_bigint(s)` returns `(ok, value, err)` where `value` is the parsed `BigInt` or `bigint_from_int(0)`
+  - `integer_to_string(x)` converts an `Int` to its decimal string form
   - `string_from_codepoints(xs)` takes a `list<int>` of Unicode scalar values and returns a UTF-8 string
   - `string_try_first(s)`, `string_try_last(s)`, `bytes_try_get(s, index)`, and `string_try_pop(s)` also return `(ok, value, err)` instead of trapping on empty strings or out-of-bounds access
   - `map_try_get(m, key)` returns `(ok, value, err)` where `value` is the stored value or `0`, and `err` is `""` on success or `"missing key"` on failure
@@ -186,6 +188,19 @@ Guidance for coding agents working in this repository.
   - these runnable paths pass only actual CLI arguments, not the executable name
   - for CLI JIT runs, program arguments are passed after `--`
   - `main` currently supports at most one argument in these modes
+- Method-call sugar is supported for exact-known receiver kinds:
+  - `receiver.method(args...)`
+  - it lowers at compile time to `{type_prefix}_{method}(receiver, args...)`
+  - examples:
+    - `"1234".is_integer()` -> `string_is_integer("1234")`
+    - `m.keys()` -> `map_keys(m)`
+    - `it.next()` -> `map_iter_next(it)`
+  - user-defined helpers also work when they follow the same naming convention:
+    - `fn string_wrap(s) do ... end`
+    - `"x".wrap()`
+  - unknown receiver kinds are compile errors
+  - ambiguous receiver kinds are compile errors
+  - `is_*` narrowing can make method calls resolvable inside guarded branches
 
 ## Build and Test
 

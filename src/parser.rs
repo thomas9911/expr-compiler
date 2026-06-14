@@ -164,6 +164,7 @@ pub enum Ast {
     FunctionDef(FunctionDefAst),
     Lambda { inputs: Vec<String>, body: Box<Ast> },
     FunctionRef(Ident),
+    MethodCall { receiver: Box<Ast>, method: Ident, args: Vec<Ast>, span: Option<Span> },
     Expression(ExpressionAst),
     MultiValue(Vec<Ast>),
     Literal(LiteralAst),
@@ -187,6 +188,10 @@ impl PartialEq for Ast {
                 Ast::Lambda { inputs: b_inputs, body: b_body },
             ) => a_inputs == b_inputs && a_body == b_body,
             (Ast::FunctionRef(a), Ast::FunctionRef(b)) => a == b,
+            (
+                Ast::MethodCall { receiver: a_receiver, method: a_method, args: a_args, .. },
+                Ast::MethodCall { receiver: b_receiver, method: b_method, args: b_args, .. },
+            ) => a_receiver == b_receiver && a_method == b_method && a_args == b_args,
             (Ast::Expression(a), Ast::Expression(b)) => a == b,
             (Ast::MultiValue(a), Ast::MultiValue(b)) => a == b,
             (Ast::Literal(a), Ast::Literal(b)) => a == b,
@@ -878,6 +883,39 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                         .map(|(start, end)| Span::cover(start, end)),
                 };
             }
+            Some(Ok(Token::Dot)) => {
+                let start_span = span_of_ast(&lhs).or_else(|| lex.peek_span());
+                lex.next();
+                let Some(Ok(Token::Symbol(method_name))) = lex.next() else {
+                    return Err(ParseError::unexpected(lex));
+                };
+                let method_span =
+                    lex.last_span().expect("consumed method symbol should have a span");
+                if lex.next() != Some(Ok(Token::OpenBracket)) {
+                    return Err(ParseError::unexpected(lex));
+                }
+                let mut args = vec![];
+                loop {
+                    match lex.peek() {
+                        Some(Ok(Token::CloseBracket)) => {
+                            lex.next();
+                            break;
+                        }
+                        Some(Ok(Token::Comma)) => {
+                            lex.next();
+                        }
+                        _ => args.push(parse_expr(lex, 0)?),
+                    }
+                }
+                lhs = Ast::MethodCall {
+                    receiver: Box::new(lhs),
+                    method: Ident::spanned(method_name, method_span),
+                    args,
+                    span: start_span
+                        .zip(lex.last_span())
+                        .map(|(start, end)| Span::cover(start, end)),
+                };
+            }
             _ => break,
         }
     }
@@ -928,6 +966,28 @@ impl LiteralAst {
             Some(Ok(Token::StringLiteral(value))) => Ok(LiteralAst::String(value)),
             _ => Err(ParseError::unexpected(lex)),
         }
+    }
+}
+
+fn span_of_ast(ast: &Ast) -> Option<Span> {
+    match ast {
+        Ast::FunctionDef(func) => func.span.clone(),
+        Ast::MethodCall { span, .. }
+        | Ast::Index { span, .. }
+        | Ast::IndexAssign { span, .. }
+        | Ast::Assign { span, .. }
+        | Ast::MultiAssign { span, .. }
+        | Ast::If { span, .. } => span.clone(),
+        Ast::Variable(name) | Ast::FunctionRef(name) => name.span.clone(),
+        Ast::Expression(ExpressionAst { function_span, .. }) => function_span.clone(),
+        Ast::Block(block) => block.lines.first().and_then(span_of_ast),
+        Ast::Lambda { body, .. } => span_of_ast(body),
+        Ast::MultiValue(values) | Ast::ListLiteral(values) => values.first().and_then(span_of_ast),
+        Ast::MapLiteral(entries) => entries.first().and_then(|entry| match &entry.key {
+            MapKeyAst::Dynamic(key) => span_of_ast(key).or_else(|| span_of_ast(&entry.value)),
+            MapKeyAst::Static(_) => span_of_ast(&entry.value),
+        }),
+        Ast::Literal(_) => None,
     }
 }
 
@@ -1438,6 +1498,21 @@ fn parse_multiline_map_literal() {
     let Ast::Assign { value, .. } = &func.block.lines[0] else { panic!("expected assign") };
     let Ast::MapLiteral(entries) = &**value else { panic!("expected map literal") };
     assert_eq!(entries.len(), 3);
+}
+
+#[test]
+fn parse_method_call() {
+    let text = "fn main() do\n    \"1234\".is_integer()\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let result = Ast::from_lexer(&mut lexer).expect("method call should parse");
+    let Ast::FunctionDef(func) = result else { panic!("expected function") };
+    let Ast::MethodCall { receiver, method, args, .. } = &func.block.lines[0] else {
+        panic!("expected method call")
+    };
+    assert_eq!(receiver.as_ref(), &Ast::Literal(LiteralAst::String("1234".to_string())));
+    assert_eq!(method.as_str(), "is_integer");
+    assert!(args.is_empty());
 }
 
 #[test]

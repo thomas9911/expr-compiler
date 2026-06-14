@@ -143,6 +143,7 @@ impl<'a> AstFormatter<'a> {
     fn line_of_ast(&self, ast: &Ast) -> Option<usize> {
         match ast {
             Ast::FunctionDef(func) => func.span.as_ref().map(|span| self.line_of_span(span)),
+            Ast::MethodCall { span, .. } => span.as_ref().map(|span| self.line_of_span(span)),
             Ast::If { span, .. }
             | Ast::Assign { span, .. }
             | Ast::MultiAssign { span, .. }
@@ -172,6 +173,11 @@ impl<'a> AstFormatter<'a> {
     fn end_line_of_ast(&self, ast: &Ast) -> Option<usize> {
         match ast {
             Ast::FunctionDef(func) => func.span.as_ref().map(|span| self.end_line_of_span(span)),
+            Ast::MethodCall { receiver, args, span, .. } => args
+                .last()
+                .and_then(|arg| self.end_line_of_ast(arg))
+                .or_else(|| self.end_line_of_ast(receiver))
+                .or_else(|| span.as_ref().map(|span| self.end_line_of_span(span))),
             Ast::If { condition, then, else_, span } => else_
                 .as_ref()
                 .and_then(|else_block| self.end_line_of_ast(&Ast::Block(else_block.clone())))
@@ -675,6 +681,11 @@ impl FormatNode for Ast {
                 format!("[{items}]")
             }
             Ast::MapLiteral(entries) => fmt.format_map_literal(entries),
+            Ast::MethodCall { receiver, method, args, .. } => {
+                let args =
+                    args.iter().map(|arg| arg.format_node(fmt, 0)).collect::<Vec<_>>().join(", ");
+                format!("{}.{}({args})", receiver.format_node(fmt, 10), method)
+            }
             Ast::Lambda { inputs, body } => {
                 let rendered = fmt.format_lambda(inputs, body);
                 if parent_prec > 0 { format!("({rendered})") } else { rendered }

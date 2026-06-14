@@ -1,0 +1,39 @@
+fn string_wrap(s) do
+    "[".concat(s.concat("]"))
+end
+
+fn string_repeat_twice(s) do
+    s.repeat(2)
+end
+
+fn string_describe(s) do
+    "string:".concat(s)
+end
+
+fn list_sum_from(xs, i) do
+    if i == xs.len() do
+        0
+    else
+        xs[i] + xs.sum_from(i + 1)
+    end
+end
+
+fn list_sum(xs) do
+    xs.sum_from(0)
+end
+
+fn list_describe(xs) do
+    "list-sum:".concat(integer_to_string(xs.sum()))
+end
+
+fn main() do
+    # here the `"expr".wrap()` gets transformed into: `string_wrap("expr")` defined above
+    print("expr".wrap())
+    # here the `"ha".repeat_twice()` gets transformed into: `string_repeat_twice("ha")` defined above
+    print("ha".repeat_twice())
+    # here the `[1, 2, 3, 4].sum()` gets transformed into: `list_sum([1, 2, 3, 4])` defined above
+    print([1, 2, 3, 4].sum())
+    # same method name, but the inferred receiver kind changes the target helper
+    print("abcdef".describe())
+    print([1, 2, 3, 4, 5].describe())
+end
