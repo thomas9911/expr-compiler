@@ -2,7 +2,9 @@ use crate::analysis::{
     FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, StructValueKindMetadata,
     ValueKind, ValueShape, narrowed_function_analyses_for_condition,
 };
-use crate::methods::{MethodResolutionError, method_target_functions, resolve_method};
+use crate::methods::{
+    MethodResolutionError, exact_receiver_kind, method_target_functions, resolve_method,
+};
 use crate::parser::{
     Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
     StructDefAst,
@@ -1097,14 +1099,35 @@ impl Module {
 
 fn infer_known_struct_name(
     ast: &Ast,
-    env: &HashMap<String, String>,
+    env: &HashMap<String, ValueShape>,
     structs: &HashMap<String, StructMetadata>,
 ) -> Option<String> {
+    infer_known_struct_shape(ast, env, structs)
+        .and_then(|shape| shape.struct_name().map(str::to_string))
+}
+
+fn infer_known_struct_shape(
+    ast: &Ast,
+    env: &HashMap<String, ValueShape>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Option<ValueShape> {
     match ast {
         Ast::Variable(name) => env.get(name.as_str()).cloned(),
-        Ast::StructLiteral { type_name, .. } if structs.contains_key(type_name.as_str()) => {
-            Some(type_name.to_string())
+        Ast::StructLiteral { type_name, fields, .. }
+            if structs.contains_key(type_name.as_str()) =>
+        {
+            let mut field_shapes = HashMap::new();
+            for field in fields {
+                field_shapes.insert(
+                    field.name.clone(),
+                    infer_known_struct_shape(&field.value, env, structs)
+                        .unwrap_or_else(|| ValueShape::unknown_scalar()),
+                );
+            }
+            Some(ValueShape::struct_(type_name.to_string(), field_shapes))
         }
+        Ast::FieldAccess { base, field, .. } => infer_known_struct_shape(base, env, structs)
+            .and_then(|shape| shape.struct_field(field.as_str())),
         _ => None,
     }
 }
@@ -1114,15 +1137,18 @@ fn exact_struct_name(
     function_analysis: &FunctionValueKindAnalysis,
     value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> Option<String> {
-    match ast {
-        Ast::Variable(name) => function_analysis.struct_bindings.get(name.as_str()).cloned(),
-        Ast::StructLiteral { type_name, .. }
-            if value_kind_analysis.structs.contains_key(type_name.as_str()) =>
-        {
-            Some(type_name.to_string())
-        }
-        _ => None,
-    }
+    infer_ast_value_shape(ast, function_analysis, value_kind_analysis)
+        .struct_name()
+        .map(str::to_string)
+        .or_else(|| match ast {
+            Ast::Variable(name) => function_analysis.struct_bindings.get(name.as_str()).cloned(),
+            Ast::StructLiteral { type_name, .. }
+                if value_kind_analysis.structs.contains_key(type_name.as_str()) =>
+            {
+                Some(type_name.to_string())
+            }
+            _ => None,
+        })
 }
 
 fn analyze_struct_bindings_for_function(
@@ -1131,7 +1157,7 @@ fn analyze_struct_bindings_for_function(
 ) -> HashMap<String, String> {
     fn analyze_block(
         block: &BlockAst,
-        env: &mut HashMap<String, String>,
+        env: &mut HashMap<String, ValueShape>,
         structs: &HashMap<String, StructMetadata>,
     ) {
         for line in &block.lines {
@@ -1141,14 +1167,14 @@ fn analyze_struct_bindings_for_function(
 
     fn analyze_ast(
         ast: &Ast,
-        env: &mut HashMap<String, String>,
+        env: &mut HashMap<String, ValueShape>,
         structs: &HashMap<String, StructMetadata>,
     ) {
         match ast {
             Ast::Assign { name, value, .. } => {
                 analyze_ast(value, env, structs);
-                if let Some(struct_name) = infer_known_struct_name(value, env, structs) {
-                    env.insert(name.clone(), struct_name);
+                if let Some(shape) = infer_known_struct_shape(value, env, structs) {
+                    env.insert(name.clone(), shape);
                 } else {
                     env.remove(name);
                 }
@@ -1168,9 +1194,9 @@ fn analyze_struct_bindings_for_function(
                     let mut else_env = original.clone();
                     analyze_block(else_block, &mut else_env, structs);
                     env.clear();
-                    for (name, struct_name) in then_env {
-                        if else_env.get(&name) == Some(&struct_name) {
-                            env.insert(name, struct_name);
+                    for (name, shape) in then_env {
+                        if else_env.get(&name) == Some(&shape) {
+                            env.insert(name, shape);
                         }
                     }
                 } else {
@@ -1233,14 +1259,18 @@ fn analyze_struct_bindings_for_function(
         }
     }
 
-    let mut env = HashMap::new();
+    let mut env: HashMap<String, ValueShape> = HashMap::new();
     analyze_block(&function.block, &mut env, structs);
-    env
+    env.into_iter()
+        .filter_map(|(name, shape)| {
+            shape.struct_name().map(|struct_name| (name, struct_name.to_string()))
+        })
+        .collect()
 }
 
 fn validate_struct_usage_in_block(
     block: &BlockAst,
-    env: &mut HashMap<String, String>,
+    env: &mut HashMap<String, ValueShape>,
     structs: &HashMap<String, StructMetadata>,
 ) -> Result<(), CompileError> {
     for line in &block.lines {
@@ -1251,7 +1281,7 @@ fn validate_struct_usage_in_block(
 
 fn validate_struct_usage_in_ast(
     ast: &Ast,
-    env: &mut HashMap<String, String>,
+    env: &mut HashMap<String, ValueShape>,
     structs: &HashMap<String, StructMetadata>,
 ) -> Result<(), CompileError> {
     match ast {
@@ -1377,8 +1407,8 @@ fn validate_struct_usage_in_ast(
         }
         Ast::Assign { name, value, .. } => {
             validate_struct_usage_in_ast(value, env, structs)?;
-            if let Some(struct_name) = infer_known_struct_name(value, env, structs) {
-                env.insert(name.clone(), struct_name);
+            if let Some(shape) = infer_known_struct_shape(value, env, structs) {
+                env.insert(name.clone(), shape);
             } else {
                 env.remove(name);
             }
@@ -1400,9 +1430,9 @@ fn validate_struct_usage_in_ast(
                 let mut else_env = original.clone();
                 validate_struct_usage_in_block(else_block, &mut else_env, structs)?;
                 env.clear();
-                for (name, struct_name) in then_env {
-                    if else_env.get(&name) == Some(&struct_name) {
-                        env.insert(name, struct_name);
+                for (name, shape) in then_env {
+                    if else_env.get(&name) == Some(&shape) {
+                        env.insert(name, shape);
                     }
                 }
             } else {
@@ -1943,6 +1973,7 @@ fn string_stdlib_function(name: &str) -> Option<StdlibFunction> {
                 "is_string",
                 "is_list",
                 "is_map",
+                "is_struct",
                 "is_map_iter",
                 "is_function",
                 "is_string_iter",
@@ -2574,6 +2605,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "is_string"
                 | "is_list"
                 | "is_map"
+                | "is_struct"
                 | "is_map_iter"
                 | "is_function"
                 | "is_string_iter"
@@ -2892,8 +2924,18 @@ fn validate_method_call_user_facing(
         value_kind_analysis,
         function_analysis,
     )?;
+    let receiver_shape = infer_ast_value_shape(receiver, function_analysis, value_kind_analysis);
     let function =
         resolve_method_call_or_error(receiver, method, function_analysis, value_kind_analysis)?;
+    if !is_known_callable_name(&function, function_names) && stdlib_function(&function).is_none() {
+        if let Ok(kind) = exact_receiver_kind(&receiver_shape) {
+            return Err(CompileError::UnknownMethod {
+                receiver_kind: format_kind_set_for_error(single_kind_set(kind)),
+                method: method.to_string(),
+                span: method.span.clone(),
+            });
+        }
+    }
     let mut resolved_args = Vec::with_capacity(args.len() + 1);
     resolved_args.push(receiver.clone());
     resolved_args.extend(args.iter().cloned());
@@ -3882,6 +3924,7 @@ fn format_kind_set_for_error(kinds: KindSet) -> String {
         (ValueKind::String, "string"),
         (ValueKind::List, "list"),
         (ValueKind::Map, "map"),
+        (ValueKind::Struct, "struct"),
         (ValueKind::MapIter, "map_iter"),
         (ValueKind::Function, "function"),
         (ValueKind::StringIter, "string_iter"),
@@ -3934,6 +3977,7 @@ fn kind_sets_intersect(lhs: KindSet, rhs: KindSet) -> bool {
         ValueKind::String,
         ValueKind::List,
         ValueKind::Map,
+        ValueKind::Struct,
         ValueKind::MapIter,
         ValueKind::Function,
         ValueKind::StringIter,
@@ -3973,6 +4017,7 @@ fn single_kind_set(kind: ValueKind) -> KindSet {
         ValueKind::String => KindSet::string(),
         ValueKind::List => KindSet::list(),
         ValueKind::Map => KindSet::map(),
+        ValueKind::Struct => KindSet::struct_(),
         ValueKind::MapIter => KindSet::map_iter(),
         ValueKind::Function => KindSet::function(),
         ValueKind::StringIter => KindSet::string_iter(),
@@ -4057,10 +4102,19 @@ fn infer_ast_value_shape(
             }))
         }
         Ast::StructLiteral { fields, .. } => {
+            let mut field_shapes = HashMap::new();
             for field in fields {
-                let _ = infer_ast_value_shape(&field.value, function_analysis, value_kind_analysis);
+                field_shapes.insert(
+                    field.name.clone(),
+                    infer_ast_value_shape(&field.value, function_analysis, value_kind_analysis),
+                );
             }
-            ValueShape::unknown_scalar()
+            match ast {
+                Ast::StructLiteral { type_name, .. } => {
+                    ValueShape::struct_(type_name.as_str(), field_shapes)
+                }
+                _ => unreachable!(),
+            }
         }
         Ast::MultiValue(values) => ValueShape::from_slots(
             values
@@ -4155,9 +4209,9 @@ fn infer_ast_value_shape(
         Ast::IndexAssign { value, .. } => {
             infer_ast_value_shape(value, function_analysis, value_kind_analysis)
         }
-        Ast::FieldAccess { base, .. } => {
-            let _ = infer_ast_value_shape(base, function_analysis, value_kind_analysis);
-            ValueShape::unknown_scalar()
+        Ast::FieldAccess { base, field, .. } => {
+            let base_shape = infer_ast_value_shape(base, function_analysis, value_kind_analysis);
+            base_shape.struct_field(field.as_str()).unwrap_or_else(ValueShape::unknown_scalar)
         }
         Ast::FieldAssign { value, .. } => {
             infer_ast_value_shape(value, function_analysis, value_kind_analysis)
@@ -4186,6 +4240,7 @@ fn infer_builtin_boolean_shape(function: &str) -> Option<ValueShape> {
             | "is_string"
             | "is_list"
             | "is_map"
+            | "is_struct"
             | "is_map_iter"
             | "is_function"
             | "is_string_iter"
@@ -7892,6 +7947,7 @@ fn compile_type_predicate_expression_ast(
             | "is_string"
             | "is_list"
             | "is_map"
+            | "is_struct"
             | "is_map_iter"
             | "is_function"
             | "is_string_iter"
@@ -7918,6 +7974,7 @@ fn compile_type_predicate_expression_ast(
         "is_string" => TAG_STRING,
         "is_list" => TAG_LIST,
         "is_map" => TAG_MAP,
+        "is_struct" => TAG_STRUCT,
         "is_map_iter" => TAG_MAP_ITER,
         "is_function" => TAG_FUNCTION,
         "is_string_iter" => TAG_STRING_ITER,
@@ -9442,10 +9499,10 @@ fn autoloaded_stdlib_functions_can_be_used_as_values() {
 
 #[test]
 fn runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
+    let src = "struct Person = {name}\n\nfn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    person = Person { name: \"Ada\" }\n    print(is_struct(person))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(person) == \"struct\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
     assert_cranelift_executable_output(
         src,
-        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
         0,
     );
 }
@@ -9744,6 +9801,13 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
             ("typed_list".to_string(), ValueShape::list(KindSet::int().union(KindSet::string()))),
             ("generic_list".to_string(), ValueShape::scalar(KindSet::list())),
             ("value_var".to_string(), ValueShape::scalar(KindSet::bigint())),
+            (
+                "person_var".to_string(),
+                ValueShape::struct_(
+                    "Person",
+                    HashMap::from([("name".to_string(), ValueShape::scalar(KindSet::string()))]),
+                ),
+            ),
         ]),
         function_bindings: HashMap::new(),
         struct_bindings: HashMap::new(),
@@ -9828,6 +9892,24 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
             &module_analysis
         ),
         ValueShape::list(KindSet::int().union(KindSet::string()))
+    );
+    assert_eq!(
+        infer_ast_value_shape(
+            &Ast::StructLiteral {
+                type_name: Ident::synthetic("Person".to_string()),
+                fields: vec![crate::parser::StructFieldValueAst {
+                    name: "name".to_string(),
+                    value: Ast::Literal(LiteralAst::String("Ada".to_string())),
+                }],
+                span: None,
+            },
+            &function_analysis,
+            &module_analysis
+        ),
+        ValueShape::struct_(
+            "Person",
+            HashMap::from([("name".to_string(), ValueShape::scalar(KindSet::string()))]),
+        )
     );
     assert_eq!(
         infer_ast_value_shape(
@@ -9992,6 +10074,18 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
                 collection: Box::new(Ast::Variable(Ident::synthetic("typed_list".to_string()))),
                 index: Box::new(Ast::Literal(LiteralAst::Integer(0))),
                 value: Box::new(Ast::Literal(LiteralAst::String("x".to_string()))),
+                span: None,
+            },
+            &function_analysis,
+            &module_analysis
+        ),
+        ValueShape::scalar(KindSet::string())
+    );
+    assert_eq!(
+        infer_ast_value_shape(
+            &Ast::FieldAccess {
+                base: Box::new(Ast::Variable(Ident::synthetic("person_var".to_string()))),
+                field: Ident::synthetic("name".to_string()),
                 span: None,
             },
             &function_analysis,
@@ -10284,11 +10378,11 @@ fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
+    let src = "struct Person = {name}\n\nfn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    person = Person { name: \"Ada\" }\n    print(is_struct(person))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(person) == \"struct\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
         0,
     );
 }
@@ -10868,6 +10962,12 @@ fn jit_struct_field_assign_works() {
 }
 
 #[test]
+fn jit_nested_struct_field_access_and_assign_work() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.address.city)\n    person.address = Address { city: \"Paris\" }\n    print(person.address.city)\n    0\nend";
+    assert_cranelift_executable_output(src, "London\nParis\n", 0);
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_map_get_map_argument_type() {
     let src = "fn main() do\n    map_get(list_new(), \"a\")\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -11291,6 +11391,23 @@ fn try_compile_to_jit_rejects_method_call_with_unknown_receiver_kind() {
 }
 
 #[test]
+fn try_compile_to_jit_rejects_unknown_method_on_exact_struct_receiver() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.missing()\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::UnknownMethod { receiver_kind, method, .. } => {
+            assert_eq!(receiver_kind, "struct");
+            assert_eq!(method, "missing");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_bitwise_argument_type() {
     let src = "fn main() do\n    \"a\" & 1\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -11662,6 +11779,13 @@ fn llvm_struct_literal_and_field_access_work() {
 fn llvm_struct_field_assign_works() {
     let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.name = \"Bob\"\n    print(person.name)\n    0\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "Bob\n", 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_nested_struct_field_access_and_assign_work() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.address.city)\n    person.address = Address { city: \"Paris\" }\n    print(person.address.city)\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "London\nParis\n", 0);
 }
 
 #[cfg(feature = "llvm-backend")]

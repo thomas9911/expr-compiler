@@ -198,6 +198,11 @@ Guidance for coding agents working in this repository.
   - user-defined helpers also work when they follow the same naming convention:
     - `fn string_wrap(s) do ... end`
     - `"x".wrap()`
+  - struct receivers currently use the generic `struct_` prefix:
+    - `fn struct_kind(value) do type_of(value) end`
+    - `person.kind()`
+  - struct method sugar is not nominal dispatch:
+    - it does not currently resolve `Person.kind()` through `Person_kind`
   - unknown receiver kinds are compile errors
   - ambiguous receiver kinds are compile errors
   - `is_*` narrowing can make method calls resolvable inside guarded branches

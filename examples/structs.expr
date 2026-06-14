@@ -1,0 +1,26 @@
+struct Address = {city}
+struct Person = {name, address}
+
+fn struct_kind(value) do
+    type_of(value)
+end
+
+fn main() do
+    person = Person {
+        name: "Ada",
+        address: Address {
+            city: "London",
+        },
+    }
+
+    print(person.name)
+    print(person.address.city)
+    print(person.kind())
+
+    person.address = Address {
+        city: "Paris",
+    }
+    print(person.address.city)
+
+    0
+end

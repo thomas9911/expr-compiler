@@ -721,12 +721,17 @@ impl<'ctx> LlvmCompiler<'ctx> {
         current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         let function_analysis = self.function_analysis(current_function_name);
-        let struct_name = match base {
-            Ast::Variable(name) => function_analysis.struct_bindings.get(name.as_str()).cloned(),
-            Ast::StructLiteral { type_name, .. } => Some(type_name.to_string()),
-            _ => None,
-        }
-        .unwrap_or_else(|| panic!("validated field access must have an exact struct receiver"));
+        let struct_name = infer_ast_value_shape(base, function_analysis, &self.value_kind_analysis)
+            .struct_name()
+            .map(str::to_string)
+            .or_else(|| match base {
+                Ast::Variable(name) => {
+                    function_analysis.struct_bindings.get(name.as_str()).cloned()
+                }
+                Ast::StructLiteral { type_name, .. } => Some(type_name.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("validated field access must have an exact struct receiver"));
         let metadata = self
             .value_kind_analysis
             .structs
@@ -838,12 +843,19 @@ impl<'ctx> LlvmCompiler<'ctx> {
         current_function_name: &str,
     ) -> CompiledValue<'ctx> {
         let function_analysis = self.function_analysis(current_function_name);
-        let struct_name = match base {
-            Ast::Variable(name) => function_analysis.struct_bindings.get(name.as_str()).cloned(),
-            Ast::StructLiteral { type_name, .. } => Some(type_name.to_string()),
-            _ => None,
-        }
-        .unwrap_or_else(|| panic!("validated field assignment must have an exact struct receiver"));
+        let struct_name = infer_ast_value_shape(base, function_analysis, &self.value_kind_analysis)
+            .struct_name()
+            .map(str::to_string)
+            .or_else(|| match base {
+                Ast::Variable(name) => {
+                    function_analysis.struct_bindings.get(name.as_str()).cloned()
+                }
+                Ast::StructLiteral { type_name, .. } => Some(type_name.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("validated field assignment must have an exact struct receiver")
+            });
         let metadata = self
             .value_kind_analysis
             .structs
@@ -1034,6 +1046,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 | "is_string"
                 | "is_list"
                 | "is_map"
+                | "is_struct"
                 | "is_map_iter"
                 | "is_function"
                 | "is_string_iter"
@@ -1053,6 +1066,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 "is_string" => TAG_STRING,
                 "is_list" => TAG_LIST,
                 "is_map" => TAG_MAP,
+                "is_struct" => TAG_STRUCT,
                 "is_map_iter" => TAG_MAP_ITER,
                 "is_function" => TAG_FUNCTION,
                 "is_string_iter" => TAG_STRING_ITER,
