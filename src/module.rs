@@ -1419,11 +1419,7 @@ fn infer_ast_return_arity(
             Ok(then_arity)
         }
         Ast::Expression(ExpressionAst { function, .. }) if !function.is_empty() => {
-            if function == "map_iter_next" {
-                Ok(2)
-            } else {
-                Ok(*function_return_arities.get(function).unwrap_or(&1))
-            }
+            Ok(expression_return_arity(function, function_return_arities))
         }
         Ast::MethodCall { method, .. } => {
             let arities = method_target_functions(method.as_str())
@@ -2410,7 +2406,7 @@ fn validate_ast_user_facing(
                     function_analysis,
                     value_kind_analysis,
                 )?;
-                let actual_arity = resolved_method_return_arity(&function);
+                let actual_arity = callable_return_arity(&function, value_kind_analysis);
                 if actual_arity != names.len() {
                     return Err(CompileError::DestructuringArityMismatch {
                         expected: names.len(),
@@ -2463,8 +2459,8 @@ fn expression_return_arity(
 ) -> usize {
     if function.is_empty() {
         1
-    } else if function == "map_iter_next" {
-        2
+    } else if let Some(arity) = builtin_return_arity(function) {
+        arity
     } else {
         *function_return_arities.get(function).unwrap_or(&1)
     }
@@ -3371,20 +3367,30 @@ fn single_kind_set(kind: ValueKind) -> KindSet {
     }
 }
 
-fn resolved_method_return_arity(function: &str) -> usize {
-    match function {
-        "map_iter_next" => 2,
-        "string_try_first"
-        | "string_try_last"
-        | "bytes_try_get"
-        | "string_try_pop"
-        | "string_try_parse_integer"
-        | "string_try_parse_bigint"
-        | "map_try_get"
-        | "map_try_delete"
-        | "map_try_pop" => 3,
-        _ => 1,
-    }
+fn known_callable_shape(function: &str, arg_shapes: &[ValueShape]) -> Option<ValueShape> {
+    let scalar_arg = |index: usize| {
+        arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any)
+    };
+    infer_builtin_string_shape(function)
+        .or_else(|| infer_builtin_list_shape(function, arg_shapes))
+        .or_else(|| infer_builtin_map_shape(function, arg_shapes))
+        .or_else(|| infer_builtin_boolean_shape(function))
+        .or_else(|| infer_builtin_numeric_shape(function, &scalar_arg))
+}
+
+fn builtin_return_arity(function: &str) -> Option<usize> {
+    known_callable_shape(function, &[]).map(|shape| shape.arity())
+}
+
+fn callable_return_arity(function: &str, value_kind_analysis: &ModuleValueKindAnalysis) -> usize {
+    builtin_return_arity(function)
+        .or_else(|| {
+            value_kind_analysis
+                .functions
+                .get(function)
+                .map(|analysis| analysis.returns.arity())
+        })
+        .unwrap_or(1)
 }
 
 fn infer_ast_value_shape(
@@ -3636,6 +3642,9 @@ fn infer_builtin_string_shape(function: &str) -> Option<ValueShape> {
         }
         "string_try_parse_bigint" => {
             Some(ValueShape::from_slots(vec![KindSet::int(), KindSet::bigint(), KindSet::string()]))
+        }
+        "string_try_first" | "string_try_last" | "bytes_try_get" | "string_try_pop" => {
+            Some(ValueShape::from_slots(vec![KindSet::int(), KindSet::int(), KindSet::string()]))
         }
         _ => None,
     }
