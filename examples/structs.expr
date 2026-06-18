@@ -1,8 +1,22 @@
-struct Address = {city}
-struct Person = {name, address}
+struct Address = {
+    city,
+}
+
+struct Person = {
+    name,
+    address,
+}
 
 fn struct_kind(value) do
-    type_of(value)
+    "struct"
+end
+
+fn Person_kind(value) do
+    "person"
+end
+
+fn Address_city_first_character(address) do
+    string_from_codepoints([string_first(address.city)])
 end
 
 fn main() do
@@ -16,6 +30,8 @@ fn main() do
     print(person.name)
     print(person.address.city)
     print(person.kind())
+    print(person.address.kind())
+    print(person.address.city_first_character())
 
     person.address = Address {
         city: "Paris",

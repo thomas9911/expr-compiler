@@ -3,7 +3,8 @@ use crate::analysis::{
     ValueKind, ValueShape, narrowed_function_analyses_for_condition,
 };
 use crate::methods::{
-    MethodResolutionError, exact_receiver_kind, method_target_functions, resolve_method,
+    MethodResolutionError, exact_receiver_kind, method_target_functions,
+    method_target_functions_for_shape,
 };
 use crate::parser::{
     Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
@@ -208,7 +209,7 @@ impl Module {
     pub fn analyze_value_kinds(&self) -> Result<ModuleValueKindAnalysis, CompileError> {
         let return_arities = function_return_arities(&self.functions)?;
         let mut analysis =
-            crate::analysis::analyze_module_value_kinds(&self.functions, &return_arities);
+            crate::analysis::analyze_module_value_kinds(&self.functions, &self.structs, &return_arities);
         let registry = struct_registry(&self.structs);
         analysis.structs = registry
             .iter()
@@ -283,7 +284,14 @@ impl Module {
                 &function_return_arities,
                 *function_return_arities.get(&func.name).unwrap_or(&1),
             )?;
-            validate_struct_usage_in_block(&func.block, &mut HashMap::new(), &structs)?;
+            let mut struct_env = HashMap::new();
+            if let (Some(first_input), Some(shape)) = (
+                func.inputs.first(),
+                nominal_struct_method_shape_for_function(func, &structs),
+            ) {
+                struct_env.insert(first_input.clone(), shape);
+            }
+            validate_struct_usage_in_block(&func.block, &mut struct_env, &structs)?;
         }
         self.validate_main_return_arity(&function_return_arities)?;
         Ok(())
@@ -1130,6 +1138,33 @@ fn infer_known_struct_shape(
             .and_then(|shape| shape.struct_field(field.as_str())),
         _ => None,
     }
+}
+
+fn nominal_struct_method_shape_for_function(
+    function: &FunctionDefAst,
+    structs: &HashMap<String, StructMetadata>,
+) -> Option<ValueShape> {
+    let struct_name = structs
+        .keys()
+        .filter_map(|name| {
+            function
+                .name
+                .strip_prefix(name.as_str())
+                .filter(|rest| rest.starts_with('_'))
+                .map(|_| name.as_str())
+        })
+        .max_by_key(|name| name.len())?;
+    let metadata = structs
+        .get(struct_name)
+        .expect("nominal struct method must refer to declared struct");
+    Some(ValueShape::struct_(
+        struct_name.to_string(),
+        metadata
+            .fields
+            .iter()
+            .map(|field| (field.clone(), ValueShape::scalar(KindSet::empty())))
+            .collect::<HashMap<_, _>>(),
+    ))
 }
 
 fn exact_struct_name(
@@ -3993,20 +4028,39 @@ fn resolve_method_call_or_error(
     value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> Result<String, CompileError> {
     let receiver_shape = infer_ast_value_shape(receiver, function_analysis, value_kind_analysis);
-    resolve_method(&receiver_shape, method.as_str()).map_err(|err| match err {
-        MethodResolutionError::UnknownReceiver => CompileError::UnknownMethodReceiver {
-            method: method.to_string(),
-            span: method.span.clone(),
+    let candidates = method_target_functions_for_shape(&receiver_shape, method.as_str()).map_err(
+        |err| match err {
+            MethodResolutionError::UnknownReceiver => CompileError::UnknownMethodReceiver {
+                method: method.to_string(),
+                span: method.span.clone(),
+            },
+            MethodResolutionError::AmbiguousReceiver(kinds) => {
+                CompileError::AmbiguousMethodReceiver {
+                    method: method.to_string(),
+                    receiver_kinds: kinds
+                        .into_iter()
+                        .map(|kind| format_kind_set_for_error(single_kind_set(kind)))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    span: method.span.clone(),
+                }
+            }
         },
-        MethodResolutionError::AmbiguousReceiver(kinds) => CompileError::AmbiguousMethodReceiver {
-            method: method.to_string(),
-            receiver_kinds: kinds
-                .into_iter()
-                .map(|kind| format_kind_set_for_error(single_kind_set(kind)))
-                .collect::<Vec<_>>()
-                .join(" | "),
-            span: method.span.clone(),
-        },
+    )?;
+    for function in &candidates {
+        if known_callable_shape(function, &[]).is_some()
+            || stdlib_function(function).is_some()
+            || value_kind_analysis.functions.contains_key(function)
+        {
+            return Ok(function.clone());
+        }
+    }
+    let receiver_kind = exact_receiver_kind(&receiver_shape)
+        .expect("exact method target candidates should imply exact receiver kind");
+    Err(CompileError::UnknownMethod {
+        receiver_kind: format_kind_set_for_error(single_kind_set(receiver_kind)),
+        method: method.to_string(),
+        span: method.span.clone(),
     })
 }
 
@@ -10968,6 +11022,12 @@ fn jit_nested_struct_field_access_and_assign_work() {
 }
 
 #[test]
+fn jit_nominal_struct_method_dispatch_works() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn struct_kind(value) do\n    \"struct\"\nend\n\nfn Person_kind(value) do\n    \"person\"\nend\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.kind())\n    print(person.address.kind())\n    0\nend";
+    assert_cranelift_executable_output(src, "person\nstruct\n", 0);
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_map_get_map_argument_type() {
     let src = "fn main() do\n    map_get(list_new(), \"a\")\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -11786,6 +11846,13 @@ fn llvm_struct_field_assign_works() {
 fn llvm_nested_struct_field_access_and_assign_work() {
     let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.address.city)\n    person.address = Address { city: \"Paris\" }\n    print(person.address.city)\n    0\nend";
     assert_backend_executable_output(src, CodegenBackend::Llvm, "London\nParis\n", 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_nominal_struct_method_dispatch_works() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn struct_kind(value) do\n    \"struct\"\nend\n\nfn Person_kind(value) do\n    \"person\"\nend\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.kind())\n    print(person.address.kind())\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "person\nstruct\n", 0);
 }
 
 #[cfg(feature = "llvm-backend")]

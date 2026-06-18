@@ -1,5 +1,5 @@
 use super::*;
-use crate::methods::{method_target_functions, resolve_method};
+use crate::methods::{method_target_functions, method_target_functions_for_shape};
 use crate::module::stdlib_function;
 use crate::parser::{Ident, MapEntryAst, MapKeyAst, StructFieldValueAst};
 
@@ -115,7 +115,20 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 let function_analysis = self.function_analysis(current_function_name);
                 let receiver_shape =
                     infer_ast_value_shape(receiver, function_analysis, &self.value_kind_analysis);
-                let resolved_function = resolve_method(&receiver_shape, method.as_str())
+                let resolved_function = method_target_functions_for_shape(
+                    &receiver_shape,
+                    method.as_str(),
+                )
+                .and_then(|candidates| {
+                    candidates
+                        .into_iter()
+                        .find(|function| {
+                            is_builtin_name(function.as_str())
+                                || stdlib_function(function.as_str()).is_some()
+                                || self.function_arities.contains_key(function.as_str())
+                        })
+                        .ok_or(crate::methods::MethodResolutionError::UnknownReceiver)
+                })
                     .or_else(|_| {
                         let mut candidates = method_target_functions(method.as_str())
                             .into_iter()
