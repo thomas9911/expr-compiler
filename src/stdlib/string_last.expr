@@ -1,0 +1,12 @@
+fn string_last(s) do
+    __string_last_walk(string_chars(s))
+end
+
+fn __string_last_walk(it) do
+    current = string_iter_next(it)
+    if string_iter_done(it) do
+        current
+    else
+        __string_last_walk(it)
+    end
+end

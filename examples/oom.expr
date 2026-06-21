@@ -1,0 +1,10 @@
+fn sum(list, current):
+    if list_len(list) == 0:
+        current
+    else:
+        item = list_pop(list)
+        sum(list, current + item)
+
+fn main():
+    large = list_range(1, 1000000)
+    print(sum(large, 0))

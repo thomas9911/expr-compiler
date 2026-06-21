@@ -1,0 +1,14 @@
+fn inner_fib(a, b, n):
+    if a > n:
+        print(a)
+        a
+    else:
+        print(a)
+        inner_fib(b, a + b, n)
+
+fn fibonacci(n):
+    inner_fib(0, 1, n)
+
+fn main():
+    fibonacci(90)
+    0

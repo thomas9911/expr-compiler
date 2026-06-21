@@ -1,0 +1,75 @@
+fn main():
+    print("hello")
+    print("line1\nline2")
+    print(string_concat("ab", "cd"))
+    print("abc" == "abc")
+    print("abc" != "xyz")
+    print("abc" == 1)
+    print("abc" != 1)
+    print(bytes_len("hello"))
+    print(bytes_get("hello", 1))
+    print(bytes_slice("hello", 1, 2))
+    print(bytes_slice("hello", 1, 4))
+
+    s = "hello"
+    print(bytes_pop(s))
+    print(bytes_pop(s))
+    print(s)
+    bytes_insert(s, 1, 97)
+    bytes_insert(s, 4, 33)
+    print(s)
+    print(bytes_remove(s, 2))
+    print(s)
+    bytes_push(s, 33)
+    bytes_set(s, 0, 72)
+    print(s)
+
+    t = string_copy(s)
+    bytes_set(t, 1, 97)
+    print(t)
+    print(s)
+
+    print(bytes_len("hi\n"))
+
+    if "11234".is_integer():
+        print("integer!")
+    if not "11T234".is_integer():
+        print("not integer :(")
+
+    ok, value, err = "".try_first()
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    ok, value, err = "hello".try_last()
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    ok, value, err = bytes_try_get("hello", 1)
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    sample = "hello"
+    ok, value, err = sample.try_pop()
+    if ok:
+        print(value)
+        print(sample)
+    else:
+        print(err)
+
+    ok, value, err = string_try_parse_integer("-123")
+    if ok:
+        print(value)
+    else:
+        print(err)
+
+    ok, value, err = string_try_parse_integer("12x")
+    if ok:
+        print(value)
+    else:
+        print(err)

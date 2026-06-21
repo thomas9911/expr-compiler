@@ -1,0 +1,7 @@
+fn string_starts_with(s, prefix) do
+    __string_starts_with_len(s, prefix, bytes_len(s), bytes_len(prefix))
+end
+
+fn __string_starts_with_len(s, prefix, s_len, prefix_len) do
+    prefix_len <= s_len and bytes_slice(s, 0, prefix_len) == prefix
+end

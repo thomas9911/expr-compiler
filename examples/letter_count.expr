@@ -1,0 +1,38 @@
+fn main() do
+    text = "the map has the counts of the letters in this sentence"
+    counts = count_letters(string_chars(text), {})
+
+    print("text:")
+    print(text)
+    print("letter counts:")
+    print_counts("abcdefghijklmnopqrstuvwxyz", 0, counts)
+    0
+end
+
+fn count_letters(it, counts) do
+    if string_iter_done(it) do
+        counts
+    else
+        codepoint = string_iter_next(it)
+        key = string_from_codepoints([codepoint])
+        map_update_or_default(counts, key, 0, fn value -> value + 1 end)
+
+        count_letters(it, counts)
+    end
+end
+
+fn print_counts(alphabet, index, counts) do
+    if index == bytes_len(alphabet) do
+        0
+    else
+        key = bytes_slice(alphabet, index, index + 1)
+        exists, value, msg = map_try_get(counts, key)
+        if exists do
+            amount_as_string = string_from_codepoints([value + 48])
+            print(string_concat(string_concat(key, " => "), amount_as_string))
+        else
+            0
+        end
+        print_counts(alphabet, index + 1, counts)
+    end
+end

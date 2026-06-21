@@ -1,0 +1,12 @@
+fn string_len(s) do
+    __string_len_count(string_chars(s), 0)
+end
+
+fn __string_len_count(it, acc) do
+    if string_iter_done(it) do
+        acc
+    else
+        string_iter_next(it)
+        __string_len_count(it, acc + 1)
+    end
+end

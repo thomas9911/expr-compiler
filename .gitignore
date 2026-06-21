@@ -1,1 +1,13 @@
-/target
+/target*
+
+# Generated Windows binaries
+*.exe
+*.pdb
+
+# Generated Linux/macOS binaries from example programs (no extension)
+/examples/*
+!/examples/*.expr
+!/examples/*/
+
+__pycache__/
+local_test.sh

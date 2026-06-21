@@ -1,0 +1,51 @@
+fn main() do
+    inventory = {
+        apples: 7,
+        bananas: 2,
+        coffee: 5,
+        rice: 9,
+        tea: 3,
+    }
+
+    summary = {
+        total_units: 0,
+        low_stock_count: 0,
+        best_name: "",
+        best_units: 0,
+    }
+
+    analyze_inventory(inventory.iter(), summary)
+
+    print("inventory report")
+    print("products")
+    print(inventory.len())
+    print("total units")
+    print(summary.get("total_units"))
+    print("low stock items")
+    print(summary.get("low_stock_count"))
+    print("best stocked product")
+    print(summary.get("best_name"))
+    print("best stocked units")
+    print(summary.get("best_units"))
+end
+
+fn analyze_inventory(it, summary) do
+    if it.done() do
+        0
+    else
+        key, value = it.next()
+
+        summary.update_or_default("total_units", 0, fn current -> current + value end)
+
+        if value < 4 do
+            summary.update_or_default("low_stock_count", 0, fn current -> current + 1 end)
+        end
+
+        if value > summary.get("best_units") do
+            summary.set("best_name", key)
+            summary.set("best_units", value)
+        end
+
+        analyze_inventory(it, summary)
+    end
+end

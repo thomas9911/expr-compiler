@@ -1,0 +1,8 @@
+fn map_update(map, key, callback) do
+    if map_has(map, key) do
+        map_set(map, key, callback(map_get(map, key)))
+        true
+    else
+        false
+    end
+end

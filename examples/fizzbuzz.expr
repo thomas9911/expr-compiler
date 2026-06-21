@@ -1,0 +1,21 @@
+# Python-style FizzBuzz using recursion for iteration.
+
+fn fizzbuzz_one(x):
+    if x % 15 == 0:
+        print("fizzbuzz")
+    elif x % 3 == 0:
+        print("fizz")
+    elif x % 5 == 0:
+        print("buzz")
+    else:
+        print(x)
+
+fn fizzbuzz_range(i, limit):
+    if i > limit:
+        0
+    else:
+        fizzbuzz_one(i)
+        fizzbuzz_range(i + 1, limit)
+
+fn main():
+    fizzbuzz_range(1, 15)

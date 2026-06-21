@@ -1,0 +1,30 @@
+# Demonstrates higher-order list operations with named and anonymous functions
+
+fn double(item) do
+    item * 2
+end
+
+fn is_odd(item) do
+    item % 2 == 1
+end
+
+fn main() do
+    xs = [1, 2, 3, 4]
+
+    doubled = list_map(xs, double)
+    tripled = list_map(xs, fn item -> item * 3 end)
+
+    is_even = fn item -> item % 2 == 0 end
+    even = list_filter(xs, is_even)
+    odd = list_filter(xs, is_odd)
+    gt_two = list_filter(xs, fn item -> item > 2 end)
+
+    print(doubled)
+    print(tripled)
+
+    print(odd)
+    print(even)
+    print(gt_two)
+
+    0
+end

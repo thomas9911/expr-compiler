@@ -1,0 +1,25 @@
+fn factor_out(n, found, d):
+    if n % d == 0:
+        list_push(found, d)
+        factor_out(n / d, found, d)
+    else:
+        factor_loop(n, found, d + 1)
+
+fn factor_loop(n, found, d):
+    if n < 2:
+        0
+    elif d * d > n:
+        list_push(found, n)
+        0
+    else:
+        factor_out(n, found, d)
+
+fn prime_factors(n):
+    found = []
+    factor_loop(n, found, 2)
+    found
+
+fn main():
+    found = prime_factors(360)
+    print(found)
+    0

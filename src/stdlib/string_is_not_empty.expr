@@ -1,0 +1,3 @@
+fn string_is_not_empty(s) do
+    not string_is_empty(s)
+end

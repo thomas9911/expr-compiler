@@ -1,0 +1,10 @@
+fn main(args) do
+    print(list_len(args))
+    if list_len(args) > 0 do
+        print(list_get(args, 0))
+    end
+    if list_len(args) > 1 do
+        print(list_get(args, 1))
+    end
+    list_len(args)
+end

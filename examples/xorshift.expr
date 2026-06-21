@@ -1,0 +1,24 @@
+fn main() do
+    print("xorshift32")
+    combined = emit(5, 123456789, 0)
+    print("combined_or")
+    print(combined)
+    0
+end
+
+fn emit(count, state, combined) do
+    if count == 0 do
+        combined
+    else
+        next = xorshift32(state)
+        print(next)
+        emit(count - 1, next, combined | next)
+    end
+end
+
+fn xorshift32(x) do
+    mask = 2147483647
+    x1 = (x ^ (x << 13)) & mask
+    x2 = (x1 ^ (x1 >> 17)) & mask
+    (x2 ^ (x2 << 5)) & mask
+end

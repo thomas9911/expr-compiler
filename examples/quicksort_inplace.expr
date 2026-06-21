@@ -1,0 +1,33 @@
+# In-place quicksort using indexed assignment
+fn swap(xs, i, j):
+    list_swap(xs, i, j)
+
+fn partition_loop(xs, high, pivot, i, j):
+    if j == high:
+        swap(xs, i, high)
+        i
+    else:
+        value = xs[j]
+        if value < pivot:
+            swap(xs, i, j)
+            partition_loop(xs, high, pivot, i + 1, j + 1)
+        else:
+            partition_loop(xs, high, pivot, i, j + 1)
+
+fn partition(xs, low, high):
+    pivot = xs[high]
+    partition_loop(xs, high, pivot, low, low)
+
+fn quicksort_range(xs, low, high):
+    if low < high:
+        pivot_index = partition(xs, low, high)
+        quicksort_range(xs, low, pivot_index - 1)
+        quicksort_range(xs, pivot_index + 1, high)
+    else:
+        0
+
+fn main():
+    xs = [9, 1, 5, 3, 8, 2, 7, 4, 6]
+    quicksort_range(xs, 0, list_len(xs) - 1)
+    print(xs)
+    0

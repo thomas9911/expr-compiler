@@ -1,0 +1,15 @@
+fn string_all(string, predicate) do
+    if bytes_len(string) == 0 do
+        false
+    else
+        __string_all_loop(string_chars(string), true, predicate)
+    end
+end
+
+fn __string_all_loop(it, now, predicate) do
+    if string_iter_done(it) or not now do
+        now
+    else
+        __string_all_loop(it, predicate(string_iter_next(it)), predicate)
+    end
+end

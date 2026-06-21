@@ -1,0 +1,7 @@
+fn string_try_pop(s) do
+    if bytes_len(s) == 0 do
+        false, 0, "expected non-empty string"
+    else
+        true, bytes_pop(s), ""
+    end
+end

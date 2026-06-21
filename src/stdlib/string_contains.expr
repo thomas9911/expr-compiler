@@ -1,0 +1,13 @@
+fn string_contains(s, needle) do
+    __string_contains_at(s, needle, 0, bytes_len(s), bytes_len(needle))
+end
+
+fn __string_contains_at(s, needle, index, s_len, needle_len) do
+    if needle_len == 0 do
+        true
+    else if index + needle_len > s_len do
+        false
+    else
+        bytes_slice(s, index, index + needle_len) == needle or __string_contains_at(s, needle, index + 1, s_len, needle_len)
+    end
+end

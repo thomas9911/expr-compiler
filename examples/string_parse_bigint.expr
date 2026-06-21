@@ -1,0 +1,22 @@
+fn main() do
+    ok, value, err = string_try_parse_bigint("12345678901234567890")
+    if ok do
+        print(value)
+    else
+        print(err)
+    end
+
+    ok, value, err = string_try_parse_bigint("-12")
+    if ok do
+        print(value)
+    else
+        print(err)
+    end
+
+    ok, value, err = string_try_parse_bigint("12x")
+    if ok do
+        print(value)
+    else
+        print(err)
+    end
+end

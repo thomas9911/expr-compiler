@@ -1,0 +1,22 @@
+fn factor_out(n, d):
+    if n % d == 0:
+        print(d)
+        factor_out(n / d, d)
+    else:
+        factor_loop(n, d + 1)
+
+fn factor_loop(n, d):
+    if n < 2:
+        0
+    elif d * d > n:
+        print(n)
+        0
+    else:
+        factor_out(n, d)
+
+fn prime_factors(n):
+    factor_loop(n, 2)
+
+fn main():
+    prime_factors(360)
+    0

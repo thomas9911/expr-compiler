@@ -1,0 +1,19 @@
+fn integer_to_string(value) do
+    if value == 0 do
+        "0"
+    else if value == (0 - 9223372036854775807 - 1) do
+        "-9223372036854775808"
+    else if value < 0 do
+        string_concat("-", __integer_to_string_positive(0 - value))
+    else
+        __integer_to_string_positive(value)
+    end
+end
+
+fn __integer_to_string_positive(value) do
+    if value < 10 do
+        string_from_codepoints([48 + value])
+    else
+        string_concat(__integer_to_string_positive(value / 10), string_from_codepoints([48 + (value % 10)]))
+    end
+end
