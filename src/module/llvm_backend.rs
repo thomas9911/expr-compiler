@@ -6,8 +6,9 @@ use crate::analysis::{FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysi
 use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
 use crate::value::{
     BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, MULTI_HEADER_SIZE, STRING_HEADER_SIZE,
-    STRING_ITER_HEADER_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER,
-    TAG_MULTI, TAG_STRING, TAG_STRING_ITER, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
+    STRING_ITER_HEADER_SIZE, STRUCT_FIELD_COUNT_OFFSET, STRUCT_FIELDS_PTR_OFFSET,
+    STRUCT_HEADER_SIZE, TAG_BIGINT, TAG_FUNCTION, TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER,
+    TAG_MULTI, TAG_STRING, TAG_STRING_ITER, TAG_STRUCT, VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
@@ -327,7 +328,10 @@ impl<'ctx> LlvmCompiler<'ctx> {
             function_ordinals: HashMap::new(),
             function_arities: HashMap::new(),
             closure_metadata: HashMap::new(),
-            value_kind_analysis: ModuleValueKindAnalysis { functions: HashMap::new() },
+            value_kind_analysis: ModuleValueKindAnalysis {
+                functions: HashMap::new(),
+                structs: HashMap::new(),
+            },
         }
     }
 

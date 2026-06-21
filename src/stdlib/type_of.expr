@@ -9,6 +9,8 @@ fn type_of(value) do
         "list"
     else if is_map(value) do
         "map"
+    else if is_struct(value) do
+        "struct"
     else if is_map_iter(value) do
         "map_iter"
     else if is_function(value) do

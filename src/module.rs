@@ -1,18 +1,23 @@
 use crate::analysis::{
-    FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, ValueKind, ValueShape,
-    narrowed_function_analyses_for_condition,
+    FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis, StructValueKindMetadata,
+    ValueKind, ValueShape, narrowed_function_analyses_for_condition,
 };
-use crate::methods::{MethodResolutionError, method_target_functions, resolve_method};
+use crate::methods::{
+    MethodResolutionError, exact_receiver_kind, method_target_functions,
+    method_target_functions_for_shape,
+};
 use crate::parser::{
     Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
+    StructDefAst,
 };
 use crate::source::Span;
 use crate::value::{
     CLOSURE_ENV_PTR_OFFSET, CLOSURE_FUNCTION_ORDINAL_OFFSET, CLOSURE_SIZE, LIST_LEN_OFFSET,
     LIST_PTR_OFFSET, MULTI_HEADER_SIZE, MULTI_LEN_OFFSET, MULTI_PTR_OFFSET, STRING_CAP_OFFSET,
     STRING_HEADER_SIZE, STRING_ITER_HEADER_SIZE, STRING_ITER_INDEX_OFFSET,
-    STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, TAG_BIGINT, TAG_FUNCTION,
-    TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER, TAG_MULTI, TAG_STRING, TAG_STRING_ITER,
+    STRING_ITER_STRING_OFFSET, STRING_LEN_OFFSET, STRING_PTR_OFFSET, STRUCT_FIELD_COUNT_OFFSET,
+    STRUCT_FIELDS_PTR_OFFSET, STRUCT_HEADER_SIZE, STRUCT_TYPE_ID_OFFSET, TAG_BIGINT, TAG_FUNCTION,
+    TAG_INT, TAG_LIST, TAG_MAP, TAG_MAP_ITER, TAG_MULTI, TAG_STRING, TAG_STRING_ITER, TAG_STRUCT,
     VALUE_PAYLOAD_OFFSET, VALUE_SIZE,
 };
 use cranelift::codegen::ir::FuncRef;
@@ -79,6 +84,20 @@ pub enum CompileError {
     UndefinedFunction { name: String, span: Option<Span> },
     #[error("undefined variable: {name}")]
     UndefinedVariable { name: String, span: Option<Span> },
+    #[error("struct name conflicts with an existing struct or function: {name}")]
+    StructNameConflict { name: String, span: Option<Span> },
+    #[error("duplicate field `{field}` in struct {struct_name}")]
+    DuplicateStructField { struct_name: String, field: String, span: Option<Span> },
+    #[error("undefined struct: {name}")]
+    UndefinedStruct { name: String, span: Option<Span> },
+    #[error("struct {struct_name} is missing required field `{field}`")]
+    MissingStructField { struct_name: String, field: String, span: Option<Span> },
+    #[error("struct {struct_name} has no field `{field}`")]
+    UnknownStructField { struct_name: String, field: String, span: Option<Span> },
+    #[error("duplicate field `{field}` in {struct_name} literal")]
+    DuplicateStructLiteralField { struct_name: String, field: String, span: Option<Span> },
+    #[error("cannot resolve field access .{field} because receiver struct type is unknown")]
+    UnknownStructReceiver { field: String, span: Option<Span> },
     #[error("{function} argument {argument} expects {expected}, found {found}")]
     InvalidArgumentType {
         function: String,
@@ -115,6 +134,13 @@ impl CompileError {
             | Self::InvalidMainArity { span, .. }
             | Self::UndefinedFunction { span, .. }
             | Self::UndefinedVariable { span, .. }
+            | Self::StructNameConflict { span, .. }
+            | Self::DuplicateStructField { span, .. }
+            | Self::UndefinedStruct { span, .. }
+            | Self::MissingStructField { span, .. }
+            | Self::UnknownStructField { span, .. }
+            | Self::DuplicateStructLiteralField { span, .. }
+            | Self::UnknownStructReceiver { span, .. }
             | Self::InvalidArgumentType { span, .. }
             | Self::UnknownMethodReceiver { span, .. }
             | Self::AmbiguousMethodReceiver { span, .. }
@@ -130,9 +156,16 @@ impl CompileError {
 
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
+    pub structs: Vec<StructDefAst>,
     source: Option<String>,
     closure_metadata: HashMap<String, ClosureMetadata>,
     used_features: UsedFeatures,
+}
+
+#[derive(Clone, Debug)]
+struct StructMetadata {
+    type_id: i64,
+    fields: Vec<String>,
 }
 
 struct LambdaLifter {
@@ -175,7 +208,28 @@ struct UsedFeatures {
 impl Module {
     pub fn analyze_value_kinds(&self) -> Result<ModuleValueKindAnalysis, CompileError> {
         let return_arities = function_return_arities(&self.functions)?;
-        Ok(crate::analysis::analyze_module_value_kinds(&self.functions, &return_arities))
+        let mut analysis =
+            crate::analysis::analyze_module_value_kinds(&self.functions, &self.structs, &return_arities);
+        let registry = struct_registry(&self.structs);
+        analysis.structs = registry
+            .iter()
+            .map(|(name, metadata)| {
+                (
+                    name.clone(),
+                    StructValueKindMetadata {
+                        type_id: metadata.type_id,
+                        fields: metadata.fields.clone(),
+                    },
+                )
+            })
+            .collect();
+        for func in &self.functions {
+            if let Some(function_analysis) = analysis.functions.get_mut(&func.name) {
+                function_analysis.struct_bindings =
+                    analyze_struct_bindings_for_function(func, &registry);
+            }
+        }
+        Ok(analysis)
     }
 
     fn validate_native_main_arity(&self) -> Result<(), CompileError> {
@@ -198,6 +252,7 @@ impl Module {
         let function_arities = function_arities(&self.functions);
         let function_return_arities = function_return_arities(&self.functions)?;
         let value_kind_analysis = self.analyze_value_kinds()?;
+        let structs = struct_registry(&self.structs);
         for func in &self.functions {
             let mut scope_names = func.inputs.clone();
             if let Some(metadata) = self.closure_metadata.get(&func.name) {
@@ -229,6 +284,14 @@ impl Module {
                 &function_return_arities,
                 *function_return_arities.get(&func.name).unwrap_or(&1),
             )?;
+            let mut struct_env = HashMap::new();
+            if let (Some(first_input), Some(shape)) = (
+                func.inputs.first(),
+                nominal_struct_method_shape_for_function(func, &structs),
+            ) {
+                struct_env.insert(first_input.clone(), shape);
+            }
+            validate_struct_usage_in_block(&func.block, &mut struct_env, &structs)?;
         }
         self.validate_main_return_arity(&function_return_arities)?;
         Ok(())
@@ -254,6 +317,7 @@ impl Module {
     pub fn new() -> Self {
         Module {
             functions: vec![],
+            structs: vec![],
             source: None,
             closure_metadata: HashMap::new(),
             used_features: UsedFeatures::default(),
@@ -269,7 +333,8 @@ impl Module {
     }
 
     pub fn try_from_source(source: &str) -> Result<Self, CompileError> {
-        let mut module = Self::try_from_functions(parse_source_functions(source)?)?;
+        let (functions, structs) = parse_source_items(source)?;
+        let mut module = Self::try_from_items(functions, structs)?;
         module.source = Some(source.to_string());
         Ok(module)
     }
@@ -280,28 +345,38 @@ impl Module {
 
     pub fn try_from_ast(ast: Ast) -> Result<Self, CompileError> {
         let mut functions = vec![];
+        let mut structs = vec![];
         match ast {
             Ast::FunctionDef(func) => functions.push(func),
+            Ast::StructDef(def) => structs.push(def),
             Ast::Block(block) => {
                 for line in block.lines {
-                    if let Ast::FunctionDef(func) = line {
-                        functions.push(func);
+                    match line {
+                        Ast::FunctionDef(func) => functions.push(func),
+                        Ast::StructDef(def) => structs.push(def),
+                        _ => {}
                     }
                 }
             }
             _ => {}
         }
-        Self::try_from_functions(functions)
+        Self::try_from_items(functions, structs)
     }
 
-    fn try_from_functions(functions: Vec<FunctionDefAst>) -> Result<Self, CompileError> {
+    fn try_from_items(
+        functions: Vec<FunctionDefAst>,
+        structs: Vec<StructDefAst>,
+    ) -> Result<Self, CompileError> {
         for func in &functions {
             validate_no_nested_function_defs(&Ast::Block(func.block.clone()))?;
         }
+        validate_struct_declarations(&structs, &functions)?;
         let functions = autoload_stdlib_functions(functions);
+        validate_struct_declarations(&structs, &functions)?;
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
         let module = Module {
             functions,
+            structs,
             source: None,
             closure_metadata,
             used_features: UsedFeatures::default(),
@@ -1030,6 +1105,381 @@ impl Module {
     }
 }
 
+fn infer_known_struct_name(
+    ast: &Ast,
+    env: &HashMap<String, ValueShape>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Option<String> {
+    infer_known_struct_shape(ast, env, structs)
+        .and_then(|shape| shape.struct_name().map(str::to_string))
+}
+
+fn infer_known_struct_shape(
+    ast: &Ast,
+    env: &HashMap<String, ValueShape>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Option<ValueShape> {
+    match ast {
+        Ast::Variable(name) => env.get(name.as_str()).cloned(),
+        Ast::StructLiteral { type_name, fields, .. }
+            if structs.contains_key(type_name.as_str()) =>
+        {
+            let mut field_shapes = HashMap::new();
+            for field in fields {
+                field_shapes.insert(
+                    field.name.clone(),
+                    infer_known_struct_shape(&field.value, env, structs)
+                        .unwrap_or_else(|| ValueShape::unknown_scalar()),
+                );
+            }
+            Some(ValueShape::struct_(type_name.to_string(), field_shapes))
+        }
+        Ast::FieldAccess { base, field, .. } => infer_known_struct_shape(base, env, structs)
+            .and_then(|shape| shape.struct_field(field.as_str())),
+        _ => None,
+    }
+}
+
+fn nominal_struct_method_shape_for_function(
+    function: &FunctionDefAst,
+    structs: &HashMap<String, StructMetadata>,
+) -> Option<ValueShape> {
+    let struct_name = structs
+        .keys()
+        .filter_map(|name| {
+            function
+                .name
+                .strip_prefix(name.as_str())
+                .filter(|rest| rest.starts_with('_'))
+                .map(|_| name.as_str())
+        })
+        .max_by_key(|name| name.len())?;
+    let metadata = structs
+        .get(struct_name)
+        .expect("nominal struct method must refer to declared struct");
+    Some(ValueShape::struct_(
+        struct_name.to_string(),
+        metadata
+            .fields
+            .iter()
+            .map(|field| (field.clone(), ValueShape::scalar(KindSet::empty())))
+            .collect::<HashMap<_, _>>(),
+    ))
+}
+
+fn exact_struct_name(
+    ast: &Ast,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> Option<String> {
+    infer_ast_value_shape(ast, function_analysis, value_kind_analysis)
+        .struct_name()
+        .map(str::to_string)
+        .or_else(|| match ast {
+            Ast::Variable(name) => function_analysis.struct_bindings.get(name.as_str()).cloned(),
+            Ast::StructLiteral { type_name, .. }
+                if value_kind_analysis.structs.contains_key(type_name.as_str()) =>
+            {
+                Some(type_name.to_string())
+            }
+            _ => None,
+        })
+}
+
+fn analyze_struct_bindings_for_function(
+    function: &FunctionDefAst,
+    structs: &HashMap<String, StructMetadata>,
+) -> HashMap<String, String> {
+    fn analyze_block(
+        block: &BlockAst,
+        env: &mut HashMap<String, ValueShape>,
+        structs: &HashMap<String, StructMetadata>,
+    ) {
+        for line in &block.lines {
+            analyze_ast(line, env, structs);
+        }
+    }
+
+    fn analyze_ast(
+        ast: &Ast,
+        env: &mut HashMap<String, ValueShape>,
+        structs: &HashMap<String, StructMetadata>,
+    ) {
+        match ast {
+            Ast::Assign { name, value, .. } => {
+                analyze_ast(value, env, structs);
+                if let Some(shape) = infer_known_struct_shape(value, env, structs) {
+                    env.insert(name.clone(), shape);
+                } else {
+                    env.remove(name);
+                }
+            }
+            Ast::MultiAssign { names, value, .. } => {
+                analyze_ast(value, env, structs);
+                for name in names {
+                    env.remove(name);
+                }
+            }
+            Ast::If { condition, then, else_, .. } => {
+                analyze_ast(condition, env, structs);
+                let original = env.clone();
+                let mut then_env = original.clone();
+                analyze_block(then, &mut then_env, structs);
+                if let Some(else_block) = else_ {
+                    let mut else_env = original.clone();
+                    analyze_block(else_block, &mut else_env, structs);
+                    env.clear();
+                    for (name, shape) in then_env {
+                        if else_env.get(&name) == Some(&shape) {
+                            env.insert(name, shape);
+                        }
+                    }
+                } else {
+                    *env = original;
+                }
+            }
+            Ast::Block(block) => analyze_block(block, env, structs),
+            Ast::Expression(ExpressionAst { args, .. }) => {
+                for arg in args {
+                    analyze_ast(arg, env, structs);
+                }
+            }
+            Ast::MethodCall { receiver, args, .. } => {
+                analyze_ast(receiver, env, structs);
+                for arg in args {
+                    analyze_ast(arg, env, structs);
+                }
+            }
+            Ast::MultiValue(values) | Ast::ListLiteral(values) => {
+                for value in values {
+                    analyze_ast(value, env, structs);
+                }
+            }
+            Ast::MapLiteral(entries) => {
+                for entry in entries {
+                    if let MapKeyAst::Dynamic(key) = &entry.key {
+                        analyze_ast(key, env, structs);
+                    }
+                    analyze_ast(&entry.value, env, structs);
+                }
+            }
+            Ast::StructLiteral { fields, .. } => {
+                for field in fields {
+                    analyze_ast(&field.value, env, structs);
+                }
+            }
+            Ast::FieldAccess { base, .. } => analyze_ast(base, env, structs),
+            Ast::FieldAssign { base, value, .. } => {
+                analyze_ast(base, env, structs);
+                analyze_ast(value, env, structs);
+            }
+            Ast::Index { collection, index, .. } => {
+                analyze_ast(collection, env, structs);
+                analyze_ast(index, env, structs);
+            }
+            Ast::IndexAssign { collection, index, value, .. } => {
+                analyze_ast(collection, env, structs);
+                analyze_ast(index, env, structs);
+                analyze_ast(value, env, structs);
+            }
+            Ast::Lambda { body, .. } => {
+                let mut nested = env.clone();
+                analyze_ast(body, &mut nested, structs);
+            }
+            Ast::Literal(_)
+            | Ast::Variable(_)
+            | Ast::FunctionRef(_)
+            | Ast::FunctionDef(_)
+            | Ast::StructDef(_) => {}
+        }
+    }
+
+    let mut env: HashMap<String, ValueShape> = HashMap::new();
+    analyze_block(&function.block, &mut env, structs);
+    env.into_iter()
+        .filter_map(|(name, shape)| {
+            shape.struct_name().map(|struct_name| (name, struct_name.to_string()))
+        })
+        .collect()
+}
+
+fn validate_struct_usage_in_block(
+    block: &BlockAst,
+    env: &mut HashMap<String, ValueShape>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Result<(), CompileError> {
+    for line in &block.lines {
+        validate_struct_usage_in_ast(line, env, structs)?;
+    }
+    Ok(())
+}
+
+fn validate_struct_usage_in_ast(
+    ast: &Ast,
+    env: &mut HashMap<String, ValueShape>,
+    structs: &HashMap<String, StructMetadata>,
+) -> Result<(), CompileError> {
+    match ast {
+        Ast::StructDef(_) | Ast::Literal(_) | Ast::FunctionRef(_) => Ok(()),
+        Ast::Variable(_) => Ok(()),
+        Ast::Lambda { body, .. } => {
+            let mut nested_env = env.clone();
+            validate_struct_usage_in_ast(body, &mut nested_env, structs)
+        }
+        Ast::Expression(ExpressionAst { args, .. }) => {
+            for arg in args {
+                validate_struct_usage_in_ast(arg, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::MethodCall { receiver, args, .. } => {
+            validate_struct_usage_in_ast(receiver, env, structs)?;
+            for arg in args {
+                validate_struct_usage_in_ast(arg, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::MultiValue(values) | Ast::ListLiteral(values) => {
+            for value in values {
+                validate_struct_usage_in_ast(value, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::MapLiteral(entries) => {
+            for entry in entries {
+                if let MapKeyAst::Dynamic(key) = &entry.key {
+                    validate_struct_usage_in_ast(key, env, structs)?;
+                }
+                validate_struct_usage_in_ast(&entry.value, env, structs)?;
+            }
+            Ok(())
+        }
+        Ast::StructLiteral { type_name, fields, span } => {
+            let Some(metadata) = structs.get(type_name.as_str()) else {
+                return Err(CompileError::UndefinedStruct {
+                    name: type_name.to_string(),
+                    span: type_name.span.clone().or_else(|| span.clone()),
+                });
+            };
+            let mut seen = HashSet::new();
+            for field in fields {
+                if !seen.insert(field.name.clone()) {
+                    return Err(CompileError::DuplicateStructLiteralField {
+                        struct_name: type_name.to_string(),
+                        field: field.name.clone(),
+                        span: span.clone(),
+                    });
+                }
+                if !metadata.fields.contains(&field.name) {
+                    return Err(CompileError::UnknownStructField {
+                        struct_name: type_name.to_string(),
+                        field: field.name.clone(),
+                        span: span.clone(),
+                    });
+                }
+                validate_struct_usage_in_ast(&field.value, env, structs)?;
+            }
+            for required in &metadata.fields {
+                if !seen.contains(required) {
+                    return Err(CompileError::MissingStructField {
+                        struct_name: type_name.to_string(),
+                        field: required.clone(),
+                        span: span.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        Ast::FieldAccess { base, field, span } => {
+            validate_struct_usage_in_ast(base, env, structs)?;
+            let Some(struct_name) = infer_known_struct_name(base, env, structs) else {
+                return Err(CompileError::UnknownStructReceiver {
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            };
+            let metadata = structs
+                .get(&struct_name)
+                .expect("known struct inference should only produce declared structs");
+            if !metadata.fields.contains(&field.name) {
+                return Err(CompileError::UnknownStructField {
+                    struct_name,
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            }
+            Ok(())
+        }
+        Ast::FieldAssign { base, field, value, span } => {
+            validate_struct_usage_in_ast(base, env, structs)?;
+            validate_struct_usage_in_ast(value, env, structs)?;
+            let Some(struct_name) = infer_known_struct_name(base, env, structs) else {
+                return Err(CompileError::UnknownStructReceiver {
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            };
+            let metadata = structs
+                .get(&struct_name)
+                .expect("known struct inference should only produce declared structs");
+            if !metadata.fields.contains(&field.name) {
+                return Err(CompileError::UnknownStructField {
+                    struct_name,
+                    field: field.to_string(),
+                    span: span.clone().or_else(|| field.span.clone()),
+                });
+            }
+            Ok(())
+        }
+        Ast::Index { collection, index, .. } => {
+            validate_struct_usage_in_ast(collection, env, structs)?;
+            validate_struct_usage_in_ast(index, env, structs)
+        }
+        Ast::IndexAssign { collection, index, value, .. } => {
+            validate_struct_usage_in_ast(collection, env, structs)?;
+            validate_struct_usage_in_ast(index, env, structs)?;
+            validate_struct_usage_in_ast(value, env, structs)
+        }
+        Ast::Assign { name, value, .. } => {
+            validate_struct_usage_in_ast(value, env, structs)?;
+            if let Some(shape) = infer_known_struct_shape(value, env, structs) {
+                env.insert(name.clone(), shape);
+            } else {
+                env.remove(name);
+            }
+            Ok(())
+        }
+        Ast::MultiAssign { names, value, .. } => {
+            validate_struct_usage_in_ast(value, env, structs)?;
+            for name in names {
+                env.remove(name);
+            }
+            Ok(())
+        }
+        Ast::If { condition, then, else_, .. } => {
+            validate_struct_usage_in_ast(condition, env, structs)?;
+            let original = env.clone();
+            let mut then_env = original.clone();
+            validate_struct_usage_in_block(then, &mut then_env, structs)?;
+            if let Some(else_block) = else_ {
+                let mut else_env = original.clone();
+                validate_struct_usage_in_block(else_block, &mut else_env, structs)?;
+                env.clear();
+                for (name, shape) in then_env {
+                    if else_env.get(&name) == Some(&shape) {
+                        env.insert(name, shape);
+                    }
+                }
+            } else {
+                *env = original;
+            }
+            Ok(())
+        }
+        Ast::Block(block) => validate_struct_usage_in_block(block, env, structs),
+        Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+    }
+}
+
 pub enum JitArtifact {
     Cranelift(CraneliftJitModule),
     #[cfg(feature = "llvm-backend")]
@@ -1330,6 +1780,43 @@ fn function_arities(functions: &[FunctionDefAst]) -> HashMap<String, usize> {
     functions.iter().map(|func| (func.name.clone(), func.inputs.len())).collect()
 }
 
+fn validate_struct_declarations(
+    structs: &[StructDefAst],
+    functions: &[FunctionDefAst],
+) -> Result<(), CompileError> {
+    let mut seen_names = functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
+    for def in structs {
+        if !seen_names.insert(def.name.clone()) {
+            return Err(CompileError::StructNameConflict {
+                name: def.name.clone(),
+                span: def.span.clone(),
+            });
+        }
+        let mut seen_fields = HashSet::new();
+        for field in &def.fields {
+            if !seen_fields.insert(field.clone()) {
+                return Err(CompileError::DuplicateStructField {
+                    struct_name: def.name.clone(),
+                    field: field.clone(),
+                    span: def.span.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn struct_registry(structs: &[StructDefAst]) -> HashMap<String, StructMetadata> {
+    structs
+        .iter()
+        .enumerate()
+        .map(|(index, def)| {
+            let type_id = i64::try_from(index).expect("too many structs to assign ids");
+            (def.name.clone(), StructMetadata { type_id, fields: def.fields.clone() })
+        })
+        .collect()
+}
+
 fn function_return_arities(
     functions: &[FunctionDefAst],
 ) -> Result<HashMap<String, usize>, CompileError> {
@@ -1436,11 +1923,14 @@ fn infer_ast_return_arity(
     }
 }
 
-fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
+fn parse_source_items(
+    source: &str,
+) -> Result<(Vec<FunctionDefAst>, Vec<StructDefAst>), CompileError> {
     use crate::parser::ParseLexer;
     use crate::tokenizer::{Logos, Token};
 
     let mut functions = vec![];
+    let mut structs = vec![];
     let lex = Token::lexer(source);
     let mut lexer = ParseLexer::new(lex);
 
@@ -1453,6 +1943,7 @@ fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileEr
         }
         match Ast::from_lexer(&mut lexer) {
             Ok(Ast::FunctionDef(func)) => functions.push(func),
+            Ok(Ast::StructDef(def)) => structs.push(def),
             Ok(_) => return Err(CompileError::TopLevelExpression),
             Err(err) => {
                 return Err(CompileError::Parse {
@@ -1463,6 +1954,14 @@ fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileEr
         }
     }
 
+    Ok((functions, structs))
+}
+
+fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
+    let (functions, structs) = parse_source_items(source)?;
+    if !structs.is_empty() {
+        return Err(CompileError::UnsupportedFeature("struct declarations in stdlib"));
+    }
     Ok(functions)
 }
 
@@ -1509,6 +2008,7 @@ fn string_stdlib_function(name: &str) -> Option<StdlibFunction> {
                 "is_string",
                 "is_list",
                 "is_map",
+                "is_struct",
                 "is_map_iter",
                 "is_function",
                 "is_string_iter",
@@ -1681,6 +2181,7 @@ fn collect_stdlib_references_from_ast(
     refs: &mut HashSet<String>,
 ) {
     match ast {
+        Ast::StructDef(_) => {}
         Ast::Expression(ExpressionAst { function, args, .. }) => {
             if !function.is_empty() {
                 maybe_collect_stdlib_reference(function, scope, refs);
@@ -1716,6 +2217,16 @@ fn collect_stdlib_references_from_ast(
         Ast::MapLiteral(entries) => {
             collect_stdlib_references_from_map_entries(entries, scope, refs)
         }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_stdlib_references_from_ast(&field.value, scope, refs);
+            }
+        }
+        Ast::FieldAccess { base, .. } => collect_stdlib_references_from_ast(base, scope, refs),
+        Ast::FieldAssign { base, value, .. } => {
+            collect_stdlib_references_from_ast(base, scope, refs);
+            collect_stdlib_references_from_ast(value, scope, refs);
+        }
         Ast::Index { collection, index, .. } => {
             collect_stdlib_references_from_ast(collection, scope, refs);
             collect_stdlib_references_from_ast(index, scope, refs);
@@ -1749,6 +2260,7 @@ fn collect_used_features_from_block(block: &BlockAst, features: &mut UsedFeature
 
 fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
     match ast {
+        Ast::StructDef(_) => {}
         Ast::Expression(ExpressionAst { function, args, .. }) => {
             if matches!(
                 function.as_str(),
@@ -1845,6 +2357,16 @@ fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
                 }
                 collect_used_features_from_ast(&entry.value, features);
             }
+        }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_used_features_from_ast(&field.value, features);
+            }
+        }
+        Ast::FieldAccess { base, .. } => collect_used_features_from_ast(base, features),
+        Ast::FieldAssign { base, value, .. } => {
+            collect_used_features_from_ast(base, features);
+            collect_used_features_from_ast(value, features);
         }
         Ast::Index { collection, index, .. } => {
             features.lists = true;
@@ -2118,6 +2640,7 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
                 | "is_string"
                 | "is_list"
                 | "is_map"
+                | "is_struct"
                 | "is_map_iter"
                 | "is_function"
                 | "is_string_iter"
@@ -2270,6 +2793,7 @@ fn validate_ast_user_facing(
         Ast::Variable(name) => validate_variable_reference(name, locals, function_names),
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::StructDef(_) => Err(CompileError::UnsupportedFeature("nested struct definitions")),
         Ast::FunctionRef(name) => validate_function_reference(name, function_names),
         Ast::MethodCall { receiver, method, args, .. } => validate_method_call_user_facing(
             receiver,
@@ -2305,6 +2829,40 @@ fn validate_ast_user_facing(
             value_kind_analysis,
             function_analysis,
         ),
+        Ast::StructLiteral { fields, .. } => validate_ast_sequence(
+            &fields.iter().map(|field| field.value.clone()).collect::<Vec<_>>(),
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
+        Ast::FieldAccess { base, .. } => validate_ast_user_facing(
+            base,
+            locals,
+            function_names,
+            function_arities,
+            value_kind_analysis,
+            function_analysis,
+        ),
+        Ast::FieldAssign { base, value, .. } => {
+            validate_ast_user_facing(
+                base,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )?;
+            validate_ast_user_facing(
+                value,
+                locals,
+                function_names,
+                function_arities,
+                value_kind_analysis,
+                function_analysis,
+            )
+        }
         Ast::Index { collection, index, .. } => validate_index_ast(
             collection,
             index,
@@ -2401,8 +2959,18 @@ fn validate_method_call_user_facing(
         value_kind_analysis,
         function_analysis,
     )?;
+    let receiver_shape = infer_ast_value_shape(receiver, function_analysis, value_kind_analysis);
     let function =
         resolve_method_call_or_error(receiver, method, function_analysis, value_kind_analysis)?;
+    if !is_known_callable_name(&function, function_names) && stdlib_function(&function).is_none() {
+        if let Ok(kind) = exact_receiver_kind(&receiver_shape) {
+            return Err(CompileError::UnknownMethod {
+                receiver_kind: format_kind_set_for_error(single_kind_set(kind)),
+                method: method.to_string(),
+                span: method.span.clone(),
+            });
+        }
+    }
     let mut resolved_args = Vec::with_capacity(args.len() + 1);
     resolved_args.push(receiver.clone());
     resolved_args.extend(args.iter().cloned());
@@ -2594,7 +3162,7 @@ fn validate_ast_multi_return_usage(
         Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {
             validate_single_value_multi_return_usage(expected_arity, None)
         }
-        Ast::Lambda { .. } | Ast::FunctionDef(_) => Ok(()),
+        Ast::Lambda { .. } | Ast::FunctionDef(_) | Ast::StructDef(_) => Ok(()),
         Ast::MethodCall { receiver, method, args, .. } => {
             validate_child_multi_return_usage(
                 receiver,
@@ -2675,6 +3243,45 @@ fn validate_ast_multi_return_usage(
                 )?;
             }
             validate_single_value_multi_return_usage(expected_arity, None)
+        }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                validate_child_multi_return_usage(
+                    &field.value,
+                    current_function,
+                    locals,
+                    function_names,
+                    function_return_arities,
+                )?;
+            }
+            validate_single_value_multi_return_usage(expected_arity, None)
+        }
+        Ast::FieldAccess { base, .. } => {
+            validate_child_multi_return_usage(
+                base,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+            )?;
+            validate_single_value_multi_return_usage(expected_arity, None)
+        }
+        Ast::FieldAssign { base, value, span, .. } => {
+            validate_child_multi_return_usage(
+                base,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+            )?;
+            validate_child_multi_return_usage(
+                value,
+                current_function,
+                locals,
+                function_names,
+                function_return_arities,
+            )?;
+            validate_single_value_multi_return_usage(expected_arity, span.as_ref())
         }
         Ast::Index { collection, index, span } => validate_index_multi_return_usage(
             collection,
@@ -3352,6 +3959,7 @@ fn format_kind_set_for_error(kinds: KindSet) -> String {
         (ValueKind::String, "string"),
         (ValueKind::List, "list"),
         (ValueKind::Map, "map"),
+        (ValueKind::Struct, "struct"),
         (ValueKind::MapIter, "map_iter"),
         (ValueKind::Function, "function"),
         (ValueKind::StringIter, "string_iter"),
@@ -3404,6 +4012,7 @@ fn kind_sets_intersect(lhs: KindSet, rhs: KindSet) -> bool {
         ValueKind::String,
         ValueKind::List,
         ValueKind::Map,
+        ValueKind::Struct,
         ValueKind::MapIter,
         ValueKind::Function,
         ValueKind::StringIter,
@@ -3419,20 +4028,39 @@ fn resolve_method_call_or_error(
     value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> Result<String, CompileError> {
     let receiver_shape = infer_ast_value_shape(receiver, function_analysis, value_kind_analysis);
-    resolve_method(&receiver_shape, method.as_str()).map_err(|err| match err {
-        MethodResolutionError::UnknownReceiver => CompileError::UnknownMethodReceiver {
-            method: method.to_string(),
-            span: method.span.clone(),
+    let candidates = method_target_functions_for_shape(&receiver_shape, method.as_str()).map_err(
+        |err| match err {
+            MethodResolutionError::UnknownReceiver => CompileError::UnknownMethodReceiver {
+                method: method.to_string(),
+                span: method.span.clone(),
+            },
+            MethodResolutionError::AmbiguousReceiver(kinds) => {
+                CompileError::AmbiguousMethodReceiver {
+                    method: method.to_string(),
+                    receiver_kinds: kinds
+                        .into_iter()
+                        .map(|kind| format_kind_set_for_error(single_kind_set(kind)))
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                    span: method.span.clone(),
+                }
+            }
         },
-        MethodResolutionError::AmbiguousReceiver(kinds) => CompileError::AmbiguousMethodReceiver {
-            method: method.to_string(),
-            receiver_kinds: kinds
-                .into_iter()
-                .map(|kind| format_kind_set_for_error(single_kind_set(kind)))
-                .collect::<Vec<_>>()
-                .join(" | "),
-            span: method.span.clone(),
-        },
+    )?;
+    for function in &candidates {
+        if known_callable_shape(function, &[]).is_some()
+            || stdlib_function(function).is_some()
+            || value_kind_analysis.functions.contains_key(function)
+        {
+            return Ok(function.clone());
+        }
+    }
+    let receiver_kind = exact_receiver_kind(&receiver_shape)
+        .expect("exact method target candidates should imply exact receiver kind");
+    Err(CompileError::UnknownMethod {
+        receiver_kind: format_kind_set_for_error(single_kind_set(receiver_kind)),
+        method: method.to_string(),
+        span: method.span.clone(),
     })
 }
 
@@ -3443,6 +4071,7 @@ fn single_kind_set(kind: ValueKind) -> KindSet {
         ValueKind::String => KindSet::string(),
         ValueKind::List => KindSet::list(),
         ValueKind::Map => KindSet::map(),
+        ValueKind::Struct => KindSet::struct_(),
         ValueKind::MapIter => KindSet::map_iter(),
         ValueKind::Function => KindSet::function(),
         ValueKind::StringIter => KindSet::string_iter(),
@@ -3525,6 +4154,21 @@ fn infer_ast_value_shape(
                         .scalar_slot(),
                 )
             }))
+        }
+        Ast::StructLiteral { fields, .. } => {
+            let mut field_shapes = HashMap::new();
+            for field in fields {
+                field_shapes.insert(
+                    field.name.clone(),
+                    infer_ast_value_shape(&field.value, function_analysis, value_kind_analysis),
+                );
+            }
+            match ast {
+                Ast::StructLiteral { type_name, .. } => {
+                    ValueShape::struct_(type_name.as_str(), field_shapes)
+                }
+                _ => unreachable!(),
+            }
         }
         Ast::MultiValue(values) => ValueShape::from_slots(
             values
@@ -3619,7 +4263,14 @@ fn infer_ast_value_shape(
         Ast::IndexAssign { value, .. } => {
             infer_ast_value_shape(value, function_analysis, value_kind_analysis)
         }
-        Ast::FunctionDef(_) => ValueShape::scalar(KindSet::empty()),
+        Ast::FieldAccess { base, field, .. } => {
+            let base_shape = infer_ast_value_shape(base, function_analysis, value_kind_analysis);
+            base_shape.struct_field(field.as_str()).unwrap_or_else(ValueShape::unknown_scalar)
+        }
+        Ast::FieldAssign { value, .. } => {
+            infer_ast_value_shape(value, function_analysis, value_kind_analysis)
+        }
+        Ast::FunctionDef(_) | Ast::StructDef(_) => ValueShape::scalar(KindSet::empty()),
     }
 }
 
@@ -3643,6 +4294,7 @@ fn infer_builtin_boolean_shape(function: &str) -> Option<ValueShape> {
             | "is_string"
             | "is_list"
             | "is_map"
+            | "is_struct"
             | "is_map_iter"
             | "is_function"
             | "is_string_iter"
@@ -3879,19 +4531,23 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
     match ast {
         Ast::Variable(name) | Ast::FunctionRef(name) => name.span.clone(),
         Ast::Expression(ExpressionAst { function_span, .. }) => function_span.clone(),
-        Ast::MethodCall { span, .. } => span.clone(),
+        Ast::MethodCall { span, .. }
+        | Ast::FieldAccess { span, .. }
+        | Ast::FieldAssign { span, .. } => span.clone(),
         Ast::Index { span, .. }
         | Ast::IndexAssign { span, .. }
         | Ast::Assign { span, .. }
         | Ast::MultiAssign { span, .. }
         | Ast::If { span, .. } => span.clone(),
         Ast::FunctionDef(func) => func.span.clone(),
+        Ast::StructDef(def) => def.span.clone(),
         Ast::Block(_)
         | Ast::Lambda { .. }
         | Ast::MultiValue(_)
         | Ast::Literal(_)
         | Ast::ListLiteral(_)
-        | Ast::MapLiteral(_) => None,
+        | Ast::MapLiteral(_)
+        | Ast::StructLiteral { .. } => None,
     }
 }
 
@@ -3928,9 +4584,21 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
 
     match ast {
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
+        Ast::StructDef(_) => Ok(()),
         Ast::Lambda { body, .. } => validate_no_nested_function_defs(body),
         Ast::MultiValue(values) | Ast::ListLiteral(values) => validate_nested_free_slice(values),
         Ast::MapLiteral(entries) => validate_nested_free_map_entries(entries),
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                validate_no_nested_function_defs(&field.value)?;
+            }
+            Ok(())
+        }
+        Ast::FieldAccess { base, .. } => validate_no_nested_function_defs(base),
+        Ast::FieldAssign { base, value, .. } => {
+            validate_no_nested_function_defs(base)?;
+            validate_no_nested_function_defs(value)
+        }
         Ast::Index { collection, index, .. } => {
             validate_no_nested_function_defs(collection)?;
             validate_no_nested_function_defs(index)
@@ -4037,6 +4705,16 @@ impl LambdaLifter {
                     self.lift_ast(&mut entry.value, scope_names);
                 }
             }
+            Ast::StructLiteral { fields, .. } => {
+                for field in fields {
+                    self.lift_ast(&mut field.value, scope_names);
+                }
+            }
+            Ast::FieldAccess { base, .. } => self.lift_ast(base, scope_names),
+            Ast::FieldAssign { base, value, .. } => {
+                self.lift_ast(base, scope_names);
+                self.lift_ast(value, scope_names);
+            }
             Ast::Index { collection, index, .. } => {
                 self.lift_ast(collection, scope_names);
                 self.lift_ast(index, scope_names);
@@ -4056,6 +4734,7 @@ impl LambdaLifter {
                 }
             }
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
+            Ast::StructDef(_) => {}
             Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {}
         }
     }
@@ -4161,6 +4840,18 @@ fn collect_captures_into(
         Ast::MapLiteral(entries) => {
             collect_captures_from_map_entries(entries, local_names, scope_names, captures);
         }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_captures_into(&field.value, local_names, scope_names, captures);
+            }
+        }
+        Ast::FieldAccess { base, .. } => {
+            collect_captures_into(base, local_names, scope_names, captures);
+        }
+        Ast::FieldAssign { base, value, .. } => {
+            collect_captures_into(base, local_names, scope_names, captures);
+            collect_captures_into(value, local_names, scope_names, captures);
+        }
         Ast::Index { collection, index, .. } => {
             collect_captures_into(collection, local_names, scope_names, captures);
             collect_captures_into(index, local_names, scope_names, captures);
@@ -4193,12 +4884,14 @@ fn collect_captures_into(
         Ast::MultiAssign { value, .. } => {
             collect_captures_into(value, local_names, scope_names, captures);
         }
+        Ast::StructDef(_) => {}
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
 
 fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
     match ast {
+        Ast::StructDef(_) => {}
         Ast::Lambda { body, .. } => {
             collect_var_names(body, names);
         }
@@ -4245,6 +4938,16 @@ fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
                 }
                 collect_var_names(&entry.value, names);
             }
+        }
+        Ast::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_var_names(&field.value, names);
+            }
+        }
+        Ast::FieldAccess { base, .. } => collect_var_names(base, names),
+        Ast::FieldAssign { base, value, .. } => {
+            collect_var_names(base, names);
+            collect_var_names(value, names);
         }
         Ast::If { condition, then, else_, .. } => {
             collect_var_names(condition, names);
@@ -5631,6 +6334,215 @@ fn compile_map_literal(
     map
 }
 
+fn compile_struct_literal(
+    builder: &mut FunctionBuilder,
+    type_name: &Ident,
+    fields: &[crate::parser::StructFieldValueAst],
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let metadata = value_kind_analysis
+        .structs
+        .get(type_name.as_str())
+        .unwrap_or_else(|| panic!("validated struct literal must refer to a declared struct"));
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let field_count = i64::try_from(metadata.fields.len()).expect("too many struct fields");
+    let total_size = STRUCT_HEADER_SIZE + field_count * VALUE_SIZE;
+    let total_size_value = builder.ins().iconst(types::I64, total_size);
+    let alloc_call = builder.ins().call(alloc_ref, &[total_size_value, align]);
+    let header_ptr = builder.inst_results(alloc_call)[0];
+    let type_id_value = builder.ins().iconst(types::I64, metadata.type_id);
+    let field_count_value = builder.ins().iconst(types::I64, field_count);
+    let fields_ptr = builder.ins().iadd_imm(header_ptr, STRUCT_HEADER_SIZE);
+    builder.ins().store(MemFlags::new(), type_id_value, header_ptr, STRUCT_TYPE_ID_OFFSET);
+    builder.ins().store(MemFlags::new(), field_count_value, header_ptr, STRUCT_FIELD_COUNT_OFFSET);
+    builder.ins().store(MemFlags::new(), fields_ptr, header_ptr, STRUCT_FIELDS_PTR_OFFSET);
+
+    let compiled_fields = fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.as_str(),
+                compile_ast(
+                    builder,
+                    &field.value,
+                    vars,
+                    func_refs,
+                    function_ordinals,
+                    function_arities,
+                    closure_metadata,
+                    capture_slots,
+                    env_ptr,
+                    function_analysis,
+                    value_kind_analysis,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (index, field_name) in metadata.fields.iter().enumerate() {
+        let value = compiled_fields
+            .get(field_name.as_str())
+            .unwrap_or_else(|| panic!("validated struct literal must initialize every field"));
+        let slot_offset = i32::try_from(i64::try_from(index).unwrap() * VALUE_SIZE)
+            .expect("struct slot overflow");
+        let tag_i8 = builder.ins().ireduce(types::I8, value.tag);
+        builder.ins().store(MemFlags::new(), tag_i8, fields_ptr, slot_offset);
+        builder.ins().store(
+            MemFlags::new(),
+            value.payload,
+            fields_ptr,
+            slot_offset + VALUE_PAYLOAD_OFFSET,
+        );
+    }
+
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRUCT), payload: header_ptr }
+}
+
+fn compile_field_access(
+    builder: &mut FunctionBuilder,
+    base: &Ast,
+    field: &Ident,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let struct_name = exact_struct_name(base, function_analysis, value_kind_analysis)
+        .unwrap_or_else(|| panic!("validated field access must have an exact struct receiver"));
+    let metadata = value_kind_analysis
+        .structs
+        .get(&struct_name)
+        .unwrap_or_else(|| panic!("validated field access must use a declared struct"));
+    let field_index = metadata
+        .fields
+        .iter()
+        .position(|name| name == field.as_str())
+        .unwrap_or_else(|| panic!("validated field access must use a declared field"));
+
+    let value = compile_ast(
+        builder,
+        base,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+        function_analysis,
+        value_kind_analysis,
+    );
+    let is_struct = builder.ins().icmp_imm(IntCC::Equal, value.tag, TAG_STRUCT);
+    builder.ins().trapz(is_struct, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let stored_type_id =
+        builder.ins().load(types::I64, MemFlags::new(), value.payload, STRUCT_TYPE_ID_OFFSET);
+    let expected_type_id = builder.ins().iconst(types::I64, metadata.type_id);
+    let type_ok = builder.ins().icmp(IntCC::Equal, stored_type_id, expected_type_id);
+    builder.ins().trapz(type_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let fields_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), value.payload, STRUCT_FIELDS_PTR_OFFSET);
+    let slot_offset = i32::try_from(i64::try_from(field_index).unwrap() * VALUE_SIZE)
+        .expect("struct slot overflow");
+    let tag_i8 = builder.ins().load(types::I8, MemFlags::new(), fields_ptr, slot_offset);
+    let tag = builder.ins().uextend(types::I64, tag_i8);
+    let payload = builder.ins().load(
+        types::I64,
+        MemFlags::new(),
+        fields_ptr,
+        slot_offset + VALUE_PAYLOAD_OFFSET,
+    );
+    CompiledValue { tag, payload }
+}
+
+fn compile_field_assign(
+    builder: &mut FunctionBuilder,
+    base: &Ast,
+    field: &Ident,
+    value_ast: &Ast,
+    vars: &HashMap<String, LocalValueVar>,
+    func_refs: &HashMap<String, FuncRef>,
+    function_ordinals: &HashMap<String, i64>,
+    function_arities: &HashMap<String, usize>,
+    closure_metadata: &HashMap<String, ClosureMetadata>,
+    capture_slots: &HashMap<String, usize>,
+    env_ptr: Value,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> CompiledValue {
+    let struct_name = exact_struct_name(base, function_analysis, value_kind_analysis)
+        .unwrap_or_else(|| panic!("validated field assignment must have an exact struct receiver"));
+    let metadata = value_kind_analysis
+        .structs
+        .get(&struct_name)
+        .unwrap_or_else(|| panic!("validated field assignment must use a declared struct"));
+    let field_index = metadata
+        .fields
+        .iter()
+        .position(|name| name == field.as_str())
+        .unwrap_or_else(|| panic!("validated field assignment must use a declared field"));
+
+    let receiver = compile_ast(
+        builder,
+        base,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+        function_analysis,
+        value_kind_analysis,
+    );
+    let is_struct = builder.ins().icmp_imm(IntCC::Equal, receiver.tag, TAG_STRUCT);
+    builder.ins().trapz(is_struct, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let stored_type_id =
+        builder.ins().load(types::I64, MemFlags::new(), receiver.payload, STRUCT_TYPE_ID_OFFSET);
+    let expected_type_id = builder.ins().iconst(types::I64, metadata.type_id);
+    let type_ok = builder.ins().icmp(IntCC::Equal, stored_type_id, expected_type_id);
+    builder.ins().trapz(type_ok, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let fields_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), receiver.payload, STRUCT_FIELDS_PTR_OFFSET);
+    let assigned = compile_ast(
+        builder,
+        value_ast,
+        vars,
+        func_refs,
+        function_ordinals,
+        function_arities,
+        closure_metadata,
+        capture_slots,
+        env_ptr,
+        function_analysis,
+        value_kind_analysis,
+    );
+    let slot_offset = i32::try_from(i64::try_from(field_index).unwrap() * VALUE_SIZE)
+        .expect("struct slot overflow");
+    let tag_i8 = builder.ins().ireduce(types::I8, assigned.tag);
+    builder.ins().store(MemFlags::new(), tag_i8, fields_ptr, slot_offset);
+    builder.ins().store(
+        MemFlags::new(),
+        assigned.payload,
+        fields_ptr,
+        slot_offset + VALUE_PAYLOAD_OFFSET,
+    );
+    assigned
+}
+
 fn create_empty_list(
     builder: &mut FunctionBuilder,
     func_refs: &HashMap<String, FuncRef>,
@@ -6474,6 +7386,49 @@ fn compile_ast(
             function_analysis,
             value_kind_analysis,
         ),
+        Ast::StructLiteral { type_name, fields, .. } => compile_struct_literal(
+            builder,
+            type_name,
+            fields,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
+        Ast::FieldAccess { base, field, .. } => compile_field_access(
+            builder,
+            base,
+            field,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
+        Ast::FieldAssign { base, field, value, .. } => compile_field_assign(
+            builder,
+            base,
+            field,
+            value,
+            vars,
+            func_refs,
+            function_ordinals,
+            function_arities,
+            closure_metadata,
+            capture_slots,
+            env_ptr,
+            function_analysis,
+            value_kind_analysis,
+        ),
         Ast::Index { collection, index, .. } => compile_index_ast(
             builder,
             collection,
@@ -6584,6 +7539,7 @@ fn compile_ast(
             value_kind_analysis,
         ),
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
+        Ast::StructDef(_) => boxed_int_const(builder, 0),
     }
 }
 
@@ -7045,6 +8001,7 @@ fn compile_type_predicate_expression_ast(
             | "is_string"
             | "is_list"
             | "is_map"
+            | "is_struct"
             | "is_map_iter"
             | "is_function"
             | "is_string_iter"
@@ -7071,6 +8028,7 @@ fn compile_type_predicate_expression_ast(
         "is_string" => TAG_STRING,
         "is_list" => TAG_LIST,
         "is_map" => TAG_MAP,
+        "is_struct" => TAG_STRUCT,
         "is_map_iter" => TAG_MAP_ITER,
         "is_function" => TAG_FUNCTION,
         "is_string_iter" => TAG_STRING_ITER,
@@ -7861,6 +8819,15 @@ fn try_from_source_rejects_top_level_expressions() {
 
 #[cfg(test)]
 #[test]
+fn try_from_source_accepts_struct_declarations() {
+    let module = Module::try_from_source("struct Person = {name}\n\nfn main() do\n    0\nend")
+        .expect("source should parse");
+    assert_eq!(module.structs.len(), 1);
+    assert_eq!(module.structs[0].name, "Person");
+}
+
+#[cfg(test)]
+#[test]
 fn try_from_source_preserves_parse_error_span() {
     let err = match Module::try_from_source("fn main()) do\n    1\nend") {
         Ok(_) => panic!("invalid source should return a parse error"),
@@ -8586,10 +9553,10 @@ fn autoloaded_stdlib_functions_can_be_used_as_values() {
 
 #[test]
 fn runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
+    let src = "struct Person = {name}\n\nfn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    person = Person { name: \"Ada\" }\n    print(is_struct(person))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(person) == \"struct\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
     assert_cranelift_executable_output(
         src,
-        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
         0,
     );
 }
@@ -8888,8 +9855,16 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
             ("typed_list".to_string(), ValueShape::list(KindSet::int().union(KindSet::string()))),
             ("generic_list".to_string(), ValueShape::scalar(KindSet::list())),
             ("value_var".to_string(), ValueShape::scalar(KindSet::bigint())),
+            (
+                "person_var".to_string(),
+                ValueShape::struct_(
+                    "Person",
+                    HashMap::from([("name".to_string(), ValueShape::scalar(KindSet::string()))]),
+                ),
+            ),
         ]),
         function_bindings: HashMap::new(),
+        struct_bindings: HashMap::new(),
         returns: ValueShape::scalar(KindSet::int()),
     };
     let module_analysis = ModuleValueKindAnalysis {
@@ -8900,6 +9875,7 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
                     inputs: vec![],
                     variables: HashMap::new(),
                     function_bindings: HashMap::new(),
+                    struct_bindings: HashMap::new(),
                     returns: ValueShape::from_slots(vec![KindSet::int(), KindSet::string()]),
                 },
             ),
@@ -8909,10 +9885,12 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
                     inputs: vec![],
                     variables: HashMap::new(),
                     function_bindings: HashMap::new(),
+                    struct_bindings: HashMap::new(),
                     returns: ValueShape::scalar(KindSet::string()),
                 },
             ),
         ]),
+        structs: HashMap::new(),
     };
 
     assert_eq!(
@@ -8968,6 +9946,24 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
             &module_analysis
         ),
         ValueShape::list(KindSet::int().union(KindSet::string()))
+    );
+    assert_eq!(
+        infer_ast_value_shape(
+            &Ast::StructLiteral {
+                type_name: Ident::synthetic("Person".to_string()),
+                fields: vec![crate::parser::StructFieldValueAst {
+                    name: "name".to_string(),
+                    value: Ast::Literal(LiteralAst::String("Ada".to_string())),
+                }],
+                span: None,
+            },
+            &function_analysis,
+            &module_analysis
+        ),
+        ValueShape::struct_(
+            "Person",
+            HashMap::from([("name".to_string(), ValueShape::scalar(KindSet::string()))]),
+        )
     );
     assert_eq!(
         infer_ast_value_shape(
@@ -9132,6 +10128,18 @@ fn infer_ast_value_shape_covers_manual_ast_variants() {
                 collection: Box::new(Ast::Variable(Ident::synthetic("typed_list".to_string()))),
                 index: Box::new(Ast::Literal(LiteralAst::Integer(0))),
                 value: Box::new(Ast::Literal(LiteralAst::String("x".to_string()))),
+                span: None,
+            },
+            &function_analysis,
+            &module_analysis
+        ),
+        ValueShape::scalar(KindSet::string())
+    );
+    assert_eq!(
+        infer_ast_value_shape(
+            &Ast::FieldAccess {
+                base: Box::new(Ast::Variable(Ident::synthetic("person_var".to_string()))),
+                field: Ident::synthetic("name".to_string()),
                 span: None,
             },
             &function_analysis,
@@ -9424,11 +10432,11 @@ fn llvm_autoloaded_stdlib_functions_can_be_used_as_values() {
 #[cfg(all(test, feature = "llvm-backend"))]
 #[test]
 fn llvm_runtime_type_predicates_and_type_of_work() {
-    let src = "fn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
+    let src = "struct Person = {name}\n\nfn helper(x) do\n    x\nend\n\nfn main() do\n    print(is_int(1))\n    print(is_bigint(1))\n    print(is_bigint(1n))\n    print(is_string(\"x\"))\n    print(is_list([1]))\n    m = map_new()\n    print(is_map(m))\n    person = Person { name: \"Ada\" }\n    print(is_struct(person))\n    f = helper\n    print(is_function(f))\n    it = string_chars(\"a\")\n    print(is_string_iter(it))\n    map_it = map_iter(m)\n    print(is_map_iter(map_it))\n    print(type_of(1) == \"int\")\n    print(type_of(1n) == \"bigint\")\n    print(type_of(\"x\") == \"string\")\n    print(type_of([1]) == \"list\")\n    print(type_of(m) == \"map\")\n    print(type_of(person) == \"struct\")\n    print(type_of(f) == \"function\")\n    print(type_of(it) == \"string_iter\")\n    print(type_of(map_it) == \"map_iter\")\nend";
     assert_backend_executable_output(
         src,
         CodegenBackend::Llvm,
-        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
+        "1\n0\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n1\n",
         0,
     );
 }
@@ -9889,6 +10897,137 @@ fn try_compile_to_jit_rejects_invalid_map_literal_dynamic_key_type() {
 }
 
 #[test]
+fn try_compile_to_jit_rejects_struct_literals() {
+    let src = "fn main() do\n    Person { name: \"Ada\" }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UndefinedStruct {
+            name: "Person".to_string(),
+            span: Some(Span { start: 17, end: 23 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_struct_field_access() {
+    let src = "fn main() do\n    person.name\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UndefinedVariable {
+            name: "person".to_string(),
+            span: Some(Span { start: 17, end: 23 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_missing_struct_literal_field() {
+    let src = "struct Person = {name, age}\n\nfn main() do\n    Person { name: \"Ada\" }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::MissingStructField {
+            struct_name: "Person".to_string(),
+            field: "age".to_string(),
+            span: Some(Span { start: 46, end: 68 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_unknown_struct_literal_field() {
+    let src = "struct Person = {name}\n\nfn main() do\n    Person { age: 37 }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UnknownStructField {
+            struct_name: "Person".to_string(),
+            field: "age".to_string(),
+            span: Some(Span { start: 41, end: 59 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_duplicate_struct_literal_field() {
+    let src =
+        "struct Person = {name}\n\nfn main() do\n    Person { name: \"Ada\", name: \"Bob\" }\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::DuplicateStructLiteralField {
+            struct_name: "Person".to_string(),
+            field: "name".to_string(),
+            span: Some(Span { start: 41, end: 76 }),
+        }
+    );
+}
+
+#[test]
+fn try_compile_to_jit_rejects_unknown_field_on_known_struct_receiver() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.age\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::UnknownStructField {
+            struct_name: "Person".to_string(),
+            field: "age".to_string(),
+            span: Some(Span { start: 77, end: 87 }),
+        }
+    );
+}
+
+#[test]
+fn jit_struct_literal_and_field_access_work() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    print(person.name)\n    0\nend";
+    assert_cranelift_executable_output(src, "Ada\n", 0);
+}
+
+#[test]
+fn jit_struct_field_assign_works() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.name = \"Bob\"\n    print(person.name)\n    0\nend";
+    assert_cranelift_executable_output(src, "Bob\n", 0);
+}
+
+#[test]
+fn jit_nested_struct_field_access_and_assign_work() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.address.city)\n    person.address = Address { city: \"Paris\" }\n    print(person.address.city)\n    0\nend";
+    assert_cranelift_executable_output(src, "London\nParis\n", 0);
+}
+
+#[test]
+fn jit_nominal_struct_method_dispatch_works() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn struct_kind(value) do\n    \"struct\"\nend\n\nfn Person_kind(value) do\n    \"person\"\nend\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.kind())\n    print(person.address.kind())\n    0\nend";
+    assert_cranelift_executable_output(src, "person\nstruct\n", 0);
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_map_get_map_argument_type() {
     let src = "fn main() do\n    map_get(list_new(), \"a\")\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -10312,6 +11451,23 @@ fn try_compile_to_jit_rejects_method_call_with_unknown_receiver_kind() {
 }
 
 #[test]
+fn try_compile_to_jit_rejects_unknown_method_on_exact_struct_receiver() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.missing()\nend";
+    let module = Module::try_from_source(src).expect("source should parse");
+    let err = match module.try_compile_to_jit() {
+        Ok(_) => panic!("jit compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        CompileError::UnknownMethod { receiver_kind, method, .. } => {
+            assert_eq!(receiver_kind, "struct");
+            assert_eq!(method, "missing");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn try_compile_to_jit_rejects_invalid_bitwise_argument_type() {
     let src = "fn main() do\n    \"a\" & 1\nend";
     let module = Module::try_from_source(src).expect("source should parse");
@@ -10669,6 +11825,34 @@ fn llvm_jit_if_else_works() {
 fn llvm_jit_lists_work() {
     let src = "fn main() do\n    xs = [1, 2, 3]\n    ys = list_copy(xs)\n    list_pop(xs)\n    list_len(xs) + list_len(ys) + ys[2]\nend";
     assert_jit_backend_result(src, CodegenBackend::Llvm, 8);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_struct_literal_and_field_access_work() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    print(person.name)\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "Ada\n", 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_struct_field_assign_works() {
+    let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person.name = \"Bob\"\n    print(person.name)\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "Bob\n", 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_nested_struct_field_access_and_assign_work() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.address.city)\n    person.address = Address { city: \"Paris\" }\n    print(person.address.city)\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "London\nParis\n", 0);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn llvm_nominal_struct_method_dispatch_works() {
+    let src = "struct Address = {city}\nstruct Person = {name, address}\n\nfn struct_kind(value) do\n    \"struct\"\nend\n\nfn Person_kind(value) do\n    \"person\"\nend\n\nfn main() do\n    person = Person { name: \"Ada\", address: Address { city: \"London\" } }\n    print(person.kind())\n    print(person.address.kind())\n    0\nend";
+    assert_backend_executable_output(src, CodegenBackend::Llvm, "person\nstruct\n", 0);
 }
 
 #[cfg(feature = "llvm-backend")]

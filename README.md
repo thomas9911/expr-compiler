@@ -256,6 +256,12 @@ Current behavior:
   - example:
     - `fn string_wrap(s) do ... end`
     - `"x".wrap()`
+- struct receivers first try nominal dispatch, then fall back to the generic `struct_` prefix
+  - examples:
+    - `fn Person_kind(value) do "person" end`
+    - `fn struct_kind(value) do "struct" end`
+    - `person.kind()` resolves to `Person_kind(person)` when present
+    - `address.kind()` falls back to `struct_kind(address)` when `Address_kind` is absent
 - if the receiver kind is unknown, method-call resolution is a compile error
 - if the receiver kind is ambiguous, method-call resolution is a compile error
 - `is_*` guards can narrow values enough to make method calls resolvable

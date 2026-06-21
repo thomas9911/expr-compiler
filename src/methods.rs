@@ -10,9 +10,29 @@ pub fn method_target_functions(method: &str) -> Vec<String> {
     supported_method_kinds().into_iter().map(|kind| method_function_name(*kind, method)).collect()
 }
 
-pub fn resolve_method(shape: &ValueShape, method: &str) -> Result<String, MethodResolutionError> {
+pub fn method_target_functions_for_shape(
+    shape: &ValueShape,
+    method: &str,
+) -> Result<Vec<String>, MethodResolutionError> {
     let receiver = exact_receiver_kind(shape)?;
-    Ok(method_function_name(receiver, method))
+    let mut targets = vec![];
+    if receiver == ValueKind::Struct {
+        if let Some(struct_name) = shape.struct_name() {
+            targets.push(format!("{struct_name}_{method}"));
+        }
+    }
+    targets.push(method_function_name(receiver, method));
+    targets.dedup();
+    Ok(targets)
+}
+
+pub fn resolve_method(shape: &ValueShape, method: &str) -> Result<String, MethodResolutionError> {
+    Ok(
+        method_target_functions_for_shape(shape, method)?
+            .into_iter()
+            .next()
+            .expect("method target list should be non-empty"),
+    )
 }
 
 pub fn exact_receiver_kind(shape: &ValueShape) -> Result<ValueKind, MethodResolutionError> {
@@ -42,6 +62,7 @@ pub fn supported_method_kinds() -> &'static [ValueKind] {
         ValueKind::String,
         ValueKind::List,
         ValueKind::Map,
+        ValueKind::Struct,
         ValueKind::MapIter,
         ValueKind::Function,
         ValueKind::StringIter,
@@ -55,6 +76,7 @@ fn method_prefix(kind: ValueKind) -> &'static str {
         ValueKind::String => "string",
         ValueKind::List => "list",
         ValueKind::Map => "map",
+        ValueKind::Struct => "struct",
         ValueKind::MapIter => "map_iter",
         ValueKind::Function => "function",
         ValueKind::StringIter => "string_iter",

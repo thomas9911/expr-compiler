@@ -1,5 +1,5 @@
 use crate::methods::resolve_method;
-use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst};
+use crate::parser::{Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst, StructDefAst};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9,28 +9,31 @@ pub enum ValueKind {
     String,
     List,
     Map,
+    Struct,
     MapIter,
     Function,
     StringIter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct KindSet(u8);
+pub struct KindSet(u16);
 
 impl KindSet {
-    const INT_BIT: u8 = 1 << 0;
-    const BIGINT_BIT: u8 = 1 << 1;
-    const STRING_BIT: u8 = 1 << 2;
-    const LIST_BIT: u8 = 1 << 3;
-    const MAP_BIT: u8 = 1 << 4;
-    const MAP_ITER_BIT: u8 = 1 << 5;
-    const FUNCTION_BIT: u8 = 1 << 6;
-    const STRING_ITER_BIT: u8 = 1 << 7;
-    const ALL_BITS: u8 = Self::INT_BIT
+    const INT_BIT: u16 = 1 << 0;
+    const BIGINT_BIT: u16 = 1 << 1;
+    const STRING_BIT: u16 = 1 << 2;
+    const LIST_BIT: u16 = 1 << 3;
+    const MAP_BIT: u16 = 1 << 4;
+    const STRUCT_BIT: u16 = 1 << 5;
+    const MAP_ITER_BIT: u16 = 1 << 6;
+    const FUNCTION_BIT: u16 = 1 << 7;
+    const STRING_ITER_BIT: u16 = 1 << 8;
+    const ALL_BITS: u16 = Self::INT_BIT
         | Self::BIGINT_BIT
         | Self::STRING_BIT
         | Self::LIST_BIT
         | Self::MAP_BIT
+        | Self::STRUCT_BIT
         | Self::MAP_ITER_BIT
         | Self::FUNCTION_BIT
         | Self::STRING_ITER_BIT;
@@ -63,6 +66,10 @@ impl KindSet {
         Self(Self::MAP_BIT)
     }
 
+    pub const fn struct_() -> Self {
+        Self(Self::STRUCT_BIT)
+    }
+
     pub const fn map_iter() -> Self {
         Self(Self::MAP_ITER_BIT)
     }
@@ -86,6 +93,7 @@ impl KindSet {
             ValueKind::String => Self::STRING_BIT,
             ValueKind::List => Self::LIST_BIT,
             ValueKind::Map => Self::MAP_BIT,
+            ValueKind::Struct => Self::STRUCT_BIT,
             ValueKind::MapIter => Self::MAP_ITER_BIT,
             ValueKind::Function => Self::FUNCTION_BIT,
             ValueKind::StringIter => Self::STRING_ITER_BIT,
@@ -108,6 +116,7 @@ impl KindSet {
             ValueKind::String => Self::STRING_BIT,
             ValueKind::List => Self::LIST_BIT,
             ValueKind::Map => Self::MAP_BIT,
+            ValueKind::Struct => Self::STRUCT_BIT,
             ValueKind::MapIter => Self::MAP_ITER_BIT,
             ValueKind::Function => Self::FUNCTION_BIT,
             ValueKind::StringIter => Self::STRING_ITER_BIT,
@@ -122,6 +131,7 @@ pub enum ValueShape {
     Multi(Vec<KindSet>),
     List { items: KindSet },
     Map { values: KindSet },
+    Struct { name: String, fields: HashMap<String, ValueShape> },
     MapIter { values: KindSet },
 }
 
@@ -136,6 +146,10 @@ impl ValueShape {
 
     pub fn map(values: KindSet) -> Self {
         Self::Map { values }
+    }
+
+    pub fn struct_(name: impl Into<String>, fields: HashMap<String, ValueShape>) -> Self {
+        Self::Struct { name: name.into(), fields }
     }
 
     pub fn map_iter(values: KindSet) -> Self {
@@ -160,7 +174,11 @@ impl ValueShape {
 
     pub fn arity(&self) -> usize {
         match self {
-            Self::Scalar(_) | Self::List { .. } | Self::Map { .. } | Self::MapIter { .. } => 1,
+            Self::Scalar(_)
+            | Self::List { .. }
+            | Self::Map { .. }
+            | Self::Struct { .. }
+            | Self::MapIter { .. } => 1,
             Self::Multi(slots) => slots.len(),
         }
     }
@@ -170,6 +188,7 @@ impl ValueShape {
             Self::Scalar(kinds) => (index == 0).then_some(*kinds),
             Self::List { .. } => (index == 0).then_some(KindSet::list()),
             Self::Map { .. } => (index == 0).then_some(KindSet::map()),
+            Self::Struct { .. } => (index == 0).then_some(KindSet::struct_()),
             Self::MapIter { .. } => (index == 0).then_some(KindSet::map_iter()),
             Self::Multi(slots) => slots.get(index).copied(),
         }
@@ -193,6 +212,20 @@ impl ValueShape {
         }
     }
 
+    pub fn struct_name(&self) -> Option<&str> {
+        match self {
+            Self::Struct { name, .. } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn struct_field(&self, field: &str) -> Option<ValueShape> {
+        match self {
+            Self::Struct { fields, .. } => fields.get(field).cloned(),
+            _ => None,
+        }
+    }
+
     pub fn map_iter_values(&self) -> Option<KindSet> {
         match self {
             Self::MapIter { values } => Some(*values),
@@ -205,6 +238,20 @@ impl ValueShape {
             (Self::Scalar(lhs), Self::Scalar(rhs)) => Self::scalar(lhs.union(*rhs)),
             (Self::List { items: lhs }, Self::List { items: rhs }) => Self::list(lhs.union(*rhs)),
             (Self::Map { values: lhs }, Self::Map { values: rhs }) => Self::map(lhs.union(*rhs)),
+            (
+                Self::Struct { name: lhs_name, fields: lhs_fields },
+                Self::Struct { name: rhs_name, fields: rhs_fields },
+            ) if lhs_name == rhs_name => {
+                let mut merged = HashMap::new();
+                for key in lhs_fields.keys().chain(rhs_fields.keys()) {
+                    let lhs =
+                        lhs_fields.get(key).cloned().unwrap_or_else(ValueShape::unknown_scalar);
+                    let rhs =
+                        rhs_fields.get(key).cloned().unwrap_or_else(ValueShape::unknown_scalar);
+                    merged.insert(key.clone(), lhs.union(&rhs));
+                }
+                Self::struct_(lhs_name.clone(), merged)
+            }
             (Self::MapIter { values: lhs }, Self::MapIter { values: rhs }) => {
                 Self::map_iter(lhs.union(*rhs))
             }
@@ -227,12 +274,20 @@ pub struct FunctionValueKindAnalysis {
     pub inputs: Vec<ValueShape>,
     pub variables: HashMap<String, ValueShape>,
     pub function_bindings: HashMap<String, String>,
+    pub struct_bindings: HashMap<String, String>,
     pub returns: ValueShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructValueKindMetadata {
+    pub type_id: i64,
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleValueKindAnalysis {
     pub functions: HashMap<String, FunctionValueKindAnalysis>,
+    pub structs: HashMap<String, StructValueKindMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,10 +304,44 @@ struct InferFunctionResult {
     calls: HashMap<String, Vec<ValueShape>>,
 }
 
+fn nominal_struct_method_name<'a>(
+    function_name: &str,
+    struct_fields: &'a HashMap<String, Vec<String>>,
+) -> Option<&'a str> {
+    struct_fields
+        .keys()
+        .filter_map(|name| {
+            function_name
+                .strip_prefix(name.as_str())
+                .filter(|rest| rest.starts_with('_'))
+                .map(|_| name.as_str())
+        })
+        .max_by_key(|name| name.len())
+}
+
+fn nominal_struct_input_shape(
+    function_name: &str,
+    struct_fields: &HashMap<String, Vec<String>>,
+) -> Option<ValueShape> {
+    let struct_name = nominal_struct_method_name(function_name, struct_fields)?;
+    let fields = struct_fields
+        .get(struct_name)
+        .expect("nominal struct method must refer to declared struct")
+        .iter()
+        .map(|field| (field.clone(), ValueShape::scalar(KindSet::empty())))
+        .collect::<HashMap<_, _>>();
+    Some(ValueShape::struct_(struct_name.to_string(), fields))
+}
+
 pub fn analyze_module_value_kinds(
     functions: &[FunctionDefAst],
+    structs: &[StructDefAst],
     function_return_arities: &HashMap<String, usize>,
 ) -> ModuleValueKindAnalysis {
+    let struct_fields = structs
+        .iter()
+        .map(|def| (def.name.clone(), def.fields.clone()))
+        .collect::<HashMap<_, _>>();
     let mut summaries = function_return_arities
         .iter()
         .map(|(name, arity)| {
@@ -268,6 +357,9 @@ pub fn analyze_module_value_kinds(
                         .map(|index| {
                             if name == "main" && index == 0 {
                                 ValueShape::list(KindSet::string())
+                            } else if index == 0 {
+                                nominal_struct_input_shape(name, &struct_fields)
+                                    .unwrap_or_else(|| ValueShape::scalar(KindSet::empty()))
                             } else {
                                 ValueShape::scalar(KindSet::empty())
                             }
@@ -283,7 +375,7 @@ pub fn analyze_module_value_kinds(
         let mut changed = false;
         let mut incoming = HashMap::<String, Vec<ValueShape>>::new();
         for func in functions {
-            let inferred = infer_function(func, &summaries);
+            let inferred = infer_function(func, &summaries, &struct_fields);
             for (callee, args) in inferred.calls {
                 merge_input_kinds(&mut incoming, &callee, &args);
             }
@@ -339,7 +431,7 @@ pub fn analyze_module_value_kinds(
     let analyses = functions
         .iter()
         .map(|func| {
-            let inferred = infer_function(func, &summaries);
+            let inferred = infer_function(func, &summaries, &struct_fields);
             let inputs = summaries
                 .get(&func.name)
                 .map(|summary| summary.inputs.clone())
@@ -350,18 +442,20 @@ pub fn analyze_module_value_kinds(
                     inputs,
                     variables: inferred.variables,
                     function_bindings: inferred.function_bindings,
+                    struct_bindings: HashMap::new(),
                     returns: inferred.returns,
                 },
             )
         })
         .collect::<HashMap<_, _>>();
 
-    ModuleValueKindAnalysis { functions: analyses }
+    ModuleValueKindAnalysis { functions: analyses, structs: HashMap::new() }
 }
 
 fn infer_function(
     function: &FunctionDefAst,
     summaries: &HashMap<String, FunctionKindSummary>,
+    struct_fields: &HashMap<String, Vec<String>>,
 ) -> InferFunctionResult {
     let summary_inputs =
         summaries.get(&function.name).map(|summary| summary.inputs.as_slice()).unwrap_or(&[]);
@@ -372,6 +466,9 @@ fn infer_function(
         .map(|(index, name)| {
             let default_shape = if function.name == "main" && index == 0 {
                 ValueShape::list(KindSet::string())
+            } else if index == 0 {
+                nominal_struct_input_shape(&function.name, struct_fields)
+                    .unwrap_or_else(ValueShape::unknown_scalar)
             } else {
                 ValueShape::scalar(KindSet::empty())
             };
@@ -417,7 +514,7 @@ fn infer_ast(
 ) -> ValueShape {
     match ast {
         Ast::Block(block) => infer_block(block, env, function_bindings, summaries, calls),
-        Ast::FunctionDef(_) => ValueShape::unknown_scalar(),
+        Ast::FunctionDef(_) | Ast::StructDef(_) => ValueShape::unknown_scalar(),
         Ast::Lambda { .. } | Ast::FunctionRef(_) => ValueShape::scalar(KindSet::function()),
         Ast::MethodCall { receiver, method, args, .. } => {
             let receiver_shape = infer_ast(receiver, env, function_bindings, summaries, calls);
@@ -465,6 +562,46 @@ fn infer_ast(
                 )
             });
             ValueShape::map(values)
+        }
+        Ast::StructLiteral { fields, .. } => {
+            let mut field_shapes = HashMap::new();
+            for field in fields {
+                field_shapes.insert(
+                    field.name.clone(),
+                    infer_ast(&field.value, env, function_bindings, summaries, calls),
+                );
+            }
+            let type_name = match ast {
+                Ast::StructLiteral { type_name, .. } => type_name.as_str(),
+                _ => unreachable!(),
+            };
+            ValueShape::struct_(type_name, field_shapes)
+        }
+        Ast::FieldAccess { base, .. } => {
+            let base_shape = infer_ast(base, env, function_bindings, summaries, calls);
+            match ast {
+                Ast::FieldAccess { field, .. } => base_shape
+                    .struct_field(field.as_str())
+                    .unwrap_or_else(ValueShape::unknown_scalar),
+                _ => unreachable!(),
+            }
+        }
+        Ast::FieldAssign { base, value, .. } => {
+            let base_shape = infer_ast(base, env, function_bindings, summaries, calls);
+            let value_shape = infer_ast(value, env, function_bindings, summaries, calls);
+            if let (Ast::Variable(name), Ast::FieldAssign { field, .. }, Some(struct_name)) =
+                (base.as_ref(), ast, base_shape.struct_name())
+            {
+                if let ValueShape::Struct { fields, .. } = &base_shape {
+                    let mut next_fields = fields.clone();
+                    next_fields.insert(field.as_str().to_string(), value_shape.clone());
+                    env.insert(
+                        name.as_str().to_string(),
+                        ValueShape::struct_(struct_name.to_string(), next_fields),
+                    );
+                }
+            }
+            value_shape
         }
         Ast::Index { collection, index, .. } => {
             let collection_shape = infer_ast(collection, env, function_bindings, summaries, calls);
@@ -673,6 +810,7 @@ fn predicate_kind(function: &str) -> Option<ValueKind> {
         "is_string" => Some(ValueKind::String),
         "is_list" => Some(ValueKind::List),
         "is_map" => Some(ValueKind::Map),
+        "is_struct" => Some(ValueKind::Struct),
         "is_map_iter" => Some(ValueKind::MapIter),
         "is_function" => Some(ValueKind::Function),
         "is_string_iter" => Some(ValueKind::StringIter),
@@ -712,6 +850,13 @@ fn exact_shape_for_kind(shape: &ValueShape, kind: ValueKind) -> ValueShape {
             .map_values()
             .map(ValueShape::map)
             .unwrap_or_else(|| ValueShape::scalar(KindSet::map())),
+        ValueKind::Struct => {
+            if let ValueShape::Struct { name, fields } = shape {
+                ValueShape::struct_(name.clone(), fields.clone())
+            } else {
+                ValueShape::scalar(KindSet::struct_())
+            }
+        }
         ValueKind::MapIter => shape
             .map_iter_values()
             .map(ValueShape::map_iter)
@@ -725,6 +870,7 @@ fn negative_narrowed_shape(shape: &ValueShape, kind: ValueKind) -> ValueShape {
     match (shape, kind) {
         (ValueShape::List { .. }, ValueKind::List)
         | (ValueShape::Map { .. }, ValueKind::Map)
+        | (ValueShape::Struct { .. }, ValueKind::Struct)
         | (ValueShape::MapIter { .. }, ValueKind::MapIter) => ValueShape::scalar(KindSet::empty()),
         _ => ValueShape::scalar(shape.scalar_slot().without(kind)),
     }
@@ -811,6 +957,7 @@ fn builtin_boolean_shape(name: &str) -> Option<ValueShape> {
             | "is_string"
             | "is_list"
             | "is_map"
+            | "is_struct"
             | "is_function"
             | "is_string_iter"
             | "is_map_iter"
@@ -1034,14 +1181,16 @@ fn merge_input_kinds(
     callee: &str,
     args: &[ValueShape],
 ) {
-    let entry = calls
-        .entry(callee.to_string())
-        .or_insert_with(|| vec![ValueShape::scalar(KindSet::empty()); args.len()]);
+    let entry = calls.entry(callee.to_string()).or_insert_with(|| args.to_vec());
     if entry.len() < args.len() {
-        entry.resize(args.len(), ValueShape::scalar(KindSet::empty()));
+        entry.extend(args[entry.len()..].iter().cloned());
     }
-    for (slot, arg) in entry.iter_mut().zip(args.iter()) {
-        *slot = slot.union(arg);
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(slot) = entry.get_mut(index) {
+            *slot = slot.union(arg);
+        } else {
+            entry.push(arg.clone());
+        }
     }
 }
 
@@ -1049,6 +1198,7 @@ fn merge_input_kinds(
 mod tests {
     use super::{KindSet, ValueKind, ValueShape, narrowed_shape};
     use crate::module::Module;
+    use std::collections::HashMap;
 
     #[test]
     fn narrowed_shape_preserves_container_metadata_on_positive_narrowing() {
@@ -1208,6 +1358,64 @@ mod tests {
         let main = analysis.functions.get("main").expect("main analysis missing");
         assert_eq!(main.variables.get("key"), Some(&ValueShape::scalar(KindSet::string())));
         assert_eq!(main.variables.get("value"), Some(&ValueShape::scalar(KindSet::string())));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_struct_literals_as_struct() {
+        let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    person\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(
+            main.variables.get("person"),
+            Some(&ValueShape::struct_(
+                "Person",
+                HashMap::from([("name".to_string(), ValueShape::scalar(KindSet::string()))]),
+            ))
+        );
+        assert_eq!(
+            main.returns,
+            ValueShape::struct_(
+                "Person",
+                HashMap::from([("name".to_string(), ValueShape::scalar(KindSet::string()))]),
+            )
+        );
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_struct_field_access_and_mutation() {
+        let src = "struct Person = {name}\n\nfn main() do\n    person = Person { name: \"Ada\" }\n    first = person.name\n    person.name = 1\n    second = person.name\n    second\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let main = analysis.functions.get("main").expect("main analysis missing");
+        assert_eq!(main.variables.get("first"), Some(&ValueShape::scalar(KindSet::string())));
+        assert_eq!(main.variables.get("second"), Some(&ValueShape::scalar(KindSet::int())));
+        assert_eq!(
+            main.variables.get("person"),
+            Some(&ValueShape::struct_(
+                "Person",
+                HashMap::from([("name".to_string(), ValueShape::scalar(KindSet::int()))]),
+            ))
+        );
+        assert_eq!(main.returns, ValueShape::scalar(KindSet::int()));
+    }
+
+    #[test]
+    fn analyze_value_kinds_tracks_nominal_struct_method_receiver_fields() {
+        let src = "struct Address = {city}\n\nfn Address_first_character(address) do\n    address.city.first()\nend\n\nfn main() do\n    address = Address { city: \"London\" }\n    address.first_character()\nend";
+        let module = Module::try_from_source(src).expect("source should parse");
+        let analysis = module.analyze_value_kinds().expect("analysis should succeed");
+        let helper = analysis
+            .functions
+            .get("Address_first_character")
+            .expect("helper analysis missing");
+        assert_eq!(
+            helper.variables.get("address"),
+            Some(&ValueShape::struct_(
+                "Address",
+                HashMap::from([("city".to_string(), ValueShape::scalar(KindSet::string()))]),
+            ))
+        );
     }
 
     #[test]

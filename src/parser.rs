@@ -158,20 +158,37 @@ pub struct MapEntryAst {
     pub value: Ast,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructDefAst {
+    pub name: String,
+    pub fields: Vec<String>,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructFieldValueAst {
+    pub name: String,
+    pub value: Ast,
+}
+
 #[derive(Debug, Clone)]
 pub enum Ast {
     Block(BlockAst),
     FunctionDef(FunctionDefAst),
+    StructDef(StructDefAst),
     Lambda { inputs: Vec<String>, body: Box<Ast> },
     FunctionRef(Ident),
     MethodCall { receiver: Box<Ast>, method: Ident, args: Vec<Ast>, span: Option<Span> },
+    FieldAccess { base: Box<Ast>, field: Ident, span: Option<Span> },
     Expression(ExpressionAst),
     MultiValue(Vec<Ast>),
     Literal(LiteralAst),
     ListLiteral(Vec<Ast>),
     MapLiteral(Vec<MapEntryAst>),
+    StructLiteral { type_name: Ident, fields: Vec<StructFieldValueAst>, span: Option<Span> },
     Index { collection: Box<Ast>, index: Box<Ast>, span: Option<Span> },
     IndexAssign { collection: Box<Ast>, index: Box<Ast>, value: Box<Ast>, span: Option<Span> },
+    FieldAssign { base: Box<Ast>, field: Ident, value: Box<Ast>, span: Option<Span> },
     Variable(Ident),
     Assign { name: String, value: Box<Ast>, span: Option<Span> },
     MultiAssign { names: Vec<String>, value: Box<Ast>, span: Option<Span> },
@@ -183,6 +200,7 @@ impl PartialEq for Ast {
         match (self, other) {
             (Ast::Block(a), Ast::Block(b)) => a == b,
             (Ast::FunctionDef(a), Ast::FunctionDef(b)) => a == b,
+            (Ast::StructDef(a), Ast::StructDef(b)) => a == b,
             (
                 Ast::Lambda { inputs: a_inputs, body: a_body },
                 Ast::Lambda { inputs: b_inputs, body: b_body },
@@ -192,11 +210,19 @@ impl PartialEq for Ast {
                 Ast::MethodCall { receiver: a_receiver, method: a_method, args: a_args, .. },
                 Ast::MethodCall { receiver: b_receiver, method: b_method, args: b_args, .. },
             ) => ast_eq_method_call(a_receiver, a_method, a_args, b_receiver, b_method, b_args),
+            (
+                Ast::FieldAccess { base: a_base, field: a_field, .. },
+                Ast::FieldAccess { base: b_base, field: b_field, .. },
+            ) => ast_eq_field_access(a_base, a_field, b_base, b_field),
             (Ast::Expression(a), Ast::Expression(b)) => a == b,
             (Ast::MultiValue(a), Ast::MultiValue(b)) => a == b,
             (Ast::Literal(a), Ast::Literal(b)) => a == b,
             (Ast::ListLiteral(a), Ast::ListLiteral(b)) => a == b,
             (Ast::MapLiteral(a), Ast::MapLiteral(b)) => a == b,
+            (
+                Ast::StructLiteral { type_name: a_type, fields: a_fields, .. },
+                Ast::StructLiteral { type_name: b_type, fields: b_fields, .. },
+            ) => a_type == b_type && a_fields == b_fields,
             (
                 Ast::Index { collection: a_collection, index: a_index, .. },
                 Ast::Index { collection: b_collection, index: b_index, .. },
@@ -211,6 +237,10 @@ impl PartialEq for Ast {
             ) => {
                 ast_eq_index_assign(a_collection, a_index, a_value, b_collection, b_index, b_value)
             }
+            (
+                Ast::FieldAssign { base: a_base, field: a_field, value: a_value, .. },
+                Ast::FieldAssign { base: b_base, field: b_field, value: b_value, .. },
+            ) => a_base == b_base && a_field == b_field && a_value == b_value,
             (Ast::Variable(a), Ast::Variable(b)) => a == b,
             (
                 Ast::Assign { name: a_name, value: a_value, .. },
@@ -249,6 +279,10 @@ fn ast_eq_method_call(
     b_args: &[Ast],
 ) -> bool {
     a_receiver == b_receiver && a_method == b_method && a_args == b_args
+}
+
+fn ast_eq_field_access(a_base: &Ast, a_field: &Ident, b_base: &Ast, b_field: &Ident) -> bool {
+    a_base == b_base && a_field == b_field
 }
 
 fn ast_eq_index(a_collection: &Ast, a_index: &Ast, b_collection: &Ast, b_index: &Ast) -> bool {
@@ -484,6 +518,15 @@ impl Ast {
                             .zip(lex.last_span())
                             .map(|(start, end)| Span::cover(start, end)),
                     }),
+                    Ast::FieldAccess { base, field, span } => Ok(Ast::FieldAssign {
+                        base,
+                        field,
+                        value: Box::new(value),
+                        span: span
+                            .or(assign_span)
+                            .zip(lex.last_span())
+                            .map(|(start, end)| Span::cover(start, end)),
+                    }),
                     _ => Err(ParseError::unexpected(lex)),
                 };
             }
@@ -491,6 +534,7 @@ impl Ast {
         }
 
         match lex.peek() {
+            Some(&Ok(Token::DefineStruct)) => Ok(Ast::StructDef(StructDefAst::from_lexer(lex)?)),
             Some(&Ok(Token::DefineFunction)) => {
                 if is_lambda_start(lex) {
                     parse_expr(lex, 0)
@@ -543,6 +587,44 @@ pub struct FunctionDefAst {
     pub output: Option<String>,
     pub block: BlockAst,
     pub span: Option<Span>,
+}
+
+impl StructDefAst {
+    pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
+        assert!(lex.next() == Some(Ok(Token::DefineStruct)));
+        let start_span = lex.last_span();
+        let Some(Ok(Token::Symbol(name))) = lex.next() else {
+            return Err(ParseError::unexpected(lex));
+        };
+        if lex.next() != Some(Ok(Token::Assign)) {
+            return Err(ParseError::unexpected(lex));
+        }
+        if lex.next() != Some(Ok(Token::OpenBrace)) {
+            return Err(ParseError::unexpected(lex));
+        }
+        let mut fields = vec![];
+        loop {
+            match lex.peek() {
+                Some(Ok(Token::CloseBrace)) => {
+                    lex.next();
+                    break;
+                }
+                Some(Ok(Token::Comma)) | Some(Ok(Token::Newline)) | Some(Ok(Token::Indent)) => {
+                    lex.next();
+                }
+                Some(Ok(Token::Symbol(_))) => {
+                    let Some(Ok(Token::Symbol(field))) = lex.next() else { unreachable!() };
+                    fields.push(field);
+                }
+                _ => return Err(ParseError::unexpected(lex)),
+            }
+        }
+        Ok(Self {
+            name,
+            fields,
+            span: start_span.zip(lex.last_span()).map(|(start, end)| Span::cover(start, end)),
+        })
+    }
 }
 
 impl PartialEq for FunctionDefAst {
@@ -798,10 +880,17 @@ fn parse_not_expression<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<
 
 fn parse_symbol_variable<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
     let Token::Symbol(name) = lex.next().unwrap().unwrap() else { unreachable!() };
-    Ok(Ast::Variable(Ident::spanned(
-        name,
-        lex.last_span().expect("consumed symbol should have a span"),
-    )))
+    let ident = Ident::spanned(name, lex.last_span().expect("consumed symbol should have a span"));
+    if lex.peek() == Some(&Ok(Token::OpenBrace)) {
+        let start_span = ident.span.clone();
+        let fields = parse_struct_literal_fields(lex)?;
+        return Ok(Ast::StructLiteral {
+            type_name: ident,
+            fields,
+            span: start_span.zip(lex.last_span()).map(|(start, end)| Span::cover(start, end)),
+        });
+    }
+    Ok(Ast::Variable(ident))
 }
 
 fn parse_grouped_expression<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
@@ -829,6 +918,34 @@ fn parse_list_literal_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, Parse
         }
     }
     Ok(Ast::ListLiteral(items))
+}
+
+fn parse_struct_literal_fields<'a>(
+    lex: &mut ParseLexer<'a>,
+) -> Result<Vec<StructFieldValueAst>, ParseError<'a>> {
+    assert!(lex.next() == Some(Ok(Token::OpenBrace)));
+    let mut fields = vec![];
+    loop {
+        let next = lex.peek().cloned();
+        let next_next = lex.peek_n(1).cloned();
+        match next {
+            Some(Ok(Token::CloseBrace)) => {
+                lex.next();
+                break;
+            }
+            Some(Ok(Token::Comma)) | Some(Ok(Token::Newline)) | Some(Ok(Token::Indent)) => {
+                lex.next();
+            }
+            Some(Ok(Token::Symbol(_))) if next_next == Some(Ok(Token::ColonBlock)) => {
+                let Some(Ok(Token::Symbol(name))) = lex.next() else { unreachable!() };
+                lex.next();
+                let value = parse_expr(lex, 0)?;
+                fields.push(StructFieldValueAst { name, value });
+            }
+            _ => return Err(ParseError::unexpected(lex)),
+        }
+    }
+    Ok(fields)
 }
 
 fn parse_map_literal_primary<'a>(lex: &mut ParseLexer<'a>) -> Result<Ast, ParseError<'a>> {
@@ -931,6 +1048,20 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                     args,
                 });
             }
+            Some(Ok(Token::OpenBrace)) => {
+                let Ast::Variable(type_name) = lhs else {
+                    break;
+                };
+                let start_span = type_name.span.clone();
+                let fields = parse_struct_literal_fields(lex)?;
+                lhs = Ast::StructLiteral {
+                    type_name,
+                    fields,
+                    span: start_span
+                        .zip(lex.last_span())
+                        .map(|(start, end)| Span::cover(start, end)),
+                };
+            }
             Some(Ok(Token::OpenSquareBracket)) => {
                 let start_span = lex.peek_span();
                 lex.next();
@@ -952,9 +1083,21 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                 let Some(Ok(Token::Symbol(method_name))) = lex.next() else {
                     return Err(ParseError::unexpected(lex));
                 };
-                let method_span =
-                    lex.last_span().expect("consumed method symbol should have a span");
-                if lex.next() != Some(Ok(Token::OpenBracket)) {
+                let field_span =
+                    lex.last_span().expect("consumed field or method symbol should have a span");
+                if lex.peek() != Some(&Ok(Token::OpenBracket)) {
+                    lhs = Ast::FieldAccess {
+                        base: Box::new(lhs),
+                        field: Ident::spanned(method_name, field_span.clone()),
+                        span: start_span
+                            .zip(Some(field_span))
+                            .map(|(start, end)| Span::cover(start, end)),
+                    };
+                    continue;
+                }
+                lex.next();
+                let method_ident = Ident::spanned(method_name, field_span);
+                if lex.last_span().is_none() {
                     return Err(ParseError::unexpected(lex));
                 }
                 let mut args = vec![];
@@ -972,7 +1115,7 @@ fn parse_postfix<'a>(lex: &mut ParseLexer<'a>, mut lhs: Ast) -> Result<Ast, Pars
                 }
                 lhs = Ast::MethodCall {
                     receiver: Box::new(lhs),
-                    method: Ident::spanned(method_name, method_span),
+                    method: method_ident,
                     args,
                     span: start_span
                         .zip(lex.last_span())
@@ -1050,9 +1193,12 @@ fn span_of_map_entries(entries: &[MapEntryAst]) -> Option<Span> {
 fn span_of_ast(ast: &Ast) -> Option<Span> {
     match ast {
         Ast::FunctionDef(func) => func.span.clone(),
+        Ast::StructDef(def) => def.span.clone(),
         Ast::MethodCall { span, .. }
+        | Ast::FieldAccess { span, .. }
         | Ast::Index { span, .. }
         | Ast::IndexAssign { span, .. }
+        | Ast::FieldAssign { span, .. }
         | Ast::Assign { span, .. }
         | Ast::MultiAssign { span, .. }
         | Ast::If { span, .. } => span.clone(),
@@ -1062,6 +1208,9 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
         Ast::Lambda { body, .. } => span_of_ast(body),
         Ast::MultiValue(values) | Ast::ListLiteral(values) => span_of_ast_slice(values),
         Ast::MapLiteral(entries) => span_of_map_entries(entries),
+        Ast::StructLiteral { fields, .. } => {
+            fields.first().and_then(|field| span_of_ast(&field.value))
+        }
         Ast::Literal(_) => None,
     }
 }
@@ -1650,6 +1799,90 @@ fn parse_index_expression() {
     });
 
     assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_struct_declaration() {
+    let text = "struct Person = {name, age}";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let Ast::StructDef(def) = ast else {
+        panic!("expected struct definition");
+    };
+    assert_eq!(def.name, "Person");
+    assert_eq!(def.fields, vec!["name".to_string(), "age".to_string()]);
+}
+
+#[test]
+fn parse_struct_literal() {
+    let text = "fn main() do\n    Person { name: \"Ada\", age: 42 }\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let Ast::FunctionDef(function) = ast else {
+        panic!("expected function definition");
+    };
+    let [Ast::StructLiteral { type_name, fields, .. }] = function.block.lines.as_slice() else {
+        panic!("expected struct literal statement");
+    };
+    assert_eq!(type_name.as_str(), "Person");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].name, "name");
+    assert_eq!(fields[0].value, Ast::Literal(LiteralAst::String("Ada".to_string())));
+    assert_eq!(fields[1].name, "age");
+    assert_eq!(fields[1].value, Ast::Literal(LiteralAst::Integer(42)));
+}
+
+#[test]
+fn parse_field_access() {
+    let text = "fn main() do\n    person.name\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let Ast::FunctionDef(function) = ast else {
+        panic!("expected function definition");
+    };
+    let [Ast::FieldAccess { base, field, .. }] = function.block.lines.as_slice() else {
+        panic!("expected field access statement");
+    };
+    assert_eq!(field.as_str(), "name");
+    assert_eq!(base.as_ref(), &Ast::Variable(Ident::synthetic("person".to_string())));
+}
+
+#[test]
+fn parse_field_assign() {
+    let text = "fn main() do\n    person.name = \"Bob\"\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let Ast::FunctionDef(function) = ast else {
+        panic!("expected function definition");
+    };
+    let [Ast::FieldAssign { base, field, value, .. }] = function.block.lines.as_slice() else {
+        panic!("expected field assignment statement");
+    };
+    assert_eq!(field.as_str(), "name");
+    assert_eq!(base.as_ref(), &Ast::Variable(Ident::synthetic("person".to_string())));
+    assert_eq!(value.as_ref(), &Ast::Literal(LiteralAst::String("Bob".to_string())));
+}
+
+#[test]
+fn parse_method_call_and_field_access_are_distinct() {
+    let text = "fn main() do\n    value.name\n    value.name()\nend";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let Ast::FunctionDef(function) = ast else {
+        panic!("expected function definition");
+    };
+    assert!(matches!(function.block.lines[0], Ast::FieldAccess { .. }));
+    assert!(matches!(function.block.lines[1], Ast::MethodCall { .. }));
 }
 
 #[test]
