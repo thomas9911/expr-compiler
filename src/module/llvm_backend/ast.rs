@@ -129,27 +129,25 @@ impl<'ctx> LlvmCompiler<'ctx> {
                         })
                         .ok_or(crate::methods::MethodResolutionError::UnknownReceiver)
                 })
-                    .or_else(|_| {
-                        let mut candidates = method_target_functions(method.as_str())
-                            .into_iter()
-                            .filter(|function| {
-                                is_builtin_name(function.as_str())
-                                    || stdlib_function(function.as_str()).is_some()
-                                    || self.function_arities.contains_key(function.as_str())
-                            })
-                            .collect::<Vec<_>>();
-                        candidates.sort_unstable();
-                        candidates.dedup();
-                        match candidates.as_slice() {
-                            [function] => Ok(function.clone()),
-                            _ => Err(crate::methods::MethodResolutionError::UnknownReceiver),
-                        }
-                    })
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "method call should have been validated before LLVM codegen: {err:?}"
-                        )
-                    });
+                .or_else(|_| {
+                    let mut candidates = method_target_functions(method.as_str())
+                        .into_iter()
+                        .filter(|function| {
+                            is_builtin_name(function.as_str())
+                                || stdlib_function(function.as_str()).is_some()
+                                || self.function_arities.contains_key(function.as_str())
+                        })
+                        .collect::<Vec<_>>();
+                    candidates.sort_unstable();
+                    candidates.dedup();
+                    match candidates.as_slice() {
+                        [function] => Ok(function.clone()),
+                        _ => Err(crate::methods::MethodResolutionError::UnknownReceiver),
+                    }
+                })
+                .unwrap_or_else(|err| {
+                    panic!("method call should have been validated before LLVM codegen: {err:?}")
+                });
                 let mut resolved_args = Vec::with_capacity(args.len() + 1);
                 resolved_args.push((**receiver).clone());
                 resolved_args.extend(args.iter().cloned());
@@ -203,7 +201,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 current_function_name,
             ),
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
-            Ast::StructDef(_) => self.int_value(self.i64_type.const_zero()),
+            Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {
+                self.int_value(self.i64_type.const_zero())
+            }
         }
     }
 
@@ -1613,6 +1613,9 @@ impl<'ctx> LlvmCompiler<'ctx> {
         if let Some(value) = self.compile_map_named_expression_ast(name, compiled) {
             return value;
         }
+        if let Some(value) = self.compile_ffi_named_expression_ast(name, compiled) {
+            return value;
+        }
         self.compile_fallback_named_expression_ast(
             name,
             compiled,
@@ -1868,6 +1871,32 @@ impl<'ctx> LlvmCompiler<'ctx> {
         }
     }
 
+    fn compile_ffi_named_expression_ast(
+        &self,
+        name: &str,
+        compiled: &[CompiledValue<'ctx>],
+    ) -> Option<CompiledValue<'ctx>> {
+        match name {
+            "ffi_null" => Some(self.int_value(self.i64_type.const_zero())),
+            "ffi_ptr_from_int" | "ffi_int_from_c_int" | "ffi_int_from_c_size" => {
+                let raw = self.build_internal_scalar_call(
+                    self.require_func("__value_to_i64"),
+                    &[compiled[0]],
+                    name,
+                );
+                Some(self.int_value(raw))
+            }
+            "ffi_string" => Some(self.build_ffi_string(compiled[0], "ffi_string")),
+            "ffi_c_string_len" => {
+                Some(self.build_ffi_c_string_len(compiled[0], "ffi_c_string_len"))
+            }
+            "ffi_c_string_to_string" => {
+                Some(self.build_ffi_c_string_to_string(compiled[0], "ffi_c_string_to_string"))
+            }
+            _ => None,
+        }
+    }
+
     fn compile_list_len_named_expression_ast(
         &self,
         args: &[Ast],
@@ -1933,8 +1962,60 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 name,
             );
         }
+        if let Some(extern_def) = self.extern_functions.get(name) {
+            return self.build_extern_c_call(extern_def, compiled, name);
+        }
         let callee = self.require_func(name);
         self.build_internal_call(callee, compiled, name)
+    }
+
+    fn build_extern_c_call(
+        &self,
+        extern_def: &crate::parser::ExternFunctionDefAst,
+        compiled: &[CompiledValue<'ctx>],
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let callee = self.require_func(&extern_def.name);
+        let mut args = Vec::with_capacity(compiled.len());
+        for (arg, input) in compiled.iter().zip(&extern_def.inputs) {
+            let raw = self.build_internal_scalar_call(
+                self.require_func("__value_to_i64"),
+                &[*arg],
+                &format!("{label}_raw"),
+            );
+            let coerced = match input.abi_type {
+                crate::parser::ExternAbiTypeAst::CInt => self
+                    .builder
+                    .build_int_truncate(raw, self.context.i32_type(), &format!("{label}_i32"))
+                    .expect("failed to truncate extern c_int argument")
+                    .into(),
+                crate::parser::ExternAbiTypeAst::CI64
+                | crate::parser::ExternAbiTypeAst::CU64
+                | crate::parser::ExternAbiTypeAst::CSize
+                | crate::parser::ExternAbiTypeAst::CPtr
+                | crate::parser::ExternAbiTypeAst::CVoid => raw.into(),
+            };
+            args.push(coerced);
+        }
+        let raw = self
+            .builder
+            .build_call(callee, &args, label)
+            .expect("failed to build extern c call")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let boxed = match extern_def.output {
+            crate::parser::ExternAbiTypeAst::CInt => self
+                .builder
+                .build_int_s_extend(raw, self.i64_type, &format!("{label}_sext"))
+                .expect("failed to sign-extend extern c_int result"),
+            crate::parser::ExternAbiTypeAst::CI64
+            | crate::parser::ExternAbiTypeAst::CU64
+            | crate::parser::ExternAbiTypeAst::CSize
+            | crate::parser::ExternAbiTypeAst::CPtr
+            | crate::parser::ExternAbiTypeAst::CVoid => raw,
+        };
+        self.int_value(boxed)
     }
 
     fn compile_block_ast(

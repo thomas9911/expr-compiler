@@ -3,7 +3,9 @@ use super::{
     infer_ast_value_shape, is_builtin_name, local_var_names, shape_is_exact_kind,
 };
 use crate::analysis::{FunctionValueKindAnalysis, KindSet, ModuleValueKindAnalysis};
-use crate::parser::{Ast, ExpressionAst, FunctionDefAst, LiteralAst};
+use crate::parser::{
+    Ast, ExpressionAst, ExternAbiTypeAst, ExternFunctionDefAst, FunctionDefAst, LiteralAst,
+};
 use crate::value::{
     BIGINT_HEADER_SIZE, BIGINT_LIMB_SIZE, CLOSURE_SIZE, MULTI_HEADER_SIZE, STRING_HEADER_SIZE,
     STRING_ITER_HEADER_SIZE, STRUCT_FIELD_COUNT_OFFSET, STRUCT_FIELDS_PTR_OFFSET,
@@ -120,7 +122,13 @@ pub(super) fn compile_to_jit(expr_module: Module) -> Result<LlvmJitModule, Compi
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
         compiler.value_kind_analysis = value_kind_analysis.clone();
+        compiler.extern_functions = expr_module
+            .extern_functions
+            .iter()
+            .map(|def| (def.name.clone(), def.clone()))
+            .collect();
         compiler.declare_runtime_functions();
+        compiler.declare_extern_functions(&expr_module.extern_functions);
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Jit);
         compiler.define_user_functions(&expr_module.functions);
         compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::Jit);
@@ -133,7 +141,7 @@ pub(super) fn compile_to_jit(expr_module: Module) -> Result<LlvmJitModule, Compi
         module.create_jit_execution_engine(OptimizationLevel::None).map_err(|e| {
             CompileError::Toolchain(format!("failed to create LLVM execution engine: {e}"))
         })?;
-    install_runtime_mappings(&functions, &execution_engine);
+    install_runtime_mappings(&functions, &execution_engine, &expr_module.extern_functions)?;
 
     Ok(LlvmJitModule {
         _context: context,
@@ -161,7 +169,13 @@ pub(super) fn compile_to_object(expr_module: Module, name: &str) -> Result<Vec<u
         compiler.function_arities = function_arities(&expr_module.functions);
         compiler.closure_metadata = expr_module.closure_metadata.clone();
         compiler.value_kind_analysis = value_kind_analysis;
+        compiler.extern_functions = expr_module
+            .extern_functions
+            .iter()
+            .map(|def| (def.name.clone(), def.clone()))
+            .collect();
         compiler.declare_runtime_functions();
+        compiler.declare_extern_functions(&expr_module.extern_functions);
         compiler.declare_user_functions(&expr_module.functions, LlvmOutputMode::Executable);
         compiler.define_user_functions(&expr_module.functions);
         compiler.define_int_result_wrappers(&expr_module.functions, LlvmOutputMode::Executable);
@@ -179,6 +193,9 @@ pub(super) fn compile_to_wasm_assembly(
     expr_module: Module,
     name: &str,
 ) -> Result<Vec<u8>, CompileError> {
+    if !expr_module.extern_functions.is_empty() {
+        return Err(CompileError::UnsupportedFeature("extern c functions in wasm output"));
+    }
     Target::initialize_webassembly(&InitializationConfig::default());
     let value_kind_analysis = expr_module.analyze_value_kinds()?;
     let needs_argv_list =
@@ -214,6 +231,11 @@ pub(super) fn compile_to_wasm_preview1_command_assembly(
     expr_module: Module,
     name: &str,
 ) -> Result<Vec<u8>, CompileError> {
+    if !expr_module.extern_functions.is_empty() {
+        return Err(CompileError::UnsupportedFeature(
+            "extern c functions in wasi component output",
+        ));
+    }
     Target::initialize_webassembly(&InitializationConfig::default());
     let value_kind_analysis = expr_module.analyze_value_kinds()?;
     let needs_argv_list =
@@ -293,6 +315,7 @@ struct LlvmCompiler<'ctx> {
     function_arities: HashMap<String, usize>,
     closure_metadata: HashMap<String, ClosureMetadata>,
     value_kind_analysis: ModuleValueKindAnalysis,
+    extern_functions: HashMap<String, ExternFunctionDefAst>,
 }
 
 #[derive(Clone, Copy)]
@@ -332,6 +355,7 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 functions: HashMap::new(),
                 structs: HashMap::new(),
             },
+            extern_functions: HashMap::new(),
         }
     }
 
@@ -587,6 +611,22 @@ impl<'ctx> LlvmCompiler<'ctx> {
                 Some(Linkage::Private),
             );
             self.functions.insert(func.name.clone(), internal);
+        }
+    }
+
+    fn declare_extern_functions(&mut self, extern_functions: &[ExternFunctionDefAst]) {
+        for func in extern_functions {
+            let params = func
+                .inputs
+                .iter()
+                .map(|input| llvm_extern_abi_type(self.context, input.abi_type).into())
+                .collect::<Vec<_>>();
+            let function = self.module.add_function(
+                &func.name,
+                llvm_extern_abi_type(self.context, func.output).fn_type(&params, false),
+                Some(Linkage::External),
+            );
+            self.functions.insert(func.name.clone(), function);
         }
     }
 
@@ -3032,6 +3072,20 @@ fn internal_symbol_name(name: &str) -> String {
     format!("__expr_internal_{name}")
 }
 
+fn llvm_extern_abi_type<'ctx>(
+    context: &'ctx Context,
+    abi: ExternAbiTypeAst,
+) -> inkwell::types::IntType<'ctx> {
+    match abi {
+        ExternAbiTypeAst::CInt => context.i32_type(),
+        ExternAbiTypeAst::CI64
+        | ExternAbiTypeAst::CU64
+        | ExternAbiTypeAst::CSize
+        | ExternAbiTypeAst::CPtr
+        | ExternAbiTypeAst::CVoid => context.i64_type(),
+    }
+}
+
 fn int_result_symbol_name(name: &str, mode: LlvmOutputMode) -> String {
     if name == "main" && matches!(mode, LlvmOutputMode::Executable) {
         #[cfg(windows)]
@@ -3059,7 +3113,8 @@ fn int_result_symbol_name(name: &str, mode: LlvmOutputMode) -> String {
 fn install_runtime_mappings<'ctx>(
     functions: &HashMap<String, FunctionValue<'ctx>>,
     execution_engine: &ExecutionEngine<'ctx>,
-) {
+    extern_functions: &[ExternFunctionDefAst],
+) -> Result<(), CompileError> {
     let mappings = [
         ("print", crate::runtime::__expr_print_host as *const () as usize),
         ("list_print", crate::runtime::__expr_list_print_host as *const () as usize),
@@ -3072,4 +3127,17 @@ fn install_runtime_mappings<'ctx>(
             functions.get(name).unwrap_or_else(|| panic!("missing function declaration: {name}"));
         execution_engine.add_global_mapping(function, addr);
     }
+    for extern_func in extern_functions {
+        let Some(addr) = crate::runtime::jit_lookup_symbol(&extern_func.name) else {
+            return Err(CompileError::Toolchain(format!(
+                "unable to resolve extern c symbol `{}` for LLVM JIT",
+                extern_func.name
+            )));
+        };
+        let function = functions
+            .get(&extern_func.name)
+            .unwrap_or_else(|| panic!("missing extern function declaration: {}", extern_func.name));
+        execution_engine.add_global_mapping(function, addr as usize);
+    }
+    Ok(())
 }

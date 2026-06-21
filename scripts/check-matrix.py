@@ -16,6 +16,7 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
 MAX_NATIVE_BINARY_SIZE = 64 * 1024
+MAX_FFI_NATIVE_BINARY_SIZE = 128 * 1024
 EXAMPLE_RUN_ARGS: dict[str, list[str]] = {
     "args": ["hello", "world"],
     "calculator": ["*", "12345678901234567890", "12345678901234567890"],
@@ -322,11 +323,28 @@ def compare_to_baseline(
     return (True, "")
 
 
-def check_binary_size(size: int) -> tuple[bool, str]:
-    if size > MAX_NATIVE_BINARY_SIZE:
+def native_binary_size_limit(example: Path) -> int:
+    if example.stem.startswith("ffi_"):
+        return MAX_FFI_NATIVE_BINARY_SIZE
+    return MAX_NATIVE_BINARY_SIZE
+
+
+def is_ffi_example(example: Path) -> bool:
+    return example.stem.startswith("ffi_")
+
+
+def baseline_mode_for_example(example: Path, modes: list[str]) -> str:
+    if is_ffi_example(example) and "cranelift-native" in modes:
+        return "cranelift-native"
+    return "cranelift-jit"
+
+
+def check_binary_size(example: Path, size: int) -> tuple[bool, str]:
+    limit = native_binary_size_limit(example)
+    if size > limit:
         return (
             False,
-            f"binary size {size} exceeds limit {MAX_NATIVE_BINARY_SIZE}",
+            f"binary size {size} exceeds limit {limit}",
         )
     return (True, "")
 
@@ -530,11 +548,20 @@ def main() -> int:
     try:
         for example in examples:
             example_results: list[RunResult] = []
-            baseline = run_cranelift_jit(
-                cranelift_compiler, example, cranelift_build_env
-            )
+            baseline_mode = baseline_mode_for_example(example, args.modes)
+            if baseline_mode == "cranelift-native":
+                baseline, baseline_size = run_cranelift_native(
+                    cranelift_compiler, example, temp_dir, cranelift_build_env
+                )
+            elif baseline_mode == "cranelift-jit":
+                baseline = run_cranelift_jit(
+                    cranelift_compiler, example, cranelift_build_env
+                )
+                baseline_size = None
+            else:
+                raise AssertionError(f"unsupported baseline mode: {baseline_mode}")
             baseline_stdout = normalize_output(baseline.stdout)
-            baseline_name = f"{example.stem}:cranelift-jit"
+            baseline_name = f"{example.stem}:{baseline_mode}"
             baseline_result = RunResult(
                 example=example.stem,
                 name=baseline_name,
@@ -542,11 +569,16 @@ def main() -> int:
                 returncode=baseline.returncode,
                 stdout=baseline.stdout,
                 stderr=baseline.stderr,
+                binary_size=baseline_size if baseline.returncode == 0 else None,
             )
             example_results.append(baseline_result)
 
             for mode in args.modes:
-                if mode == "cranelift-jit":
+                if mode == baseline_mode:
+                    continue
+                if is_ffi_example(example) and mode == "cranelift-jit":
+                    continue
+                if is_ffi_example(example) and mode in {"llvm-wasm", "llvm-component"}:
                     continue
 
                 name = f"{example.stem}:{mode}"
@@ -560,7 +592,7 @@ def main() -> int:
                         baseline_returncode=baseline.returncode,
                     )
                     if ok and proc.returncode == 0:
-                        ok, detail = check_binary_size(size)
+                        ok, detail = check_binary_size(example, size)
                     result = RunResult(
                         example=example.stem,
                         name=name,
@@ -622,7 +654,7 @@ def main() -> int:
                         baseline_returncode=baseline.returncode,
                     )
                     if ok and proc.returncode == 0:
-                        ok, detail = check_binary_size(size)
+                        ok, detail = check_binary_size(example, size)
                     result = RunResult(
                         example=example.stem,
                         name=name,

@@ -1,0 +1,11 @@
+extern c fn strlen(text: c_ptr) -> c_size
+
+fn main() do
+    print(strlen(ffi_string("hello")))
+    print(strlen(ffi_string("expr-compiler")))
+    print(ffi_c_string_to_string(ffi_string("roundtrip")))
+    print(bytes_len(ffi_c_string_to_string(ffi_null())))
+    print(ffi_c_string_len(ffi_string("length")))
+    print(ffi_c_string_len(ffi_null()))
+    0
+end

@@ -165,6 +165,36 @@ pub struct StructDefAst {
     pub span: Option<Span>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternAbiTypeAst {
+    CInt,
+    CI64,
+    CU64,
+    CSize,
+    CPtr,
+    CVoid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternFunctionInputAst {
+    pub name: String,
+    pub abi_type: ExternAbiTypeAst,
+}
+
+#[derive(Debug, Clone, Eq)]
+pub struct ExternFunctionDefAst {
+    pub name: String,
+    pub inputs: Vec<ExternFunctionInputAst>,
+    pub output: ExternAbiTypeAst,
+    pub span: Option<Span>,
+}
+
+impl PartialEq for ExternFunctionDefAst {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.inputs == other.inputs && self.output == other.output
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructFieldValueAst {
     pub name: String,
@@ -176,6 +206,7 @@ pub enum Ast {
     Block(BlockAst),
     FunctionDef(FunctionDefAst),
     StructDef(StructDefAst),
+    ExternFunctionDef(ExternFunctionDefAst),
     Lambda { inputs: Vec<String>, body: Box<Ast> },
     FunctionRef(Ident),
     MethodCall { receiver: Box<Ast>, method: Ident, args: Vec<Ast>, span: Option<Span> },
@@ -201,6 +232,7 @@ impl PartialEq for Ast {
             (Ast::Block(a), Ast::Block(b)) => a == b,
             (Ast::FunctionDef(a), Ast::FunctionDef(b)) => a == b,
             (Ast::StructDef(a), Ast::StructDef(b)) => a == b,
+            (Ast::ExternFunctionDef(a), Ast::ExternFunctionDef(b)) => a == b,
             (
                 Ast::Lambda { inputs: a_inputs, body: a_body },
                 Ast::Lambda { inputs: b_inputs, body: b_body },
@@ -535,6 +567,9 @@ impl Ast {
 
         match lex.peek() {
             Some(&Ok(Token::DefineStruct)) => Ok(Ast::StructDef(StructDefAst::from_lexer(lex)?)),
+            Some(&Ok(Token::Extern)) => {
+                Ok(Ast::ExternFunctionDef(ExternFunctionDefAst::from_lexer(lex)?))
+            }
             Some(&Ok(Token::DefineFunction)) => {
                 if is_lambda_start(lex) {
                     parse_expr(lex, 0)
@@ -622,6 +657,74 @@ impl StructDefAst {
         Ok(Self {
             name,
             fields,
+            span: start_span.zip(lex.last_span()).map(|(start, end)| Span::cover(start, end)),
+        })
+    }
+}
+
+fn parse_extern_abi_type<'a>(lex: &mut ParseLexer<'a>) -> Result<ExternAbiTypeAst, ParseError<'a>> {
+    match lex.next() {
+        Some(Ok(Token::Symbol(name))) => match name.as_str() {
+            "c_int" => Ok(ExternAbiTypeAst::CInt),
+            "c_i64" => Ok(ExternAbiTypeAst::CI64),
+            "c_u64" => Ok(ExternAbiTypeAst::CU64),
+            "c_size" => Ok(ExternAbiTypeAst::CSize),
+            "c_ptr" => Ok(ExternAbiTypeAst::CPtr),
+            "c_void" => Ok(ExternAbiTypeAst::CVoid),
+            _ => Err(ParseError::unexpected(lex)),
+        },
+        _ => Err(ParseError::unexpected(lex)),
+    }
+}
+
+impl ExternFunctionDefAst {
+    pub fn from_lexer<'a>(lex: &mut ParseLexer<'a>) -> Result<Self, ParseError<'a>> {
+        assert!(lex.next() == Some(Ok(Token::Extern)));
+        let start_span = lex.last_span();
+        let Some(Ok(Token::Symbol(c_abi))) = lex.next() else {
+            return Err(ParseError::unexpected(lex));
+        };
+        if c_abi != "c" {
+            return Err(ParseError::unexpected(lex));
+        }
+        if lex.next() != Some(Ok(Token::DefineFunction)) {
+            return Err(ParseError::unexpected(lex));
+        }
+        let Some(Ok(Token::Symbol(name))) = lex.next() else {
+            return Err(ParseError::unexpected(lex));
+        };
+        if lex.next() != Some(Ok(Token::OpenBracket)) {
+            return Err(ParseError::unexpected(lex));
+        }
+        let mut inputs = vec![];
+        loop {
+            match lex.peek() {
+                Some(Ok(Token::CloseBracket)) => {
+                    lex.next();
+                    break;
+                }
+                Some(Ok(Token::Comma)) => {
+                    lex.next();
+                }
+                Some(Ok(Token::Symbol(_))) => {
+                    let Some(Ok(Token::Symbol(input_name))) = lex.next() else { unreachable!() };
+                    if lex.next() != Some(Ok(Token::ColonBlock)) {
+                        return Err(ParseError::unexpected(lex));
+                    }
+                    let abi_type = parse_extern_abi_type(lex)?;
+                    inputs.push(ExternFunctionInputAst { name: input_name, abi_type });
+                }
+                _ => return Err(ParseError::unexpected(lex)),
+            }
+        }
+        if lex.next() != Some(Ok(Token::Arrow)) {
+            return Err(ParseError::unexpected(lex));
+        }
+        let output = parse_extern_abi_type(lex)?;
+        Ok(Self {
+            name,
+            inputs,
+            output,
             span: start_span.zip(lex.last_span()).map(|(start, end)| Span::cover(start, end)),
         })
     }
@@ -1194,6 +1297,7 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
     match ast {
         Ast::FunctionDef(func) => func.span.clone(),
         Ast::StructDef(def) => def.span.clone(),
+        Ast::ExternFunctionDef(def) => def.span.clone(),
         Ast::MethodCall { span, .. }
         | Ast::FieldAccess { span, .. }
         | Ast::Index { span, .. }
@@ -1297,6 +1401,28 @@ fn main():
                 ],
             })],
         },
+        span: None,
+    });
+
+    assert_eq!(ast, expected);
+}
+
+#[test]
+fn parse_extern_c_function_decl() {
+    use Ast::*;
+
+    let text = "extern c fn puts(text: c_ptr) -> c_int";
+    let lex = tokenizer::Token::lexer(text);
+    let mut lexer = ParseLexer::new(lex);
+    let ast = Ast::from_lexer(&mut lexer).unwrap();
+
+    let expected = ExternFunctionDef(ExternFunctionDefAst {
+        name: "puts".to_string(),
+        inputs: vec![ExternFunctionInputAst {
+            name: "text".to_string(),
+            abi_type: ExternAbiTypeAst::CPtr,
+        }],
+        output: ExternAbiTypeAst::CInt,
         span: None,
     });
 

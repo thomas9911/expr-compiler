@@ -149,6 +149,8 @@ pub enum Token {
     Assign,
     #[token("fn")]
     DefineFunction,
+    #[token("extern")]
+    Extern,
     #[token("struct")]
     DefineStruct,
     #[token("if")]
@@ -247,6 +249,31 @@ fn main():
     assert_eq!(result.unwrap(), expected);
 
     // Both block styles are currently accepted: `do ... end` and `: + indentation`.
+}
+
+#[test]
+fn tokenize_extern_c_function() {
+    use Token::*;
+
+    let result: Result<Vec<_>, _> =
+        Token::lexer("extern c fn puts(text: c_ptr) -> c_int").collect();
+
+    assert_eq!(
+        result.unwrap(),
+        vec![
+            Extern,
+            Symbol("c".to_string()),
+            DefineFunction,
+            Symbol("puts".to_string()),
+            OpenBracket,
+            Symbol("text".to_string()),
+            ColonBlock,
+            Symbol("c_ptr".to_string()),
+            CloseBracket,
+            Arrow,
+            Symbol("c_int".to_string()),
+        ]
+    );
 }
 
 #[test]

@@ -338,10 +338,8 @@ pub fn analyze_module_value_kinds(
     structs: &[StructDefAst],
     function_return_arities: &HashMap<String, usize>,
 ) -> ModuleValueKindAnalysis {
-    let struct_fields = structs
-        .iter()
-        .map(|def| (def.name.clone(), def.fields.clone()))
-        .collect::<HashMap<_, _>>();
+    let struct_fields =
+        structs.iter().map(|def| (def.name.clone(), def.fields.clone())).collect::<HashMap<_, _>>();
     let mut summaries = function_return_arities
         .iter()
         .map(|(name, arity)| {
@@ -514,7 +512,9 @@ fn infer_ast(
 ) -> ValueShape {
     match ast {
         Ast::Block(block) => infer_block(block, env, function_bindings, summaries, calls),
-        Ast::FunctionDef(_) | Ast::StructDef(_) => ValueShape::unknown_scalar(),
+        Ast::FunctionDef(_) | Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {
+            ValueShape::unknown_scalar()
+        }
         Ast::Lambda { .. } | Ast::FunctionRef(_) => ValueShape::scalar(KindSet::function()),
         Ast::MethodCall { receiver, method, args, .. } => {
             let receiver_shape = infer_ast(receiver, env, function_bindings, summaries, calls);
@@ -1010,6 +1010,19 @@ fn builtin_numeric_shape(name: &str, args: &[ValueShape]) -> Option<ValueShape> 
     }
 }
 
+fn builtin_ffi_shape(name: &str) -> Option<ValueShape> {
+    match name {
+        "ffi_null"
+        | "ffi_ptr_from_int"
+        | "ffi_int_from_c_int"
+        | "ffi_int_from_c_size"
+        | "ffi_string" => Some(ValueShape::scalar(KindSet::int())),
+        "ffi_c_string_len" => Some(ValueShape::scalar(KindSet::int())),
+        "ffi_c_string_to_string" => Some(ValueShape::scalar(KindSet::string())),
+        _ => None,
+    }
+}
+
 fn builtin_string_shape(name: &str) -> Option<ValueShape> {
     match name {
         "string_concat"
@@ -1100,6 +1113,7 @@ fn builtin_map_shape(name: &str, args: &[ValueShape]) -> Option<ValueShape> {
 
 fn builtin_shape(name: &str, args: &[ValueShape]) -> ValueShape {
     builtin_boolean_shape(name)
+        .or_else(|| builtin_ffi_shape(name))
         .or_else(|| builtin_numeric_shape(name, args))
         .or_else(|| builtin_string_shape(name))
         .or_else(|| builtin_list_shape(name, args))
@@ -1405,10 +1419,8 @@ mod tests {
         let src = "struct Address = {city}\n\nfn Address_first_character(address) do\n    address.city.first()\nend\n\nfn main() do\n    address = Address { city: \"London\" }\n    address.first_character()\nend";
         let module = Module::try_from_source(src).expect("source should parse");
         let analysis = module.analyze_value_kinds().expect("analysis should succeed");
-        let helper = analysis
-            .functions
-            .get("Address_first_character")
-            .expect("helper analysis missing");
+        let helper =
+            analysis.functions.get("Address_first_character").expect("helper analysis missing");
         assert_eq!(
             helper.variables.get("address"),
             Some(&ValueShape::struct_(

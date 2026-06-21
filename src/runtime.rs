@@ -236,6 +236,57 @@ pub fn build_argv_list_value(args: &[String]) -> (i64, i64) {
     (value.tag as i64, value.payload)
 }
 
+#[cfg(unix)]
+pub fn jit_lookup_symbol(name: &str) -> Option<*const u8> {
+    use std::ffi::CString;
+    use std::ffi::{c_char, c_void};
+
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    let symbol = CString::new(name).ok()?;
+    let addr = unsafe { dlsym((-2isize) as *mut c_void, symbol.as_ptr()) };
+    (!addr.is_null()).then_some(addr as *const u8)
+}
+
+#[cfg(windows)]
+pub fn jit_lookup_symbol(name: &str) -> Option<*const u8> {
+    use std::ffi::CString;
+    use std::ffi::c_void;
+
+    unsafe extern "system" {
+        fn GetModuleHandleA(name: *const u8) -> *mut c_void;
+        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+
+    let symbol = CString::new(name).ok()?;
+    let module_names = [None, Some("ucrtbase.dll"), Some("msvcrt.dll")];
+    for module_name in module_names {
+        let module = match module_name {
+            None => unsafe { GetModuleHandleA(std::ptr::null()) },
+            Some(name) => {
+                let Ok(c_name) = CString::new(name) else { continue };
+                let loaded = unsafe { GetModuleHandleA(c_name.as_ptr() as *const u8) };
+                if loaded.is_null() {
+                    unsafe { LoadLibraryA(c_name.as_ptr() as *const u8) }
+                } else {
+                    loaded
+                }
+            }
+        };
+        if module.is_null() {
+            continue;
+        }
+        let addr = unsafe { GetProcAddress(module, symbol.as_ptr() as *const u8) };
+        if !addr.is_null() {
+            return Some(addr as *const u8);
+        }
+    }
+    None
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __expr_runtime_oom_host() -> i64 {
     runtime_trap("out of arena memory");

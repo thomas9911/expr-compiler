@@ -1,6 +1,182 @@
 use super::*;
 
 impl<'ctx> LlvmCompiler<'ctx> {
+    pub(super) fn build_ffi_string(
+        &self,
+        string_value: CompiledValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let ok_block = self.context.append_basic_block(function, &format!("{label}_ok"));
+        let trap_block = self.context.append_basic_block(function, &format!("{label}_trap"));
+        let raw = self.expect_tag_payload(string_value, TAG_STRING, label, ok_block, trap_block);
+        self.builder.position_at_end(ok_block);
+        let len = self.build_string_len_load(raw, &format!("{label}_len"));
+        let src_ptr = self.build_string_ptr_load(raw, &format!("{label}_src"));
+        let total_len = self
+            .builder
+            .build_int_add(len, self.i64_type.const_int(1, false), &format!("{label}_total_len"))
+            .expect("failed to add ffi string terminator");
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let data_raw = self.build_boxed_call(alloc, &[total_len, align], &format!("{label}_data"));
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                data_raw,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_data_ptr"),
+            )
+            .expect("failed to convert ffi string ptr");
+        self.build_copy_bytes_loop(src_ptr, data_ptr, len, function, &format!("{label}_copy"));
+        let nul_addr = self
+            .builder
+            .build_int_add(data_raw, len, &format!("{label}_nul_addr"))
+            .expect("failed to compute ffi nul addr");
+        let nul_ptr = self
+            .builder
+            .build_int_to_ptr(
+                nul_addr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_nul_ptr"),
+            )
+            .expect("failed to convert ffi nul ptr");
+        self.builder
+            .build_store(nul_ptr, self.context.i8_type().const_zero())
+            .expect("failed to store ffi nul terminator");
+        let done_block = self.builder.get_insert_block().unwrap();
+        self.builder.position_at_end(trap_block);
+        self.build_trap_and_unreachable();
+        self.builder.position_at_end(done_block);
+        self.int_value(data_raw)
+    }
+
+    pub(super) fn build_ffi_c_string_to_string(
+        &self,
+        ptr_value: CompiledValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let raw_ptr = self.build_internal_scalar_call(
+            self.require_func("__value_to_i64"),
+            &[ptr_value],
+            &format!("{label}_raw"),
+        );
+        let len = self.build_ffi_c_string_len_raw(raw_ptr, &format!("{label}_len"));
+        let alloc = self.require_func("__alloc");
+        let align = self.i64_type.const_int(8, false);
+        let data_raw = self.build_boxed_call(alloc, &[len, align], &format!("{label}_data"));
+        let data_ptr = self
+            .builder
+            .build_int_to_ptr(
+                data_raw,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_data_ptr"),
+            )
+            .expect("failed ffi c string data ptr");
+        let src_ptr = self
+            .builder
+            .build_int_to_ptr(
+                raw_ptr,
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_src_ptr"),
+            )
+            .expect("failed ffi c string src ptr");
+        self.build_copy_bytes_loop(src_ptr, data_ptr, len, function, &format!("{label}_copy"));
+        self.build_string_header_from_parts(data_ptr, len, label)
+    }
+
+    pub(super) fn build_ffi_c_string_len(
+        &self,
+        ptr_value: CompiledValue<'ctx>,
+        label: &str,
+    ) -> CompiledValue<'ctx> {
+        let raw_ptr = self.build_internal_scalar_call(
+            self.require_func("__value_to_i64"),
+            &[ptr_value],
+            &format!("{label}_raw"),
+        );
+        self.int_value(self.build_ffi_c_string_len_raw(raw_ptr, label))
+    }
+
+    fn build_ffi_c_string_len_raw(&self, raw_ptr: IntValue<'ctx>, label: &str) -> IntValue<'ctx> {
+        let function = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let null_block = self.context.append_basic_block(function, &format!("{label}_null"));
+        let scan_block = self.context.append_basic_block(function, &format!("{label}_scan"));
+        let body_block = self.context.append_basic_block(function, &format!("{label}_body"));
+        let done_block = self.context.append_basic_block(function, &format!("{label}_done"));
+        let is_null = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                raw_ptr,
+                self.i64_type.const_zero(),
+                &format!("{label}_is_null"),
+            )
+            .expect("failed ffi c string null check");
+        let entry_block = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_conditional_branch(is_null, null_block, scan_block)
+            .expect("failed ffi c string null branch");
+
+        self.builder.position_at_end(null_block);
+        self.builder.build_unconditional_branch(done_block).expect("failed ffi c string null jump");
+        let null_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(scan_block);
+        let idx_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_idx"))
+            .expect("failed ffi c string idx phi");
+        idx_phi.add_incoming(&[(&self.i64_type.const_zero(), entry_block)]);
+        let idx = idx_phi.as_basic_value().into_int_value();
+        let byte_ptr = self
+            .builder
+            .build_int_to_ptr(
+                self.builder
+                    .build_int_add(raw_ptr, idx, &format!("{label}_byte_addr"))
+                    .expect("failed ffi c string byte addr"),
+                self.context.ptr_type(Default::default()),
+                &format!("{label}_byte_ptr"),
+            )
+            .expect("failed ffi c string byte ptr");
+        let byte = self
+            .builder
+            .build_load(self.context.i8_type(), byte_ptr, &format!("{label}_byte"))
+            .expect("failed ffi c string byte load")
+            .into_int_value();
+        let is_end = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                byte,
+                self.context.i8_type().const_zero(),
+                &format!("{label}_is_end"),
+            )
+            .expect("failed ffi c string terminator check");
+        self.builder
+            .build_conditional_branch(is_end, done_block, body_block)
+            .expect("failed ffi c string scan branch");
+        let scan_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(body_block);
+        let next_idx = self
+            .builder
+            .build_int_add(idx, self.i64_type.const_int(1, false), &format!("{label}_next"))
+            .expect("failed ffi c string next idx");
+        self.builder.build_unconditional_branch(scan_block).expect("failed ffi c string scan loop");
+        let body_end = self.builder.get_insert_block().unwrap();
+        idx_phi.add_incoming(&[(&next_idx, body_end)]);
+
+        self.builder.position_at_end(done_block);
+        let len_phi = self
+            .builder
+            .build_phi(self.i64_type, &format!("{label}_len"))
+            .expect("failed ffi c string len phi");
+        len_phi.add_incoming(&[(&self.i64_type.const_zero(), null_end), (&idx, scan_end)]);
+        len_phi.as_basic_value().into_int_value()
+    }
+
     pub(super) fn build_string_literal(&self, bytes: &[u8], label: &str) -> CompiledValue<'ctx> {
         let alloc = self.require_func("__alloc");
         let len = self.i64_type.const_int(bytes.len() as u64, false);

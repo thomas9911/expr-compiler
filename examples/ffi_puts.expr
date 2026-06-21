@@ -1,0 +1,7 @@
+extern c fn puts(text: c_ptr) -> c_int
+
+fn main() do
+    puts(ffi_string("hello from puts"))
+    puts(ffi_string("ffi side effects work"))
+    0
+end

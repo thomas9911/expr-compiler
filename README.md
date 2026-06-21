@@ -18,6 +18,67 @@ Current execution paths:
 - LLVM `wasi:cli/command` component output
 - IR/codegen inspection paths
 
+## C FFI
+
+There is now a narrow native/JIT C FFI surface.
+
+Current declaration syntax:
+
+```text
+extern c fn strlen(text: c_ptr) -> c_size
+```
+
+Current explicit helper surface:
+
+- `ffi_null()`
+- `ffi_ptr_from_int(x)`
+- `ffi_int_from_c_int(x)`
+- `ffi_int_from_c_size(x)`
+- `ffi_string(s)`
+- `ffi_c_string_len(ptr)`
+- `ffi_c_string_to_string(ptr)`
+
+Current behavior:
+
+- extern C functions are supported on native/JIT paths
+- the current ABI types are:
+  - `c_int`
+  - `c_i64`
+  - `c_u64`
+  - `c_size`
+  - `c_ptr`
+- `c_void` is not supported yet
+- extern calls currently box their return value back as an expr `Int`
+- `ffi_string(s)` allocates a NUL-terminated byte buffer in the arena and returns its pointer as an `Int`
+- `ffi_c_string_len(ptr)` scans a NUL-terminated C string and returns its byte length as an expr `Int`
+- `ffi_c_string_to_string(ptr)` copies a NUL-terminated C string into a normal expr `String`
+- `ffi_c_string_len(ffi_null())` returns `0`
+- `ffi_c_string_to_string(ffi_null())` returns `""`
+- externs are not first-class function values
+- wasm/component output does not support `extern c fn`
+
+Minimal example:
+
+```text
+extern c fn strlen(text: c_ptr) -> c_size
+
+fn main() do
+    print(strlen(ffi_string("hello")))
+    0
+end
+```
+
+Side-effecting example:
+
+```text
+extern c fn puts(text: c_ptr) -> c_int
+
+fn main() do
+    puts(ffi_string("hello from puts"))
+    0
+end
+```
+
 ## Runtime model
 
 The current runtime value model is:

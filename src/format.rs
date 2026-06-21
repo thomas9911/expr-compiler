@@ -1,7 +1,7 @@
 use crate::module::CompileError;
 use crate::parser::{
-    Ast, BlockAst, ExpressionAst, FunctionDefAst, LiteralAst, MapEntryAst, MapKeyAst, ParseLexer,
-    StructDefAst, StructFieldValueAst,
+    Ast, BlockAst, ExpressionAst, ExternAbiTypeAst, ExternFunctionDefAst, FunctionDefAst,
+    LiteralAst, MapEntryAst, MapKeyAst, ParseLexer, StructDefAst, StructFieldValueAst,
 };
 use crate::source::{Span, offset_to_line_col};
 use crate::tokenizer::{Logos, Token};
@@ -145,6 +145,7 @@ impl<'a> AstFormatter<'a> {
         match ast {
             Ast::FunctionDef(func) => func.span.as_ref().map(|span| self.line_of_span(span)),
             Ast::StructDef(def) => def.span.as_ref().map(|span| self.line_of_span(span)),
+            Ast::ExternFunctionDef(def) => def.span.as_ref().map(|span| self.line_of_span(span)),
             Ast::MethodCall { span, .. } | Ast::FieldAccess { span, .. } => {
                 span.as_ref().map(|span| self.line_of_span(span))
             }
@@ -182,6 +183,9 @@ impl<'a> AstFormatter<'a> {
         match ast {
             Ast::FunctionDef(func) => func.span.as_ref().map(|span| self.end_line_of_span(span)),
             Ast::StructDef(def) => def.span.as_ref().map(|span| self.end_line_of_span(span)),
+            Ast::ExternFunctionDef(def) => {
+                def.span.as_ref().map(|span| self.end_line_of_span(span))
+            }
             Ast::MethodCall { receiver, args, span, .. } => args
                 .last()
                 .and_then(|arg| self.end_line_of_ast(arg))
@@ -797,6 +801,35 @@ impl FormatNode for StructDefAst {
     }
 }
 
+fn format_extern_abi_type(abi: ExternAbiTypeAst) -> &'static str {
+    match abi {
+        ExternAbiTypeAst::CInt => "c_int",
+        ExternAbiTypeAst::CI64 => "c_i64",
+        ExternAbiTypeAst::CU64 => "c_u64",
+        ExternAbiTypeAst::CSize => "c_size",
+        ExternAbiTypeAst::CPtr => "c_ptr",
+        ExternAbiTypeAst::CVoid => "c_void",
+    }
+}
+
+impl FormatNode for ExternFunctionDefAst {
+    fn format_node(&self, fmt: &mut AstFormatter<'_>, _parent_prec: u8) -> String {
+        let args = self
+            .inputs
+            .iter()
+            .map(|input| format!("{}: {}", input.name, format_extern_abi_type(input.abi_type)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut head =
+            format!("extern c fn {}({args}) -> {}", self.name, format_extern_abi_type(self.output));
+        fmt.append_trailing_comment(
+            &mut head,
+            self.span.as_ref().map(|span| fmt.line_of_span(span)),
+        );
+        head
+    }
+}
+
 impl FormatNode for Ast {
     fn format_node(&self, fmt: &mut AstFormatter<'_>, parent_prec: u8) -> String {
         match self {
@@ -828,7 +861,8 @@ impl FormatNode for Ast {
             | Ast::MultiAssign { .. }
             | Ast::IndexAssign { .. }
             | Ast::FieldAssign { .. }
-            | Ast::FunctionDef(_) => {
+            | Ast::FunctionDef(_)
+            | Ast::ExternFunctionDef(_) => {
                 unreachable!("statement AST should not be formatted as expression")
             }
         }
@@ -847,7 +881,9 @@ fn parse_top_level_items(source: &str) -> Result<Vec<Ast>, CompileError> {
             break;
         }
         match Ast::from_lexer(&mut lexer) {
-            Ok(item @ Ast::FunctionDef(_)) | Ok(item @ Ast::StructDef(_)) => items.push(item),
+            Ok(item @ Ast::FunctionDef(_))
+            | Ok(item @ Ast::StructDef(_))
+            | Ok(item @ Ast::ExternFunctionDef(_)) => items.push(item),
             Ok(_) => return Err(CompileError::TopLevelExpression),
             Err(err) => {
                 return Err(CompileError::Parse { message: err.to_string(), span: Some(err.span) });
@@ -867,6 +903,7 @@ pub fn format_source(source: &str, config: &FormatConfig) -> Result<String, Comp
         let item_span = match item {
             Ast::FunctionDef(func) => func.span.as_ref(),
             Ast::StructDef(def) => def.span.as_ref(),
+            Ast::ExternFunctionDef(def) => def.span.as_ref(),
             _ => None,
         };
         let item_start_line = item_span.map(|span| fmt.line_of_span(span));
@@ -912,7 +949,8 @@ pub fn format_source(source: &str, config: &FormatConfig) -> Result<String, Comp
         match item {
             Ast::FunctionDef(func) => rendered.push_str(&func.format_node(&mut fmt, 0)),
             Ast::StructDef(def) => rendered.push_str(&def.format_node(&mut fmt, 0)),
-            _ => unreachable!("top-level formatter only accepts functions and structs"),
+            Ast::ExternFunctionDef(def) => rendered.push_str(&def.format_node(&mut fmt, 0)),
+            _ => unreachable!("top-level formatter only accepts functions, structs, and externs"),
         }
         wrote_item = true;
         previous_end_line = item_span.map(|span| fmt.end_line_of_span(span));
@@ -1088,6 +1126,13 @@ mod tests {
     #[test]
     fn format_source_preserves_struct_syntax() {
         let source = "struct Person = {\n    name,\n    age,\n}\n";
+        let formatted = format_source(source, &config(BlockStyle::DoEnd)).unwrap();
+        assert_eq!(formatted, source);
+    }
+
+    #[test]
+    fn format_source_preserves_extern_c_function() {
+        let source = "extern c fn puts(text: c_ptr) -> c_int\n";
         let formatted = format_source(source, &config(BlockStyle::DoEnd)).unwrap();
         assert_eq!(formatted, source);
     }

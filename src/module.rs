@@ -7,8 +7,8 @@ use crate::methods::{
     method_target_functions_for_shape,
 };
 use crate::parser::{
-    Ast, BlockAst, ExpressionAst, FunctionDefAst, Ident, LiteralAst, MapEntryAst, MapKeyAst,
-    StructDefAst,
+    Ast, BlockAst, ExpressionAst, ExternAbiTypeAst, ExternFunctionDefAst, FunctionDefAst, Ident,
+    LiteralAst, MapEntryAst, MapKeyAst, StructDefAst,
 };
 use crate::source::Span;
 use crate::value::{
@@ -86,6 +86,10 @@ pub enum CompileError {
     UndefinedVariable { name: String, span: Option<Span> },
     #[error("struct name conflicts with an existing struct or function: {name}")]
     StructNameConflict { name: String, span: Option<Span> },
+    #[error(
+        "extern function name conflicts with an existing struct, function, or extern declaration: {name}"
+    )]
+    ExternNameConflict { name: String, span: Option<Span> },
     #[error("duplicate field `{field}` in struct {struct_name}")]
     DuplicateStructField { struct_name: String, field: String, span: Option<Span> },
     #[error("undefined struct: {name}")]
@@ -135,6 +139,7 @@ impl CompileError {
             | Self::UndefinedFunction { span, .. }
             | Self::UndefinedVariable { span, .. }
             | Self::StructNameConflict { span, .. }
+            | Self::ExternNameConflict { span, .. }
             | Self::DuplicateStructField { span, .. }
             | Self::UndefinedStruct { span, .. }
             | Self::MissingStructField { span, .. }
@@ -157,6 +162,7 @@ impl CompileError {
 pub struct Module {
     pub functions: Vec<FunctionDefAst>,
     pub structs: Vec<StructDefAst>,
+    pub extern_functions: Vec<ExternFunctionDefAst>,
     source: Option<String>,
     closure_metadata: HashMap<String, ClosureMetadata>,
     used_features: UsedFeatures,
@@ -208,8 +214,11 @@ struct UsedFeatures {
 impl Module {
     pub fn analyze_value_kinds(&self) -> Result<ModuleValueKindAnalysis, CompileError> {
         let return_arities = function_return_arities(&self.functions)?;
-        let mut analysis =
-            crate::analysis::analyze_module_value_kinds(&self.functions, &self.structs, &return_arities);
+        let mut analysis = crate::analysis::analyze_module_value_kinds(
+            &self.functions,
+            &self.structs,
+            &return_arities,
+        );
         let registry = struct_registry(&self.structs);
         analysis.structs = registry
             .iter()
@@ -247,9 +256,17 @@ impl Module {
     }
 
     fn validate_user_facing_constructs(&self) -> Result<(), CompileError> {
-        let function_names =
+        let user_function_names =
             self.functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
-        let function_arities = function_arities(&self.functions);
+        let extern_registry = extern_function_registry(&self.extern_functions);
+        let extern_function_names =
+            self.extern_functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
+        let mut function_names = user_function_names;
+        function_names.extend(extern_function_names.iter().cloned());
+        let mut function_arities = function_arities(&self.functions);
+        function_arities.extend(
+            self.extern_functions.iter().map(|func| (func.name.clone(), func.inputs.len())),
+        );
         let function_return_arities = function_return_arities(&self.functions)?;
         let value_kind_analysis = self.analyze_value_kinds()?;
         let structs = struct_registry(&self.structs);
@@ -272,6 +289,8 @@ impl Module {
                 &Ast::Block(func.block.clone()),
                 &locals,
                 &function_names,
+                &extern_function_names,
+                &extern_registry,
                 &function_arities,
                 &value_kind_analysis,
                 function_analysis,
@@ -285,10 +304,9 @@ impl Module {
                 *function_return_arities.get(&func.name).unwrap_or(&1),
             )?;
             let mut struct_env = HashMap::new();
-            if let (Some(first_input), Some(shape)) = (
-                func.inputs.first(),
-                nominal_struct_method_shape_for_function(func, &structs),
-            ) {
+            if let (Some(first_input), Some(shape)) =
+                (func.inputs.first(), nominal_struct_method_shape_for_function(func, &structs))
+            {
                 struct_env.insert(first_input.clone(), shape);
             }
             validate_struct_usage_in_block(&func.block, &mut struct_env, &structs)?;
@@ -318,6 +336,7 @@ impl Module {
         Module {
             functions: vec![],
             structs: vec![],
+            extern_functions: vec![],
             source: None,
             closure_metadata: HashMap::new(),
             used_features: UsedFeatures::default(),
@@ -333,8 +352,8 @@ impl Module {
     }
 
     pub fn try_from_source(source: &str) -> Result<Self, CompileError> {
-        let (functions, structs) = parse_source_items(source)?;
-        let mut module = Self::try_from_items(functions, structs)?;
+        let (functions, structs, extern_functions) = parse_source_items(source)?;
+        let mut module = Self::try_from_items(functions, structs, extern_functions)?;
         module.source = Some(source.to_string());
         Ok(module)
     }
@@ -346,37 +365,44 @@ impl Module {
     pub fn try_from_ast(ast: Ast) -> Result<Self, CompileError> {
         let mut functions = vec![];
         let mut structs = vec![];
+        let mut extern_functions = vec![];
         match ast {
             Ast::FunctionDef(func) => functions.push(func),
             Ast::StructDef(def) => structs.push(def),
+            Ast::ExternFunctionDef(def) => extern_functions.push(def),
             Ast::Block(block) => {
                 for line in block.lines {
                     match line {
                         Ast::FunctionDef(func) => functions.push(func),
                         Ast::StructDef(def) => structs.push(def),
+                        Ast::ExternFunctionDef(def) => extern_functions.push(def),
                         _ => {}
                     }
                 }
             }
             _ => {}
         }
-        Self::try_from_items(functions, structs)
+        Self::try_from_items(functions, structs, extern_functions)
     }
 
     fn try_from_items(
         functions: Vec<FunctionDefAst>,
         structs: Vec<StructDefAst>,
+        extern_functions: Vec<ExternFunctionDefAst>,
     ) -> Result<Self, CompileError> {
         for func in &functions {
             validate_no_nested_function_defs(&Ast::Block(func.block.clone()))?;
         }
         validate_struct_declarations(&structs, &functions)?;
+        validate_extern_function_declarations(&extern_functions, &functions, &structs)?;
         let functions = autoload_stdlib_functions(functions);
         validate_struct_declarations(&structs, &functions)?;
+        validate_extern_function_declarations(&extern_functions, &functions, &structs)?;
         let (functions, closure_metadata) = lift_anonymous_functions(functions);
         let module = Module {
             functions,
             structs,
+            extern_functions,
             source: None,
             closure_metadata,
             used_features: UsedFeatures::default(),
@@ -424,7 +450,7 @@ impl Module {
         self.validate_user_facing_constructs()?;
         match backend {
             CodegenBackend::Cranelift => {
-                Ok(JitArtifact::Cranelift(self.compile_to_cranelift_jit()))
+                Ok(JitArtifact::Cranelift(self.compile_to_cranelift_jit()?))
             }
             CodegenBackend::Llvm => {
                 #[cfg(feature = "llvm-backend")]
@@ -440,7 +466,7 @@ impl Module {
         }
     }
 
-    fn compile_to_cranelift_jit(self) -> CraneliftJitModule {
+    fn compile_to_cranelift_jit(self) -> Result<CraneliftJitModule, CompileError> {
         let value_kind_analysis = self
             .analyze_value_kinds()
             .expect("value kind analysis should succeed before Cranelift JIT codegen");
@@ -450,7 +476,16 @@ impl Module {
             .finish(flags.clone())
             .unwrap();
 
-        let jit_builder = JITBuilder::with_isa(isa.clone(), default_libcall_names());
+        let mut jit_builder = JITBuilder::with_isa(isa.clone(), default_libcall_names());
+        for extern_func in &self.extern_functions {
+            let Some(addr) = crate::runtime::jit_lookup_symbol(&extern_func.name) else {
+                return Err(CompileError::Toolchain(format!(
+                    "unable to resolve extern c symbol `{}` for JIT",
+                    extern_func.name
+                )));
+            };
+            jit_builder.symbol(&extern_func.name, addr);
+        }
         let mut cranelift_module = JITModule::new(jit_builder);
 
         let (arena_base_addr, arena_offset_addr) = crate::runtime::jit_arena_addresses();
@@ -470,8 +505,18 @@ impl Module {
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
+        let extern_registry = extern_function_registry(&self.extern_functions);
         let mut internal_func_ids = builtin_ids.clone();
         let mut int_result_func_ids = HashMap::new();
+        for extern_func in &self.extern_functions {
+            let extern_id = declare_extern_c_function_sig(
+                &mut cranelift_module,
+                &isa,
+                extern_func,
+                Linkage::Import,
+            );
+            internal_func_ids.insert(extern_func.name.clone(), extern_id);
+        }
         for func_def in &self.functions {
             let internal_id = declare_internal_function_sig(
                 &mut cranelift_module,
@@ -491,6 +536,7 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &extern_registry,
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
@@ -518,12 +564,12 @@ impl Module {
 
         cranelift_module.finalize_definitions().unwrap();
 
-        CraneliftJitModule {
+        Ok(CraneliftJitModule {
             module: cranelift_module,
             func_ids: internal_func_ids.clone(),
             internal_func_ids,
             int_result_func_ids,
-        }
+        })
     }
 
     pub fn compile_to_ir(self) -> String {
@@ -555,7 +601,17 @@ impl Module {
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
+        let extern_registry = extern_function_registry(&self.extern_functions);
         let mut internal_func_ids = builtin_ids.clone();
+        for extern_func in &self.extern_functions {
+            let extern_id = declare_extern_c_function_sig(
+                &mut cranelift_module,
+                &isa,
+                extern_func,
+                Linkage::Import,
+            );
+            internal_func_ids.insert(extern_func.name.clone(), extern_id);
+        }
         for func_def in &self.functions {
             let id = declare_internal_function_sig(
                 &mut cranelift_module,
@@ -591,6 +647,7 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &extern_registry,
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
@@ -663,7 +720,17 @@ impl Module {
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
+        let extern_registry = extern_function_registry(&self.extern_functions);
         let mut internal_func_ids = builtin_ids.clone();
+        for extern_func in &self.extern_functions {
+            let extern_id = declare_extern_c_function_sig(
+                &mut cranelift_module,
+                &isa,
+                extern_func,
+                Linkage::Import,
+            );
+            internal_func_ids.insert(extern_func.name.clone(), extern_id);
+        }
         for func_def in &self.functions {
             let internal_id = declare_internal_function_sig(
                 &mut cranelift_module,
@@ -683,6 +750,7 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &extern_registry,
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
@@ -796,8 +864,18 @@ impl Module {
         let function_ordinals = function_ordinals(&self.functions);
         let function_arities = function_arities(&self.functions);
         let closure_metadata = self.closure_metadata.clone();
+        let extern_registry = extern_function_registry(&self.extern_functions);
         let mut internal_func_ids = builtin_ids.clone();
         let mut expr_main_int_id: Option<FuncId> = None;
+        for extern_func in &self.extern_functions {
+            let extern_id = declare_extern_c_function_sig(
+                &mut cranelift_module,
+                &isa,
+                extern_func,
+                Linkage::Import,
+            );
+            internal_func_ids.insert(extern_func.name.clone(), extern_id);
+        }
         for func_def in &self.functions {
             if func_def.name == "main" {
                 let internal_id = declare_internal_function_sig(
@@ -837,6 +915,7 @@ impl Module {
                 func_def,
                 internal_func_ids[&func_def.name],
                 &internal_func_ids,
+                &extern_registry,
                 &function_ordinals,
                 &function_arities,
                 &closure_metadata,
@@ -862,8 +941,13 @@ impl Module {
         write_file_or_compile_error(&tmp, &bytes, "failed to write native object file")?;
 
         #[cfg(windows)]
-        let status = Command::new("rustc")
-            .arg(write_windows_wrapper(output)?)
+        let uses_extern_c = !self.extern_functions.is_empty();
+
+        #[cfg(windows)]
+        let mut status = Command::new("rustc");
+        #[cfg(windows)]
+        status
+            .arg(write_windows_wrapper(output, uses_extern_c)?)
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -877,15 +961,24 @@ impl Module {
             .arg("-C")
             .arg("link-arg=/DEBUG:NONE")
             .arg("-C")
-            .arg("link-arg=/ENTRY:mainCRTStartup")
-            .arg("-C")
             .arg("link-arg=/SUBSYSTEM:CONSOLE")
             .arg("-C")
             .arg(format!("link-arg={}", tmp.display()))
             .arg("-o")
-            .arg(output)
-            .status()
-            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
+            .arg(output);
+
+        #[cfg(windows)]
+        let status = if uses_extern_c {
+            status
+                .status()
+                .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?
+        } else {
+            status
+                .arg("-C")
+                .arg("link-arg=/ENTRY:mainCRTStartup")
+                .status()
+                .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?
+        };
 
         #[cfg(not(windows))]
         let status = Command::new("rustc")
@@ -910,7 +1003,10 @@ impl Module {
             .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(windows)]
-        std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
+        {
+            std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
+            std::fs::remove_file(generated_wrapper_path(output, "windows_ffi_wrapper.rs")).ok();
+        }
         #[cfg(not(windows))]
         std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
@@ -922,6 +1018,9 @@ impl Module {
 
     #[cfg(feature = "llvm-backend")]
     fn compile_to_llvm_executable(self, output: &Path) -> Result<(), CompileError> {
+        #[cfg(windows)]
+        let uses_extern_c = !self.extern_functions.is_empty();
+
         let bytes = llvm_backend::compile_to_object(self, "llvm_exe")?;
         #[cfg(windows)]
         let tmp = output.with_extension("obj");
@@ -930,8 +1029,10 @@ impl Module {
         write_file_or_compile_error(&tmp, &bytes, "failed to write llvm object file")?;
 
         #[cfg(windows)]
-        let status = Command::new("rustc")
-            .arg(write_windows_wrapper(output)?)
+        let mut status = Command::new("rustc");
+        #[cfg(windows)]
+        status
+            .arg(write_windows_wrapper(output, uses_extern_c)?)
             .arg("--crate-name")
             .arg("expr_windows_wrapper")
             .arg("-C")
@@ -945,15 +1046,24 @@ impl Module {
             .arg("-C")
             .arg("link-arg=/DEBUG:NONE")
             .arg("-C")
-            .arg("link-arg=/ENTRY:mainCRTStartup")
-            .arg("-C")
             .arg("link-arg=/SUBSYSTEM:CONSOLE")
             .arg("-C")
             .arg(format!("link-arg={}", tmp.display()))
             .arg("-o")
-            .arg(output)
-            .status()
-            .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
+            .arg(output);
+
+        #[cfg(windows)]
+        let status = if uses_extern_c {
+            status
+                .status()
+                .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?
+        } else {
+            status
+                .arg("-C")
+                .arg("link-arg=/ENTRY:mainCRTStartup")
+                .status()
+                .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?
+        };
 
         #[cfg(not(windows))]
         let status = Command::new("rustc")
@@ -976,7 +1086,10 @@ impl Module {
             .map_err(|err| toolchain_error(format!("failed to launch rustc: {err}")))?;
 
         #[cfg(windows)]
-        std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
+        {
+            std::fs::remove_file(generated_wrapper_path(output, "windows_wrapper.rs")).ok();
+            std::fs::remove_file(generated_wrapper_path(output, "windows_ffi_wrapper.rs")).ok();
+        }
         #[cfg(not(windows))]
         std::fs::remove_file(generated_wrapper_path(output, "unix_wrapper.rs")).ok();
         std::fs::remove_file(&tmp).ok();
@@ -1154,9 +1267,8 @@ fn nominal_struct_method_shape_for_function(
                 .map(|_| name.as_str())
         })
         .max_by_key(|name| name.len())?;
-    let metadata = structs
-        .get(struct_name)
-        .expect("nominal struct method must refer to declared struct");
+    let metadata =
+        structs.get(struct_name).expect("nominal struct method must refer to declared struct");
     Some(ValueShape::struct_(
         struct_name.to_string(),
         metadata
@@ -1290,7 +1402,8 @@ fn analyze_struct_bindings_for_function(
             | Ast::Variable(_)
             | Ast::FunctionRef(_)
             | Ast::FunctionDef(_)
-            | Ast::StructDef(_) => {}
+            | Ast::StructDef(_)
+            | Ast::ExternFunctionDef(_) => {}
         }
     }
 
@@ -1320,7 +1433,9 @@ fn validate_struct_usage_in_ast(
     structs: &HashMap<String, StructMetadata>,
 ) -> Result<(), CompileError> {
     match ast {
-        Ast::StructDef(_) | Ast::Literal(_) | Ast::FunctionRef(_) => Ok(()),
+        Ast::StructDef(_) | Ast::ExternFunctionDef(_) | Ast::Literal(_) | Ast::FunctionRef(_) => {
+            Ok(())
+        }
         Ast::Variable(_) => Ok(()),
         Ast::Lambda { body, .. } => {
             let mut nested_env = env.clone();
@@ -1558,9 +1673,25 @@ impl CraneliftJitModule {
 }
 
 #[cfg(windows)]
-fn write_windows_wrapper(output: &Path) -> Result<std::path::PathBuf, CompileError> {
-    let wrapper = generated_wrapper_path(output, "windows_wrapper.rs");
-    let source = include_str!("./wrapper/windows.rs");
+fn write_windows_wrapper(
+    output: &Path,
+    use_crt_wrapper: bool,
+) -> Result<std::path::PathBuf, CompileError> {
+    let (suffix, prefix, suffix_source) = if use_crt_wrapper {
+        (
+            "windows_ffi_wrapper.rs",
+            include_str!("./wrapper/windows/std_prefix.rs"),
+            include_str!("./wrapper/windows/std_suffix.rs"),
+        )
+    } else {
+        (
+            "windows_wrapper.rs",
+            include_str!("./wrapper/windows/no_std_prefix.rs"),
+            include_str!("./wrapper/windows/no_std_suffix.rs"),
+        )
+    };
+    let source = [prefix, include_str!("./wrapper/windows/shared.rs"), suffix_source].join("\n\n");
+    let wrapper = generated_wrapper_path(output, suffix);
     let parent = wrapper.parent().unwrap();
     std::fs::create_dir_all(parent).map_err(|err| {
         io_toolchain_error("failed to create generated wrapper directory", parent, err)
@@ -1669,6 +1800,31 @@ fn declare_internal_function_sig(
         sig.params.push(AbiParam::new(types::I64));
     }
     module.declare_function(name, linkage, &sig).unwrap()
+}
+
+fn declare_extern_c_function_sig(
+    module: &mut impl CraneliftModule,
+    isa: &OwnedTargetIsa,
+    func_def: &ExternFunctionDefAst,
+    linkage: Linkage,
+) -> FuncId {
+    let mut sig = Signature::new(isa.default_call_conv());
+    for input in &func_def.inputs {
+        sig.params.push(AbiParam::new(extern_abi_clif_type(input.abi_type)));
+    }
+    sig.returns.push(AbiParam::new(extern_abi_clif_type(func_def.output)));
+    module.declare_function(&func_def.name, linkage, &sig).unwrap()
+}
+
+fn extern_abi_clif_type(abi: ExternAbiTypeAst) -> Type {
+    match abi {
+        ExternAbiTypeAst::CInt => types::I32,
+        ExternAbiTypeAst::CI64
+        | ExternAbiTypeAst::CU64
+        | ExternAbiTypeAst::CSize
+        | ExternAbiTypeAst::CPtr
+        | ExternAbiTypeAst::CVoid => types::I64,
+    }
 }
 
 fn internal_symbol_name(name: &str) -> String {
@@ -1806,6 +1962,35 @@ fn validate_struct_declarations(
     Ok(())
 }
 
+fn validate_extern_function_declarations(
+    extern_functions: &[ExternFunctionDefAst],
+    functions: &[FunctionDefAst],
+    structs: &[StructDefAst],
+) -> Result<(), CompileError> {
+    let mut seen_names = functions.iter().map(|func| func.name.clone()).collect::<HashSet<_>>();
+    seen_names.extend(structs.iter().map(|def| def.name.clone()));
+    for def in extern_functions {
+        if !seen_names.insert(def.name.clone()) {
+            return Err(CompileError::ExternNameConflict {
+                name: def.name.clone(),
+                span: def.span.clone(),
+            });
+        }
+        if def.output == ExternAbiTypeAst::CVoid
+            || def.inputs.iter().any(|input| input.abi_type == ExternAbiTypeAst::CVoid)
+        {
+            return Err(CompileError::UnsupportedFeature("c_void extern c ABI"));
+        }
+    }
+    Ok(())
+}
+
+fn extern_function_registry(
+    extern_functions: &[ExternFunctionDefAst],
+) -> HashMap<String, ExternFunctionDefAst> {
+    extern_functions.iter().map(|def| (def.name.clone(), def.clone())).collect()
+}
+
 fn struct_registry(structs: &[StructDefAst]) -> HashMap<String, StructMetadata> {
     structs
         .iter()
@@ -1925,12 +2110,13 @@ fn infer_ast_return_arity(
 
 fn parse_source_items(
     source: &str,
-) -> Result<(Vec<FunctionDefAst>, Vec<StructDefAst>), CompileError> {
+) -> Result<(Vec<FunctionDefAst>, Vec<StructDefAst>, Vec<ExternFunctionDefAst>), CompileError> {
     use crate::parser::ParseLexer;
     use crate::tokenizer::{Logos, Token};
 
     let mut functions = vec![];
     let mut structs = vec![];
+    let mut extern_functions = vec![];
     let lex = Token::lexer(source);
     let mut lexer = ParseLexer::new(lex);
 
@@ -1944,6 +2130,7 @@ fn parse_source_items(
         match Ast::from_lexer(&mut lexer) {
             Ok(Ast::FunctionDef(func)) => functions.push(func),
             Ok(Ast::StructDef(def)) => structs.push(def),
+            Ok(Ast::ExternFunctionDef(def)) => extern_functions.push(def),
             Ok(_) => return Err(CompileError::TopLevelExpression),
             Err(err) => {
                 return Err(CompileError::Parse {
@@ -1954,13 +2141,16 @@ fn parse_source_items(
         }
     }
 
-    Ok((functions, structs))
+    Ok((functions, structs, extern_functions))
 }
 
 fn parse_source_functions(source: &str) -> Result<Vec<FunctionDefAst>, CompileError> {
-    let (functions, structs) = parse_source_items(source)?;
+    let (functions, structs, extern_functions) = parse_source_items(source)?;
     if !structs.is_empty() {
         return Err(CompileError::UnsupportedFeature("struct declarations in stdlib"));
+    }
+    if !extern_functions.is_empty() {
+        return Err(CompileError::UnsupportedFeature("extern c function declarations in stdlib"));
     }
     Ok(functions)
 }
@@ -2181,7 +2371,7 @@ fn collect_stdlib_references_from_ast(
     refs: &mut HashSet<String>,
 ) {
     match ast {
-        Ast::StructDef(_) => {}
+        Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {}
         Ast::Expression(ExpressionAst { function, args, .. }) => {
             if !function.is_empty() {
                 maybe_collect_stdlib_reference(function, scope, refs);
@@ -2260,7 +2450,7 @@ fn collect_used_features_from_block(block: &BlockAst, features: &mut UsedFeature
 
 fn collect_used_features_from_ast(ast: &Ast, features: &mut UsedFeatures) {
     match ast {
-        Ast::StructDef(_) => {}
+        Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {}
         Ast::Expression(ExpressionAst { function, args, .. }) => {
             if matches!(
                 function.as_str(),
@@ -2405,6 +2595,7 @@ fn define_function_body(
     func_def: &FunctionDefAst,
     func_id: FuncId,
     all_funcs: &HashMap<String, FuncId>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -2482,6 +2673,7 @@ fn define_function_body(
             &func_def.block,
             &vars,
             &func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -2635,6 +2827,13 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
         || matches!(
             name,
             "print"
+                | "ffi_null"
+                | "ffi_ptr_from_int"
+                | "ffi_int_from_c_int"
+                | "ffi_int_from_c_size"
+                | "ffi_string"
+                | "ffi_c_string_len"
+                | "ffi_c_string_to_string"
                 | "is_int"
                 | "is_bigint"
                 | "is_string"
@@ -2745,11 +2944,15 @@ fn validate_unary_callback_reference(
     ast: &Ast,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
     function_arities: &HashMap<String, usize>,
     builtin: &str,
 ) -> Result<(), CompileError> {
     match ast {
         Ast::FunctionRef(name) => {
+            if extern_function_names.contains(name.as_str()) {
+                return Err(CompileError::UnsupportedFeature("extern c function values"));
+            }
             if !function_names.contains(name.as_str()) {
                 return Err(CompileError::UndefinedFunction {
                     name: name.to_string(),
@@ -2767,6 +2970,9 @@ fn validate_unary_callback_reference(
         Ast::Variable(name)
             if !locals.contains(name.as_str()) && function_names.contains(name.as_str()) =>
         {
+            if extern_function_names.contains(name.as_str()) {
+                return Err(CompileError::UnsupportedFeature("extern c function values"));
+            }
             if function_arities.get(name.as_str()) != Some(&1usize) {
                 return Err(CompileError::CallbackArity {
                     builtin: builtin.to_string(),
@@ -2784,6 +2990,8 @@ fn validate_ast_user_facing(
     ast: &Ast,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -2794,13 +3002,20 @@ fn validate_ast_user_facing(
         Ast::Lambda { .. } => Err(CompileError::UnsupportedFeature("anonymous functions")),
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
         Ast::StructDef(_) => Err(CompileError::UnsupportedFeature("nested struct definitions")),
-        Ast::FunctionRef(name) => validate_function_reference(name, function_names),
+        Ast::ExternFunctionDef(_) => {
+            Err(CompileError::UnsupportedFeature("nested extern c function declarations"))
+        }
+        Ast::FunctionRef(name) => {
+            validate_function_reference(name, function_names, extern_function_names)
+        }
         Ast::MethodCall { receiver, method, args, .. } => validate_method_call_user_facing(
             receiver,
             method,
             args,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2809,6 +3024,8 @@ fn validate_ast_user_facing(
             values,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2817,6 +3034,8 @@ fn validate_ast_user_facing(
             items,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2825,6 +3044,8 @@ fn validate_ast_user_facing(
             entries,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2833,6 +3054,8 @@ fn validate_ast_user_facing(
             &fields.iter().map(|field| field.value.clone()).collect::<Vec<_>>(),
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2841,6 +3064,8 @@ fn validate_ast_user_facing(
             base,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2850,6 +3075,8 @@ fn validate_ast_user_facing(
                 base,
                 locals,
                 function_names,
+                extern_function_names,
+                extern_functions,
                 function_arities,
                 value_kind_analysis,
                 function_analysis,
@@ -2858,6 +3085,8 @@ fn validate_ast_user_facing(
                 value,
                 locals,
                 function_names,
+                extern_function_names,
+                extern_functions,
                 function_arities,
                 value_kind_analysis,
                 function_analysis,
@@ -2868,6 +3097,8 @@ fn validate_ast_user_facing(
             index,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2878,6 +3109,8 @@ fn validate_ast_user_facing(
             value,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2889,6 +3122,8 @@ fn validate_ast_user_facing(
                 function_span.clone(),
                 locals,
                 function_names,
+                extern_function_names,
+                extern_functions,
                 function_arities,
                 value_kind_analysis,
                 function_analysis,
@@ -2898,6 +3133,8 @@ fn validate_ast_user_facing(
             &block.lines,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2906,6 +3143,8 @@ fn validate_ast_user_facing(
             value,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2916,6 +3155,8 @@ fn validate_ast_user_facing(
             span.as_ref(),
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2926,6 +3167,8 @@ fn validate_ast_user_facing(
             else_,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -2939,6 +3182,8 @@ fn validate_method_call_user_facing(
     args: &[Ast],
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -2947,6 +3192,8 @@ fn validate_method_call_user_facing(
         receiver,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -2955,6 +3202,8 @@ fn validate_method_call_user_facing(
         args,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -2980,6 +3229,8 @@ fn validate_method_call_user_facing(
         method.span.clone(),
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -2990,6 +3241,8 @@ fn validate_dynamic_map_key_user_facing(
     key: &Ast,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -2998,6 +3251,8 @@ fn validate_dynamic_map_key_user_facing(
         key,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3020,6 +3275,8 @@ fn validate_map_literal_user_facing(
     entries: &[MapEntryAst],
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -3030,6 +3287,8 @@ fn validate_map_literal_user_facing(
                 key,
                 locals,
                 function_names,
+                extern_function_names,
+                extern_functions,
                 function_arities,
                 value_kind_analysis,
                 function_analysis,
@@ -3039,6 +3298,8 @@ fn validate_map_literal_user_facing(
             &entry.value,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -3053,6 +3314,8 @@ fn validate_multi_assign_user_facing(
     span: Option<&Span>,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -3061,6 +3324,8 @@ fn validate_multi_assign_user_facing(
         value,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3083,7 +3348,11 @@ fn validate_multi_assign_user_facing(
 fn validate_function_reference(
     name: &Ident,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
 ) -> Result<(), CompileError> {
+    if extern_function_names.contains(name.as_str()) {
+        return Err(CompileError::UnsupportedFeature("extern c function values"));
+    }
     if function_names.contains(name.as_str()) {
         Ok(())
     } else {
@@ -3162,7 +3431,10 @@ fn validate_ast_multi_return_usage(
         Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {
             validate_single_value_multi_return_usage(expected_arity, None)
         }
-        Ast::Lambda { .. } | Ast::FunctionDef(_) | Ast::StructDef(_) => Ok(()),
+        Ast::Lambda { .. }
+        | Ast::FunctionDef(_)
+        | Ast::StructDef(_)
+        | Ast::ExternFunctionDef(_) => Ok(()),
         Ast::MethodCall { receiver, method, args, .. } => {
             validate_child_multi_return_usage(
                 receiver,
@@ -3629,6 +3901,8 @@ fn validate_ast_sequence(
     items: &[Ast],
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -3638,6 +3912,8 @@ fn validate_ast_sequence(
             item,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             function_analysis,
@@ -3651,6 +3927,8 @@ fn validate_index_ast(
     index: &Ast,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -3659,6 +3937,8 @@ fn validate_index_ast(
         collection,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3667,6 +3947,8 @@ fn validate_index_ast(
         index,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3704,6 +3986,8 @@ fn validate_index_assign_ast(
     value: &Ast,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -3712,6 +3996,8 @@ fn validate_index_assign_ast(
         collection,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3720,6 +4006,8 @@ fn validate_index_assign_ast(
         index,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3728,6 +4016,8 @@ fn validate_index_assign_ast(
         value,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3780,16 +4070,27 @@ fn validate_expression_user_facing(
     function_span: Option<Span>,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
 ) -> Result<(), CompileError> {
     validate_callable_name(function, function_span.clone(), locals, function_names)?;
-    validate_callback_argument(function, args, locals, function_names, function_arities)?;
+    validate_callback_argument(
+        function,
+        args,
+        locals,
+        function_names,
+        extern_function_names,
+        function_arities,
+    )?;
     validate_ast_sequence(
         args,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3798,6 +4099,7 @@ fn validate_expression_user_facing(
         function,
         args,
         function_span,
+        extern_functions,
         function_analysis,
         value_kind_analysis,
     )
@@ -3823,6 +4125,7 @@ fn validate_callback_argument(
     args: &[Ast],
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
     function_arities: &HashMap<String, usize>,
 ) -> Result<(), CompileError> {
     if let Some(callback) = args.get(1) {
@@ -3832,6 +4135,7 @@ fn validate_callback_argument(
                     callback,
                     locals,
                     function_names,
+                    extern_function_names,
                     function_arities,
                     function,
                 )?
@@ -3848,6 +4152,8 @@ fn validate_if_ast_user_facing(
     else_: &Option<BlockAst>,
     locals: &HashSet<String>,
     function_names: &HashSet<String>,
+    extern_function_names: &HashSet<String>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_arities: &HashMap<String, usize>,
     value_kind_analysis: &ModuleValueKindAnalysis,
     function_analysis: &FunctionValueKindAnalysis,
@@ -3856,6 +4162,8 @@ fn validate_if_ast_user_facing(
         condition,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         function_analysis,
@@ -3866,6 +4174,8 @@ fn validate_if_ast_user_facing(
         &then.lines,
         locals,
         function_names,
+        extern_function_names,
+        extern_functions,
         function_arities,
         value_kind_analysis,
         &then_analysis,
@@ -3875,6 +4185,8 @@ fn validate_if_ast_user_facing(
             &else_.lines,
             locals,
             function_names,
+            extern_function_names,
+            extern_functions,
             function_arities,
             value_kind_analysis,
             &else_analysis,
@@ -3901,6 +4213,12 @@ fn builtin_argument_specs(function: &str) -> Option<&'static [BuiltinArgSpec]> {
     const FUNCTION: BuiltinArgSpec = Spec { expected: KindSet::function() };
 
     match function {
+        "ffi_string" => Some(&[STRING]),
+        "ffi_ptr_from_int"
+        | "ffi_int_from_c_int"
+        | "ffi_int_from_c_size"
+        | "ffi_c_string_len"
+        | "ffi_c_string_to_string" => Some(&[INT]),
         "bytes_len"
         | "bytes_pop"
         | "string_copy"
@@ -3975,9 +4293,21 @@ fn validate_expression_argument_types(
     function: &str,
     args: &[Ast],
     function_span: Option<Span>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_analysis: &FunctionValueKindAnalysis,
     value_kind_analysis: &ModuleValueKindAnalysis,
 ) -> Result<(), CompileError> {
+    if let Some(extern_def) = extern_functions.get(function) {
+        return validate_extern_expression_argument_types(
+            function,
+            args,
+            function_span,
+            extern_def,
+            function_analysis,
+            value_kind_analysis,
+        );
+    }
+
     let Some(specs) = builtin_argument_specs(function) else {
         return Ok(());
     };
@@ -4002,6 +4332,44 @@ fn validate_expression_argument_types(
         }
     }
 
+    Ok(())
+}
+
+fn validate_extern_expression_argument_types(
+    function: &str,
+    args: &[Ast],
+    function_span: Option<Span>,
+    extern_def: &ExternFunctionDefAst,
+    function_analysis: &FunctionValueKindAnalysis,
+    value_kind_analysis: &ModuleValueKindAnalysis,
+) -> Result<(), CompileError> {
+    for (index, input) in extern_def.inputs.iter().enumerate() {
+        let Some(arg) = args.get(index) else {
+            break;
+        };
+        let actual =
+            infer_ast_value_shape(arg, function_analysis, value_kind_analysis).scalar_slot();
+        if actual.is_empty() {
+            continue;
+        }
+        let expected = match input.abi_type {
+            ExternAbiTypeAst::CInt
+            | ExternAbiTypeAst::CI64
+            | ExternAbiTypeAst::CU64
+            | ExternAbiTypeAst::CSize
+            | ExternAbiTypeAst::CPtr
+            | ExternAbiTypeAst::CVoid => KindSet::int(),
+        };
+        if !kind_sets_intersect(actual, expected) {
+            return Err(CompileError::InvalidArgumentType {
+                function: function.to_string(),
+                argument: index + 1,
+                expected: format_kind_set_for_error(expected),
+                found: format_kind_set_for_error(actual),
+                span: function_span,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -4082,7 +4450,8 @@ fn known_callable_shape(function: &str, arg_shapes: &[ValueShape]) -> Option<Val
     let scalar_arg = |index: usize| {
         arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any)
     };
-    infer_builtin_string_shape(function)
+    infer_builtin_ffi_shape(function)
+        .or_else(|| infer_builtin_string_shape(function))
         .or_else(|| infer_builtin_list_shape(function, arg_shapes))
         .or_else(|| infer_builtin_map_shape(function, arg_shapes))
         .or_else(|| infer_builtin_boolean_shape(function))
@@ -4270,7 +4639,9 @@ fn infer_ast_value_shape(
         Ast::FieldAssign { value, .. } => {
             infer_ast_value_shape(value, function_analysis, value_kind_analysis)
         }
-        Ast::FunctionDef(_) | Ast::StructDef(_) => ValueShape::scalar(KindSet::empty()),
+        Ast::FunctionDef(_) | Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {
+            ValueShape::scalar(KindSet::empty())
+        }
     }
 }
 
@@ -4354,6 +4725,19 @@ fn infer_builtin_numeric_shape(
         "bigint_shl" | "bigint_shr" => Some(ValueShape::scalar(scalar_arg(0))),
         "bigint_from_int" | "bigint_add" | "bigint_subtract" | "bigint_multiply"
         | "bigint_divide" | "bigint_modulo" => Some(ValueShape::scalar(KindSet::bigint())),
+        _ => None,
+    }
+}
+
+fn infer_builtin_ffi_shape(function: &str) -> Option<ValueShape> {
+    match function {
+        "ffi_null"
+        | "ffi_ptr_from_int"
+        | "ffi_int_from_c_int"
+        | "ffi_int_from_c_size"
+        | "ffi_string" => Some(ValueShape::scalar(KindSet::int())),
+        "ffi_c_string_len" => Some(ValueShape::scalar(KindSet::int())),
+        "ffi_c_string_to_string" => Some(ValueShape::scalar(KindSet::string())),
         _ => None,
     }
 }
@@ -4480,7 +4864,8 @@ fn infer_builtin_value_shape(function: &str, arg_shapes: &[ValueShape]) -> Value
     let scalar_arg = |index: usize| {
         arg_shapes.get(index).map(ValueShape::scalar_slot).unwrap_or_else(KindSet::any)
     };
-    infer_builtin_boolean_shape(function)
+    infer_builtin_ffi_shape(function)
+        .or_else(|| infer_builtin_boolean_shape(function))
         .or_else(|| infer_builtin_numeric_shape(function, &scalar_arg))
         .or_else(|| infer_builtin_string_shape(function))
         .or_else(|| infer_builtin_list_shape(function, arg_shapes))
@@ -4541,6 +4926,7 @@ fn span_of_ast(ast: &Ast) -> Option<Span> {
         | Ast::If { span, .. } => span.clone(),
         Ast::FunctionDef(func) => func.span.clone(),
         Ast::StructDef(def) => def.span.clone(),
+        Ast::ExternFunctionDef(def) => def.span.clone(),
         Ast::Block(_)
         | Ast::Lambda { .. }
         | Ast::MultiValue(_)
@@ -4584,7 +4970,7 @@ fn validate_no_nested_function_defs(ast: &Ast) -> Result<(), CompileError> {
 
     match ast {
         Ast::FunctionDef(_) => Err(CompileError::UnsupportedFeature("nested function definitions")),
-        Ast::StructDef(_) => Ok(()),
+        Ast::StructDef(_) | Ast::ExternFunctionDef(_) => Ok(()),
         Ast::Lambda { body, .. } => validate_no_nested_function_defs(body),
         Ast::MultiValue(values) | Ast::ListLiteral(values) => validate_nested_free_slice(values),
         Ast::MapLiteral(entries) => validate_nested_free_map_entries(entries),
@@ -4734,7 +5120,7 @@ impl LambdaLifter {
                 }
             }
             Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
-            Ast::StructDef(_) => {}
+            Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {}
             Ast::Literal(_) | Ast::Variable(_) | Ast::FunctionRef(_) => {}
         }
     }
@@ -4884,14 +5270,14 @@ fn collect_captures_into(
         Ast::MultiAssign { value, .. } => {
             collect_captures_into(value, local_names, scope_names, captures);
         }
-        Ast::StructDef(_) => {}
+        Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {}
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
     }
 }
 
 fn collect_var_names(ast: &Ast, names: &mut Vec<String>) {
     match ast {
-        Ast::StructDef(_) => {}
+        Ast::StructDef(_) | Ast::ExternFunctionDef(_) => {}
         Ast::Lambda { body, .. } => {
             collect_var_names(body, names);
         }
@@ -4986,6 +5372,7 @@ fn compile_logical_op(
     rhs_ast: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -4999,6 +5386,7 @@ fn compile_logical_op(
         lhs_ast,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -5033,6 +5421,7 @@ fn compile_logical_op(
         rhs_ast,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -5057,6 +5446,7 @@ fn compile_logical_not(
     arg_ast: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -5070,6 +5460,7 @@ fn compile_logical_not(
         arg_ast,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6243,6 +6634,7 @@ fn compile_list_literal(
     items: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6264,6 +6656,7 @@ fn compile_list_literal(
             item,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -6283,6 +6676,7 @@ fn compile_map_literal(
     entries: &[MapEntryAst],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6306,6 +6700,7 @@ fn compile_map_literal(
                 key,
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -6320,6 +6715,7 @@ fn compile_map_literal(
             &entry.value,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -6340,6 +6736,7 @@ fn compile_struct_literal(
     fields: &[crate::parser::StructFieldValueAst],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6376,6 +6773,7 @@ fn compile_struct_literal(
                     &field.value,
                     vars,
                     func_refs,
+                    extern_functions,
                     function_ordinals,
                     function_arities,
                     closure_metadata,
@@ -6413,6 +6811,7 @@ fn compile_field_access(
     field: &Ident,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6438,6 +6837,7 @@ fn compile_field_access(
         base,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6475,6 +6875,7 @@ fn compile_field_assign(
     value_ast: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6500,6 +6901,7 @@ fn compile_field_assign(
         base,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6522,6 +6924,7 @@ fn compile_field_assign(
         value_ast,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6587,6 +6990,7 @@ fn compile_multi_value(
     values: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6603,6 +7007,7 @@ fn compile_multi_value(
                 value,
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -6654,6 +7059,7 @@ fn compile_multi_assign_ast(
     value: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6667,6 +7073,7 @@ fn compile_multi_assign_ast(
         value,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6832,6 +7239,7 @@ fn compile_list_map(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6847,6 +7255,7 @@ fn compile_list_map(
         &args[0],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6860,6 +7269,7 @@ fn compile_list_map(
         &args[1],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6912,6 +7322,7 @@ fn compile_list_filter(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -6927,6 +7338,7 @@ fn compile_list_filter(
         &args[0],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -6940,6 +7352,7 @@ fn compile_list_filter(
         &args[1],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7009,6 +7422,7 @@ fn compile_list_range(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7023,6 +7437,7 @@ fn compile_list_range(
         &args[0],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7036,6 +7451,7 @@ fn compile_list_range(
         &args[1],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7079,6 +7495,7 @@ fn compile_tail_block(
     block: &BlockAst,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7101,6 +7518,7 @@ fn compile_tail_block(
             line,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7116,6 +7534,7 @@ fn compile_tail_block(
         &block.lines[block.lines.len() - 1],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7133,6 +7552,7 @@ fn compile_tail_ast(
     ast: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7155,6 +7575,7 @@ fn compile_tail_ast(
                         arg,
                         vars,
                         func_refs,
+                        extern_functions,
                         function_ordinals,
                         function_arities,
                         closure_metadata,
@@ -7179,6 +7600,7 @@ fn compile_tail_ast(
                 condition,
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -7200,6 +7622,7 @@ fn compile_tail_ast(
                 then,
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -7219,6 +7642,7 @@ fn compile_tail_ast(
                     else_block_ast,
                     vars,
                     func_refs,
+                    extern_functions,
                     function_ordinals,
                     function_arities,
                     closure_metadata,
@@ -7240,6 +7664,7 @@ fn compile_tail_ast(
             block,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7256,6 +7681,7 @@ fn compile_tail_ast(
                 ast,
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -7274,6 +7700,7 @@ fn compile_ast(
     ast: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7338,6 +7765,7 @@ fn compile_ast(
                 &resolved_args,
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -7352,6 +7780,7 @@ fn compile_ast(
             values,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7365,6 +7794,7 @@ fn compile_ast(
             items,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7378,6 +7808,7 @@ fn compile_ast(
             entries,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7392,6 +7823,7 @@ fn compile_ast(
             fields,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7406,6 +7838,7 @@ fn compile_ast(
             field,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7421,6 +7854,7 @@ fn compile_ast(
             value,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7435,6 +7869,7 @@ fn compile_ast(
             index,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7450,6 +7885,7 @@ fn compile_ast(
             value,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7464,6 +7900,7 @@ fn compile_ast(
             args,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7477,6 +7914,7 @@ fn compile_ast(
             block,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7501,6 +7939,7 @@ fn compile_ast(
             value,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7515,6 +7954,7 @@ fn compile_ast(
             value,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7530,6 +7970,7 @@ fn compile_ast(
             else_,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7539,7 +7980,7 @@ fn compile_ast(
             value_kind_analysis,
         ),
         Ast::FunctionDef(_) => unimplemented!("nested function definitions"),
-        Ast::StructDef(_) => boxed_int_const(builder, 0),
+        Ast::StructDef(_) | Ast::ExternFunctionDef(_) => boxed_int_const(builder, 0),
     }
 }
 
@@ -7549,6 +7990,7 @@ fn compile_index_ast(
     index: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7565,6 +8007,7 @@ fn compile_index_ast(
         collection,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7578,6 +8021,7 @@ fn compile_index_ast(
         index,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7602,6 +8046,7 @@ fn compile_index_assign_ast(
     value: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7615,6 +8060,7 @@ fn compile_index_assign_ast(
         collection,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7628,6 +8074,7 @@ fn compile_index_assign_ast(
         index,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7641,6 +8088,7 @@ fn compile_index_assign_ast(
         value,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7657,6 +8105,7 @@ fn compile_block_ast(
     block: &BlockAst,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7672,6 +8121,7 @@ fn compile_block_ast(
             line,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7690,6 +8140,7 @@ fn compile_assign_ast(
     value: &Ast,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7703,6 +8154,7 @@ fn compile_assign_ast(
         value,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7726,6 +8178,7 @@ fn compile_if_ast(
     else_: &Option<BlockAst>,
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7739,6 +8192,7 @@ fn compile_if_ast(
         condition,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7766,6 +8220,7 @@ fn compile_if_ast(
             then,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7785,6 +8240,7 @@ fn compile_if_ast(
             else_block_ast,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7813,6 +8269,7 @@ fn compile_if_ast(
             then,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7838,6 +8295,7 @@ fn compile_expression_ast(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -7852,6 +8310,7 @@ fn compile_expression_ast(
         args,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7868,6 +8327,7 @@ fn compile_expression_ast(
         args,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7885,6 +8345,7 @@ fn compile_expression_ast(
             &args[0],
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7903,6 +8364,7 @@ fn compile_expression_ast(
             &args[1],
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -7918,6 +8380,7 @@ fn compile_expression_ast(
         args,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7934,6 +8397,7 @@ fn compile_expression_ast(
         args,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7953,6 +8417,7 @@ fn compile_expression_ast(
                 arg,
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -7972,6 +8437,7 @@ fn compile_expression_ast(
         &compiled,
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -7986,6 +8452,7 @@ fn compile_type_predicate_expression_ast(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -8014,6 +8481,7 @@ fn compile_type_predicate_expression_ast(
         &args[0],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -8043,6 +8511,7 @@ fn compile_exact_numeric_expression_ast(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -8091,6 +8560,7 @@ fn compile_exact_numeric_expression_ast(
         &args[0],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -8104,6 +8574,7 @@ fn compile_exact_numeric_expression_ast(
         &args[1],
         vars,
         func_refs,
+        extern_functions,
         function_ordinals,
         function_arities,
         closure_metadata,
@@ -8145,6 +8616,7 @@ fn compile_list_expression_ast(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -8159,6 +8631,7 @@ fn compile_list_expression_ast(
             args,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -8172,6 +8645,7 @@ fn compile_list_expression_ast(
             args,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -8185,6 +8659,7 @@ fn compile_list_expression_ast(
             args,
             vars,
             func_refs,
+            extern_functions,
             function_ordinals,
             function_arities,
             closure_metadata,
@@ -8201,6 +8676,7 @@ fn compile_list_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8226,6 +8702,7 @@ fn compile_list_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8239,6 +8716,7 @@ fn compile_list_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8267,6 +8745,7 @@ fn compile_string_expression_ast(
     args: &[Ast],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -8284,6 +8763,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8309,6 +8789,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8322,6 +8803,7 @@ fn compile_string_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8345,6 +8827,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8362,6 +8845,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8375,6 +8859,7 @@ fn compile_string_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8392,6 +8877,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8405,6 +8891,7 @@ fn compile_string_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8418,6 +8905,7 @@ fn compile_string_expression_ast(
                 &args[2],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8435,6 +8923,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8448,6 +8937,7 @@ fn compile_string_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8465,6 +8955,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8478,6 +8969,7 @@ fn compile_string_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8491,6 +8983,7 @@ fn compile_string_expression_ast(
                 &args[2],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8513,6 +9006,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8526,6 +9020,7 @@ fn compile_string_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8539,6 +9034,7 @@ fn compile_string_expression_ast(
                 &args[2],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8565,6 +9061,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8582,6 +9079,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8599,6 +9097,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8616,6 +9115,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8633,6 +9133,7 @@ fn compile_string_expression_ast(
                 &args[0],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8646,6 +9147,7 @@ fn compile_string_expression_ast(
                 &args[1],
                 vars,
                 func_refs,
+                extern_functions,
                 function_ordinals,
                 function_arities,
                 closure_metadata,
@@ -8666,6 +9168,7 @@ fn compile_named_expression_ast(
     compiled: &[CompiledValue],
     vars: &HashMap<String, LocalValueVar>,
     func_refs: &HashMap<String, FuncRef>,
+    extern_functions: &HashMap<String, ExternFunctionDefAst>,
     function_ordinals: &HashMap<String, i64>,
     function_arities: &HashMap<String, usize>,
     closure_metadata: &HashMap<String, ClosureMetadata>,
@@ -8678,6 +9181,9 @@ fn compile_named_expression_ast(
         return value;
     }
     if let Some(value) = compile_named_map_expression(builder, function, compiled, func_refs) {
+        return value;
+    }
+    if let Some(value) = compile_ffi_expression(builder, function, compiled, func_refs) {
         return value;
     }
     match function {
@@ -8712,6 +9218,9 @@ fn compile_named_expression_ast(
                 let zero_env = builder.ins().iconst(types::I64, 0);
                 return call_named_with_env(builder, func_refs, name, zero_env, &compiled);
             }
+            if let Some(extern_def) = extern_functions.get(name) {
+                return compile_extern_c_call(builder, func_refs, extern_def, compiled);
+            }
             if let Some(func_ref) = func_refs.get(name) {
                 let mut args = Vec::with_capacity(compiled.len() * 2);
                 for value in compiled {
@@ -8725,6 +9234,149 @@ fn compile_named_expression_ast(
             unreachable!("undefined function should have been rejected before codegen: {name}");
         }
     }
+}
+
+fn compile_ffi_expression(
+    builder: &mut FunctionBuilder,
+    function: &str,
+    compiled: &[CompiledValue],
+    func_refs: &HashMap<String, FuncRef>,
+) -> Option<CompiledValue> {
+    match function {
+        "ffi_null" => Some(boxed_int_const(builder, 0)),
+        "ffi_ptr_from_int" | "ffi_int_from_c_int" | "ffi_int_from_c_size" => Some(CompiledValue {
+            tag: builder.ins().iconst(types::I64, TAG_INT),
+            payload: expect_int_payload(builder, compiled[0]),
+        }),
+        "ffi_string" => Some(compile_ffi_string(builder, func_refs, compiled[0])),
+        "ffi_c_string_len" => Some(compile_ffi_c_string_len(builder, compiled[0])),
+        "ffi_c_string_to_string" => {
+            Some(compile_ffi_c_string_to_string(builder, func_refs, compiled[0]))
+        }
+        _ => None,
+    }
+}
+
+fn compile_ffi_c_string_len_raw(builder: &mut FunctionBuilder, raw_ptr: Value) -> Value {
+    let is_null = builder.ins().icmp_imm(IntCC::Equal, raw_ptr, 0);
+    let null_block = builder.create_block();
+    let scan_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(scan_block, types::I64);
+    builder.append_block_param(done_block, types::I64);
+    let zero = builder.ins().iconst(types::I64, 0);
+
+    builder.ins().brif(is_null, null_block, &[], scan_block, &[BlockArg::Value(zero)]);
+
+    builder.seal_block(null_block);
+    builder.switch_to_block(null_block);
+    builder.ins().jump(done_block, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(scan_block);
+    let idx = builder.block_params(scan_block)[0];
+    let byte_ptr = builder.ins().iadd(raw_ptr, idx);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), byte_ptr, 0);
+    let is_end = builder.ins().icmp_imm(IntCC::Equal, byte, 0);
+    let next_idx = builder.ins().iadd_imm(idx, 1);
+    builder.ins().brif(
+        is_end,
+        done_block,
+        &[BlockArg::Value(idx)],
+        scan_block,
+        &[BlockArg::Value(next_idx)],
+    );
+    builder.seal_block(scan_block);
+    builder.seal_block(done_block);
+
+    builder.switch_to_block(done_block);
+    builder.block_params(done_block)[0]
+}
+
+fn compile_ffi_c_string_len(
+    builder: &mut FunctionBuilder,
+    ptr_value: CompiledValue,
+) -> CompiledValue {
+    let raw_ptr = expect_int_payload(builder, ptr_value);
+    let len = compile_ffi_c_string_len_raw(builder, raw_ptr);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: len }
+}
+
+fn compile_ffi_string(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    string_value: CompiledValue,
+) -> CompiledValue {
+    let is_string = builder.ins().icmp_imm(IntCC::Equal, string_value.tag, TAG_STRING);
+    builder.ins().trapz(is_string, TrapCode::BAD_CONVERSION_TO_INTEGER);
+    let len =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_LEN_OFFSET);
+    let src_ptr =
+        builder.ins().load(types::I64, MemFlags::new(), string_value.payload, STRING_PTR_OFFSET);
+    let total_len = builder.ins().iadd_imm(len, 1);
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let data_call = builder.ins().call(alloc_ref, &[total_len, align]);
+    let data_ptr = builder.inst_results(data_call)[0];
+    let zero = builder.ins().iconst(types::I64, 0);
+    copy_string_bytes(builder, src_ptr, data_ptr, len, zero);
+    let nul_ptr = builder.ins().iadd(data_ptr, len);
+    builder.ins().store(MemFlags::new(), zero, nul_ptr, 0);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload: data_ptr }
+}
+
+fn compile_ffi_c_string_to_string(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    ptr_value: CompiledValue,
+) -> CompiledValue {
+    let raw_ptr = expect_int_payload(builder, ptr_value);
+    let len = compile_ffi_c_string_len_raw(builder, raw_ptr);
+    let alloc_ref = require_func(func_refs, "__alloc");
+    let align = builder.ins().iconst(types::I64, 8);
+    let data_call = builder.ins().call(alloc_ref, &[len, align]);
+    let data_ptr = builder.inst_results(data_call)[0];
+    let zero = builder.ins().iconst(types::I64, 0);
+    copy_string_bytes(builder, raw_ptr, data_ptr, len, zero);
+    let header_size = builder.ins().iconst(types::I64, STRING_HEADER_SIZE);
+    let header_call = builder.ins().call(alloc_ref, &[header_size, align]);
+    let header_ptr = builder.inst_results(header_call)[0];
+    builder.ins().store(MemFlags::new(), len, header_ptr, STRING_LEN_OFFSET);
+    builder.ins().store(MemFlags::new(), len, header_ptr, STRING_CAP_OFFSET);
+    builder.ins().store(MemFlags::new(), data_ptr, header_ptr, STRING_PTR_OFFSET);
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_STRING), payload: header_ptr }
+}
+
+fn compile_extern_c_call(
+    builder: &mut FunctionBuilder,
+    func_refs: &HashMap<String, FuncRef>,
+    extern_def: &ExternFunctionDefAst,
+    compiled: &[CompiledValue],
+) -> CompiledValue {
+    let func_ref = require_func(func_refs, &extern_def.name);
+    let mut args = Vec::with_capacity(compiled.len());
+    for (arg, input) in compiled.iter().zip(&extern_def.inputs) {
+        let raw = expect_int_payload(builder, *arg);
+        let coerced = match input.abi_type {
+            ExternAbiTypeAst::CInt => builder.ins().ireduce(types::I32, raw),
+            ExternAbiTypeAst::CI64
+            | ExternAbiTypeAst::CU64
+            | ExternAbiTypeAst::CSize
+            | ExternAbiTypeAst::CPtr
+            | ExternAbiTypeAst::CVoid => raw,
+        };
+        args.push(coerced);
+    }
+    let call = builder.ins().call(func_ref, &args);
+    let raw = builder.inst_results(call)[0];
+    let payload = match extern_def.output {
+        ExternAbiTypeAst::CInt => builder.ins().sextend(types::I64, raw),
+        ExternAbiTypeAst::CI64
+        | ExternAbiTypeAst::CU64
+        | ExternAbiTypeAst::CSize
+        | ExternAbiTypeAst::CPtr
+        | ExternAbiTypeAst::CVoid => raw,
+    };
+    CompiledValue { tag: builder.ins().iconst(types::I64, TAG_INT), payload }
 }
 
 fn compile_named_generic_binary_expression(
@@ -12032,4 +12684,120 @@ fn llvm_executable_main_can_receive_argument_list() {
 fn llvm_jit_main_can_receive_argument_list() {
     let src = "fn main(args) do\n    print(list_len(args))\n    print(list_get(args, 0))\n    print(list_get(args, 1))\n    list_len(args)\nend";
     assert_jit_backend_result_with_args(src, CodegenBackend::Llvm, &["hello", "world"], 2);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_wasm_rejects_extern_c_functions() {
+    let src = "extern c fn strlen(text: c_ptr) -> c_size\n\nfn main() do\n    strlen(ffi_string(\"hello\"))\nend\n";
+    let err = llvm_backend::compile_to_wasm_assembly(Module::from_source(src), "llvm_opt_test")
+        .expect_err("extern c functions should be rejected for wasm output");
+    assert!(matches!(err, CompileError::UnsupportedFeature("extern c functions in wasm output")));
+}
+
+#[cfg(all(test, feature = "llvm-backend", feature = "wasi"))]
+#[test]
+fn llvm_component_rejects_extern_c_functions() {
+    let src = "extern c fn strlen(text: c_ptr) -> c_size\n\nfn main() do\n    strlen(ffi_string(\"hello\"))\nend\n";
+    let err = llvm_backend::compile_to_wasm_preview1_command_assembly(
+        Module::from_source(src),
+        "llvm_component_test",
+    )
+    .expect_err("extern c functions should be rejected for component output");
+    assert!(matches!(
+        err,
+        CompileError::UnsupportedFeature("extern c functions in wasi component output")
+    ));
+}
+
+#[test]
+fn try_from_source_accepts_extern_c_function_declarations() {
+    let src = "extern c fn puts(text: c_ptr) -> c_int\n\nfn main() do\n    0\nend\n";
+    let module = Module::try_from_source(src).expect("extern c declaration should parse");
+    assert_eq!(module.extern_functions.len(), 1);
+    assert_eq!(module.extern_functions[0].name, "puts");
+    assert_eq!(module.extern_functions[0].inputs.len(), 1);
+}
+
+#[test]
+fn try_from_source_rejects_conflicting_extern_c_function_names() {
+    let src = "fn puts() do\n    0\nend\n\nextern c fn puts(text: c_ptr) -> c_int\n";
+    let err = match Module::try_from_source(src) {
+        Ok(_) => panic!("conflicting extern name should fail"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, CompileError::ExternNameConflict { name, .. } if name == "puts"));
+}
+
+#[test]
+fn jit_extern_c_strlen_with_ffi_string_works() {
+    let src = "extern c fn strlen(text: c_ptr) -> c_size\n\nfn main() do\n    strlen(ffi_string(\"hello\"))\nend\n";
+    assert_cranelift_jit_result(src, 5);
+}
+
+#[test]
+fn jit_ffi_c_string_to_string_roundtrip_works() {
+    let src = "fn main() do\n    bytes_len(ffi_c_string_to_string(ffi_string(\"hello\")))\nend\n";
+    assert_cranelift_jit_result(src, 5);
+}
+
+#[test]
+fn jit_ffi_c_string_to_string_null_is_empty() {
+    let src = "fn main() do\n    bytes_len(ffi_c_string_to_string(ffi_null()))\nend\n";
+    assert_cranelift_jit_result(src, 0);
+}
+
+#[test]
+fn jit_ffi_c_string_len_works() {
+    let src = "fn main() do\n    ffi_c_string_len(ffi_string(\"hello\")) + ffi_c_string_len(ffi_null())\nend\n";
+    assert_cranelift_jit_result(src, 5);
+}
+
+#[test]
+fn try_compile_to_jit_rejects_invalid_extern_c_argument_type() {
+    let src =
+        "extern c fn strlen(text: c_ptr) -> c_size\n\nfn main() do\n    strlen(\"hello\")\nend\n";
+    let err = match Module::try_from_source(src).expect("source should parse").try_compile_to_jit()
+    {
+        Ok(_) => panic!("invalid extern c argument type should be rejected"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err,
+        CompileError::InvalidArgumentType {
+            function: "strlen".to_string(),
+            argument: 1,
+            expected: "int".to_string(),
+            found: "string".to_string(),
+            span: Some(Span { start: 60, end: 66 }),
+        }
+    );
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_extern_c_strlen_with_ffi_string_works() {
+    let src = "extern c fn strlen(text: c_ptr) -> c_size\n\nfn main() do\n    strlen(ffi_string(\"hello\"))\nend\n";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 5);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_ffi_c_string_to_string_roundtrip_works() {
+    let src = "fn main() do\n    bytes_len(ffi_c_string_to_string(ffi_string(\"hello\")))\nend\n";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 5);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_ffi_c_string_to_string_null_is_empty() {
+    let src = "fn main() do\n    bytes_len(ffi_c_string_to_string(ffi_null()))\nend\n";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 0);
+}
+
+#[cfg(all(test, feature = "llvm-backend"))]
+#[test]
+fn llvm_jit_ffi_c_string_len_works() {
+    let src = "fn main() do\n    ffi_c_string_len(ffi_string(\"hello\")) + ffi_c_string_len(ffi_null())\nend\n";
+    assert_jit_backend_result(src, CodegenBackend::Llvm, 5);
 }

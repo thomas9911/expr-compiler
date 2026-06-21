@@ -27,12 +27,10 @@ pub fn method_target_functions_for_shape(
 }
 
 pub fn resolve_method(shape: &ValueShape, method: &str) -> Result<String, MethodResolutionError> {
-    Ok(
-        method_target_functions_for_shape(shape, method)?
-            .into_iter()
-            .next()
-            .expect("method target list should be non-empty"),
-    )
+    Ok(method_target_functions_for_shape(shape, method)?
+        .into_iter()
+        .next()
+        .expect("method target list should be non-empty"))
 }
 
 pub fn exact_receiver_kind(shape: &ValueShape) -> Result<ValueKind, MethodResolutionError> {

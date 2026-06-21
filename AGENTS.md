@@ -182,6 +182,32 @@ Guidance for coding agents working in this repository.
 - Function values can be stored in variables and passed around.
 - Generic direct function-value calls are supported:
   - `f(10)`
+- Native/JIT C FFI is supported through explicit extern declarations:
+  - `extern c fn strlen(text: c_ptr) -> c_size`
+  - supported ABI types:
+    - `c_int`
+    - `c_i64`
+    - `c_u64`
+    - `c_size`
+    - `c_ptr`
+  - explicit helpers:
+    - `ffi_null()`
+    - `ffi_ptr_from_int(x)`
+    - `ffi_int_from_c_int(x)`
+    - `ffi_int_from_c_size(x)`
+    - `ffi_string(s)`
+    - `ffi_c_string_len(ptr)`
+    - `ffi_c_string_to_string(ptr)`
+  - current contract:
+    - extern arguments and returns are scalar ABI values
+    - extern returns are boxed back as expr `Int`
+    - `ffi_string(s)` allocates a NUL-terminated arena buffer and returns its pointer as an `Int`
+    - `ffi_c_string_len(ptr)` scans a NUL-terminated C string and returns its byte length as an expr `Int`
+    - `ffi_c_string_to_string(ptr)` copies a NUL-terminated C string into a normal expr `String`
+    - `ffi_c_string_len(ffi_null())` returns `0`
+    - `ffi_c_string_to_string(ffi_null())` returns `""`
+    - externs are not first-class function values
+    - wasm/component output does not support `extern c fn`
 - JIT, native executable, LLVM core Wasm, and LLVM `wasi:cli/command` component `main` may optionally take one argument:
   - `fn main(args) do ... end`
   - `args` is a list of strings containing the CLI arguments passed to the program

@@ -1,9 +1,3 @@
-#![no_std]
-#![no_main]
-
-use core::convert::TryFrom;
-use core::panic::PanicInfo;
-use core::ptr;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -691,14 +685,11 @@ unsafe extern "C" {
     fn expr_main_entry_int(arg_tag: i64, arg_payload: i64) -> i64;
 }
 
-#[no_mangle]
-pub extern "C" fn mainCRTStartup() -> ! {
+fn expr_windows_main() -> u32 {
     let mut argc = 0i32;
     let argv = unsafe { CommandLineToArgvW(GetCommandLineW(), &mut argc as *mut i32) };
     if argv.is_null() {
-        unsafe {
-            ExitProcess(1);
-        }
+        return 1;
     }
     let args = unsafe { build_argv_list_from_wide(argc, argv) };
     unsafe {
@@ -706,20 +697,9 @@ pub extern "C" fn mainCRTStartup() -> ! {
     }
     let args_value = unsafe { &*value_ptr(args) };
     let int_code = unsafe { expr_main_entry_int(args_value.tag as i64, args_value.payload) };
-    let exit_code = if int_code < u32::MIN as i64 || int_code > u32::MAX as i64 {
+    if int_code < u32::MIN as i64 || int_code > u32::MAX as i64 {
         1
     } else {
         int_code as u32
-    };
-
-    unsafe {
-        ExitProcess(exit_code);
-    }
-}
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    unsafe {
-        ExitProcess(1);
     }
 }
